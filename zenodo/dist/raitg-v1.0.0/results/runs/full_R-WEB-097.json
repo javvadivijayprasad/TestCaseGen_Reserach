@@ -1,0 +1,182 @@
+{
+  "req": {
+    "id": "R-WEB-097",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Bulk import employees",
+    "statement": "An hr-admin shall bulk-import employees via CSV; the import shall validate each row and commit only rows that pass validation, reporting errors per row.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin uploads CSV"
+    ],
+    "expected_outcomes": [
+      "valid rows imported",
+      "error report generated"
+    ],
+    "error_pathways": [
+      "415 when file not CSV",
+      "422 when header missing required columns"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/employees/import"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-097",
+    "reasoning": "R-WEB-097 requires bulk CSV import with per-row validation, partial commit, and structured error reporting. Test coverage is designed across four dimensions: (1) EP \u2013 a well-formed CSV with mixed valid/invalid rows exercises the core happy-path partition and partial-commit behaviour; (2) NEG \u2013 uploading a non-CSV file triggers the 415 error pathway; (3) NEG/DT \u2013 a CSV whose header omits required columns triggers the 422 error pathway; (4) BVA \u2013 a single-data-row CSV (minimum non-empty payload) probes the lower boundary of importable content; (5) STC \u2013 the state transition from 'no employees' through 'import initiated' to 'employees committed + error report available' is exercised by the positive case. Each test is self-contained via fixtures that create and clean up state, and idempotent because teardown deletes any imported records by the seeded external-id.",
+    "tests": [
+      {
+        "name": "test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Actor has role hr-admin",
+          "Session cookie for hr-admin is available via <hr_admin_session> fixture",
+          "No employee with external_id EXT-001 or EXT-002 exists in the system"
+        ],
+        "actions": [
+          "Build a CSV with two valid rows (EXT-001, EXT-002) and one invalid row (missing required email field)",
+          "POST multipart/form-data to /employees/import with the CSV file",
+          "Capture the JSON response body"
+        ],
+        "expected": [
+          "HTTP status 207 (multi-status) or 200",
+          "Response body contains imported_count == 2",
+          "Response body contains errors list with exactly 1 entry referencing row 3",
+          "GET /employees?external_id=EXT-001 returns 200 with employee record",
+          "GET /employees?external_id=EXT-002 returns 200 with employee record"
+        ],
+        "trace": [
+          "R-WEB-097: valid rows imported",
+          "R-WEB-097: error report generated",
+          "R-WEB-097: commit only rows that pass validation"
+        ],
+        "executable": "import pytest\nimport io\n\nCSV_MIXED = (\n    \"external_id,first_name,last_name,email\\n\"\n    \"EXT-001,Alice,Smith,alice@example.com\\n\"\n    \"EXT-002,Bob,Jones,bob@example.com\\n\"\n    \"EXT-BAD,Charlie,,\\n\"\n)\n\ndef test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors(\n    hr_admin_session,  # <fixture>\n    api_base_url,      # <fixture>\n    cleanup_employees, # <fixture> deletes by external_id on teardown\n):\n    cleanup_employees([\"EXT-001\", \"EXT-002\", \"EXT-BAD\"])\n    files = {\"file\": (\"employees.csv\", io.StringIO(CSV_MIXED), \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code in (200, 207)\n    body = resp.json()\n    assert body[\"imported_count\"] == 2\n    assert len(body[\"errors\"]) == 1\n    assert body[\"errors\"][0][\"row\"] == 3\n    r1 = hr_admin_session.get(f\"{api_base_url}/employees\", params={\"external_id\": \"EXT-001\"})\n    assert r1.status_code == 200 and r1.json()[\"total\"] >= 1\n    r2 = hr_admin_session.get(f\"{api_base_url}/employees\", params={\"external_id\": \"EXT-002\"})\n    assert r2.status_code == 200 and r2.json()[\"total\"] >= 1\n"
+      },
+      {
+        "name": "test_bulk_import_non_csv_file_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Actor has role hr-admin",
+          "Session cookie for hr-admin is available via <hr_admin_session> fixture"
+        ],
+        "actions": [
+          "Build a plain-text file with .txt extension and text/plain MIME type",
+          "POST multipart/form-data to /employees/import with the text file"
+        ],
+        "expected": [
+          "HTTP status 415 Unsupported Media Type",
+          "Response body contains an error message referencing unsupported file type"
+        ],
+        "trace": [
+          "R-WEB-097: error pathway \u2013 415 when file not CSV"
+        ],
+        "executable": "import io\n\ndef test_bulk_import_non_csv_file_returns_415(\n    hr_admin_session,  # <fixture>\n    api_base_url,      # <fixture>\n):\n    content = b\"not,a,csv,file\\nfoo,bar,baz\"\n    files = {\"file\": (\"employees.txt\", io.BytesIO(content), \"text/plain\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code == 415\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body\n    error_text = (body.get(\"error\") or body.get(\"message\", \"\")).lower()\n    assert any(kw in error_text for kw in [\"unsupported\", \"media type\", \"csv\", \"file type\"])\n"
+      },
+      {
+        "name": "test_bulk_import_csv_missing_required_header_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Actor has role hr-admin",
+          "Session cookie for hr-admin is available via <hr_admin_session> fixture"
+        ],
+        "actions": [
+          "Build a CSV that omits the required 'email' column from its header row",
+          "POST multipart/form-data to /employees/import with that CSV file"
+        ],
+        "expected": [
+          "HTTP status 422 Unprocessable Entity",
+          "Response body contains an error referencing the missing required column"
+        ],
+        "trace": [
+          "R-WEB-097: error pathway \u2013 422 when header missing required columns"
+        ],
+        "executable": "import io\n\nCSV_BAD_HEADER = (\n    \"external_id,first_name,last_name\\n\"\n    \"EXT-999,Dave,Brown\\n\"\n)\n\ndef test_bulk_import_csv_missing_required_header_returns_422(\n    hr_admin_session,  # <fixture>\n    api_base_url,      # <fixture>\n):\n    files = {\"file\": (\"employees.csv\", io.StringIO(CSV_BAD_HEADER), \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body or \"message\" in body\n    raw = str(body).lower()\n    assert \"email\" in raw or \"column\" in raw or \"header\" in raw\n"
+      },
+      {
+        "name": "test_bulk_import_single_valid_row_csv_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Actor has role hr-admin",
+          "Session cookie for hr-admin is available via <hr_admin_session> fixture",
+          "No employee with external_id EXT-BVA exists in the system"
+        ],
+        "actions": [
+          "Build a CSV with exactly one data row (minimum non-empty payload, BVA lower bound)",
+          "POST multipart/form-data to /employees/import with the CSV file",
+          "Verify the single row is committed and error list is empty"
+        ],
+        "expected": [
+          "HTTP status 200 or 207",
+          "Response body contains imported_count == 1",
+          "Response body contains an empty errors list",
+          "GET /employees?external_id=EXT-BVA returns the imported employee"
+        ],
+        "trace": [
+          "R-WEB-097: valid rows imported",
+          "R-WEB-097: boundary \u2013 minimum importable payload (1 data row)"
+        ],
+        "executable": "import io\n\nCSV_SINGLE = (\n    \"external_id,first_name,last_name,email\\n\"\n    \"EXT-BVA,Eve,Taylor,eve@example.com\\n\"\n)\n\ndef test_bulk_import_single_valid_row_csv_boundary(\n    hr_admin_session,  # <fixture>\n    api_base_url,      # <fixture>\n    cleanup_employees, # <fixture>\n):\n    cleanup_employees([\"EXT-BVA\"])\n    files = {\"file\": (\"employees.csv\", io.StringIO(CSV_SINGLE), \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code in (200, 207)\n    body = resp.json()\n    assert body[\"imported_count\"] == 1\n    assert body.get(\"errors\", []) == []\n    r = hr_admin_session.get(f\"{api_base_url}/employees\", params={\"external_id\": \"EXT-BVA\"})\n    assert r.status_code == 200 and r.json()[\"total\"] >= 1\n"
+      },
+      {
+        "name": "test_bulk_import_state_transition_no_employees_to_partial_import",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Actor has role hr-admin",
+          "Session cookie for hr-admin is available via <hr_admin_session> fixture",
+          "System is in state: no employees with external_ids EXT-STC-A or EXT-STC-B exist",
+          "Import endpoint is in idle state (no in-flight import jobs)"
+        ],
+        "actions": [
+          "Assert pre-state: GET /employees?external_id=EXT-STC-A returns total==0",
+          "Transition: POST CSV with one valid row (EXT-STC-A) and one invalid row to /employees/import",
+          "Assert post-state: imported_count==1, errors list has 1 entry",
+          "Assert committed state: GET /employees?external_id=EXT-STC-A returns total==1",
+          "Assert rejected state: GET /employees?external_id=EXT-STC-B returns total==0"
+        ],
+        "expected": [
+          "Pre-state: no employees with tested external_ids",
+          "Transition returns 200/207 with imported_count==1 and 1 error",
+          "Post-state: EXT-STC-A employee exists; EXT-STC-B employee does not exist"
+        ],
+        "trace": [
+          "R-WEB-097: state transition \u2013 idle -> importing -> committed+error_reported",
+          "R-WEB-097: commit only rows that pass validation"
+        ],
+        "executable": "import io\n\nCSV_STC = (\n    \"external_id,first_name,last_name,email\\n\"\n    \"EXT-STC-A,Frank,Moore,frank@example.com\\n\"\n    \"EXT-STC-B,,,\\n\"\n)\n\ndef test_bulk_import_state_transition_no_employees_to_partial_import(\n    hr_admin_session,  # <fixture>\n    api_base_url,      # <fixture>\n    cleanup_employees, # <fixture>\n):\n    cleanup_employees([\"EXT-STC-A\", \"EXT-STC-B\"])\n    pre_a = hr_admin_session.get(f\"{api_base_url}/employees\", params={\"external_id\": \"EXT-STC-A\"})\n    assert pre_a.json()[\"total\"] == 0, \"Pre-state violated: EXT-STC-A already exists\"\n    files = {\"file\": (\"employees.csv\", io.StringIO(CSV_STC), \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code in (200, 207)\n    body = resp.json()\n    assert body[\"imported_count\"] == 1\n    assert len(body[\"errors\"]) == 1\n    post_a = hr_admin_session.get(f\"{api_base_url}/employees\", params={\"external_id\": \"EXT-STC-A\"})\n    assert post_a.json()[\"total\"] == 1\n    post_b = hr_admin_session.get(f\"{api_base_url}/employees\", params={\"external_id\": \"EXT-STC-B\"})\n    assert post_b.json()[\"total\"] == 0\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-097",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 998,
+    "output_tokens": 3530,
+    "latency_ms": 43223,
+    "wall_ms": 43223,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-097\",\n  \"reasoning\": \"R-WEB-097 requires bulk CSV import with per-row validation, partial commit, and structured error reporting. Test coverage is designed across four dimensions: (1) EP \u2013 a well-formed CSV with mixed valid/invalid rows exercises the core happy-path partition and partial-commit behaviour; (2) NEG \u2013 uploading a non-CSV file triggers the 415 error pathway; (3) NEG/DT \u2013 a CSV whose header omits required columns triggers the 422 error pathway; (4) BVA \u2013 a single-data-row CSV (minimum non-empty payload) probes the lower boundary of importable content; (5) STC \u2013 the state transition from 'no employees' through 'import initiated' to 'employees committed + error report available' is exercised by the positive case. Each test is self-contained via fixtures that create and clean up state, and idempotent because teardown deletes any imported records by the seeded external-id.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Actor has role hr-admin\",\n        \"Session cookie for hr-admin is available via <hr_admin_session> fixture\",\n        \"No employee with external_id EXT-001 or EXT-002 exists in the system\"\n      ],\n      \"actions\": [\n        \"Build a CSV with two valid rows (EXT-001, EXT-002) and one invalid row (missing required email field)\",\n        \"POST multipart/form-data to /employees/import with the CSV file\",\n        \"Capture the JSON response body\"\n      ],\n      \"expected\": [\n        \"HTTP status 207 (multi-status) or 200\",\n        \"Response body contains imported_count == 2\",\n        \"Response body contains errors list with exactly 1 entry referencing row 3\",\n        \"GET /employees?external_id=EXT-001 returns 200 with employee record\",\n        \"GET /employees?external_id=EXT-002 returns 200 with employee record\"\n      ],\n      \"trace\": [\n        \"R-WEB-097: valid rows imported\",\n        \"R-WEB-097: error report generated\",\n        \"R-WEB-097: commit only rows that pass validation\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\n\\nCSV_MIXED = (\\n    \\\"external_id,first_name,last_name,email\\\\n\\\"\\n    \\\"EXT-001,Alice,Smith,alice@example.com\\\\n\\\"\\n    \\\"EXT-002,Bob,Jones,bob@example.com\\\\n\\\"\\n    \\\"EXT-BAD,Charlie,,\\\\n\\\"\\n)\\n\\ndef test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors(\\n    hr_admin_session,  # <fixture>\\n    api_base_url,      # <fixture>\\n    cleanup_employees, # <fixture> deletes by external_id on teardown\\n):\\n    cleanup_employees([\\\"EXT-001\\\", \\\"EXT-002\\\", \\\"EXT-BAD\\\"])\\n    files = {\\\"file\\\": (\\\"employees.csv\\\", io.StringIO(CSV_MIXED), \\\"text/csv\\\")}\\n    resp = hr_admin_session.post(f\\\"{api_base_url}/employees/import\\\", files=files)\\n    assert resp.status_code in (200, 207)\\n    body = resp.json()\\n    assert body[\\\"imported_count\\\"] == 2\\n    assert len(body[\\\"errors\\\"]) == 1\\n    assert body[\\\"errors\\\"][0][\\\"row\\\"] == 3\\n    r1 = hr_admin_session.get(f\\\"{api_base_url}/employees\\\", params={\\\"external_id\\\": \\\"EXT-001\\\"})\\n    assert r1.status_code == 200 and r1.json()[\\\"total\\\"] >= 1\\n    r2 = hr_admin_session.get(f\\\"{api_base_url}/employees\\\", params={\\\"external_id\\\": \\\"EXT-002\\\"})\\n    assert r2.status_code == 200 and r2.json()[\\\"total\\\"] >= 1\\n\"\n    },\n    {\n      \"name\": \"test_bulk_import_non_csv_file_returns_415\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Actor has role hr-admin\",\n        \"Session cookie for hr-admin is available via <hr_admin_session> fixture\"\n      ],\n      \"actions\": [\n        \"Build a plain-text file with .txt extension and text/plain MIME type\",\n        \"POST multipart/form-data to /employees/import with the text file\"\n      ],\n      \"expected\": [\n        \"HTTP status 415 Unsupported Media Type\",\n        \"Response body contains an error message referencing unsupported file type\"\n      ],\n      \"trace\": [\n        \"R-WEB-097: e"
+  }
+}

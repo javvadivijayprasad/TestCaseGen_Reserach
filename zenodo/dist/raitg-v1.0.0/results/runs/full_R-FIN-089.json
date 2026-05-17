@@ -1,0 +1,194 @@
+{
+  "req": {
+    "id": "R-FIN-089",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Account close (idempotency variant)",
+    "statement": "A customer shall close an account with zero balance; closing with non-zero balance shall require sweep to another account. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer closes account"
+    ],
+    "expected_outcomes": [
+      "account state=closed",
+      "final statement generated"
+    ],
+    "error_pathways": [
+      "409 when balance != 0 without sweep"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-089",
+    "reasoning": "R-FIN-089 defines four distinct behavioural rules: (1) zero-balance account closes cleanly, (2) non-zero balance without sweep yields 409, (3) non-zero balance with sweep closes cleanly, and (4) duplicate submission with the same Idempotency-Key returns the original response. The violation in the previous response was test[5]: it was marked kind=negative but heuristic=STC, which is invalid \u2014 STC must pair with positive or boundary kind because it traces valid state-machine transitions. The fix is to change that test's heuristic from STC to NEG, which is the correct heuristic for a negative test exercising an invalid state transition (closed\u2192closed with a new key). All other tests are preserved unchanged.",
+    "tests": [
+      {
+        "name": "test_close_zero_balance_account_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as account owner",
+          "Account exists with balance == 0.00",
+          "Account state is 'open'"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with valid Idempotency-Key and no sweep body"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned",
+          "Response body contains state == 'closed'",
+          "Final statement document reference present in response"
+        ],
+        "trace": [
+          "R-FIN-089: zero-balance close positive path",
+          "R-FIN-089: final statement generated on close"
+        ],
+        "executable": "def test_close_zero_balance_account_succeeds(api_client, zero_balance_account):\n    account_id = zero_balance_account[\"id\"]\n    idem_key = f\"test-close-zero-{account_id}\"\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        headers={\"Idempotency-Key\": idem_key},\n        json={},\n    )\n    assert resp.status_code in (200, 204), resp.text\n    if resp.status_code == 200:\n        body = resp.json()\n        assert body[\"state\"] == \"closed\"\n        assert \"final_statement\" in body or \"statement_ref\" in body"
+      },
+      {
+        "name": "test_close_nonzero_balance_without_sweep_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as account owner",
+          "Account exists with balance == 150.00 (non-zero)",
+          "Account state is 'open'",
+          "No sweep_to_account_id provided in request"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with no sweep_to field"
+        ],
+        "expected": [
+          "HTTP 409 returned",
+          "Error body contains code indicating non-zero balance rejection",
+          "Account state remains 'open'"
+        ],
+        "trace": [
+          "R-FIN-089: error pathway \u2014 409 when balance != 0 without sweep"
+        ],
+        "executable": "def test_close_nonzero_balance_without_sweep_returns_409(api_client, nonzero_balance_account):\n    account_id = nonzero_balance_account[\"id\"]\n    idem_key = f\"test-close-nonzero-no-sweep-{account_id}\"\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        headers={\"Idempotency-Key\": idem_key},\n        json={},\n    )\n    assert resp.status_code == 409, resp.text\n    body = resp.json()\n    assert \"error\" in body or \"code\" in body\n    status_resp = api_client.get(f\"/accounts/{account_id}\")\n    assert status_resp.json()[\"state\"] == \"open\""
+      },
+      {
+        "name": "test_close_account_with_balance_at_exact_zero_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as account owner",
+          "Account balance is exactly 0.00 (boundary value between zero and non-zero)",
+          "Account state is 'open'"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with no sweep body"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned (0.00 is treated as zero, not non-zero)",
+          "Account state transitions to 'closed'"
+        ],
+        "trace": [
+          "R-FIN-089: BVA at balance == 0.00 \u2014 must succeed without sweep"
+        ],
+        "executable": "def test_close_account_with_balance_at_exact_zero_boundary(api_client, create_account_with_balance):\n    account = create_account_with_balance(balance=\"0.00\")\n    account_id = account[\"id\"]\n    idem_key = f\"test-close-bva-zero-{account_id}\"\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        headers={\"Idempotency-Key\": idem_key},\n        json={},\n    )\n    assert resp.status_code in (200, 204), (\n        f\"Expected success at 0.00 balance, got {resp.status_code}: {resp.text}\"\n    )\n    if resp.status_code == 200:\n        assert resp.json()[\"state\"] == \"closed\""
+      },
+      {
+        "name": "test_close_with_nonzero_balance_and_sweep_succeeds",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as account owner",
+          "Source account exists with balance == 500.00",
+          "Sweep destination account exists, owned by same caller",
+          "Source account state is 'open'"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with sweep_to_account_id pointing to destination"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned",
+          "Source account state == 'closed'",
+          "Final statement present in response",
+          "Destination account balance increased by 500.00"
+        ],
+        "trace": [
+          "R-FIN-089: non-zero balance close with sweep \u2014 positive DT cell"
+        ],
+        "executable": "def test_close_with_nonzero_balance_and_sweep_succeeds(api_client, nonzero_balance_account, sweep_destination_account):\n    src_id = nonzero_balance_account[\"id\"]\n    dst_id = sweep_destination_account[\"id\"]\n    prior_bal = sweep_destination_account[\"balance\"]\n    idem_key = f\"test-close-sweep-{src_id}\"\n    resp = api_client.post(\n        f\"/accounts/{src_id}/close\",\n        headers={\"Idempotency-Key\": idem_key},\n        json={\"sweep_to_account_id\": dst_id},\n    )\n    assert resp.status_code in (200, 204), resp.text\n    dst_resp = api_client.get(f\"/accounts/{dst_id}\")\n    new_bal = float(dst_resp.json()[\"balance\"])\n    assert new_bal > float(prior_bal)\n    src_resp = api_client.get(f\"/accounts/{src_id}\")\n    assert src_resp.json()[\"state\"] == \"closed\""
+      },
+      {
+        "name": "test_idempotent_close_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated as account owner",
+          "Account exists with balance == 0.00",
+          "Account state is 'open'",
+          "A unique Idempotency-Key is reserved for this test run"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with Idempotency-Key X \u2014 first submission",
+          "POST /accounts/{id}/close with same Idempotency-Key X \u2014 duplicate submission"
+        ],
+        "expected": [
+          "Both requests return the same HTTP status code",
+          "Both response bodies are identical (or semantically equivalent)",
+          "Account state is 'closed' after both calls",
+          "No duplicate final statement generated"
+        ],
+        "trace": [
+          "R-FIN-089: idempotency \u2014 duplicate Idempotency-Key must return original result",
+          "R-FIN-089: STC open\u2192closed\u2192closed (no re-processing)"
+        ],
+        "executable": "def test_idempotent_close_returns_original_result(api_client, zero_balance_account):\n    account_id = zero_balance_account[\"id\"]\n    idem_key = f\"test-idempotent-close-{account_id}\"\n    first = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        headers={\"Idempotency-Key\": idem_key},\n        json={},\n    )\n    assert first.status_code in (200, 204), first.text\n    second = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        headers={\"Idempotency-Key\": idem_key},\n        json={},\n    )\n    assert second.status_code == first.status_code\n    if first.status_code == 200:\n        assert second.json() == first.json()\n    acct = api_client.get(f\"/accounts/{account_id}\").json()\n    assert acct[\"state\"] == \"closed\""
+      },
+      {
+        "name": "test_close_already_closed_account_without_idempotency_key_returns_error",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Account exists and state is already 'closed'",
+          "Request carries a NEW Idempotency-Key (not the one used to close it)"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with a fresh Idempotency-Key on an already-closed account"
+        ],
+        "expected": [
+          "HTTP 409 or 422 returned",
+          "Error body indicates account is already closed or invalid state transition"
+        ],
+        "trace": [
+          "R-FIN-089: NEG \u2014 invalid transition closed\u2192closed with new key is rejected"
+        ],
+        "executable": "def test_close_already_closed_account_without_idempotency_key_returns_error(api_client, closed_account):\n    account_id = closed_account[\"id\"]\n    fresh_idem_key = f\"test-close-already-closed-fresh-{account_id}\"\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        headers={\"Idempotency-Key\": fresh_idem_key},\n        json={},\n    )\n    assert resp.status_code in (409, 422), (\n        f\"Expected 409 or 422 for already-closed account, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"code\" in body"
+      }
+    ]
+  },
+  "req_id": "R-FIN-089",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1018,
+    "output_tokens": 2999,
+    "latency_ms": 36680,
+    "wall_ms": 36680,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-089\",\n  \"reasoning\": \"R-FIN-089 defines four distinct behavioural rules: (1) zero-balance account closes cleanly, (2) non-zero balance without sweep yields 409, (3) non-zero balance with sweep closes cleanly, and (4) duplicate submission with the same Idempotency-Key returns the original response. I derive test cases using EP (normal close path), NEG (non-zero without sweep), BVA (balance exactly at zero boundary), STC (account state machine: open\u2192closed\u2192closed idempotent), and DT (sweep presence vs absence as a decision variable). Each test is self-contained via fixtures that create and tear down accounts, and uses a fixed Idempotency-Key seeded with the test name to remain deterministic across runs.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_zero_balance_account_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as account owner\",\n        \"Account exists with balance == 0.00\",\n        \"Account state is 'open'\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/close with valid Idempotency-Key and no sweep body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 returned\",\n        \"Response body contains state == 'closed'\",\n        \"Final statement document reference present in response\"\n      ],\n      \"trace\": [\n        \"R-FIN-089: zero-balance close positive path\",\n        \"R-FIN-089: final statement generated on close\"\n      ],\n      \"executable\": \"def test_close_zero_balance_account_succeeds(api_client, zero_balance_account):\\n    account_id = zero_balance_account[\\\"id\\\"]\\n    idem_key = f\\\"test-close-zero-{account_id}\\\"\\n    resp = api_client.post(\\n        f\\\"/accounts/{account_id}/close\\\",\\n        headers={\\\"Idempotency-Key\\\": idem_key},\\n        json={},\\n    )\\n    assert resp.status_code in (200, 204), resp.text\\n    if resp.status_code == 200:\\n        body = resp.json()\\n        assert body[\\\"state\\\"] == \\\"closed\\\"\\n        assert \\\"final_statement\\\" in body or \\\"statement_ref\\\" in body\"\n    },\n    {\n      \"name\": \"test_close_nonzero_balance_without_sweep_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller is authenticated as account owner\",\n        \"Account exists with balance == 150.00 (non-zero)\",\n        \"Account state is 'open'\",\n        \"No sweep_to_account_id provided in request\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/close with no sweep_to field\"\n      ],\n      \"expected\": [\n        \"HTTP 409 returned\",\n        \"Error body contains code indicating non-zero balance rejection\",\n        \"Account state remains 'open'\"\n      ],\n      \"trace\": [\n        \"R-FIN-089: error pathway \u2014 409 when balance != 0 without sweep\"\n      ],\n      \"executable\": \"def test_close_nonzero_balance_without_sweep_returns_409(api_client, nonzero_balance_account):\\n    account_id = nonzero_balance_account[\\\"id\\\"]\\n    idem_key = f\\\"test-close-nonzero-no-sweep-{account_id}\\\"\\n    resp = api_client.post(\\n        f\\\"/accounts/{account_id}/close\\\",\\n        headers={\\\"Idempotency-Key\\\": idem_key},\\n        json={},\\n    )\\n    assert resp.status_code == 409, resp.text\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"code\\\" in body\\n    status_resp = api_client.get(f\\\"/accounts/{account_id}\\\")\\n    assert status_resp.json()[\\\"state\\\"] == \\\"open\\\"\"\n    },\n    {\n      \"name\": \"test_close_account_with_balance_at_exact_zero_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Caller is authenticated as account owner\",\n        \"Account balance is exactly 0.00 (boundary value between zero and non-zero)\",\n        \"Account state is 'open'\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/close with no sweep body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 returned (0.00 is treated as zero, not non-zero)\",\n        \"Account state transitions to 'closed'\"\n      ],\n      \"trace\": [\n        \""
+  }
+}

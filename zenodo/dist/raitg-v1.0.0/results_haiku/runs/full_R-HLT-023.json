@@ -1,0 +1,176 @@
+{
+  "req": {
+    "id": "R-HLT-023",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Patient portal login",
+    "statement": "A patient shall log in using SSO; failed attempts shall be rate-limited and notify the patient.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "valid SSO assertion"
+    ],
+    "triggers": [
+      "patient logs in"
+    ],
+    "expected_outcomes": [
+      "session established"
+    ],
+    "error_pathways": [
+      "429 when too many attempts"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/portal/login"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-023",
+    "reasoning": "R-HLT-023 mandates SSO-based patient login with rate-limiting on failed attempts and session establishment on success. The test suite applies EP to partition valid/invalid SSO assertions, BVA to test rate-limit boundaries, NEG to verify error pathways, and STC to confirm session state transitions. Each test is deterministic, idempotent, and traces to specific requirement outcomes.",
+    "tests": [
+      {
+        "name": "test_patient_sso_login_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Valid SSO assertion is available",
+          "Patient account exists and is active",
+          "Rate-limit counter is reset"
+        ],
+        "actions": [
+          "POST /portal/login with valid SSO assertion in Authorization header",
+          "Extract session token from response"
+        ],
+        "expected": [
+          "HTTP 200 response",
+          "Session token present and non-empty",
+          "Response contains user identity matching SSO assertion subject"
+        ],
+        "trace": [
+          "R-HLT-023: session established",
+          "R-HLT-023: patient logs in using SSO"
+        ],
+        "executable": "import requests\nimport pytest\n\ndef test_patient_sso_login_success():\n    sso_assertion = '<helper_fn>generate_valid_sso_assertion()</helper_fn>'\n    headers = {'Authorization': f'Bearer {sso_assertion}'}\n    \n    response = requests.post(\n        'http://localhost:8080/portal/login',\n        headers=headers,\n        timeout=5\n    )\n    \n    assert response.status_code == 200, f\"Expected 200, got {response.status_code}\"\n    data = response.json()\n    assert 'session_token' in data and data['session_token'], \"Missing session_token\"\n    assert 'user_id' in data, \"Missing user_id in response\"\n    assert data['user_id'] == '<helper_fn>extract_subject_from_sso(sso_assertion)</helper_fn>', \"User ID mismatch\""
+      },
+      {
+        "name": "test_patient_sso_login_invalid_assertion",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Invalid or malformed SSO assertion is prepared",
+          "Rate-limit counter is reset"
+        ],
+        "actions": [
+          "POST /portal/login with invalid SSO assertion",
+          "Capture HTTP status and error message"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized response",
+          "Error message indicates authentication failure",
+          "No session token in response"
+        ],
+        "trace": [
+          "R-HLT-023: error pathway triggered",
+          "R-HLT-023: failed login attempt"
+        ],
+        "executable": "import requests\n\ndef test_patient_sso_login_invalid_assertion():\n    bad_assertion = 'invalid.jwt.token'\n    headers = {'Authorization': f'Bearer {bad_assertion}'}\n    \n    response = requests.post(\n        'http://localhost:8080/portal/login',\n        headers=headers,\n        timeout=5\n    )\n    \n    assert response.status_code == 401, f\"Expected 401, got {response.status_code}\"\n    data = response.json()\n    assert 'error' in data, \"Missing error field\"\n    assert 'session_token' not in data, \"Session token should not be present on auth failure\""
+      },
+      {
+        "name": "test_patient_sso_login_rate_limit_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Valid patient exists",
+          "Rate-limit threshold is 5 failed attempts per 15 minutes",
+          "Rate-limit counter is at 4 failed attempts"
+        ],
+        "actions": [
+          "Make 1 failed login attempt with invalid assertion",
+          "Verify response status",
+          "Attempt 1 more failed login (crossing threshold to 5)",
+          "Verify rate-limit is enforced on next attempt"
+        ],
+        "expected": [
+          "5th attempt returns HTTP 429 Too Many Requests",
+          "Rate-limit headers present (Retry-After)",
+          "Error message indicates rate-limiting is active",
+          "Patient receives notification of rate-limit event"
+        ],
+        "trace": [
+          "R-HLT-023: failed attempts rate-limited",
+          "R-HLT-023: notify patient of rate-limit"
+        ],
+        "executable": "import requests\nimport time\n\ndef test_patient_sso_login_rate_limit_boundary():\n    patient_id = '<fixture>test_patient_id</fixture>'\n    bad_assertion = 'invalid.assertion'\n    headers = {'Authorization': f'Bearer {bad_assertion}'}\n    \n    <helper_fn>reset_rate_limit_for_patient(patient_id)</helper_fn>\n    <helper_fn>set_rate_limit_counter(patient_id, 4)</helper_fn>\n    \n    for i in range(2):\n        response = requests.post(\n            'http://localhost:8080/portal/login',\n            headers=headers,\n            timeout=5\n        )\n        if i < 1:\n            assert response.status_code == 401, f\"Attempt {i+1}: Expected 401\"\n        else:\n            assert response.status_code == 429, f\"Attempt {i+1}: Expected 429, got {response.status_code}\"\n            assert 'Retry-After' in response.headers, \"Missing Retry-After header\"\n            assert 'error' in response.json(), \"Missing error in 429 response\""
+      },
+      {
+        "name": "test_patient_sso_login_missing_assertion_header",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is not authenticated",
+          "No SSO assertion is provided"
+        ],
+        "actions": [
+          "POST /portal/login without Authorization header",
+          "Capture response"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized response",
+          "Error indicates missing or invalid credentials"
+        ],
+        "trace": [
+          "R-HLT-023: authentication required",
+          "R-HLT-023: SSO assertion missing"
+        ],
+        "executable": "import requests\n\ndef test_patient_sso_login_missing_assertion_header():\n    response = requests.post(\n        'http://localhost:8080/portal/login',\n        headers={},\n        timeout=5\n    )\n    \n    assert response.status_code == 401, f\"Expected 401, got {response.status_code}\"\n    data = response.json()\n    assert 'error' in data, \"Missing error field in response\""
+      },
+      {
+        "name": "test_patient_sso_login_session_state_transition",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient is unauthenticated (no active session)",
+          "Valid SSO assertion available"
+        ],
+        "actions": [
+          "POST /portal/login with valid SSO assertion",
+          "GET /portal/patient to verify authenticated state",
+          "POST /portal/logout to transition to unauthenticated"
+        ],
+        "expected": [
+          "Login returns 200 with session token",
+          "Authenticated GET returns 200 with patient data",
+          "Logout returns 200, session invalidated",
+          "Subsequent GET /portal/patient returns 401"
+        ],
+        "trace": [
+          "R-HLT-023: state transition unauthenticated -> authenticated -> unauthenticated"
+        ],
+        "executable": "import requests\n\ndef test_patient_sso_login_session_state_transition():\n    sso_assertion = '<helper_fn>generate_valid_sso_assertion()</helper_fn>'\n    headers = {'Authorization': f'Bearer {sso_assertion}'}\n    \n    resp_login = requests.post(\n        'http://localhost:8080/portal/login',\n        headers=headers,\n        timeout=5\n    )\n    assert resp_login.status_code == 200\n    session_token = resp_login.json()['session_token']\n    \n    auth_headers = {'Authorization': f'Bearer {session_token}'}\n    resp_get = requests.get(\n        'http://localhost:8080/portal/patient',\n        headers=auth_headers,\n        timeout=5\n    )\n    assert resp_get.status_code == 200\n    \n    resp_logout = requests.post(\n        'http://localhost:8080/portal/logout',\n        headers=auth_headers,\n        timeout=5\n    )\n    assert resp_logout.status_code == 200\n    \n    resp_verify = requests.get(\n        'http://localhost:8080/portal/patient',\n        headers=auth_headers,\n        timeout=5\n    )\n    assert resp_verify.status_code == 401"
+      }
+    ]
+  },
+  "req_id": "R-HLT-023",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1014,
+    "output_tokens": 2395,
+    "latency_ms": 13825,
+    "wall_ms": 13825,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-023\",\n  \"reasoning\": \"R-HLT-023 mandates SSO-based patient login with rate-limiting on failed attempts and session establishment on success. The test suite applies EP to partition valid/invalid SSO assertions, BVA to test rate-limit boundaries, NEG to verify error pathways, and STC to confirm session state transitions. Each test is deterministic, idempotent, and traces to specific requirement outcomes.\",\n  \"tests\": [\n    {\n      \"name\": \"test_patient_sso_login_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Valid SSO assertion is available\",\n        \"Patient account exists and is active\",\n        \"Rate-limit counter is reset\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with valid SSO assertion in Authorization header\",\n        \"Extract session token from response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 response\",\n        \"Session token present and non-empty\",\n        \"Response contains user identity matching SSO assertion subject\"\n      ],\n      \"trace\": [\n        \"R-HLT-023: session established\",\n        \"R-HLT-023: patient logs in using SSO\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\n\\ndef test_patient_sso_login_success():\\n    sso_assertion = '<helper_fn>generate_valid_sso_assertion()</helper_fn>'\\n    headers = {'Authorization': f'Bearer {sso_assertion}'}\\n    \\n    response = requests.post(\\n        'http://localhost:8080/portal/login',\\n        headers=headers,\\n        timeout=5\\n    )\\n    \\n    assert response.status_code == 200, f\\\"Expected 200, got {response.status_code}\\\"\\n    data = response.json()\\n    assert 'session_token' in data and data['session_token'], \\\"Missing session_token\\\"\\n    assert 'user_id' in data, \\\"Missing user_id in response\\\"\\n    assert data['user_id'] == '<helper_fn>extract_subject_from_sso(sso_assertion)</helper_fn>', \\\"User ID mismatch\\\"\"\n    },\n    {\n      \"name\": \"test_patient_sso_login_invalid_assertion\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Invalid or malformed SSO assertion is prepared\",\n        \"Rate-limit counter is reset\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with invalid SSO assertion\",\n        \"Capture HTTP status and error message\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized response\",\n        \"Error message indicates authentication failure\",\n        \"No session token in response\"\n      ],\n      \"trace\": [\n        \"R-HLT-023: error pathway triggered\",\n        \"R-HLT-023: failed login attempt\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_patient_sso_login_invalid_assertion():\\n    bad_assertion = 'invalid.jwt.token'\\n    headers = {'Authorization': f'Bearer {bad_assertion}'}\\n    \\n    response = requests.post(\\n        'http://localhost:8080/portal/login',\\n        headers=headers,\\n        timeout=5\\n    )\\n    \\n    assert response.status_code == 401, f\\\"Expected 401, got {response.status_code}\\\"\\n    data = response.json()\\n    assert 'error' in data, \\\"Missing error field\\\"\\n    assert 'session_token' not in data, \\\"Session token should not be present on auth failure\\\"\"\n    },\n    {\n      \"name\": \"test_patient_sso_login_rate_limit_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Valid patient exists\",\n        \"Rate-limit threshold is 5 failed attempts per 15 minutes\",\n        \"Rate-limit counter is at 4 failed attempts\"\n      ],\n      \"actions\": [\n        \"Make 1 failed login attempt with invalid assertion\",\n        \"Verify response status\",\n        \"Attempt 1 more failed login (crossing threshold to 5)\",\n        \"Verify rate-limit is enforced on next attempt\"\n      ],\n      \"expected\": [\n        \"5th attempt returns HTTP 429 Too Many Requests\",\n        \"Rate-limit headers present (Retry-After)\",\n        \"Error message indicates rate-limiting is active\",\n        \"Patient receives notification of rate-limit event"
+  }
+}

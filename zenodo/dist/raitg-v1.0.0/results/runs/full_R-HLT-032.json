@@ -1,0 +1,168 @@
+{
+  "req": {
+    "id": "R-HLT-032",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Close encounter (boundary)",
+    "statement": "A clinician shall close an Encounter; closed Encounters shall reject further modifications except for addendum Observations. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "encounter open"
+    ],
+    "triggers": [
+      "clinician closes encounter"
+    ],
+    "expected_outcomes": [
+      "encounter.status=finished"
+    ],
+    "error_pathways": [
+      "409 when modifying closed encounter"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-032",
+    "reasoning": "R-HLT-032 covers three orthogonal risk areas: (1) the happy-path state transition open\u2192finished, (2) rejection of modifications on a closed encounter (error pathway), and (3) boundary values on timestamp and numeric fields at the moment of closing. STC drives the state-transition test, NEG drives the 409-rejection test, BVA drives the timestamp/numeric boundary test, DT captures the addendum-observation exception that closed encounters must still accept, and NEG (not EP) is used for the fifth test because it exercises a negative scenario (non-addendum observation rejected on a closed encounter). The violation in test[4] was that a negative kind was paired with EP; EP is an equivalence-partitioning heuristic appropriate for positive or neutral partition tests, not for negative rejection scenarios. Changing heuristic to NEG for test[4] corrects the logical inconsistency while preserving all other tests unchanged.",
+    "tests": [
+      {
+        "name": "test_close_encounter_sets_status_finished",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A valid Encounter exists in status=in-progress",
+          "Clinician auth token is available via <auth_fixture>"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close with valid clinician credentials",
+          "Retrieve the Encounter via GET /Encounter/{id}"
+        ],
+        "expected": [
+          "POST returns HTTP 200",
+          "Response body contains status=finished",
+          "GET confirms persisted status=finished"
+        ],
+        "trace": [
+          "R-HLT-032: expected outcome encounter.status=finished",
+          "R-HLT-032: trigger clinician closes encounter"
+        ],
+        "executable": "import pytest\n\ndef test_close_encounter_sets_status_finished(api_client, open_encounter):\n    enc_id = open_encounter[\"id\"]\n\n    resp = api_client.post(f\"/Encounter/{enc_id}/close\")\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"finished\"\n\n    get_resp = api_client.get(f\"/Encounter/{enc_id}\")\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"finished\"\n"
+      },
+      {
+        "name": "test_modify_closed_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A valid Encounter exists and has already been closed (status=finished)",
+          "Clinician auth token is available via <auth_fixture>"
+        ],
+        "actions": [
+          "Attempt PATCH /Encounter/{id} to update a non-addendum field (e.g. subject reference)",
+          "Capture the HTTP response status and error body"
+        ],
+        "expected": [
+          "PATCH returns HTTP 409",
+          "Response body contains an error indicating the encounter is closed"
+        ],
+        "trace": [
+          "R-HLT-032: error pathway 409 when modifying closed encounter"
+        ],
+        "executable": "import pytest\n\ndef test_modify_closed_encounter_returns_409(api_client, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n    payload = {\"subject\": {\"reference\": \"Patient/different-patient\"}}\n\n    resp = api_client.patch(\n        f\"/Encounter/{enc_id}\",\n        json=payload\n    )\n    assert resp.status_code == 409\n    error_body = resp.json()\n    assert \"closed\" in str(error_body).lower() or \"finished\" in str(error_body).lower()\n"
+      },
+      {
+        "name": "test_close_encounter_boundary_timestamp_and_numeric",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "An Encounter exists in status=in-progress with period.start set to a known value",
+          "The close payload accepts an explicit end timestamp and a numeric duration element"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close with period.end equal to period.start (zero-duration, lower boundary)",
+          "Verify response",
+          "POST /Encounter/{id2}/close with period.end = period.start + 1 second (just-above boundary)",
+          "POST /Encounter/{id3}/close with numeric duration = 0 (lower boundary)",
+          "POST /Encounter/{id4}/close with numeric duration = MAX_INT (upper boundary)"
+        ],
+        "expected": [
+          "Zero-duration close (period.end == period.start) returns HTTP 200 or documented validation error",
+          "One-second duration close returns HTTP 200 and status=finished",
+          "duration=0 returns HTTP 200 or documented validation code",
+          "duration=MAX_INT returns HTTP 200 or HTTP 422 per server capacity limits; must not return 500"
+        ],
+        "trace": [
+          "R-HLT-032: boundary cases on timestamps and numeric elements must be tested"
+        ],
+        "executable": "import pytest\nimport sys\n\ndef test_close_encounter_boundary_timestamp_and_numeric(\n    api_client, open_encounter_factory\n):\n    base_start = \"2024-01-15T08:00:00Z\"\n\n    # BVA-1: period.end == period.start (zero duration)\n    enc1 = open_encounter_factory(start=base_start)\n    r1 = api_client.post(\n        f\"/Encounter/{enc1['id']}/close\",\n        json={\"period\": {\"end\": base_start}}\n    )\n    assert r1.status_code in (200, 422), f\"Unexpected {r1.status_code}\"\n\n    # BVA-2: period.end = start + 1 second (just-above lower boundary)\n    enc2 = open_encounter_factory(start=base_start)\n    r2 = api_client.post(\n        f\"/Encounter/{enc2['id']}/close\",\n        json={\"period\": {\"end\": \"2024-01-15T08:00:01Z\"}}\n    )\n    assert r2.status_code == 200\n    assert r2.json()[\"status\"] == \"finished\"\n\n    # BVA-3: numeric duration = 0\n    enc3 = open_encounter_factory(start=base_start)\n    r3 = api_client.post(\n        f\"/Encounter/{enc3['id']}/close\",\n        json={\"length\": {\"value\": 0, \"unit\": \"min\"}}\n    )\n    assert r3.status_code in (200, 422), f\"Unexpected {r3.status_code}\"\n\n    # BVA-4: numeric duration = MAX_INT (upper boundary)\n    enc4 = open_encounter_factory(start=base_start)\n    r4 = api_client.post(\n        f\"/Encounter/{enc4['id']}/close\",\n        json={\"length\": {\"value\": sys.maxsize, \"unit\": \"min\"}}\n    )\n    assert r4.status_code != 500, \"Server must not crash on MAX_INT duration\"\n"
+      },
+      {
+        "name": "test_addendum_observation_allowed_on_closed_encounter",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "A valid Encounter exists with status=finished",
+          "Clinician auth token is available"
+        ],
+        "actions": [
+          "POST /Observation with encounter reference pointing to the closed encounter and category=addendum",
+          "Retrieve the Observation to confirm persistence"
+        ],
+        "expected": [
+          "POST returns HTTP 201",
+          "Observation is persisted and linked to the finished Encounter"
+        ],
+        "trace": [
+          "R-HLT-032: closed Encounters shall reject further modifications EXCEPT for addendum Observations"
+        ],
+        "executable": "import pytest\n\ndef test_addendum_observation_allowed_on_closed_encounter(\n    api_client, closed_encounter\n):\n    enc_id = closed_encounter[\"id\"]\n    obs_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"code\": \"addendum\"}]}],\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"55423-8\"}]},\n        \"valueString\": \"Post-close addendum note\"\n    }\n\n    create_resp = api_client.post(\"/Observation\", json=obs_payload)\n    assert create_resp.status_code == 201, (\n        f\"Addendum Observation rejected: {create_resp.status_code}\"\n    )\n\n    obs_id = create_resp.json()[\"id\"]\n    get_resp = api_client.get(f\"/Observation/{obs_id}\")\n    assert get_resp.status_code == 200\n    enc_ref = get_resp.json()[\"encounter\"][\"reference\"]\n    assert enc_ref == f\"Encounter/{enc_id}\"\n"
+      },
+      {
+        "name": "test_non_addendum_observation_rejected_on_closed_encounter",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A valid Encounter exists with status=finished",
+          "Clinician auth token is available"
+        ],
+        "actions": [
+          "POST /Observation with encounter reference pointing to the closed encounter without addendum category",
+          "Capture response status code"
+        ],
+        "expected": [
+          "POST returns HTTP 409 or HTTP 422 (non-addendum write blocked)"
+        ],
+        "trace": [
+          "R-HLT-032: closed Encounters shall reject further modifications except for addendum Observations",
+          "R-HLT-032: error pathway 409 when modifying closed encounter"
+        ],
+        "executable": "import pytest\n\ndef test_non_addendum_observation_rejected_on_closed_encounter(\n    api_client, closed_encounter\n):\n    enc_id = closed_encounter[\"id\"]\n    obs_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"code\": \"vital-signs\"}]}],\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\"}\n    }\n\n    resp = api_client.post(\"/Observation\", json=obs_payload)\n    assert resp.status_code in (409, 422), (\n        f\"Expected 409 or 422 for non-addendum write on closed encounter, got {resp.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-032",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 993,
+    "output_tokens": 2888,
+    "latency_ms": 32677,
+    "wall_ms": 32677,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-032\",\n  \"reasoning\": \"R-HLT-032 covers three orthogonal risk areas: (1) the happy-path state transition open\u2192finished, (2) rejection of modifications on a closed encounter (error pathway), and (3) boundary values on timestamp and numeric fields at the moment of closing. STC drives the state-transition test, NEG drives the 409-rejection test, BVA drives the timestamp/numeric boundary test, EP covers a mid-range numeric observation on a closed encounter, and DT captures the addendum-observation exception that closed encounters must still accept. Together the five tests satisfy the minimum three required and give full traceability to all normative statements in the requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_encounter_sets_status_finished\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"A valid Encounter exists in status=in-progress\",\n        \"Clinician auth token is available via <auth_fixture>\"\n      ],\n      \"actions\": [\n        \"POST /Encounter/{id}/close with valid clinician credentials\",\n        \"Retrieve the Encounter via GET /Encounter/{id}\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 200\",\n        \"Response body contains status=finished\",\n        \"GET confirms persisted status=finished\"\n      ],\n      \"trace\": [\n        \"R-HLT-032: expected outcome encounter.status=finished\",\n        \"R-HLT-032: trigger clinician closes encounter\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_close_encounter_sets_status_finished(api_client, open_encounter):\\n    enc_id = open_encounter[\\\"id\\\"]\\n\\n    resp = api_client.post(f\\\"/Encounter/{enc_id}/close\\\")\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"finished\\\"\\n\\n    get_resp = api_client.get(f\\\"/Encounter/{enc_id}\\\")\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"finished\\\"\\n\"\n    },\n    {\n      \"name\": \"test_modify_closed_encounter_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A valid Encounter exists and has already been closed (status=finished)\",\n        \"Clinician auth token is available via <auth_fixture>\"\n      ],\n      \"actions\": [\n        \"Attempt PATCH /Encounter/{id} to update a non-addendum field (e.g. subject reference)\",\n        \"Capture the HTTP response status and error body\"\n      ],\n      \"expected\": [\n        \"PATCH returns HTTP 409\",\n        \"Response body contains an error indicating the encounter is closed\"\n      ],\n      \"trace\": [\n        \"R-HLT-032: error pathway 409 when modifying closed encounter\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_modify_closed_encounter_returns_409(api_client, closed_encounter):\\n    enc_id = closed_encounter[\\\"id\\\"]\\n    payload = {\\\"subject\\\": {\\\"reference\\\": \\\"Patient/different-patient\\\"}}\\n\\n    resp = api_client.patch(\\n        f\\\"/Encounter/{enc_id}\\\",\\n        json=payload\\n    )\\n    assert resp.status_code == 409\\n    error_body = resp.json()\\n    assert \\\"closed\\\" in str(error_body).lower() or \\\"finished\\\" in str(error_body).lower()\\n\"\n    },\n    {\n      \"name\": \"test_close_encounter_boundary_timestamp_and_numeric\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"An Encounter exists in status=in-progress with period.start set to a known value\",\n        \"The close payload accepts an explicit end timestamp and a numeric duration element\"\n      ],\n      \"actions\": [\n        \"POST /Encounter/{id}/close with period.end equal to period.start (zero-duration, lower boundary)\",\n        \"Verify response\",\n        \"POST /Encounter/{id2}/close with period.end = period.start + 1 second (just-above boundary)\",\n        \"POST /Encounter/{id3}/close with numeric duration = 0 (lower boundary)\",\n        \"POST /Encounter/{id4}/close with numeric duration = MAX_INT (upper boundary)\"\n      ],\n      \"expected\": [\n        \"Zero-duration close (perio"
+  }
+}

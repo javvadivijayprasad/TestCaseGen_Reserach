@@ -1,0 +1,192 @@
+{
+  "req": {
+    "id": "R-FIN-050",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Reconciliation report (boundary variant)",
+    "statement": "The system shall produce a daily reconciliation report comparing internal ledger to correspondent bank; non-zero variance shall open an incident. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "EOD trigger"
+    ],
+    "expected_outcomes": [
+      "report stored",
+      "incidents opened on variance"
+    ],
+    "error_pathways": [
+      "incident severity based on variance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/reconcile"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-050",
+    "reasoning": "R-FIN-050 governs EOD reconciliation between internal ledger and correspondent bank. Four orthogonal test cases are needed: (1) EP-positive: ledger equals bank => report stored, no incident; (2) EP-negative / DT: ledger differs from bank by a mid-range amount => report stored AND incident opened with correct severity; (3) BVA-boundary-lower: variance is exactly the minimum threshold (1 cent / 0.01) => incident opened, confirming inclusive lower-bound behaviour; (4) BVA-boundary-upper: variance equals the maximum threshold => incident opened with highest severity, confirming inclusive upper-bound behaviour. Each test calls POST /cron/reconcile with a seeded ledger payload, then verifies both the stored report and any incident state via GET endpoints. All tests reset ledger state through <seed_ledger_fixture> so they remain idempotent.",
+    "tests": [
+      {
+        "name": "test_reconcile_zero_variance_no_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance equals correspondent bank balance (variance = 0.00)",
+          "No pre-existing open incidents for today's reconciliation date"
+        ],
+        "actions": [
+          "Seed ledger and bank mirror with identical balance via <seed_ledger_fixture>",
+          "POST /cron/reconcile with EOD trigger payload for today",
+          "GET /reports/reconciliation?date=<today> to retrieve stored report",
+          "GET /incidents?source=reconciliation&date=<today> to check incident list"
+        ],
+        "expected": [
+          "POST /cron/reconcile returns HTTP 200",
+          "Stored report contains field variance == 0.00",
+          "Stored report status == 'BALANCED'",
+          "Incident list is empty (no incident opened)"
+        ],
+        "trace": [
+          "R-FIN-050: report stored",
+          "R-FIN-050: non-zero variance shall open an incident (contrapositive: zero variance => no incident)"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import date\n\nBASE = \"http://localhost:8080\"\nTODAY = date.today().isoformat()\n\n\ndef test_reconcile_zero_variance_no_incident(seed_ledger_fixture, api_auth_headers):\n    seed_ledger_fixture(ledger_balance=10000.00, bank_balance=10000.00, date=TODAY)\n\n    resp = requests.post(\n        f\"{BASE}/cron/reconcile\",\n        json={\"trigger\": \"EOD\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=15,\n    )\n    assert resp.status_code == 200\n\n    report_resp = requests.get(\n        f\"{BASE}/reports/reconciliation\",\n        params={\"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    )\n    assert report_resp.status_code == 200\n    report = report_resp.json()\n    assert float(report[\"variance\"]) == 0.00\n    assert report[\"status\"] == \"BALANCED\"\n\n    inc_resp = requests.get(\n        f\"{BASE}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    )\n    assert inc_resp.status_code == 200\n    assert inc_resp.json()[\"incidents\"] == []\n"
+      },
+      {
+        "name": "test_reconcile_mid_range_variance_opens_incident",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance differs from correspondent bank balance by 500.00 (mid-range variance)",
+          "No pre-existing open incidents for today's reconciliation date"
+        ],
+        "actions": [
+          "Seed ledger with balance 10500.00 and bank mirror with balance 10000.00 via <seed_ledger_fixture>",
+          "POST /cron/reconcile with EOD trigger payload for today",
+          "GET /reports/reconciliation?date=<today>",
+          "GET /incidents?source=reconciliation&date=<today>"
+        ],
+        "expected": [
+          "POST /cron/reconcile returns HTTP 200",
+          "Stored report variance == 500.00",
+          "Stored report status == 'VARIANCE_DETECTED'",
+          "Exactly one incident is opened",
+          "Incident severity matches the 500.00 variance band per error pathway rules"
+        ],
+        "trace": [
+          "R-FIN-050: non-zero variance shall open an incident",
+          "R-FIN-050: incident severity based on variance"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import date\n\nBASE = \"http://localhost:8080\"\nTODAY = date.today().isoformat()\n\n\ndef test_reconcile_mid_range_variance_opens_incident(seed_ledger_fixture, api_auth_headers, expected_severity_for):\n    seed_ledger_fixture(ledger_balance=10500.00, bank_balance=10000.00, date=TODAY)\n\n    resp = requests.post(\n        f\"{BASE}/cron/reconcile\",\n        json={\"trigger\": \"EOD\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=15,\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE}/reports/reconciliation\",\n        params={\"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    ).json()\n    assert float(report[\"variance\"]) == 500.00\n    assert report[\"status\"] == \"VARIANCE_DETECTED\"\n\n    incidents = requests.get(\n        f\"{BASE}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    ).json()[\"incidents\"]\n    assert len(incidents) == 1\n    assert incidents[0][\"severity\"] == expected_severity_for(variance=500.00)\n"
+      },
+      {
+        "name": "test_reconcile_variance_at_minimum_threshold_opens_incident",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance exceeds correspondent bank balance by exactly 0.01 (minimum non-zero threshold)",
+          "No pre-existing open incidents for today's reconciliation date"
+        ],
+        "actions": [
+          "Seed ledger with balance 10000.01 and bank mirror with balance 10000.00 via <seed_ledger_fixture>",
+          "POST /cron/reconcile with EOD trigger payload for today",
+          "GET /reports/reconciliation?date=<today>",
+          "GET /incidents?source=reconciliation&date=<today>"
+        ],
+        "expected": [
+          "POST /cron/reconcile returns HTTP 200",
+          "Stored report variance == 0.01",
+          "Stored report status == 'VARIANCE_DETECTED'",
+          "Exactly one incident is opened (inclusive lower bound confirmed)"
+        ],
+        "trace": [
+          "R-FIN-050: boundary behaviour at exact min threshold",
+          "R-FIN-050: non-zero variance shall open an incident"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import date\n\nBASE = \"http://localhost:8080\"\nTODAY = date.today().isoformat()\nMIN_VARIANCE = 0.01\n\n\ndef test_reconcile_variance_at_minimum_threshold_opens_incident(seed_ledger_fixture, api_auth_headers):\n    seed_ledger_fixture(\n        ledger_balance=10000.00 + MIN_VARIANCE,\n        bank_balance=10000.00,\n        date=TODAY,\n    )\n\n    resp = requests.post(\n        f\"{BASE}/cron/reconcile\",\n        json={\"trigger\": \"EOD\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=15,\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE}/reports/reconciliation\",\n        params={\"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    ).json()\n    assert round(float(report[\"variance\"]), 2) == MIN_VARIANCE\n    assert report[\"status\"] == \"VARIANCE_DETECTED\"\n\n    incidents = requests.get(\n        f\"{BASE}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    ).json()[\"incidents\"]\n    assert len(incidents) == 1\n"
+      },
+      {
+        "name": "test_reconcile_variance_at_maximum_threshold_opens_critical_incident",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance exceeds correspondent bank balance by exactly the configured maximum variance threshold",
+          "No pre-existing open incidents for today's reconciliation date"
+        ],
+        "actions": [
+          "Read MAX_VARIANCE from <env_config>",
+          "Seed ledger with balance (base + MAX_VARIANCE) and bank mirror with base via <seed_ledger_fixture>",
+          "POST /cron/reconcile with EOD trigger payload for today",
+          "GET /reports/reconciliation?date=<today>",
+          "GET /incidents?source=reconciliation&date=<today>"
+        ],
+        "expected": [
+          "POST /cron/reconcile returns HTTP 200",
+          "Stored report variance == MAX_VARIANCE",
+          "Stored report status == 'VARIANCE_DETECTED'",
+          "Exactly one incident opened with severity == 'CRITICAL' (inclusive upper bound confirmed)"
+        ],
+        "trace": [
+          "R-FIN-050: boundary behaviour at exact max threshold",
+          "R-FIN-050: incident severity based on variance (maximum band => CRITICAL)"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import date\n\nBASE = \"http://localhost:8080\"\nTODAY = date.today().isoformat()\nBASE_BALANCE = 50000.00\n\n\ndef test_reconcile_variance_at_maximum_threshold_opens_critical_incident(\n    seed_ledger_fixture, api_auth_headers, env_config\n):\n    max_variance = float(env_config[\"RECONCILE_MAX_VARIANCE\"])\n    seed_ledger_fixture(\n        ledger_balance=BASE_BALANCE + max_variance,\n        bank_balance=BASE_BALANCE,\n        date=TODAY,\n    )\n\n    resp = requests.post(\n        f\"{BASE}/cron/reconcile\",\n        json={\"trigger\": \"EOD\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=15,\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE}/reports/reconciliation\",\n        params={\"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    ).json()\n    assert round(float(report[\"variance\"]), 2) == round(max_variance, 2)\n    assert report[\"status\"] == \"VARIANCE_DETECTED\"\n\n    incidents = requests.get(\n        f\"{BASE}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    ).json()[\"incidents\"]\n    assert len(incidents) == 1\n    assert incidents[0][\"severity\"] == \"CRITICAL\"\n"
+      },
+      {
+        "name": "test_reconcile_missing_eod_trigger_returns_error",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "Ledger data exists for today"
+        ],
+        "actions": [
+          "POST /cron/reconcile with payload omitting the required 'trigger' field",
+          "Verify no report is persisted for today",
+          "Verify no incident is opened"
+        ],
+        "expected": [
+          "POST /cron/reconcile returns HTTP 400 or 422",
+          "Response body contains a validation error referencing 'trigger'",
+          "No reconciliation report stored for today",
+          "No incident opened"
+        ],
+        "trace": [
+          "R-FIN-050: EOD trigger is required precondition",
+          "R-FIN-050: report stored only on valid trigger execution"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import date\n\nBASE = \"http://localhost:8080\"\nTODAY = date.today().isoformat()\n\n\ndef test_reconcile_missing_eod_trigger_returns_error(api_auth_headers):\n    resp = requests.post(\n        f\"{BASE}/cron/reconcile\",\n        json={\"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    )\n    assert resp.status_code in (400, 422)\n    body = resp.json()\n    assert \"trigger\" in str(body).lower()\n\n    report_resp = requests.get(\n        f\"{BASE}/reports/reconciliation\",\n        params={\"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    )\n    assert report_resp.status_code in (404, 200)\n    if report_resp.status_code == 200:\n        assert report_resp.json().get(\"report\") is None\n\n    inc_resp = requests.get(\n        f\"{BASE}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": TODAY},\n        headers=api_auth_headers,\n        timeout=10,\n    )\n    assert inc_resp.json()[\"incidents\"] == []\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-050",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 999,
+    "output_tokens": 3842,
+    "latency_ms": 35728,
+    "wall_ms": 35728,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-050\",\n  \"reasoning\": \"R-FIN-050 governs EOD reconciliation between internal ledger and correspondent bank. Four orthogonal test cases are needed: (1) EP-positive: ledger equals bank => report stored, no incident; (2) EP-negative / DT: ledger differs from bank by a mid-range amount => report stored AND incident opened with correct severity; (3) BVA-boundary-lower: variance is exactly the minimum threshold (1 cent / 0.01) => incident opened, confirming inclusive lower-bound behaviour; (4) BVA-boundary-upper: variance equals the maximum threshold => incident opened with highest severity, confirming inclusive upper-bound behaviour. Each test calls POST /cron/reconcile with a seeded ledger payload, then verifies both the stored report and any incident state via GET endpoints. All tests reset ledger state through <seed_ledger_fixture> so they remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reconcile_zero_variance_no_incident\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Internal ledger balance equals correspondent bank balance (variance = 0.00)\",\n        \"No pre-existing open incidents for today's reconciliation date\"\n      ],\n      \"actions\": [\n        \"Seed ledger and bank mirror with identical balance via <seed_ledger_fixture>\",\n        \"POST /cron/reconcile with EOD trigger payload for today\",\n        \"GET /reports/reconciliation?date=<today> to retrieve stored report\",\n        \"GET /incidents?source=reconciliation&date=<today> to check incident list\"\n      ],\n      \"expected\": [\n        \"POST /cron/reconcile returns HTTP 200\",\n        \"Stored report contains field variance == 0.00\",\n        \"Stored report status == 'BALANCED'\",\n        \"Incident list is empty (no incident opened)\"\n      ],\n      \"trace\": [\n        \"R-FIN-050: report stored\",\n        \"R-FIN-050: non-zero variance shall open an incident (contrapositive: zero variance => no incident)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import date\\n\\nBASE = \\\"http://localhost:8080\\\"\\nTODAY = date.today().isoformat()\\n\\n\\ndef test_reconcile_zero_variance_no_incident(seed_ledger_fixture, api_auth_headers):\\n    seed_ledger_fixture(ledger_balance=10000.00, bank_balance=10000.00, date=TODAY)\\n\\n    resp = requests.post(\\n        f\\\"{BASE}/cron/reconcile\\\",\\n        json={\\\"trigger\\\": \\\"EOD\\\", \\\"date\\\": TODAY},\\n        headers=api_auth_headers,\\n        timeout=15,\\n    )\\n    assert resp.status_code == 200\\n\\n    report_resp = requests.get(\\n        f\\\"{BASE}/reports/reconciliation\\\",\\n        params={\\\"date\\\": TODAY},\\n        headers=api_auth_headers,\\n        timeout=10,\\n    )\\n    assert report_resp.status_code == 200\\n    report = report_resp.json()\\n    assert float(report[\\\"variance\\\"]) == 0.00\\n    assert report[\\\"status\\\"] == \\\"BALANCED\\\"\\n\\n    inc_resp = requests.get(\\n        f\\\"{BASE}/incidents\\\",\\n        params={\\\"source\\\": \\\"reconciliation\\\", \\\"date\\\": TODAY},\\n        headers=api_auth_headers,\\n        timeout=10,\\n    )\\n    assert inc_resp.status_code == 200\\n    assert inc_resp.json()[\\\"incidents\\\"] == []\\n\"\n    },\n    {\n      \"name\": \"test_reconcile_mid_range_variance_opens_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Internal ledger balance differs from correspondent bank balance by 500.00 (mid-range variance)\",\n        \"No pre-existing open incidents for today's reconciliation date\"\n      ],\n      \"actions\": [\n        \"Seed ledger with balance 10500.00 and bank mirror with balance 10000.00 via <seed_ledger_fixture>\",\n        \"POST /cron/reconcile with EOD trigger payload for today\",\n        \"GET /reports/reconciliation?date=<today>\",\n        \"GET /incidents?source=reconciliation&date=<today>\"\n      ],\n      \"expected\": [\n        \"POST /cron/reconcile returns HTTP 200\",\n        \"Stored report variance == 500.00\""
+  }
+}

@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-FIN-031",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Wire transfer (boundary variant)",
+    "statement": "A customer shall initiate a wire transfer requiring two-factor authentication; transfers above $100,000 require manual review. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "2fa verified in last 5 min"
+    ],
+    "triggers": [
+      "customer submits wire"
+    ],
+    "expected_outcomes": [
+      "wire queued",
+      "compliance check started"
+    ],
+    "error_pathways": [
+      "401 when 2fa stale",
+      "202 when manual review required"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/wire"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-031",
+    "reasoning": "R-FIN-031 defines three distinct decision zones: (1) transfers below $100,000 with valid 2FA \u2014 happy path, expect 200/wire queued; (2) transfers with stale 2FA \u2014 expect 401; (3) exact boundary at $100,000 \u2014 expect 202 + manual review flag; (4) exact boundary at $100,001 \u2014 also triggers manual review (above threshold). BVA demands we probe $99,999, $100,000, and $100,001. EP carves valid/invalid 2FA partitions. STC covers the 2FA state machine (fresh vs stale). NEG covers the 401 error path. DT covers the combined 2FA\u00d7amount matrix. I include five tests to satisfy minItems=3 with full heuristic coverage.",
+    "tests": [
+      {
+        "name": "test_wire_transfer_below_threshold_valid_2fa",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists and is active",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is within the standard partition (< $100,000)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=50000.00 and a fresh 2FA token"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains transfer_status = 'queued'",
+          "Response body contains compliance_check = 'started'",
+          "manual_review field is false or absent"
+        ],
+        "trace": [
+          "R-FIN-031: wire queued; compliance check started",
+          "R-FIN-031: transfers above $100,000 require manual review (complement: below does not)"
+        ],
+        "executable": "def test_wire_transfer_below_threshold_valid_2fa(api_client, fresh_2fa_token):\n    payload = {\n        \"amount\": 50000.00,\n        \"currency\": \"USD\",\n        \"recipient_account\": \"<recipient_account_fixture>\",\n        \"2fa_token\": fresh_2fa_token,\n    }\n    response = api_client.post(\"/transfers/wire\", json=payload)\n    body = response.json()\n    assert response.status_code == 200\n    assert body[\"transfer_status\"] == \"queued\"\n    assert body[\"compliance_check\"] == \"started\"\n    assert body.get(\"manual_review\", False) is False"
+      },
+      {
+        "name": "test_wire_transfer_stale_2fa_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists and is active",
+          "2FA token is older than 5 minutes (stale)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=50000.00 and a stale 2FA token"
+        ],
+        "expected": [
+          "HTTP 401 returned",
+          "Response body contains an error indicating 2FA is stale or expired"
+        ],
+        "trace": [
+          "R-FIN-031: 401 when 2fa stale"
+        ],
+        "executable": "def test_wire_transfer_stale_2fa_returns_401(api_client, stale_2fa_token):\n    payload = {\n        \"amount\": 50000.00,\n        \"currency\": \"USD\",\n        \"recipient_account\": \"<recipient_account_fixture>\",\n        \"2fa_token\": stale_2fa_token,\n    }\n    response = api_client.post(\"/transfers/wire\", json=payload)\n    body = response.json()\n    assert response.status_code == 401\n    assert \"2fa\" in body.get(\"error\", \"\").lower() or \"authentication\" in body.get(\"error\", \"\").lower()"
+      },
+      {
+        "name": "test_wire_transfer_at_exact_threshold_100000_triggers_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists and is active",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is exactly $100,000 (on-point boundary)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=100000.00 and a fresh 2FA token"
+        ],
+        "expected": [
+          "HTTP 202 returned",
+          "Response body contains manual_review = true",
+          "Response body indicates wire is pending manual review"
+        ],
+        "trace": [
+          "R-FIN-031: transfers above $100,000 require manual review",
+          "R-FIN-031: 202 when manual review required",
+          "BVA on-point: exact threshold $100,000"
+        ],
+        "executable": "def test_wire_transfer_at_exact_threshold_100000_triggers_manual_review(api_client, fresh_2fa_token):\n    payload = {\n        \"amount\": 100000.00,\n        \"currency\": \"USD\",\n        \"recipient_account\": \"<recipient_account_fixture>\",\n        \"2fa_token\": fresh_2fa_token,\n    }\n    response = api_client.post(\"/transfers/wire\", json=payload)\n    body = response.json()\n    assert response.status_code == 202\n    assert body.get(\"manual_review\") is True\n    assert body.get(\"transfer_status\") in (\"pending_review\", \"queued\")"
+      },
+      {
+        "name": "test_wire_transfer_one_cent_below_threshold_no_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists and is active",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is $99,999.99 (off-point just below boundary)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=99999.99 and a fresh 2FA token"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains transfer_status = 'queued'",
+          "manual_review field is false or absent"
+        ],
+        "trace": [
+          "R-FIN-031: transfers above $100,000 require manual review (complement boundary)",
+          "BVA off-point: $99,999.99 is one cent below the threshold"
+        ],
+        "executable": "def test_wire_transfer_one_cent_below_threshold_no_manual_review(api_client, fresh_2fa_token):\n    payload = {\n        \"amount\": 99999.99,\n        \"currency\": \"USD\",\n        \"recipient_account\": \"<recipient_account_fixture>\",\n        \"2fa_token\": fresh_2fa_token,\n    }\n    response = api_client.post(\"/transfers/wire\", json=payload)\n    body = response.json()\n    assert response.status_code == 200\n    assert body[\"transfer_status\"] == \"queued\"\n    assert body.get(\"manual_review\", False) is False"
+      },
+      {
+        "name": "test_wire_transfer_decision_matrix_stale_2fa_above_threshold",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists and is active",
+          "2FA token is stale (older than 5 minutes)",
+          "Transfer amount is above $100,000 \u2014 both failure conditions active simultaneously"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=150000.00 and a stale 2FA token"
+        ],
+        "expected": [
+          "HTTP 401 returned",
+          "Authentication error takes precedence over manual-review logic",
+          "No wire is queued or flagged for review"
+        ],
+        "trace": [
+          "R-FIN-031: 401 when 2fa stale",
+          "DT: row where 2FA=stale AND amount>100000 \u2014 401 should dominate"
+        ],
+        "executable": "def test_wire_transfer_decision_matrix_stale_2fa_above_threshold(api_client, stale_2fa_token):\n    payload = {\n        \"amount\": 150000.00,\n        \"currency\": \"USD\",\n        \"recipient_account\": \"<recipient_account_fixture>\",\n        \"2fa_token\": stale_2fa_token,\n    }\n    response = api_client.post(\"/transfers/wire\", json=payload)\n    body = response.json()\n    assert response.status_code == 401\n    assert body.get(\"transfer_status\") not in (\"queued\", \"pending_review\")"
+      }
+    ]
+  },
+  "req_id": "R-FIN-031",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 2329,
+    "latency_ms": 28099,
+    "wall_ms": 28099,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-031\",\n  \"reasoning\": \"R-FIN-031 defines three distinct decision zones: (1) transfers below $100,000 with valid 2FA \u2014 happy path, expect 200/wire queued; (2) transfers with stale 2FA \u2014 expect 401; (3) exact boundary at $100,000 \u2014 expect 202 + manual review flag; (4) exact boundary at $100,001 \u2014 also triggers manual review (above threshold). BVA demands we probe $99,999, $100,000, and $100,001. EP carves valid/invalid 2FA partitions. STC covers the 2FA state machine (fresh vs stale). NEG covers the 401 error path. DT covers the combined 2FA\u00d7amount matrix. I include five tests to satisfy minItems=3 with full heuristic coverage.\",\n  \"tests\": [\n    {\n      \"name\": \"test_wire_transfer_below_threshold_valid_2fa\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists and is active\",\n        \"2FA was verified within the last 5 minutes\",\n        \"Transfer amount is within the standard partition (< $100,000)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=50000.00 and a fresh 2FA token\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains transfer_status = 'queued'\",\n        \"Response body contains compliance_check = 'started'\",\n        \"manual_review field is false or absent\"\n      ],\n      \"trace\": [\n        \"R-FIN-031: wire queued; compliance check started\",\n        \"R-FIN-031: transfers above $100,000 require manual review (complement: below does not)\"\n      ],\n      \"executable\": \"def test_wire_transfer_below_threshold_valid_2fa(api_client, fresh_2fa_token):\\n    payload = {\\n        \\\"amount\\\": 50000.00,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"recipient_account\\\": \\\"<recipient_account_fixture>\\\",\\n        \\\"2fa_token\\\": fresh_2fa_token,\\n    }\\n    response = api_client.post(\\\"/transfers/wire\\\", json=payload)\\n    body = response.json()\\n    assert response.status_code == 200\\n    assert body[\\\"transfer_status\\\"] == \\\"queued\\\"\\n    assert body[\\\"compliance_check\\\"] == \\\"started\\\"\\n    assert body.get(\\\"manual_review\\\", False) is False\"\n    },\n    {\n      \"name\": \"test_wire_transfer_stale_2fa_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists and is active\",\n        \"2FA token is older than 5 minutes (stale)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=50000.00 and a stale 2FA token\"\n      ],\n      \"expected\": [\n        \"HTTP 401 returned\",\n        \"Response body contains an error indicating 2FA is stale or expired\"\n      ],\n      \"trace\": [\n        \"R-FIN-031: 401 when 2fa stale\"\n      ],\n      \"executable\": \"def test_wire_transfer_stale_2fa_returns_401(api_client, stale_2fa_token):\\n    payload = {\\n        \\\"amount\\\": 50000.00,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"recipient_account\\\": \\\"<recipient_account_fixture>\\\",\\n        \\\"2fa_token\\\": stale_2fa_token,\\n    }\\n    response = api_client.post(\\\"/transfers/wire\\\", json=payload)\\n    body = response.json()\\n    assert response.status_code == 401\\n    assert \\\"2fa\\\" in body.get(\\\"error\\\", \\\"\\\").lower() or \\\"authentication\\\" in body.get(\\\"error\\\", \\\"\\\").lower()\"\n    },\n    {\n      \"name\": \"test_wire_transfer_at_exact_threshold_100000_triggers_manual_review\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer account exists and is active\",\n        \"2FA was verified within the last 5 minutes\",\n        \"Transfer amount is exactly $100,000 (on-point boundary)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=100000.00 and a fresh 2FA token\"\n      ],\n      \"expected\": [\n        \"HTTP 202 returned\",\n        \"Response body contains manual_review = true\",\n        \"Response body indicates wire is pending manual review\"\n      ],\n      \"trace\": [\n        \"R-FIN-031: transfers above $100,000 require manual review\",\n        \"R-FIN-031: 202 when manual review required\",\n     "
+  }
+}

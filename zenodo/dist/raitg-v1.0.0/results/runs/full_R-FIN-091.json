@@ -1,0 +1,189 @@
+{
+  "req": {
+    "id": "R-FIN-091",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual (idempotency variant)",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-091",
+    "reasoning": "R-FIN-091 has three testable dimensions: (1) correct interest accrual and monthly crediting on a valid savings account (positive / EP), (2) idempotency: a duplicate POST with the same Idempotency-Key must return the original response without double-crediting (positive / STC), (3) a zero-balance account sits on the lower boundary \u2014 it should receive \u00a30 interest with a ledger entry of 0 (boundary / BVA), and (4) a missing or malformed Idempotency-Key header must be rejected with a 4xx error without writing any ledger entry (negative / NEG). A fifth case covers the decision table for tier-rate selection: accounts in different balance tiers must accrue at the correct tier rate (positive / DT). Together the five cases cover all major partitions, state transitions, boundary values, and error pathways described in the requirement.",
+    "tests": [
+      {
+        "name": "test_interest_credited_on_last_business_day",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A savings account (ACCT-001) exists with a positive balance in tier-1",
+          "The system date is the last business day of the current month",
+          "No interest has been credited to ACCT-001 this month",
+          "A valid unique Idempotency-Key is available"
+        ],
+        "actions": [
+          "POST /cron/interest with header Idempotency-Key: <unique_uuid> and body {\"account_id\": \"ACCT-001\"}",
+          "Record HTTP response status and body",
+          "Query ledger for ACCT-001 entries created in this month"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains interest_amount > 0",
+          "Exactly one ledger entry of type INTEREST_CREDIT exists for ACCT-001 this month",
+          "Ledger entry amount matches interest_amount in response"
+        ],
+        "trace": [
+          "R-FIN-091: interest credited monthly on last business day",
+          "R-FIN-091: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import api_client, get_ledger_entries, reset_account_interest\n\ndef test_interest_credited_on_last_business_day(<fixture_last_biz_day>, <fixture_tier1_account>):\n    account_id = <fixture_tier1_account>[\"id\"]  # e.g. \"ACCT-001\"\n    reset_account_interest(account_id)\n    idem_key = str(uuid.uuid4())\n\n    resp = api_client.post(\n        \"/cron/interest\",\n        json={\"account_id\": account_id},\n        headers={\"Idempotency-Key\": idem_key},\n    )\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"interest_amount\"] > 0\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1\n    assert entries[0][\"amount\"] == pytest.approx(body[\"interest_amount\"], rel=1e-6)\n"
+      },
+      {
+        "name": "test_duplicate_idempotency_key_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A savings account (ACCT-002) exists with a positive balance",
+          "A first POST to /cron/interest with Idempotency-Key IK-42 has already succeeded",
+          "The ledger contains exactly one INTEREST_CREDIT entry for ACCT-002"
+        ],
+        "actions": [
+          "POST /cron/interest again with the same Idempotency-Key: IK-42 and same body",
+          "Record second HTTP response status and body",
+          "Query ledger for ACCT-002 INTEREST_CREDIT entries"
+        ],
+        "expected": [
+          "Second request returns HTTP 200",
+          "Response body is identical to the first response body",
+          "Ledger still contains exactly one INTEREST_CREDIT entry (no double-credit)",
+          "Account balance has not increased a second time"
+        ],
+        "trace": [
+          "R-FIN-091: duplicate submission with same Idempotency-Key must return original result",
+          "R-FIN-091: idempotency variant"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, get_ledger_entries, reset_account_interest\n\nIDEM_KEY = \"IK-42-state-transition\"\nACCOUNT_ID = \"ACCT-002\"\n\ndef test_duplicate_idempotency_key_returns_original_result(<fixture_positive_balance_account>):\n    reset_account_interest(ACCOUNT_ID)\n\n    payload = {\"account_id\": ACCOUNT_ID}\n    headers = {\"Idempotency-Key\": IDEM_KEY}\n\n    first = api_client.post(\"/cron/interest\", json=payload, headers=headers)\n    assert first.status_code == 200\n    first_body = first.json()\n\n    second = api_client.post(\"/cron/interest\", json=payload, headers=headers)\n    assert second.status_code == 200\n    second_body = second.json()\n\n    assert second_body == first_body\n\n    entries = get_ledger_entries(ACCOUNT_ID, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1, \"Idempotent call must not create a duplicate ledger entry\"\n"
+      },
+      {
+        "name": "test_zero_balance_account_accrues_zero_interest",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A savings account (ACCT-003) exists with a balance of exactly 0.00",
+          "The system date is the last business day of the current month",
+          "No interest has been credited to ACCT-003 this month",
+          "A valid unique Idempotency-Key is available"
+        ],
+        "actions": [
+          "POST /cron/interest with header Idempotency-Key: <unique_uuid> and body {\"account_id\": \"ACCT-003\"}",
+          "Record HTTP response and ledger state"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains interest_amount == 0.00",
+          "Exactly one ledger entry of type INTEREST_CREDIT exists with amount 0.00",
+          "Account balance remains 0.00"
+        ],
+        "trace": [
+          "R-FIN-091: daily accrual using tier rate (lower boundary at zero balance)",
+          "R-FIN-091: ledger entry per account even at zero interest"
+        ],
+        "executable": "import uuid\nfrom <helper_fn> import api_client, get_ledger_entries, get_account_balance, reset_account_interest\n\ndef test_zero_balance_account_accrues_zero_interest(<fixture_zero_balance_account>):\n    account_id = <fixture_zero_balance_account>[\"id\"]  # balance == 0.00\n    reset_account_interest(account_id)\n    idem_key = str(uuid.uuid4())\n\n    resp = api_client.post(\n        \"/cron/interest\",\n        json={\"account_id\": account_id},\n        headers={\"Idempotency-Key\": idem_key},\n    )\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"interest_amount\"] == 0.00\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1\n    assert entries[0][\"amount\"] == 0.00\n\n    balance = get_account_balance(account_id)\n    assert balance == 0.00\n"
+      },
+      {
+        "name": "test_missing_idempotency_key_returns_4xx",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A savings account (ACCT-004) exists with a positive balance",
+          "The Idempotency-Key header is intentionally omitted from the request"
+        ],
+        "actions": [
+          "POST /cron/interest WITHOUT the Idempotency-Key header and body {\"account_id\": \"ACCT-004\"}",
+          "Record HTTP response status and body",
+          "Query ledger for ACCT-004 INTEREST_CREDIT entries"
+        ],
+        "expected": [
+          "HTTP 4xx (400 or 422) returned",
+          "Response body contains an error message referencing Idempotency-Key",
+          "No INTEREST_CREDIT ledger entry is created for ACCT-004",
+          "Account balance is unchanged"
+        ],
+        "trace": [
+          "R-FIN-091: idempotency \u2014 missing key must not process or partially credit",
+          "R-FIN-091 error pathway: reconciliation variance prevented by rejecting bad requests"
+        ],
+        "executable": "from <helper_fn> import api_client, get_ledger_entries, get_account_balance, reset_account_interest\n\ndef test_missing_idempotency_key_returns_4xx(<fixture_positive_balance_account>):\n    account_id = <fixture_positive_balance_account>[\"id\"]\n    reset_account_interest(account_id)\n    balance_before = get_account_balance(account_id)\n\n    resp = api_client.post(\n        \"/cron/interest\",\n        json={\"account_id\": account_id},\n        # No Idempotency-Key header\n    )\n\n    assert resp.status_code in (400, 422)\n    body = resp.json()\n    assert \"idempotency\" in body.get(\"error\", \"\").lower() or \\\n           \"idempotency\" in body.get(\"message\", \"\").lower()\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 0, \"No ledger entry should be written on bad request\"\n\n    balance_after = get_account_balance(account_id)\n    assert balance_after == balance_before\n"
+      },
+      {
+        "name": "test_tier_rate_applied_correctly_across_balance_tiers",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Three savings accounts exist: ACCT-T1 (balance in tier-1), ACCT-T2 (balance in tier-2), ACCT-T3 (balance in tier-3)",
+          "Tier rate schedule is: tier-1 <= 10000 => 1.0% p.a.; 10001-50000 => 1.5% p.a.; >50000 => 2.0% p.a.",
+          "System date is last business day of the month",
+          "No interest credited this month for any of these accounts"
+        ],
+        "actions": [
+          "POST /cron/interest for ACCT-T1 with unique Idempotency-Key",
+          "POST /cron/interest for ACCT-T2 with unique Idempotency-Key",
+          "POST /cron/interest for ACCT-T3 with unique Idempotency-Key",
+          "Compare each returned interest_amount against expected monthly accrual"
+        ],
+        "expected": [
+          "ACCT-T1 interest_amount matches balance * (1.0/100) / 12 within tolerance",
+          "ACCT-T2 interest_amount matches balance * (1.5/100) / 12 within tolerance",
+          "ACCT-T3 interest_amount matches balance * (2.0/100) / 12 within tolerance",
+          "Each account has exactly one INTEREST_CREDIT ledger entry"
+        ],
+        "trace": [
+          "R-FIN-091: tier rate used for daily accrual",
+          "R-FIN-091: interest credited monthly"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <helper_fn> import api_client, get_ledger_entries, reset_account_interest\n\nTIER_CASES = [\n    (\"ACCT-T1\", 5_000.00,  1.0 / 100 / 12),\n    (\"ACCT-T2\", 25_000.00, 1.5 / 100 / 12),\n    (\"ACCT-T3\", 75_000.00, 2.0 / 100 / 12),\n]\n\n@pytest.mark.parametrize(\"account_id,balance,monthly_rate\", TIER_CASES)\ndef test_tier_rate_applied_correctly_across_balance_tiers(account_id, balance, monthly_rate, <fixture_last_biz_day>):\n    reset_account_interest(account_id)\n    idem_key = str(uuid.uuid4())\n    expected = pytest.approx(balance * monthly_rate, rel=1e-4)\n\n    resp = api_client.post(\n        \"/cron/interest\",\n        json={\"account_id\": account_id},\n        headers={\"Idempotency-Key\": idem_key},\n    )\n\n    assert resp.status_code == 200\n    assert resp.json()[\"interest_amount\"] == expected\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-091",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 3642,
+    "latency_ms": 38586,
+    "wall_ms": 38586,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-091\",\n  \"reasoning\": \"R-FIN-091 has three testable dimensions: (1) correct interest accrual and monthly crediting on a valid savings account (positive / EP), (2) idempotency: a duplicate POST with the same Idempotency-Key must return the original response without double-crediting (positive / STC), (3) a zero-balance account sits on the lower boundary \u2014 it should receive \u00a30 interest with a ledger entry of 0 (boundary / BVA), and (4) a missing or malformed Idempotency-Key header must be rejected with a 4xx error without writing any ledger entry (negative / NEG). A fifth case covers the decision table for tier-rate selection: accounts in different balance tiers must accrue at the correct tier rate (positive / DT). Together the five cases cover all major partitions, state transitions, boundary values, and error pathways described in the requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_interest_credited_on_last_business_day\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A savings account (ACCT-001) exists with a positive balance in tier-1\",\n        \"The system date is the last business day of the current month\",\n        \"No interest has been credited to ACCT-001 this month\",\n        \"A valid unique Idempotency-Key is available\"\n      ],\n      \"actions\": [\n        \"POST /cron/interest with header Idempotency-Key: <unique_uuid> and body {\\\"account_id\\\": \\\"ACCT-001\\\"}\",\n        \"Record HTTP response status and body\",\n        \"Query ledger for ACCT-001 entries created in this month\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains interest_amount > 0\",\n        \"Exactly one ledger entry of type INTEREST_CREDIT exists for ACCT-001 this month\",\n        \"Ledger entry amount matches interest_amount in response\"\n      ],\n      \"trace\": [\n        \"R-FIN-091: interest credited monthly on last business day\",\n        \"R-FIN-091: ledger entry per account\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom <helper_fn> import api_client, get_ledger_entries, reset_account_interest\\n\\ndef test_interest_credited_on_last_business_day(<fixture_last_biz_day>, <fixture_tier1_account>):\\n    account_id = <fixture_tier1_account>[\\\"id\\\"]  # e.g. \\\"ACCT-001\\\"\\n    reset_account_interest(account_id)\\n    idem_key = str(uuid.uuid4())\\n\\n    resp = api_client.post(\\n        \\\"/cron/interest\\\",\\n        json={\\\"account_id\\\": account_id},\\n        headers={\\\"Idempotency-Key\\\": idem_key},\\n    )\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"interest_amount\\\"] > 0\\n\\n    entries = get_ledger_entries(account_id, entry_type=\\\"INTEREST_CREDIT\\\")\\n    assert len(entries) == 1\\n    assert entries[0][\\\"amount\\\"] == pytest.approx(body[\\\"interest_amount\\\"], rel=1e-6)\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_idempotency_key_returns_original_result\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"A savings account (ACCT-002) exists with a positive balance\",\n        \"A first POST to /cron/interest with Idempotency-Key IK-42 has already succeeded\",\n        \"The ledger contains exactly one INTEREST_CREDIT entry for ACCT-002\"\n      ],\n      \"actions\": [\n        \"POST /cron/interest again with the same Idempotency-Key: IK-42 and same body\",\n        \"Record second HTTP response status and body\",\n        \"Query ledger for ACCT-002 INTEREST_CREDIT entries\"\n      ],\n      \"expected\": [\n        \"Second request returns HTTP 200\",\n        \"Response body is identical to the first response body\",\n        \"Ledger still contains exactly one INTEREST_CREDIT entry (no double-credit)\",\n        \"Account balance has not increased a second time\"\n      ],\n      \"trace\": [\n        \"R-FIN-091: duplicate submission with same Idempotency-Key must return original result\",\n        \"R-FIN-091: idempotency variant\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import api_client, g"
+  }
+}

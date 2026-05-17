@@ -1,0 +1,183 @@
+{
+  "req": {
+    "id": "R-WEB-097",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Bulk import employees",
+    "statement": "An hr-admin shall bulk-import employees via CSV; the import shall validate each row and commit only rows that pass validation, reporting errors per row.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin uploads CSV"
+    ],
+    "expected_outcomes": [
+      "valid rows imported",
+      "error report generated"
+    ],
+    "error_pathways": [
+      "415 when file not CSV",
+      "422 when header missing required columns"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/employees/import"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-097",
+    "reasoning": "The requirement covers bulk CSV import with per-row validation and partial commit semantics. I derive tests across five heuristics: (1) EP-positive: a well-formed CSV with all valid rows commits all rows and returns no errors; (2) NEG: uploading a non-CSV file triggers HTTP 415; (3) NEG/DT: uploading a CSV missing required header columns triggers HTTP 422; (4) BVA: a mixed CSV with exactly one valid row and one invalid row commits only the valid row and reports exactly one error, exercising the boundary between full-success and full-failure; (5) STC: the system transitions from 'no employees' through 'import in progress' to 'employees present', verified by checking state before and after a successful import. Each test is self-contained using fixtures for auth and ephemeral CSV construction, and cleans up imported records via a teardown call.",
+    "tests": [
+      {
+        "name": "test_bulk_import_all_valid_rows_committed",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "Target employees do not already exist (idempotency guard)",
+          "CSV file contains only fully valid rows with all required columns"
+        ],
+        "actions": [
+          "Build an in-memory CSV with header row and 3 fully valid employee rows",
+          "POST multipart/form-data with the CSV to /employees/import",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body reports 3 rows imported",
+          "Response body reports 0 errors",
+          "Each employee is retrievable via GET /employees"
+        ],
+        "trace": [
+          "R-WEB-097: valid rows imported",
+          "R-WEB-097: error report generated (zero errors expected)"
+        ],
+        "executable": "import pytest\nimport io\nimport csv\n\ndef test_bulk_import_all_valid_rows_committed(hr_admin_session, api_base_url, cleanup_employees):\n    employees = [\n        {\"employee_id\": \"EMP-T001\", \"first_name\": \"Alice\", \"last_name\": \"Smith\", \"email\": \"alice@example.com\"},\n        {\"employee_id\": \"EMP-T002\", \"first_name\": \"Bob\",   \"last_name\": \"Jones\", \"email\": \"bob@example.com\"},\n        {\"employee_id\": \"EMP-T003\", \"first_name\": \"Carol\", \"last_name\": \"White\", \"email\": \"carol@example.com\"},\n    ]\n    buf = io.StringIO()\n    writer = csv.DictWriter(buf, fieldnames=[\"employee_id\",\"first_name\",\"last_name\",\"email\"])\n    writer.writeheader()\n    writer.writerows(employees)\n    buf.seek(0)\n    files = {\"file\": (\"employees.csv\", buf, \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code in (200, 201)\n    body = resp.json()\n    assert body[\"imported\"] == 3\n    assert body[\"errors\"] == []\n    cleanup_employees([e[\"employee_id\"] for e in employees])"
+      },
+      {
+        "name": "test_bulk_import_non_csv_file_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "File to upload has a .txt extension and text/plain MIME type"
+        ],
+        "actions": [
+          "Build a plain-text file payload (not CSV)",
+          "POST multipart/form-data with the text file to /employees/import",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 415 Unsupported Media Type response",
+          "Response body contains an error message indicating invalid file type"
+        ],
+        "trace": [
+          "R-WEB-097: error pathway 415 when file not CSV"
+        ],
+        "executable": "import pytest\n\ndef test_bulk_import_non_csv_file_returns_415(hr_admin_session, api_base_url):\n    payload = b\"this is just plain text, not a csv file\"\n    files = {\"file\": (\"data.txt\", payload, \"text/plain\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code == 415\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body"
+      },
+      {
+        "name": "test_bulk_import_missing_required_header_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "CSV file is valid CSV but omits the required 'email' header column"
+        ],
+        "actions": [
+          "Build an in-memory CSV with only partial headers (missing 'email')",
+          "POST multipart/form-data with the CSV to /employees/import",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity response",
+          "Response body identifies the missing required column"
+        ],
+        "trace": [
+          "R-WEB-097: error pathway 422 when header missing required columns"
+        ],
+        "executable": "import pytest\nimport io\nimport csv\n\ndef test_bulk_import_missing_required_header_returns_422(hr_admin_session, api_base_url):\n    buf = io.StringIO()\n    # Intentionally omit 'email' from headers\n    writer = csv.DictWriter(buf, fieldnames=[\"employee_id\", \"first_name\", \"last_name\"])\n    writer.writeheader()\n    writer.writerow({\"employee_id\": \"EMP-T099\", \"first_name\": \"Dan\", \"last_name\": \"Brown\"})\n    buf.seek(0)\n    files = {\"file\": (\"bad_headers.csv\", buf, \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code == 422\n    body = resp.json()\n    error_text = str(body).lower()\n    assert \"email\" in error_text or \"missing\" in error_text or \"required\" in error_text"
+      },
+      {
+        "name": "test_bulk_import_mixed_csv_commits_only_valid_rows",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "CSV contains exactly 1 valid row and exactly 1 invalid row (boundary: N=1 per partition)",
+          "Valid employee does not already exist"
+        ],
+        "actions": [
+          "Build a CSV with one fully valid row and one row with a malformed email",
+          "POST multipart/form-data with the CSV to /employees/import",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 207 Multi-Status response",
+          "Response body reports exactly 1 row imported",
+          "Response body reports exactly 1 error identifying the invalid row",
+          "Valid employee is retrievable via GET /employees",
+          "Invalid employee is NOT present in the system"
+        ],
+        "trace": [
+          "R-WEB-097: valid rows imported",
+          "R-WEB-097: error report generated per row",
+          "R-WEB-097: commit only rows that pass validation"
+        ],
+        "executable": "import pytest\nimport io\nimport csv\n\ndef test_bulk_import_mixed_csv_commits_only_valid_rows(hr_admin_session, api_base_url, cleanup_employees):\n    buf = io.StringIO()\n    fields = [\"employee_id\", \"first_name\", \"last_name\", \"email\"]\n    writer = csv.DictWriter(buf, fieldnames=fields)\n    writer.writeheader()\n    writer.writerow({\"employee_id\": \"EMP-T010\", \"first_name\": \"Eve\",  \"last_name\": \"Valid\",   \"email\": \"eve@example.com\"})\n    writer.writerow({\"employee_id\": \"EMP-T011\", \"first_name\": \"Mal\",  \"last_name\": \"Invalid\", \"email\": \"NOT_AN_EMAIL\"})\n    buf.seek(0)\n    files = {\"file\": (\"mixed.csv\", buf, \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code in (200, 207)\n    body = resp.json()\n    assert body[\"imported\"] == 1\n    assert len(body[\"errors\"]) == 1\n    assert body[\"errors\"][0][\"row\"] in (2, \"EMP-T011\")\n    get_resp = hr_admin_session.get(f\"{api_base_url}/employees/EMP-T010\")\n    assert get_resp.status_code == 200\n    bad_resp = hr_admin_session.get(f\"{api_base_url}/employees/EMP-T011\")\n    assert bad_resp.status_code == 404\n    cleanup_employees([\"EMP-T010\"])"
+      },
+      {
+        "name": "test_bulk_import_state_transitions_no_employees_to_imported",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "Target employees EMP-T020 and EMP-T021 do not exist (state: absent)",
+          "CSV is fully valid"
+        ],
+        "actions": [
+          "Verify employees are absent via GET /employees/{id} returning 404 (state: absent)",
+          "POST valid CSV to /employees/import (trigger: upload)",
+          "Verify employees are present via GET /employees/{id} returning 200 (state: imported)"
+        ],
+        "expected": [
+          "Before import: GET /employees/EMP-T020 returns 404",
+          "Before import: GET /employees/EMP-T021 returns 404",
+          "Import response HTTP 200 or 201 with 2 imported, 0 errors",
+          "After import: GET /employees/EMP-T020 returns 200",
+          "After import: GET /employees/EMP-T021 returns 200"
+        ],
+        "trace": [
+          "R-WEB-097: valid rows imported",
+          "R-WEB-097: state transition absent -> present after successful import"
+        ],
+        "executable": "import pytest\nimport io\nimport csv\n\ndef test_bulk_import_state_transitions_no_employees_to_imported(hr_admin_session, api_base_url, cleanup_employees):\n    ids = [\"EMP-T020\", \"EMP-T021\"]\n    for eid in ids:\n        pre = hr_admin_session.get(f\"{api_base_url}/employees/{eid}\")\n        assert pre.status_code == 404, f\"Precondition failed: {eid} already exists\"\n    buf = io.StringIO()\n    fields = [\"employee_id\", \"first_name\", \"last_name\", \"email\"]\n    writer = csv.DictWriter(buf, fieldnames=fields)\n    writer.writeheader()\n    writer.writerow({\"employee_id\": \"EMP-T020\", \"first_name\": \"Frank\", \"last_name\": \"A\", \"email\": \"frank@example.com\"})\n    writer.writerow({\"employee_id\": \"EMP-T021\", \"first_name\": \"Grace\", \"last_name\": \"B\", \"email\": \"grace@example.com\"})\n    buf.seek(0)\n    files = {\"file\": (\"state.csv\", buf, \"text/csv\")}\n    resp = hr_admin_session.post(f\"{api_base_url}/employees/import\", files=files)\n    assert resp.status_code in (200, 201)\n    assert resp.json()[\"imported\"] == 2\n    for eid in ids:\n        post = hr_admin_session.get(f\"{api_base_url}/employees/{eid}\")\n        assert post.status_code == 200\n    cleanup_employees(ids)"
+      }
+    ]
+  },
+  "req_id": "R-WEB-097",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 998,
+    "output_tokens": 3345,
+    "latency_ms": 34330,
+    "wall_ms": 34330,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-097\",\n  \"reasoning\": \"The requirement covers bulk CSV import with per-row validation and partial commit semantics. I derive tests across five heuristics: (1) EP-positive: a well-formed CSV with all valid rows commits all rows and returns no errors; (2) NEG: uploading a non-CSV file triggers HTTP 415; (3) NEG/DT: uploading a CSV missing required header columns triggers HTTP 422; (4) BVA: a mixed CSV with exactly one valid row and one invalid row commits only the valid row and reports exactly one error, exercising the boundary between full-success and full-failure; (5) STC: the system transitions from 'no employees' through 'import in progress' to 'employees present', verified by checking state before and after a successful import. Each test is self-contained using fixtures for auth and ephemeral CSV construction, and cleans up imported records via a teardown call.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_import_all_valid_rows_committed\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as hr-admin\",\n        \"Target employees do not already exist (idempotency guard)\",\n        \"CSV file contains only fully valid rows with all required columns\"\n      ],\n      \"actions\": [\n        \"Build an in-memory CSV with header row and 3 fully valid employee rows\",\n        \"POST multipart/form-data with the CSV to /employees/import\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body reports 3 rows imported\",\n        \"Response body reports 0 errors\",\n        \"Each employee is retrievable via GET /employees\"\n      ],\n      \"trace\": [\n        \"R-WEB-097: valid rows imported\",\n        \"R-WEB-097: error report generated (zero errors expected)\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\nimport csv\\n\\ndef test_bulk_import_all_valid_rows_committed(hr_admin_session, api_base_url, cleanup_employees):\\n    employees = [\\n        {\\\"employee_id\\\": \\\"EMP-T001\\\", \\\"first_name\\\": \\\"Alice\\\", \\\"last_name\\\": \\\"Smith\\\", \\\"email\\\": \\\"alice@example.com\\\"},\\n        {\\\"employee_id\\\": \\\"EMP-T002\\\", \\\"first_name\\\": \\\"Bob\\\",   \\\"last_name\\\": \\\"Jones\\\", \\\"email\\\": \\\"bob@example.com\\\"},\\n        {\\\"employee_id\\\": \\\"EMP-T003\\\", \\\"first_name\\\": \\\"Carol\\\", \\\"last_name\\\": \\\"White\\\", \\\"email\\\": \\\"carol@example.com\\\"},\\n    ]\\n    buf = io.StringIO()\\n    writer = csv.DictWriter(buf, fieldnames=[\\\"employee_id\\\",\\\"first_name\\\",\\\"last_name\\\",\\\"email\\\"])\\n    writer.writeheader()\\n    writer.writerows(employees)\\n    buf.seek(0)\\n    files = {\\\"file\\\": (\\\"employees.csv\\\", buf, \\\"text/csv\\\")}\\n    resp = hr_admin_session.post(f\\\"{api_base_url}/employees/import\\\", files=files)\\n    assert resp.status_code in (200, 201)\\n    body = resp.json()\\n    assert body[\\\"imported\\\"] == 3\\n    assert body[\\\"errors\\\"] == []\\n    cleanup_employees([e[\\\"employee_id\\\"] for e in employees])\"\n    },\n    {\n      \"name\": \"test_bulk_import_non_csv_file_returns_415\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as hr-admin\",\n        \"File to upload has a .txt extension and text/plain MIME type\"\n      ],\n      \"actions\": [\n        \"Build a plain-text file payload (not CSV)\",\n        \"POST multipart/form-data with the text file to /employees/import\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 415 Unsupported Media Type response\",\n        \"Response body contains an error message indicating invalid file type\"\n      ],\n      \"trace\": [\n        \"R-WEB-097: error pathway 415 when file not CSV\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_bulk_import_non_csv_file_returns_415(hr_admin_session, api_base_url):\\n    payload = b\\\"this is just plain text, not a csv file\\\"\\n    files = {\\\"file\\\": (\\\"data.txt\\\", payload, \\\"text/plain\\\")}\\n    resp = hr_admin_session.post(f\\\"{api_base_url}/employees/imp"
+  }
+}

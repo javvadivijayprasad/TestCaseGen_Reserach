@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-HLT-017",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Inter-facility referral",
+    "statement": "A clinician shall send a referral to another facility; the referral shall trigger a secure message and consent check.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician sends referral"
+    ],
+    "expected_outcomes": [
+      "referral stored",
+      "secure message dispatched"
+    ],
+    "error_pathways": [
+      "403 when consent absent"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ReferralRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-017",
+    "reasoning": "R-HLT-017 mandates three observable behaviours: (1) a clinician with a consenting patient can POST a ReferralRequest and receive 201 + stored resource + secure message dispatch; (2) a POST without patient consent must return 403; (3) a boundary case exercises the maximum-length referral note (4096 chars) to confirm the system stores it without truncation or error. EP covers the happy-path partition (valid clinician, consent present). NEG covers the error pathway (consent absent \u2192 403). BVA covers the note-length boundary. STC is implicitly verified via state transition consent-present\u2192referral-stored.",
+    "tests": [
+      {
+        "name": "test_referral_created_with_consent_and_secure_message_dispatched",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician JWT available via <clinician_auth_headers> fixture",
+          "Patient P-001 has active consent record on file",
+          "Target facility F-002 exists in the system",
+          "Message broker spy available via <message_spy> fixture"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid payload referencing patient P-001 and facility F-002",
+          "Capture HTTP response status and Location header",
+          "Poll <message_spy> for dispatched secure message within timeout"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resource id",
+          "GET on returned Location returns the stored ReferralRequest",
+          "Exactly one secure message dispatched to facility F-002"
+        ],
+        "trace": [
+          "R-HLT-017: clinician shall send referral",
+          "R-HLT-017: referral shall trigger a secure message",
+          "R-HLT-017: referral stored"
+        ],
+        "executable": "import pytest\n\ndef test_referral_created_with_consent_and_secure_message_dispatched(\n    clinician_auth_headers, api_client, message_spy, ensure_consent, cleanup_referral\n):\n    ensure_consent(patient_id=\"P-001\", granted=True)\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": \"Patient/P-001\"},\n        \"recipient\": [{\"reference\": \"Organization/F-002\"}],\n        \"note\": [{\"text\": \"Routine cardiology follow-up\"}]\n    }\n\n    resp = api_client.post(\n        \"/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    referral_id = body.get(\"id\")\n    assert referral_id, \"Response must contain resource id\"\n    cleanup_referral(referral_id)\n\n    fetch_resp = api_client.get(f\"/ReferralRequest/{referral_id}\", headers=clinician_auth_headers)\n    assert fetch_resp.status_code == 200\n    assert fetch_resp.json()[\"id\"] == referral_id\n\n    messages = message_spy.wait_for_messages(topic=\"secure-referral\", count=1, timeout=5)\n    assert len(messages) == 1\n    assert messages[0][\"recipient\"] == \"Organization/F-002\"\n"
+      },
+      {
+        "name": "test_referral_rejected_403_when_consent_absent",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician JWT available via <clinician_auth_headers> fixture",
+          "Patient P-002 has NO active consent record",
+          "Target facility F-002 exists in the system"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid payload referencing patient P-002 (no consent)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body indicates consent required",
+          "No ReferralRequest resource created",
+          "No secure message dispatched"
+        ],
+        "trace": [
+          "R-HLT-017: 403 when consent absent",
+          "R-HLT-017: referral shall trigger a consent check"
+        ],
+        "executable": "import pytest\n\ndef test_referral_rejected_403_when_consent_absent(\n    clinician_auth_headers, api_client, message_spy, ensure_consent\n):\n    ensure_consent(patient_id=\"P-002\", granted=False)\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": \"Patient/P-002\"},\n        \"recipient\": [{\"reference\": \"Organization/F-002\"}],\n        \"note\": [{\"text\": \"Cardiology consult\"}]\n    }\n\n    resp = api_client.post(\n        \"/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"consent\" in body.get(\"issue\", [{}])[0].get(\"diagnostics\", \"\").lower() \\\n        or \"consent\" in str(body).lower(), \"Response must reference consent denial\"\n\n    messages = message_spy.get_messages(topic=\"secure-referral\", timeout=1)\n    assert len(messages) == 0, \"No secure message should be dispatched on 403\"\n"
+      },
+      {
+        "name": "test_referral_note_at_maximum_length_boundary_stored_intact",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician JWT available via <clinician_auth_headers> fixture",
+          "Patient P-001 has active consent record on file",
+          "Target facility F-002 exists in the system",
+          "System documented maximum note length is 4096 characters"
+        ],
+        "actions": [
+          "Construct referral note string of exactly 4096 characters",
+          "POST /ReferralRequest with that maximum-length note",
+          "Retrieve the stored resource and compare note text length"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Stored note text length equals exactly 4096 characters without truncation"
+        ],
+        "trace": [
+          "R-HLT-017: referral stored",
+          "BVA: maximum field length must be accepted and persisted verbatim"
+        ],
+        "executable": "import pytest\n\nMAX_NOTE_LEN = 4096\n\ndef test_referral_note_at_maximum_length_boundary_stored_intact(\n    clinician_auth_headers, api_client, ensure_consent, cleanup_referral\n):\n    ensure_consent(patient_id=\"P-001\", granted=True)\n    max_note = \"A\" * MAX_NOTE_LEN\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": \"Patient/P-001\"},\n        \"recipient\": [{\"reference\": \"Organization/F-002\"}],\n        \"note\": [{\"text\": max_note}]\n    }\n\n    resp = api_client.post(\n        \"/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n\n    assert resp.status_code == 201, f\"Expected 201 at boundary, got {resp.status_code}: {resp.text}\"\n    referral_id = resp.json().get(\"id\")\n    assert referral_id\n    cleanup_referral(referral_id)\n\n    fetch_resp = api_client.get(f\"/ReferralRequest/{referral_id}\", headers=clinician_auth_headers)\n    assert fetch_resp.status_code == 200\n    stored_note = fetch_resp.json()[\"note\"][0][\"text\"]\n    assert len(stored_note) == MAX_NOTE_LEN, (\n        f\"Note truncated: expected {MAX_NOTE_LEN}, got {len(stored_note)}\"\n    )\n"
+      },
+      {
+        "name": "test_referral_state_transition_active_to_completed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician JWT available via <clinician_auth_headers> fixture",
+          "Patient P-001 has active consent record",
+          "An existing ReferralRequest in status=active exists for patient P-001 (id from <active_referral> fixture)"
+        ],
+        "actions": [
+          "PUT /ReferralRequest/{id} with status changed to completed",
+          "Retrieve the resource and inspect status field"
+        ],
+        "expected": [
+          "HTTP 200 OK on update",
+          "Stored resource status equals completed",
+          "State transition from active to completed accepted without error"
+        ],
+        "trace": [
+          "R-HLT-017: referral stored (lifecycle state must be persisted)",
+          "STC: active \u2192 completed transition must succeed"
+        ],
+        "executable": "import pytest\n\ndef test_referral_state_transition_active_to_completed(\n    clinician_auth_headers, api_client, active_referral, ensure_consent\n):\n    ensure_consent(patient_id=\"P-001\", granted=True)\n    referral_id = active_referral(patient_id=\"P-001\", facility_id=\"F-002\")\n\n    fetch_resp = api_client.get(f\"/ReferralRequest/{referral_id}\", headers=clinician_auth_headers)\n    assert fetch_resp.status_code == 200\n    resource = fetch_resp.json()\n    assert resource[\"status\"] == \"active\", \"Precondition: referral must start as active\"\n\n    resource[\"status\"] = \"completed\"\n    update_resp = api_client.put(\n        f\"/ReferralRequest/{referral_id}\",\n        json=resource,\n        headers=clinician_auth_headers\n    )\n\n    assert update_resp.status_code == 200, (\n        f\"Expected 200 on state transition, got {update_resp.status_code}: {update_resp.text}\"\n    )\n    verify_resp = api_client.get(f\"/ReferralRequest/{referral_id}\", headers=clinician_auth_headers)\n    assert verify_resp.json()[\"status\"] == \"completed\"\n"
+      },
+      {
+        "name": "test_referral_decision_table_consent_and_role_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Non-clinician (nurse) JWT available via <nurse_auth_headers> fixture",
+          "Patient P-001 has active consent record",
+          "Patient P-002 has NO consent record"
+        ],
+        "actions": [
+          "Attempt POST /ReferralRequest as nurse with consenting patient \u2192 expect 403",
+          "Attempt POST /ReferralRequest as clinician with non-consenting patient \u2192 expect 403",
+          "Confirm neither attempt creates a resource"
+        ],
+        "expected": [
+          "Non-clinician role with consent present returns 403",
+          "Clinician role with consent absent returns 403",
+          "No ReferralRequest resources persisted for either case"
+        ],
+        "trace": [
+          "R-HLT-017: role:clinician precondition",
+          "R-HLT-017: 403 when consent absent",
+          "DT: role \u00d7 consent combinations that must all fail"
+        ],
+        "executable": "import pytest\n\ndef test_referral_decision_table_consent_and_role_combinations(\n    clinician_auth_headers, nurse_auth_headers, api_client, ensure_consent\n):\n    ensure_consent(patient_id=\"P-001\", granted=True)\n    ensure_consent(patient_id=\"P-002\", granted=False)\n\n    # Row 1: wrong role (nurse), consent present \u2192 403\n    payload_nurse = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": \"Patient/P-001\"},\n        \"recipient\": [{\"reference\": \"Organization/F-002\"}]\n    }\n    resp_nurse = api_client.post(\"/ReferralRequest\", json=payload_nurse, headers=nurse_auth_headers)\n    assert resp_nurse.status_code == 403, (\n        f\"Nurse with consent: expected 403, got {resp_nurse.status_code}\"\n    )\n\n    # Row 2: correct role (clinician), consent absent \u2192 403\n    payload_no_consent = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": \"Patient/P-002\"},\n        \"recipient\": [{\"reference\": \"Organization/F-002\"}]\n    }\n    resp_no_consent = api_client.post(\n        \"/ReferralRequest\", json=payload_no_consent, headers=clinician_auth_headers\n    )\n    assert resp_no_consent.status_code == 403, (\n        f\"Clinician without consent: expected 403, got {resp_no_consent.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-017",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 986,
+    "output_tokens": 3622,
+    "latency_ms": 38161,
+    "wall_ms": 38162,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-017\",\n  \"reasoning\": \"R-HLT-017 mandates three observable behaviours: (1) a clinician with a consenting patient can POST a ReferralRequest and receive 201 + stored resource + secure message dispatch; (2) a POST without patient consent must return 403; (3) a boundary case exercises the maximum-length referral note (4096 chars) to confirm the system stores it without truncation or error. EP covers the happy-path partition (valid clinician, consent present). NEG covers the error pathway (consent absent \u2192 403). BVA covers the note-length boundary. STC is implicitly verified via state transition consent-present\u2192referral-stored.\",\n  \"tests\": [\n    {\n      \"name\": \"test_referral_created_with_consent_and_secure_message_dispatched\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician JWT available via <clinician_auth_headers> fixture\",\n        \"Patient P-001 has active consent record on file\",\n        \"Target facility F-002 exists in the system\",\n        \"Message broker spy available via <message_spy> fixture\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with valid payload referencing patient P-001 and facility F-002\",\n        \"Capture HTTP response status and Location header\",\n        \"Poll <message_spy> for dispatched secure message within timeout\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resource id\",\n        \"GET on returned Location returns the stored ReferralRequest\",\n        \"Exactly one secure message dispatched to facility F-002\"\n      ],\n      \"trace\": [\n        \"R-HLT-017: clinician shall send referral\",\n        \"R-HLT-017: referral shall trigger a secure message\",\n        \"R-HLT-017: referral stored\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_referral_created_with_consent_and_secure_message_dispatched(\\n    clinician_auth_headers, api_client, message_spy, ensure_consent, cleanup_referral\\n):\\n    ensure_consent(patient_id=\\\"P-001\\\", granted=True)\\n    payload = {\\n        \\\"resourceType\\\": \\\"ReferralRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/P-001\\\"},\\n        \\\"recipient\\\": [{\\\"reference\\\": \\\"Organization/F-002\\\"}],\\n        \\\"note\\\": [{\\\"text\\\": \\\"Routine cardiology follow-up\\\"}]\\n    }\\n\\n    resp = api_client.post(\\n        \\\"/ReferralRequest\\\",\\n        json=payload,\\n        headers=clinician_auth_headers\\n    )\\n\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    referral_id = body.get(\\\"id\\\")\\n    assert referral_id, \\\"Response must contain resource id\\\"\\n    cleanup_referral(referral_id)\\n\\n    fetch_resp = api_client.get(f\\\"/ReferralRequest/{referral_id}\\\", headers=clinician_auth_headers)\\n    assert fetch_resp.status_code == 200\\n    assert fetch_resp.json()[\\\"id\\\"] == referral_id\\n\\n    messages = message_spy.wait_for_messages(topic=\\\"secure-referral\\\", count=1, timeout=5)\\n    assert len(messages) == 1\\n    assert messages[0][\\\"recipient\\\"] == \\\"Organization/F-002\\\"\\n\"\n    },\n    {\n      \"name\": \"test_referral_rejected_403_when_consent_absent\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician JWT available via <clinician_auth_headers> fixture\",\n        \"Patient P-002 has NO active consent record\",\n        \"Target facility F-002 exists in the system\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with valid payload referencing patient P-002 (no consent)\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body indicates consent required\",\n        \"No ReferralRequest resource created\",\n        \"No secure message dispatched\"\n      ],\n      \"trace\": [\n        \"R-HLT-017: 403 when consent absent\",\n        \"R-HLT-017: referral shall trigger a consent check\"\n      ],\n      \"executable\": \"imp"
+  }
+}

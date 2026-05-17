@@ -1,0 +1,215 @@
+{
+  "req": {
+    "id": "R-WEB-059",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Submit leave request \u2014 variant 3",
+    "statement": "A full-time employee shall be able to submit a leave request for between 1 and 30 business days; requests spanning more than 30 days require hr-admin approval. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated",
+      "employment_type:full_time"
+    ],
+    "triggers": [
+      "employee submits form"
+    ],
+    "expected_outcomes": [
+      "request created",
+      "manager notified",
+      "notification email sent",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "400 when start_date > end_date",
+      "409 when overlapping existing leave",
+      "422 when request exceeds 30 days without hr-admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-059",
+    "reasoning": "The requirement defines four distinct test-worthy behaviours: (1) happy-path submission within 1-30 business days, (2) boundary at exactly 30 business days, (3) rejection when start_date > end_date (400), (4) rejection when leave overlaps an existing request (409), and (5) rejection when duration exceeds 30 days without hr-admin approval (422). A webhook emission must be verified in the positive case. EP covers the normal range; BVA covers the 30-day upper boundary; NEG covers the three documented error pathways; DT captures the hr-admin approval guard; STC verifies the state machine transition from PENDING\u2192APPROVED when manager acts. Together these satisfy the minimum suite requirement (positive, negative, boundary) with full traceability.",
+    "tests": [
+      {
+        "name": "test_submit_leave_request_valid_within_30_days",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlaps the chosen date range",
+          "Webhook listener is active and reachable"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with a date that is 5 business days from today",
+          "Fill end_date with a date that is 9 business days from today (5-day span)",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 201 or UI success banner is shown",
+          "Leave request record is created with status PENDING",
+          "Manager receives a notification",
+          "Notification email is dispatched",
+          "Webhook event leave_request.created is emitted with correct payload"
+        ],
+        "trace": [
+          "R-WEB-059 / positive outcome: request created",
+          "R-WEB-059 / manager notified",
+          "R-WEB-059 / notification email sent",
+          "R-WEB-059 / webhook event emitted"
+        ],
+        "executable": "def test_submit_leave_request_valid_within_30_days(\n    auth_client,\n    full_time_employee,\n    webhook_listener,\n    clean_leave_state,\n):\n    start, end = <calc_business_days>(offset_start=5, span=5)\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    response = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert response.status_code == 201\n    body = response.json()\n    assert body[\"status\"] == \"PENDING\"\n    assert body[\"employee_id\"] == full_time_employee[\"id\"]\n\n    <assert_manager_notified>(full_time_employee[\"manager_id\"])\n    <assert_email_sent>(recipient=full_time_employee[\"email\"])\n\n    event = webhook_listener.wait_for_event(\"leave_request.created\", timeout=5)\n    assert event is not None\n    assert event[\"data\"][\"leave_request_id\"] == body[\"id\"]\n"
+      },
+      {
+        "name": "test_submit_leave_request_exactly_30_business_days",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlaps the chosen date range",
+          "Webhook listener is active and reachable"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Set start_date and end_date to span exactly 30 business days",
+          "Submit the form without hr-admin token"
+        ],
+        "expected": [
+          "HTTP 201 or UI success banner is shown",
+          "Leave request created with status PENDING (no hr-admin approval required at boundary)",
+          "Webhook event leave_request.created emitted"
+        ],
+        "trace": [
+          "R-WEB-059 / upper boundary of self-service window (30 business days)",
+          "R-WEB-059 / requests <=30 days do NOT require hr-admin approval"
+        ],
+        "executable": "def test_submit_leave_request_exactly_30_business_days(\n    auth_client,\n    full_time_employee,\n    webhook_listener,\n    clean_leave_state,\n):\n    start, end = <calc_business_days>(offset_start=1, span=30)\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    response = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert response.status_code == 201\n    body = response.json()\n    assert body[\"status\"] == \"PENDING\"\n    assert body.get(\"requires_hr_admin\") is not True\n\n    event = webhook_listener.wait_for_event(\"leave_request.created\", timeout=5)\n    assert event is not None\n    assert event[\"data\"][\"duration_days\"] == 30\n"
+      },
+      {
+        "name": "test_submit_leave_request_start_after_end_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Set start_date to a date AFTER end_date",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request is returned",
+          "Response body contains error code DATE_RANGE_INVALID or equivalent",
+          "No leave request record is created",
+          "No webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-059 / error pathway: 400 when start_date > end_date"
+        ],
+        "executable": "def test_submit_leave_request_start_after_end_returns_400(\n    auth_client,\n    full_time_employee,\n    webhook_listener,\n):\n    start, end = <calc_business_days>(offset_start=10, span=-3)  # end before start\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    response = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert response.status_code == 400\n    body = response.json()\n    assert \"error\" in body\n    assert body[\"error\"] in (\"DATE_RANGE_INVALID\", \"invalid_date_range\")\n\n    no_event = webhook_listener.wait_for_event(\"leave_request.created\", timeout=2)\n    assert no_event is None\n"
+      },
+      {
+        "name": "test_submit_leave_request_overlapping_existing_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "An approved leave request already exists for the employee covering the target date range"
+        ],
+        "actions": [
+          "Seed an existing leave record overlapping the intended dates via fixture",
+          "Navigate to /leave-requests/new",
+          "Submit a new request with the same overlapping date range"
+        ],
+        "expected": [
+          "HTTP 409 Conflict is returned",
+          "Response body references OVERLAPPING_LEAVE or equivalent",
+          "No duplicate leave request record is created"
+        ],
+        "trace": [
+          "R-WEB-059 / error pathway: 409 when overlapping existing leave"
+        ],
+        "executable": "def test_submit_leave_request_overlapping_existing_returns_409(\n    auth_client,\n    full_time_employee,\n    existing_leave_fixture,\n):\n    start, end = existing_leave_fixture[\"start\"], existing_leave_fixture[\"end\"]\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    response = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert response.status_code == 409\n    body = response.json()\n    assert body.get(\"error\") in (\"OVERLAPPING_LEAVE\", \"leave_overlap\")\n\n    all_requests = auth_client.get(\"/leave-requests\").json()\n    overlapping = [\n        r for r in all_requests\n        if r[\"start_date\"] == start and r[\"end_date\"] == end\n    ]\n    assert len(overlapping) == 1  # only the pre-seeded one\n"
+      },
+      {
+        "name": "test_submit_leave_request_exceeds_30_days_without_hr_admin_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlaps the chosen date range",
+          "Request is submitted WITHOUT hr-admin approval token"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Set start_date and end_date to span 31 business days",
+          "Submit the form without attaching an hr-admin approval reference"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity is returned",
+          "Response body contains HR_ADMIN_APPROVAL_REQUIRED or equivalent",
+          "No leave request record is created",
+          "No webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-059 / error pathway: 422 when request exceeds 30 days without hr-admin",
+          "R-WEB-059 / decision: duration > 30 AND no hr-admin => reject"
+        ],
+        "executable": "def test_submit_leave_request_exceeds_30_days_without_hr_admin_returns_422(\n    auth_client,\n    full_time_employee,\n    webhook_listener,\n    clean_leave_state,\n):\n    start, end = <calc_business_days>(offset_start=1, span=31)\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n    # Explicitly ensure no hr_admin_approval_id is present\n    payload.pop(\"hr_admin_approval_id\", None)\n\n    response = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert response.status_code == 422\n    body = response.json()\n    assert body.get(\"error\") in (\n        \"HR_ADMIN_APPROVAL_REQUIRED\",\n        \"hr_admin_required\",\n    )\n\n    no_event = webhook_listener.wait_for_event(\"leave_request.created\", timeout=2)\n    assert no_event is None\n"
+      },
+      {
+        "name": "test_leave_request_state_transitions_pending_to_approved",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "Manager account is available and authenticated",
+          "Leave request for 5 business days has been submitted and is in PENDING state"
+        ],
+        "actions": [
+          "Submit a valid leave request (5 business days) to obtain a PENDING record",
+          "Authenticate as manager",
+          "Manager approves the leave request via the approval endpoint"
+        ],
+        "expected": [
+          "Leave request transitions from PENDING to APPROVED",
+          "Employee receives an approval notification email",
+          "Webhook event leave_request.approved is emitted"
+        ],
+        "trace": [
+          "R-WEB-059 / state transition: PENDING -> APPROVED",
+          "R-WEB-059 / manager notified (approval action)",
+          "R-WEB-059 / webhook event emitted on approval"
+        ],
+        "executable": "def test_leave_request_state_transitions_pending_to_approved(\n    auth_client,\n    manager_client,\n    full_time_employee,\n    webhook_listener,\n    clean_leave_state,\n):\n    start, end = <calc_business_days>(offset_start=2, span=5)\n    create_resp = auth_client.post(\n        \"/leave-requests/new\",\n        json={\"start_date\": start, \"end_date\": end, \"type\": \"annual\"},\n    )\n    assert create_resp.status_code == 201\n    leave_id = create_resp.json()[\"id\"]\n    assert create_resp.json()[\"status\"] == \"PENDING\"\n\n    approve_resp = manager_client.patch(\n        f\"/leave-requests/{leave_id}/approve\"\n    )\n    assert approve_resp.status_code == 200\n    assert approve_resp.json()[\"status\"] == \"APPROVED\"\n\n    <assert_email_sent>(recipient=full_time_employee[\"email\"], subject_contains=\"approved\")\n    event = webhook_listener.wait_for_event(\"leave_request.approved\", timeout=5)\n    assert event is not None\n    assert event[\"data\"][\"leave_request_id\"] == leave_id\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-059",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1057,
+    "output_tokens": 3481,
+    "latency_ms": 42156,
+    "wall_ms": 42156,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-059\",\n  \"reasoning\": \"The requirement defines four distinct test-worthy behaviours: (1) happy-path submission within 1-30 business days, (2) boundary at exactly 30 business days, (3) rejection when start_date > end_date (400), (4) rejection when leave overlaps an existing request (409), and (5) rejection when duration exceeds 30 days without hr-admin approval (422). A webhook emission must be verified in the positive case. EP covers the normal range; BVA covers the 30-day upper boundary; NEG covers the three documented error pathways; DT captures the hr-admin approval guard; STC verifies the state machine transition from PENDING\u2192APPROVED when manager acts. Together these satisfy the minimum suite requirement (positive, negative, boundary) with full traceability.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_leave_request_valid_within_30_days\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"No existing leave overlaps the chosen date range\",\n        \"Webhook listener is active and reachable\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date with a date that is 5 business days from today\",\n        \"Fill end_date with a date that is 9 business days from today (5-day span)\",\n        \"Submit the form\"\n      ],\n      \"expected\": [\n        \"HTTP 201 or UI success banner is shown\",\n        \"Leave request record is created with status PENDING\",\n        \"Manager receives a notification\",\n        \"Notification email is dispatched\",\n        \"Webhook event leave_request.created is emitted with correct payload\"\n      ],\n      \"trace\": [\n        \"R-WEB-059 / positive outcome: request created\",\n        \"R-WEB-059 / manager notified\",\n        \"R-WEB-059 / notification email sent\",\n        \"R-WEB-059 / webhook event emitted\"\n      ],\n      \"executable\": \"def test_submit_leave_request_valid_within_30_days(\\n    auth_client,\\n    full_time_employee,\\n    webhook_listener,\\n    clean_leave_state,\\n):\\n    start, end = <calc_business_days>(offset_start=5, span=5)\\n    payload = {\\\"start_date\\\": start, \\\"end_date\\\": end, \\\"type\\\": \\\"annual\\\"}\\n\\n    response = auth_client.post(\\\"/leave-requests/new\\\", json=payload)\\n\\n    assert response.status_code == 201\\n    body = response.json()\\n    assert body[\\\"status\\\"] == \\\"PENDING\\\"\\n    assert body[\\\"employee_id\\\"] == full_time_employee[\\\"id\\\"]\\n\\n    <assert_manager_notified>(full_time_employee[\\\"manager_id\\\"])\\n    <assert_email_sent>(recipient=full_time_employee[\\\"email\\\"])\\n\\n    event = webhook_listener.wait_for_event(\\\"leave_request.created\\\", timeout=5)\\n    assert event is not None\\n    assert event[\\\"data\\\"][\\\"leave_request_id\\\"] == body[\\\"id\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_exactly_30_business_days\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"No existing leave overlaps the chosen date range\",\n        \"Webhook listener is active and reachable\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Set start_date and end_date to span exactly 30 business days\",\n        \"Submit the form without hr-admin token\"\n      ],\n      \"expected\": [\n        \"HTTP 201 or UI success banner is shown\",\n        \"Leave request created with status PENDING (no hr-admin approval required at boundary)\",\n        \"Webhook event leave_request.created emitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-059 / upper boundary of self-service window (30 business days)\",\n        \"R-WEB-059 / requests <=30 days do NOT require hr-admin approval\"\n      ],\n      \"executable\": \"def test_submit_leave_request_exactly_30_business_days(\\n    auth_client,\\n    full_time_employee,\\n    webhook_listener,\\n    clean_leave_state,\\n):\\n    start, end = <calc_business_days>(offset_start=1, span=30)\\n    payload = {\\\"star"
+  }
+}

@@ -1,0 +1,213 @@
+{
+  "req": {
+    "id": "R-HLT-065",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Consent management (negative)",
+    "statement": "A patient shall grant or revoke consent for data sharing; revoked consent shall be enforced within 15 minutes. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "patient"
+    ],
+    "preconditions": [
+      "role:patient"
+    ],
+    "triggers": [
+      "patient updates consent"
+    ],
+    "expected_outcomes": [
+      "consent stored",
+      "downstream caches invalidated"
+    ],
+    "error_pathways": [
+      "accesses after revoke within SLA denied"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Consent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-065",
+    "reasoning": "The requirement covers consent grant/revoke lifecycle on the /Consent FHIR endpoint with strict SLA enforcement (15 min cache invalidation). Tests are derived from: (1) EP \u2013 valid grant payload succeeds; (2) NEG \u2013 missing mandatory 'patient' element returns 422; (3) STC \u2013 active\u2192revoked state transition blocks subsequent reads within SLA window; (4) DT \u2013 conflicting state transition (revoke already-inactive consent) is rejected; (5) BVA \u2013 access attempt at exactly the 15-minute SLA boundary is denied. Each test is self-contained via fixtures that create and teardown consent resources.",
+    "tests": [
+      {
+        "name": "test_consent_grant_valid_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "FHIR-Lite service is running and reachable",
+          "No pre-existing consent record for the test patient"
+        ],
+        "actions": [
+          "POST /Consent with a valid FHIR Consent resource body including status=active, patient reference, and scope",
+          "Assert HTTP 201 Created",
+          "Assert response body contains id and status=active"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response JSON contains 'status': 'active'",
+          "Response JSON contains non-empty 'id'",
+          "Location header references the created Consent resource"
+        ],
+        "trace": [
+          "R-HLT-065: patient shall grant consent",
+          "R-HLT-065: consent stored"
+        ],
+        "executable": "def test_consent_grant_valid_patient(api_client, patient_auth_token, consent_cleanup):\n    payload = {\n        \"resourceType\": \"Consent\",\n        \"status\": \"active\",\n        \"scope\": {\"coding\": [{\"code\": \"patient-privacy\"}]},\n        \"category\": [{\"coding\": [{\"code\": \"59284-0\"}]}],\n        \"patient\": {\"reference\": \"Patient/test-patient-001\"},\n        \"dateTime\": \"2024-01-15T10:00:00Z\",\n        \"provision\": {\"type\": \"permit\"}\n    }\n    headers = {\"Authorization\": f\"Bearer {patient_auth_token}\"}\n    resp = api_client.post(\"/Consent\", json=payload, headers=headers)\n    consent_cleanup(resp)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body.get(\"status\") == \"active\"\n    assert body.get(\"id\")\n    assert \"Location\" in resp.headers"
+      },
+      {
+        "name": "test_consent_grant_missing_patient_reference",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "FHIR-Lite service is running and reachable"
+        ],
+        "actions": [
+          "POST /Consent with a payload that omits the mandatory 'patient' field",
+          "Assert HTTP 422 Unprocessable Entity",
+          "Assert response body contains OperationOutcome with issue referencing 'patient'"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response JSON resourceType equals 'OperationOutcome'",
+          "At least one issue with diagnostics mentioning 'patient'"
+        ],
+        "trace": [
+          "R-HLT-065: missing mandatory elements must be tested",
+          "R-HLT-065: error pathways"
+        ],
+        "executable": "def test_consent_grant_missing_patient_reference(api_client, patient_auth_token):\n    payload = {\n        \"resourceType\": \"Consent\",\n        \"status\": \"active\",\n        \"scope\": {\"coding\": [{\"code\": \"patient-privacy\"}]},\n        \"category\": [{\"coding\": [{\"code\": \"59284-0\"}]}],\n        \"provision\": {\"type\": \"permit\"}\n    }\n    headers = {\"Authorization\": f\"Bearer {patient_auth_token}\"}\n    resp = api_client.post(\"/Consent\", json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\"patient\" in str(i.get(\"diagnostics\", \"\")).lower() for i in issues)"
+      },
+      {
+        "name": "test_revoked_consent_enforced_at_sla_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "Authenticated third-party accessor token available via <accessor_auth_token> fixture",
+          "Active consent record exists for the test patient (created by <create_active_consent> fixture)",
+          "System clock is controllable or test uses <advance_time> helper"
+        ],
+        "actions": [
+          "PATCH /Consent/{id} to set status=inactive (revoke)",
+          "Assert HTTP 200 OK on revoke",
+          "Advance simulated time to exactly 15 minutes after revoke using <advance_time>",
+          "GET patient data resource as third-party accessor",
+          "Assert HTTP 403 Forbidden at exactly the 15-minute boundary"
+        ],
+        "expected": [
+          "PATCH returns HTTP 200 with status=inactive",
+          "GET at T+15min returns HTTP 403 Forbidden",
+          "Response body indicates consent revoked"
+        ],
+        "trace": [
+          "R-HLT-065: revoked consent enforced within 15 minutes",
+          "R-HLT-065: accesses after revoke within SLA denied",
+          "R-HLT-065: downstream caches invalidated"
+        ],
+        "executable": "def test_revoked_consent_enforced_at_sla_boundary(\n    api_client, patient_auth_token, accessor_auth_token,\n    create_active_consent, advance_time\n):\n    consent_id = create_active_consent(patient_id=\"test-patient-001\")\n    patch_body = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"inactive\"}]\n    ph = {\"Authorization\": f\"Bearer {patient_auth_token}\"}\n    revoke_resp = api_client.patch(\n        f\"/Consent/{consent_id}\", json=patch_body,\n        headers={**ph, \"Content-Type\": \"application/json-patch+json\"}\n    )\n    assert revoke_resp.status_code == 200\n    assert revoke_resp.json().get(\"status\") == \"inactive\"\n    advance_time(minutes=15)\n    ah = {\"Authorization\": f\"Bearer {accessor_auth_token}\"}\n    data_resp = api_client.get(\"/Patient/test-patient-001/$everything\", headers=ah)\n    assert data_resp.status_code == 403"
+      },
+      {
+        "name": "test_revoke_already_inactive_consent_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "An existing consent record with status=inactive exists via <create_inactive_consent> fixture"
+        ],
+        "actions": [
+          "PATCH /Consent/{id} attempting to set status=inactive on an already-inactive consent",
+          "Assert HTTP 409 Conflict or 422 Unprocessable Entity",
+          "Assert response body contains OperationOutcome describing conflicting state"
+        ],
+        "expected": [
+          "HTTP 409 Conflict or 422 Unprocessable Entity",
+          "Response JSON resourceType equals 'OperationOutcome'",
+          "Issue diagnostics reference invalid state transition"
+        ],
+        "trace": [
+          "R-HLT-065: conflicting state transitions must be tested",
+          "R-HLT-065: error pathways"
+        ],
+        "executable": "def test_revoke_already_inactive_consent_rejected(\n    api_client, patient_auth_token, create_inactive_consent\n):\n    consent_id = create_inactive_consent(patient_id=\"test-patient-002\")\n    patch_body = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"inactive\"}]\n    headers = {\n        \"Authorization\": f\"Bearer {patient_auth_token}\",\n        \"Content-Type\": \"application/json-patch+json\"\n    }\n    resp = api_client.patch(f\"/Consent/{consent_id}\", json=patch_body, headers=headers)\n    assert resp.status_code in (409, 422)\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert issues, \"Expected at least one OperationOutcome issue\""
+      },
+      {
+        "name": "test_consent_state_transition_active_to_revoked",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "Active consent record exists via <create_active_consent> fixture",
+          "FHIR-Lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Consent/{id} to confirm initial status=active",
+          "PATCH /Consent/{id} to transition status from active to inactive",
+          "GET /Consent/{id} again to confirm status=inactive",
+          "Assert the full active\u2192inactive transition is reflected in resource history"
+        ],
+        "expected": [
+          "Initial GET returns status=active",
+          "PATCH returns HTTP 200 with status=inactive",
+          "Second GET returns status=inactive",
+          "GET /Consent/{id}/_history contains both active and inactive versions"
+        ],
+        "trace": [
+          "R-HLT-065: patient shall revoke consent",
+          "R-HLT-065: consent stored",
+          "R-HLT-065: downstream caches invalidated"
+        ],
+        "executable": "def test_consent_state_transition_active_to_revoked(\n    api_client, patient_auth_token, create_active_consent\n):\n    consent_id = create_active_consent(patient_id=\"test-patient-003\")\n    headers = {\"Authorization\": f\"Bearer {patient_auth_token}\"}\n    get1 = api_client.get(f\"/Consent/{consent_id}\", headers=headers)\n    assert get1.status_code == 200\n    assert get1.json().get(\"status\") == \"active\"\n    patch_body = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"inactive\"}]\n    patch_resp = api_client.patch(\n        f\"/Consent/{consent_id}\", json=patch_body,\n        headers={**headers, \"Content-Type\": \"application/json-patch+json\"}\n    )\n    assert patch_resp.status_code == 200\n    assert patch_resp.json().get(\"status\") == \"inactive\"\n    get2 = api_client.get(f\"/Consent/{consent_id}\", headers=headers)\n    assert get2.status_code == 200\n    assert get2.json().get(\"status\") == \"inactive\"\n    hist = api_client.get(f\"/Consent/{consent_id}/_history\", headers=headers)\n    assert hist.status_code == 200\n    statuses = [e[\"resource\"][\"status\"] for e in hist.json().get(\"entry\", [])]\n    assert \"active\" in statuses and \"inactive\" in statuses"
+      },
+      {
+        "name": "test_consent_access_denied_without_permission",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "An unauthenticated (no token) or non-patient-role request context is available",
+          "FHIR-Lite service is running and reachable"
+        ],
+        "actions": [
+          "POST /Consent with a valid payload but no Authorization header",
+          "Assert HTTP 401 Unauthorized",
+          "POST /Consent with a valid payload but using a <non_patient_token> (e.g., practitioner role)",
+          "Assert HTTP 403 Forbidden"
+        ],
+        "expected": [
+          "Unauthenticated POST returns HTTP 401 Unauthorized",
+          "Wrong-role POST returns HTTP 403 Forbidden",
+          "No consent resource created in either case"
+        ],
+        "trace": [
+          "R-HLT-065: permission denial must be tested",
+          "R-HLT-065: role:patient precondition enforced"
+        ],
+        "executable": "def test_consent_access_denied_without_permission(\n    api_client, non_patient_token\n):\n    payload = {\n        \"resourceType\": \"Consent\",\n        \"status\": \"active\",\n        \"scope\": {\"coding\": [{\"code\": \"patient-privacy\"}]},\n        \"category\": [{\"coding\": [{\"code\": \"59284-0\"}]}],\n        \"patient\": {\"reference\": \"Patient/test-patient-004\"},\n        \"provision\": {\"type\": \"permit\"}\n    }\n    no_auth_resp = api_client.post(\"/Consent\", json=payload)\n    assert no_auth_resp.status_code == 401\n    wrong_role_resp = api_client.post(\n        \"/Consent\", json=payload,\n        headers={\"Authorization\": f\"Bearer {non_patient_token}\"}\n    )\n    assert wrong_role_resp.status_code == 403"
+      }
+    ]
+  },
+  "req_id": "R-HLT-065",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1004,
+    "output_tokens": 3685,
+    "latency_ms": 45545,
+    "wall_ms": 45545,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-065\",\n  \"reasoning\": \"The requirement covers consent grant/revoke lifecycle on the /Consent FHIR endpoint with strict SLA enforcement (15 min cache invalidation). Tests are derived from: (1) EP \u2013 valid grant payload succeeds; (2) NEG \u2013 missing mandatory 'patient' element returns 422; (3) STC \u2013 active\u2192revoked state transition blocks subsequent reads within SLA window; (4) DT \u2013 conflicting state transition (revoke already-inactive consent) is rejected; (5) BVA \u2013 access attempt at exactly the 15-minute SLA boundary is denied. Each test is self-contained via fixtures that create and teardown consent resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_consent_grant_valid_patient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated patient token available via <patient_auth_token> fixture\",\n        \"FHIR-Lite service is running and reachable\",\n        \"No pre-existing consent record for the test patient\"\n      ],\n      \"actions\": [\n        \"POST /Consent with a valid FHIR Consent resource body including status=active, patient reference, and scope\",\n        \"Assert HTTP 201 Created\",\n        \"Assert response body contains id and status=active\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response JSON contains 'status': 'active'\",\n        \"Response JSON contains non-empty 'id'\",\n        \"Location header references the created Consent resource\"\n      ],\n      \"trace\": [\n        \"R-HLT-065: patient shall grant consent\",\n        \"R-HLT-065: consent stored\"\n      ],\n      \"executable\": \"def test_consent_grant_valid_patient(api_client, patient_auth_token, consent_cleanup):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Consent\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"scope\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"patient-privacy\\\"}]},\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"code\\\": \\\"59284-0\\\"}]}],\\n        \\\"patient\\\": {\\\"reference\\\": \\\"Patient/test-patient-001\\\"},\\n        \\\"dateTime\\\": \\\"2024-01-15T10:00:00Z\\\",\\n        \\\"provision\\\": {\\\"type\\\": \\\"permit\\\"}\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {patient_auth_token}\\\"}\\n    resp = api_client.post(\\\"/Consent\\\", json=payload, headers=headers)\\n    consent_cleanup(resp)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body.get(\\\"status\\\") == \\\"active\\\"\\n    assert body.get(\\\"id\\\")\\n    assert \\\"Location\\\" in resp.headers\"\n    },\n    {\n      \"name\": \"test_consent_grant_missing_patient_reference\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated patient token available via <patient_auth_token> fixture\",\n        \"FHIR-Lite service is running and reachable\"\n      ],\n      \"actions\": [\n        \"POST /Consent with a payload that omits the mandatory 'patient' field\",\n        \"Assert HTTP 422 Unprocessable Entity\",\n        \"Assert response body contains OperationOutcome with issue referencing 'patient'\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response JSON resourceType equals 'OperationOutcome'\",\n        \"At least one issue with diagnostics mentioning 'patient'\"\n      ],\n      \"trace\": [\n        \"R-HLT-065: missing mandatory elements must be tested\",\n        \"R-HLT-065: error pathways\"\n      ],\n      \"executable\": \"def test_consent_grant_missing_patient_reference(api_client, patient_auth_token):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Consent\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"scope\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"patient-privacy\\\"}]},\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"code\\\": \\\"59284-0\\\"}]}],\\n        \\\"provision\\\": {\\\"type\\\": \\\"permit\\\"}\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {patient_auth_token}\\\"}\\n    resp = api_client.post(\\\"/Consent\\\", json=payload, headers=headers)\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\"\\n    issues = body.get(\\\"issue\\\", [])\\n    ass"
+  }
+}

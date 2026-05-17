@@ -1,0 +1,264 @@
+{
+  "req": {
+    "id": "R-FIN-075",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Reconciliation report (negative variant)",
+    "statement": "The system shall produce a daily reconciliation report comparing internal ledger to correspondent bank; non-zero variance shall open an incident. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "EOD trigger"
+    ],
+    "expected_outcomes": [
+      "report stored",
+      "incidents opened on variance"
+    ],
+    "error_pathways": [
+      "incident severity based on variance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/reconcile"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-075",
+    "reasoning": "R-FIN-075 requires: (1) a daily reconciliation report stored at EOD, (2) incidents opened whenever variance != 0, and (3) incident severity scaled by variance magnitude. Negative paths explicitly called out are insufficient_funds, unauthorised, and exceeded_limits. Test design covers: EP \u2013 balanced ledger (zero variance) as the positive partition; NEG \u2013 each named error pathway triggers an incident; BVA \u2013 variance at the exact zero/non-zero boundary (variance == 0 vs variance == 0.01); DT \u2013 multi-condition table mapping (variance present \u00d7 error_code) to incident severity; STC \u2013 state transition from PENDING \u2192 RECONCILED \u2192 INCIDENT_OPEN to ensure job state machine is correct.",
+    "tests": [
+      {
+        "name": "test_reconcile_zero_variance_stores_report_no_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance equals correspondent bank balance (zero variance)",
+          "No open reconciliation incidents exist for today"
+        ],
+        "actions": [
+          "Seed ledger and correspondent bank with matching balances via <seed_balanced_ledger_fixture>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Retrieve today's reconciliation report via <get_report_fixture>"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/reconcile",
+          "Report is stored with status RECONCILED",
+          "report.variance == 0",
+          "No incident record created for today's run"
+        ],
+        "trace": [
+          "R-FIN-075: report stored",
+          "R-FIN-075: non-zero variance SHALL open incident (converse: zero variance => no incident)"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_balanced_ledger, get_todays_report, get_incidents_for_run\n\ndef test_reconcile_zero_variance_stores_report_no_incident():\n    seed_balanced_ledger(amount=10_000_00)  # <seed_balanced_ledger_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    body = resp.json()\n    run_id = body[\"run_id\"]\n\n    report = get_todays_report(run_id)  # <get_report_fixture>\n    assert report[\"status\"] == \"RECONCILED\"\n    assert report[\"variance\"] == 0\n\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    assert incidents == [], f\"Expected no incidents, got {incidents}\"\n"
+      },
+      {
+        "name": "test_reconcile_insufficient_funds_opens_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger shows debit that correspondent bank rejected due to insufficient funds",
+          "Correspondent bank balance is lower than internal ledger by a non-zero amount"
+        ],
+        "actions": [
+          "Seed ledger with a pending debit that was rejected (insufficient_funds) via <seed_insufficient_funds_fixture>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Retrieve incident list for today's run via <get_incidents_fixture>"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/reconcile",
+          "Report stored with status RECONCILED_WITH_VARIANCE",
+          "report.variance != 0",
+          "Exactly one incident opened",
+          "Incident error_code == INSUFFICIENT_FUNDS",
+          "Incident severity matches variance magnitude per severity matrix"
+        ],
+        "trace": [
+          "R-FIN-075: non-zero variance shall open an incident",
+          "R-FIN-075: negative path \u2013 insufficient funds",
+          "R-FIN-075: incident severity based on variance"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_insufficient_funds, get_todays_report, get_incidents_for_run\n\ndef test_reconcile_insufficient_funds_opens_incident():\n    variance_amount = 500_00  # cents\n    seed_insufficient_funds(variance=variance_amount)  # <seed_insufficient_funds_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    run_id = resp.json()[\"run_id\"]\n    report = get_todays_report(run_id)  # <get_report_fixture>\n    assert report[\"status\"] == \"RECONCILED_WITH_VARIANCE\"\n    assert report[\"variance\"] != 0\n\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    assert len(incidents) == 1\n    inc = incidents[0]\n    assert inc[\"error_code\"] == \"INSUFFICIENT_FUNDS\"\n    assert inc[\"severity\"] in (\"LOW\", \"MEDIUM\", \"HIGH\", \"CRITICAL\")\n    assert inc[\"status\"] == \"OPEN\"\n"
+      },
+      {
+        "name": "test_reconcile_unauthorised_transaction_opens_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "An unauthorised transaction exists in the internal ledger with no matching correspondent bank entry"
+        ],
+        "actions": [
+          "Seed ledger with an unauthorised transaction entry via <seed_unauthorised_txn_fixture>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Retrieve incident list for today's run"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/reconcile",
+          "Report stored with status RECONCILED_WITH_VARIANCE",
+          "report.variance != 0",
+          "Incident opened with error_code == UNAUTHORISED",
+          "Incident is in OPEN state"
+        ],
+        "trace": [
+          "R-FIN-075: non-zero variance shall open an incident",
+          "R-FIN-075: negative path \u2013 unauthorised transaction"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_unauthorised_txn, get_todays_report, get_incidents_for_run\n\ndef test_reconcile_unauthorised_transaction_opens_incident():\n    seed_unauthorised_txn(amount=1_200_00)  # <seed_unauthorised_txn_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    run_id = resp.json()[\"run_id\"]\n    report = get_todays_report(run_id)  # <get_report_fixture>\n    assert report[\"status\"] == \"RECONCILED_WITH_VARIANCE\"\n    assert report[\"variance\"] != 0\n\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    error_codes = [i[\"error_code\"] for i in incidents]\n    assert \"UNAUTHORISED\" in error_codes\n    for inc in incidents:\n        if inc[\"error_code\"] == \"UNAUTHORISED\":\n            assert inc[\"status\"] == \"OPEN\"\n"
+      },
+      {
+        "name": "test_reconcile_exceeded_limits_opens_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "A transaction in the internal ledger exceeded the authorised transaction limit and was declined by the correspondent bank"
+        ],
+        "actions": [
+          "Seed ledger with a transaction that exceeds the limit via <seed_exceeded_limit_fixture>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Retrieve incident list for today's run"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/reconcile",
+          "Report stored with status RECONCILED_WITH_VARIANCE",
+          "Incident opened with error_code == EXCEEDED_LIMIT",
+          "Incident severity is proportional to variance"
+        ],
+        "trace": [
+          "R-FIN-075: non-zero variance shall open an incident",
+          "R-FIN-075: negative path \u2013 exceeded limits",
+          "R-FIN-075: incident severity based on variance"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_exceeded_limit, get_todays_report, get_incidents_for_run, expected_severity\n\ndef test_reconcile_exceeded_limits_opens_incident():\n    variance_amount = 50_000_00  # large variance => HIGH or CRITICAL\n    seed_exceeded_limit(variance=variance_amount)  # <seed_exceeded_limit_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    run_id = resp.json()[\"run_id\"]\n    report = get_todays_report(run_id)  # <get_report_fixture>\n    assert report[\"variance\"] != 0\n\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    exc_inc = [i for i in incidents if i[\"error_code\"] == \"EXCEEDED_LIMIT\"]\n    assert len(exc_inc) >= 1\n    sev = exc_inc[0][\"severity\"]\n    assert sev == expected_severity(variance_amount)  # <severity_matrix_helper>\n"
+      },
+      {
+        "name": "test_reconcile_variance_at_zero_boundary_no_incident",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger and correspondent bank differ by exactly 0 (boundary at zero)"
+        ],
+        "actions": [
+          "Seed ledger and correspondent bank with identical balances (variance == 0) via <seed_exact_zero_variance_fixture>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Assert no incident is created"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/reconcile",
+          "report.variance == 0 exactly",
+          "No incident opened (zero is the non-incident boundary)"
+        ],
+        "trace": [
+          "R-FIN-075: non-zero variance shall open an incident \u2013 boundary at variance == 0",
+          "BVA lower boundary: 0 is last value that must NOT trigger incident"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_exact_zero_variance, get_todays_report, get_incidents_for_run\n\ndef test_reconcile_variance_at_zero_boundary_no_incident():\n    seed_exact_zero_variance()  # <seed_exact_zero_variance_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    run_id = resp.json()[\"run_id\"]\n    report = get_todays_report(run_id)  # <get_report_fixture>\n    assert report[\"variance\"] == 0, f\"Expected 0 variance, got {report['variance']}\"\n\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    assert incidents == [], \"Incident must NOT be opened when variance is exactly 0\"\n"
+      },
+      {
+        "name": "test_reconcile_variance_one_cent_above_zero_opens_incident",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger and correspondent bank differ by exactly 1 cent (smallest non-zero variance)"
+        ],
+        "actions": [
+          "Seed ledger with a 1-cent variance via <seed_one_cent_variance_fixture>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Assert exactly one incident is opened"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/reconcile",
+          "report.variance == 1 (1 cent)",
+          "Exactly one incident opened",
+          "Incident severity is the lowest tier (e.g. LOW) for minimal variance"
+        ],
+        "trace": [
+          "R-FIN-075: non-zero variance SHALL open an incident",
+          "BVA upper boundary: 1 cent is first value that MUST trigger incident"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_exact_variance, get_todays_report, get_incidents_for_run\n\ndef test_reconcile_variance_one_cent_above_zero_opens_incident():\n    seed_exact_variance(cents=1)  # <seed_exact_variance_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    run_id = resp.json()[\"run_id\"]\n    report = get_todays_report(run_id)  # <get_report_fixture>\n    assert report[\"variance\"] == 1, f\"Expected 1 cent variance, got {report['variance']}\"\n\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    assert len(incidents) == 1\n    assert incidents[0][\"severity\"] == \"LOW\"\n    assert incidents[0][\"status\"] == \"OPEN\"\n"
+      },
+      {
+        "name": "test_reconcile_job_state_transitions_pending_to_reconciled",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "banking-api is reachable",
+          "No prior reconciliation job is running for today",
+          "Ledger is balanced (zero variance)"
+        ],
+        "actions": [
+          "Verify job state is IDLE before trigger via <get_job_state_fixture>",
+          "POST /cron/reconcile to trigger the job",
+          "Poll job state until terminal via <poll_job_state_fixture>",
+          "Assert terminal state is RECONCILED"
+        ],
+        "expected": [
+          "Job transitions: IDLE -> PENDING -> RUNNING -> RECONCILED",
+          "No intermediate state is skipped",
+          "Terminal state is RECONCILED (not FAILED)"
+        ],
+        "trace": [
+          "R-FIN-075: system job triggered by EOD trigger",
+          "STC: all valid state transitions must be traversed"
+        ],
+        "executable": "import pytest, time\nfrom helpers import api_client, seed_balanced_ledger, get_job_state, poll_until\n\ndef test_reconcile_job_state_transitions_pending_to_reconciled():\n    seed_balanced_ledger(amount=5_000_00)  # <seed_balanced_ledger_fixture>\n\n    pre_state = get_job_state()  # <get_job_state_fixture>\n    assert pre_state in (\"IDLE\", \"COMPLETED\"), f\"Unexpected pre-state: {pre_state}\"\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n    run_id = resp.json()[\"run_id\"]\n\n    observed = poll_until(  # <poll_job_state_fixture>\n        run_id=run_id,\n        terminal_states=(\"RECONCILED\", \"FAILED\"),\n        timeout_s=30\n    )\n    assert \"PENDING\" in observed or \"RUNNING\" in observed, \"Expected intermediate states\"\n    assert observed[-1] == \"RECONCILED\", f\"Terminal state was {observed[-1]}\"\n"
+      },
+      {
+        "name": "test_reconcile_decision_table_severity_mapping",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "banking-api is reachable",
+          "Severity matrix is defined: LOW < 1000, MEDIUM 1000-9999, HIGH 10000-99999, CRITICAL >= 100000 (cents)"
+        ],
+        "actions": [
+          "For each (variance, expected_severity) pair in the decision table, seed the appropriate variance",
+          "POST /cron/reconcile",
+          "Assert the opened incident carries the correct severity"
+        ],
+        "expected": [
+          "Variance 999 cents => severity LOW",
+          "Variance 1000 cents => severity MEDIUM",
+          "Variance 99999 cents => severity HIGH",
+          "Variance 100000 cents => severity CRITICAL"
+        ],
+        "trace": [
+          "R-FIN-075: incident severity based on variance",
+          "DT: each condition combination maps to a distinct severity outcome"
+        ],
+        "executable": "import pytest\nfrom helpers import api_client, seed_exact_variance, get_incidents_for_run, reset_ledger\n\n@pytest.mark.parametrize(\"cents,exp_sev\", [\n    (999,    \"LOW\"),\n    (1000,   \"MEDIUM\"),\n    (99999,  \"HIGH\"),\n    (100000, \"CRITICAL\"),\n])\ndef test_reconcile_decision_table_severity_mapping(cents, exp_sev):\n    reset_ledger()  # <reset_ledger_fixture> \u2013 ensure idempotency\n    seed_exact_variance(cents=cents)  # <seed_exact_variance_fixture>\n\n    resp = api_client.post(\"/cron/reconcile\", json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n\n    run_id = resp.json()[\"run_id\"]\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\n    assert len(incidents) >= 1\n    assert incidents[0][\"severity\"] == exp_sev, (\n        f\"Variance {cents} cents: expected {exp_sev}, got {incidents[0]['severity']}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-075",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 4839,
+    "latency_ms": 48246,
+    "wall_ms": 48246,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-075\",\n  \"reasoning\": \"R-FIN-075 requires: (1) a daily reconciliation report stored at EOD, (2) incidents opened whenever variance != 0, and (3) incident severity scaled by variance magnitude. Negative paths explicitly called out are insufficient_funds, unauthorised, and exceeded_limits. Test design covers: EP \u2013 balanced ledger (zero variance) as the positive partition; NEG \u2013 each named error pathway triggers an incident; BVA \u2013 variance at the exact zero/non-zero boundary (variance == 0 vs variance == 0.01); DT \u2013 multi-condition table mapping (variance present \u00d7 error_code) to incident severity; STC \u2013 state transition from PENDING \u2192 RECONCILED \u2192 INCIDENT_OPEN to ensure job state machine is correct.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reconcile_zero_variance_stores_report_no_incident\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Internal ledger balance equals correspondent bank balance (zero variance)\",\n        \"No open reconciliation incidents exist for today\"\n      ],\n      \"actions\": [\n        \"Seed ledger and correspondent bank with matching balances via <seed_balanced_ledger_fixture>\",\n        \"POST /cron/reconcile with valid EOD trigger payload\",\n        \"Retrieve today's reconciliation report via <get_report_fixture>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 from /cron/reconcile\",\n        \"Report is stored with status RECONCILED\",\n        \"report.variance == 0\",\n        \"No incident record created for today's run\"\n      ],\n      \"trace\": [\n        \"R-FIN-075: report stored\",\n        \"R-FIN-075: non-zero variance SHALL open incident (converse: zero variance => no incident)\"\n      ],\n      \"executable\": \"import pytest\\nfrom helpers import api_client, seed_balanced_ledger, get_todays_report, get_incidents_for_run\\n\\ndef test_reconcile_zero_variance_stores_report_no_incident():\\n    seed_balanced_ledger(amount=10_000_00)  # <seed_balanced_ledger_fixture>\\n\\n    resp = api_client.post(\\\"/cron/reconcile\\\", json={\\\"trigger\\\": \\\"EOD\\\"})\\n    assert resp.status_code == 200\\n\\n    body = resp.json()\\n    run_id = body[\\\"run_id\\\"]\\n\\n    report = get_todays_report(run_id)  # <get_report_fixture>\\n    assert report[\\\"status\\\"] == \\\"RECONCILED\\\"\\n    assert report[\\\"variance\\\"] == 0\\n\\n    incidents = get_incidents_for_run(run_id)  # <get_incidents_fixture>\\n    assert incidents == [], f\\\"Expected no incidents, got {incidents}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reconcile_insufficient_funds_opens_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Internal ledger shows debit that correspondent bank rejected due to insufficient funds\",\n        \"Correspondent bank balance is lower than internal ledger by a non-zero amount\"\n      ],\n      \"actions\": [\n        \"Seed ledger with a pending debit that was rejected (insufficient_funds) via <seed_insufficient_funds_fixture>\",\n        \"POST /cron/reconcile with valid EOD trigger payload\",\n        \"Retrieve incident list for today's run via <get_incidents_fixture>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 from /cron/reconcile\",\n        \"Report stored with status RECONCILED_WITH_VARIANCE\",\n        \"report.variance != 0\",\n        \"Exactly one incident opened\",\n        \"Incident error_code == INSUFFICIENT_FUNDS\",\n        \"Incident severity matches variance magnitude per severity matrix\"\n      ],\n      \"trace\": [\n        \"R-FIN-075: non-zero variance shall open an incident\",\n        \"R-FIN-075: negative path \u2013 insufficient funds\",\n        \"R-FIN-075: incident severity based on variance\"\n      ],\n      \"executable\": \"import pytest\\nfrom helpers import api_client, seed_insufficient_funds, get_todays_report, get_incidents_for_run\\n\\ndef test_reconcile_insufficient_funds_opens_incident():\\n    variance_amount = 500_00  # cents\\n    seed_insufficient_funds(variance=variance_amount)  # <seed_ins"
+  }
+}

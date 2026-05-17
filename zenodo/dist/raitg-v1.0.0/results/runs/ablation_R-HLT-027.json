@@ -1,0 +1,158 @@
+{
+  "req": {
+    "id": "R-HLT-027",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient (boundary)",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-027",
+    "reasoning": "R-HLT-027 governs read access to Patient resources in fhir-lite. Three orthogonal concerns drive test selection: (1) a clinician assigned to a patient must receive the resource and trigger an audit entry \u2014 covered by an EP positive test on the happy path; (2) a clinician NOT assigned must be denied with HTTP 403 \u2014 covered by a NEG negative test; (3) boundary numeric/timestamp elements on the Patient resource (e.g., birthDate at epoch boundary, extreme age values) must round-trip correctly \u2014 covered by a BVA boundary test. A fourth DT test adds a decision-table angle covering the cross-product of assignment \u00d7 token validity to ensure both conditions must hold simultaneously. Each test is self-contained via fixtures that create and tear down their own data.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_reads_patient_returns_200_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician user 'dr_assigned' exists with role:clinician",
+          "Patient 'pt_001' exists and is assigned to 'dr_assigned'",
+          "Valid Bearer token for 'dr_assigned' is available"
+        ],
+        "actions": [
+          "GET /Patient/pt_001 with Authorization header for 'dr_assigned'",
+          "Inspect response status and body",
+          "Query audit log for the access event"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body resourceType == 'Patient'",
+          "Response body id == 'pt_001'",
+          "Audit log contains one entry for clinician 'dr_assigned' reading 'pt_001'"
+        ],
+        "trace": [
+          "R-HLT-027: clinician shall read a patient resource for patients in their care",
+          "R-HLT-027: resource returned",
+          "R-HLT-027: access audit written"
+        ],
+        "executable": "def test_assigned_clinician_reads_patient_returns_200_and_audit(\n    assigned_clinician_token, assigned_patient_id, audit_log_client, fhir_client\n):\n    resp = fhir_client.get(\n        f\"/Patient/{assigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {assigned_clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Patient\"\n    assert body[\"id\"] == assigned_patient_id\n\n    audit_entries = audit_log_client.query(\n        action=\"read\",\n        resource_id=assigned_patient_id,\n        actor=<assigned_clinician_username>,\n    )\n    assert len(audit_entries) >= 1\n    assert audit_entries[-1][\"outcome\"] == \"success\"\n"
+      },
+      {
+        "name": "test_unassigned_clinician_reads_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician user 'dr_unassigned' exists with role:clinician",
+          "Patient 'pt_002' exists and is NOT assigned to 'dr_unassigned'",
+          "Valid Bearer token for 'dr_unassigned' is available"
+        ],
+        "actions": [
+          "GET /Patient/pt_002 with Authorization header for 'dr_unassigned'",
+          "Inspect response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains OperationOutcome or error indicator",
+          "No Patient resource data exposed in response"
+        ],
+        "trace": [
+          "R-HLT-027: reading outside their assignment shall be denied",
+          "R-HLT-027: error pathway \u2014 403 when clinician not assigned"
+        ],
+        "executable": "def test_unassigned_clinician_reads_patient_returns_403(\n    unassigned_clinician_token, unassigned_patient_id, fhir_client\n):\n    resp = fhir_client.get(\n        f\"/Patient/{unassigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {unassigned_clinician_token}\"},\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"resourceType\" not in body or body.get(\"resourceType\") == \"OperationOutcome\"\n    assert \"birthDate\" not in body\n    assert \"name\" not in body\n"
+      },
+      {
+        "name": "test_patient_boundary_birthdate_epoch_and_extreme_age_round_trip",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician user 'dr_boundary' exists with role:clinician",
+          "Patient 'pt_bva' exists with birthDate='1900-01-01' (epoch boundary) and is assigned to 'dr_boundary'",
+          "Valid Bearer token for 'dr_boundary' is available"
+        ],
+        "actions": [
+          "GET /Patient/pt_bva with Authorization header for 'dr_boundary'",
+          "Extract birthDate and compute derived age",
+          "Verify birthDate string format and value precision"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "birthDate field equals '1900-01-01' exactly (no truncation or timezone shift)",
+          "Derived age is a non-negative integer not exceeding 200",
+          "No numeric overflow or null in age-related extension fields"
+        ],
+        "trace": [
+          "R-HLT-027: boundary cases on timestamps and numeric elements must be tested",
+          "R-HLT-027: resource returned"
+        ],
+        "executable": "import re\nfrom datetime import date\n\ndef test_patient_boundary_birthdate_epoch_and_extreme_age_round_trip(\n    boundary_clinician_token, boundary_patient_id, fhir_client\n):\n    resp = fhir_client.get(\n        f\"/Patient/{boundary_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {boundary_clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n\n    birth_date_str = body.get(\"birthDate\", \"\")\n    assert re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", birth_date_str), (\n        f\"birthDate format invalid: {birth_date_str!r}\"\n    )\n    assert birth_date_str == \"1900-01-01\"\n\n    birth = date.fromisoformat(birth_date_str)\n    today = date.today()\n    age_years = (today - birth).days // 365\n    assert 0 <= age_years <= 200, f\"Age out of plausible range: {age_years}\"\n\n    for ext in body.get(\"extension\", []):\n        if \"age\" in ext.get(\"url\", \"\").lower():\n            val = ext.get(\"valueInteger\") or ext.get(\"valueDecimal\")\n            assert val is not None, \"Null in age extension\"\n            assert val >= 0, \"Negative age value\"\n"
+      },
+      {
+        "name": "test_expired_token_for_assigned_clinician_returns_401",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician user 'dr_assigned' exists with role:clinician",
+          "Patient 'pt_001' exists and IS assigned to 'dr_assigned'",
+          "An expired Bearer token for 'dr_assigned' is available (assignment=YES, token_valid=NO)"
+        ],
+        "actions": [
+          "GET /Patient/pt_001 with expired Authorization header for 'dr_assigned'",
+          "Inspect response status"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized (token invalid overrides assignment check)",
+          "No Patient resource data exposed",
+          "No audit success entry written for this request"
+        ],
+        "trace": [
+          "R-HLT-027: DT cross-product \u2014 assigned=YES AND token_valid=NO must yield denial",
+          "R-HLT-027: error pathway \u2014 authorization prerequisite not met"
+        ],
+        "executable": "def test_expired_token_for_assigned_clinician_returns_401(\n    expired_clinician_token, assigned_patient_id, audit_log_client, fhir_client\n):\n    pre_count = len(\n        audit_log_client.query(action=\"read\", resource_id=assigned_patient_id, outcome=\"success\")\n    )\n\n    resp = fhir_client.get(\n        f\"/Patient/{assigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {expired_clinician_token}\"},\n    )\n    assert resp.status_code == 401\n    body = resp.json()\n    assert \"birthDate\" not in body\n    assert \"name\" not in body\n\n    post_count = len(\n        audit_log_client.query(action=\"read\", resource_id=assigned_patient_id, outcome=\"success\")\n    )\n    assert post_count == pre_count, \"Audit success count must not increase on auth failure\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-027",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 994,
+    "output_tokens": 2467,
+    "latency_ms": 33256,
+    "wall_ms": 33256,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-027\",\n  \"reasoning\": \"R-HLT-027 governs read access to Patient resources in fhir-lite. Three orthogonal concerns drive test selection: (1) a clinician assigned to a patient must receive the resource and trigger an audit entry \u2014 covered by an EP positive test on the happy path; (2) a clinician NOT assigned must be denied with HTTP 403 \u2014 covered by a NEG negative test; (3) boundary numeric/timestamp elements on the Patient resource (e.g., birthDate at epoch boundary, extreme age values) must round-trip correctly \u2014 covered by a BVA boundary test. A fourth DT test adds a decision-table angle covering the cross-product of assignment \u00d7 token validity to ensure both conditions must hold simultaneously. Each test is self-contained via fixtures that create and tear down their own data.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_returns_200_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician user 'dr_assigned' exists with role:clinician\",\n        \"Patient 'pt_001' exists and is assigned to 'dr_assigned'\",\n        \"Valid Bearer token for 'dr_assigned' is available\"\n      ],\n      \"actions\": [\n        \"GET /Patient/pt_001 with Authorization header for 'dr_assigned'\",\n        \"Inspect response status and body\",\n        \"Query audit log for the access event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body resourceType == 'Patient'\",\n        \"Response body id == 'pt_001'\",\n        \"Audit log contains one entry for clinician 'dr_assigned' reading 'pt_001'\"\n      ],\n      \"trace\": [\n        \"R-HLT-027: clinician shall read a patient resource for patients in their care\",\n        \"R-HLT-027: resource returned\",\n        \"R-HLT-027: access audit written\"\n      ],\n      \"executable\": \"def test_assigned_clinician_reads_patient_returns_200_and_audit(\\n    assigned_clinician_token, assigned_patient_id, audit_log_client, fhir_client\\n):\\n    resp = fhir_client.get(\\n        f\\\"/Patient/{assigned_patient_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {assigned_clinician_token}\\\"},\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Patient\\\"\\n    assert body[\\\"id\\\"] == assigned_patient_id\\n\\n    audit_entries = audit_log_client.query(\\n        action=\\\"read\\\",\\n        resource_id=assigned_patient_id,\\n        actor=<assigned_clinician_username>,\\n    )\\n    assert len(audit_entries) >= 1\\n    assert audit_entries[-1][\\\"outcome\\\"] == \\\"success\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_reads_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician user 'dr_unassigned' exists with role:clinician\",\n        \"Patient 'pt_002' exists and is NOT assigned to 'dr_unassigned'\",\n        \"Valid Bearer token for 'dr_unassigned' is available\"\n      ],\n      \"actions\": [\n        \"GET /Patient/pt_002 with Authorization header for 'dr_unassigned'\",\n        \"Inspect response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome or error indicator\",\n        \"No Patient resource data exposed in response\"\n      ],\n      \"trace\": [\n        \"R-HLT-027: reading outside their assignment shall be denied\",\n        \"R-HLT-027: error pathway \u2014 403 when clinician not assigned\"\n      ],\n      \"executable\": \"def test_unassigned_clinician_reads_patient_returns_403(\\n    unassigned_clinician_token, unassigned_patient_id, fhir_client\\n):\\n    resp = fhir_client.get(\\n        f\\\"/Patient/{unassigned_patient_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {unassigned_clinician_token}\\\"},\\n    )\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert \\\"resourceType\\\" not in body or body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\"\\n    assert \\\"birthDate\\\" not in body\\n    assert \\\"name\\\" not in body\\n\"\n    },\n   "
+  }
+}

@@ -1,0 +1,196 @@
+{
+  "req": {
+    "id": "R-HLT-033",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Create medication request (boundary)",
+    "statement": "A prescribing clinician shall issue a MedicationRequest; requests for controlled substances shall require schedule verification. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "prescriber"
+    ],
+    "preconditions": [
+      "role:prescriber"
+    ],
+    "triggers": [
+      "clinician prescribes"
+    ],
+    "expected_outcomes": [
+      "request stored",
+      "pharmacy notified"
+    ],
+    "error_pathways": [
+      "403 without schedule verification for CII"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/MedicationRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-033",
+    "reasoning": "The requirement covers three distinct test axes: (1) a happy-path POST by a credentialed prescriber for a non-controlled substance (EP \u2013 valid partition), (2) a forbidden path where a prescriber attempts to issue a CII controlled-substance request without schedule verification (NEG/DT \u2013 decision table row: CII + no schedule cert = 403), and (3) boundary values on the numeric dosage quantity and the ISO-8601 authoredOn timestamp (BVA \u2013 min/max quantity, midnight timestamp edge). A fourth State Transition test is added to verify the resource moves from 'active' to 'completed' after pharmacy acknowledgement (STC). All tests use a shared <prescriber_auth_fixture> that returns a bearer token and a <base_url> fixture pointing at the fhir-lite test instance.",
+    "tests": [
+      {
+        "name": "test_create_medication_request_non_controlled_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds role:prescriber",
+          "Bearer token issued by <prescriber_auth_fixture>",
+          "Medication is non-controlled (Schedule V or unscheduled)",
+          "FHIR-lite instance is reachable at <base_url>"
+        ],
+        "actions": [
+          "Construct a MedicationRequest payload with a valid non-controlled medicationCodeableConcept",
+          "POST /MedicationRequest with Authorization header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType == 'MedicationRequest'",
+          "Response body contains status == 'active'",
+          "Response body contains an id field (server-assigned)",
+          "Pharmacy notification event recorded (location header or notification stub)"
+        ],
+        "trace": [
+          "R-HLT-033: prescribing clinician shall issue a MedicationRequest",
+          "R-HLT-033: expected outcome \u2013 request stored; pharmacy notified"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_medication_request_non_controlled_success(base_url, prescriber_auth_fixture):\n    token = prescriber_auth_fixture(role=\"prescriber\")\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049502\", \"display\": \"Amoxicillin 500 MG\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-001\"},\n        \"authoredOn\": \"2024-06-01T08:00:00Z\",\n        \"dosageInstruction\": [{\"doseAndRate\": [{\"doseQuantity\": {\"value\": 1, \"unit\": \"tablet\"}}]}]\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"MedicationRequest\"\n    assert body.get(\"status\") == \"active\"\n    assert \"id\" in body\n"
+      },
+      {
+        "name": "test_create_cii_medication_request_without_schedule_verification_forbidden",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role:prescriber",
+          "Bearer token issued by <prescriber_auth_fixture>",
+          "Medication is Schedule II controlled substance (CII)",
+          "No schedule verification credential attached to the token or request",
+          "FHIR-lite instance is reachable at <base_url>"
+        ],
+        "actions": [
+          "Construct a MedicationRequest payload with a CII medicationCodeableConcept (e.g., oxycodone)",
+          "Omit any scheduleVerification extension or header",
+          "POST /MedicationRequest with Authorization header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an OperationOutcome or error message referencing schedule verification",
+          "No MedicationRequest resource is persisted"
+        ],
+        "trace": [
+          "R-HLT-033: requests for controlled substances shall require schedule verification",
+          "R-HLT-033: error pathway \u2013 403 without schedule verification for CII"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_cii_medication_request_without_schedule_verification_forbidden(\n        base_url, prescriber_auth_fixture):\n    token = prescriber_auth_fixture(role=\"prescriber\", schedule_verified=False)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049683\", \"display\": \"Oxycodone 5 MG (CII)\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-001\"},\n        \"authoredOn\": \"2024-06-01T08:00:00Z\",\n        \"dosageInstruction\": [{\"doseAndRate\": [{\"doseQuantity\": {\"value\": 1, \"unit\": \"tablet\"}}]}]\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\", json=payload, headers=headers)\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    issue_text = str(body)\n    assert \"schedule\" in issue_text.lower() or \"verification\" in issue_text.lower(), \\\n        \"Error body should reference schedule verification\"\n"
+      },
+      {
+        "name": "test_create_medication_request_boundary_dosage_quantity_and_timestamp",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role:prescriber",
+          "Bearer token issued by <prescriber_auth_fixture>",
+          "Medication is non-controlled",
+          "FHIR-lite instance is reachable at <base_url>"
+        ],
+        "actions": [
+          "Parameterize over boundary values: dosage quantity 0.001 (min positive), 9999 (system max), and authoredOn at midnight UTC '2024-01-01T00:00:00Z'",
+          "POST /MedicationRequest for each boundary combination",
+          "Assert expected status per boundary rule"
+        ],
+        "expected": [
+          "quantity=0.001 and midnight timestamp -> HTTP 201 (min-valid boundary accepted)",
+          "quantity=9999 and midnight timestamp -> HTTP 201 (max-valid boundary accepted)",
+          "quantity=0 -> HTTP 422 Unprocessable Entity (zero dose rejected)",
+          "quantity=-1 -> HTTP 422 Unprocessable Entity (negative dose rejected)"
+        ],
+        "trace": [
+          "R-HLT-033: boundary cases on timestamps and numeric elements must be tested",
+          "R-HLT-033: expected outcome \u2013 request stored for valid boundary values"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"qty,authored_on,expected_status\", [\n    (0.001, \"2024-01-01T00:00:00Z\", 201),\n    (9999,  \"2024-01-01T00:00:00Z\", 201),\n    (0,     \"2024-01-01T00:00:00Z\", 422),\n    (-1,    \"2024-01-01T00:00:00Z\", 422),\n])\ndef test_create_medication_request_boundary_dosage_quantity_and_timestamp(\n        base_url, prescriber_auth_fixture, qty, authored_on, expected_status):\n    token = prescriber_auth_fixture(role=\"prescriber\")\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049502\", \"display\": \"Amoxicillin 500 MG\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-001\"},\n        \"authoredOn\": authored_on,\n        \"dosageInstruction\": [{\"doseAndRate\": [{\"doseQuantity\": {\"value\": qty, \"unit\": \"tablet\"}}]}]\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\", json=payload, headers=headers)\n    assert resp.status_code == expected_status, \\\n        f\"qty={qty} authoredOn={authored_on}: expected {expected_status}, got {resp.status_code}: {resp.text}\"\n"
+      },
+      {
+        "name": "test_medication_request_state_transition_active_to_completed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds role:prescriber",
+          "Bearer token issued by <prescriber_auth_fixture>",
+          "A MedicationRequest in status 'active' has been created and its id is known",
+          "FHIR-lite instance is reachable at <base_url>"
+        ],
+        "actions": [
+          "POST /MedicationRequest to create an active request and capture id",
+          "Simulate pharmacy acknowledgement by PATCHing status to 'completed'",
+          "GET /MedicationRequest/{id} to verify final state"
+        ],
+        "expected": [
+          "Initial POST returns HTTP 201 with status='active'",
+          "PATCH returns HTTP 200",
+          "Subsequent GET returns status='completed'",
+          "No intermediate states skipped (active -> completed direct transition allowed by FHIR state machine)"
+        ],
+        "trace": [
+          "R-HLT-033: expected outcome \u2013 request stored; pharmacy notified",
+          "R-HLT-033: state transition active -> completed upon pharmacy acknowledgement"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_medication_request_state_transition_active_to_completed(base_url, prescriber_auth_fixture):\n    token = prescriber_auth_fixture(role=\"prescriber\")\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049502\", \"display\": \"Amoxicillin 500 MG\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-001\"},\n        \"authoredOn\": \"2024-06-01T08:00:00Z\",\n        \"dosageInstruction\": [{\"doseAndRate\": [{\"doseQuantity\": {\"value\": 1, \"unit\": \"tablet\"}}]}]\n    }\n    create_resp = requests.post(f\"{base_url}/MedicationRequest\", json=payload, headers=headers)\n    assert create_resp.status_code == 201\n    resource_id = create_resp.json()[\"id\"]\n    patch_headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/json-patch+json\"}\n    patch_body = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"completed\"}]\n    patch_resp = requests.patch(\n        f\"{base_url}/MedicationRequest/{resource_id}\", json=patch_body, headers=patch_headers)\n    assert patch_resp.status_code == 200, f\"PATCH failed: {patch_resp.text}\"\n    get_resp = requests.get(f\"{base_url}/MedicationRequest/{resource_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json().get(\"status\") == \"completed\"\n"
+      },
+      {
+        "name": "test_create_medication_request_decision_table_cii_with_schedule_verification_allowed",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role:prescriber",
+          "Bearer token includes schedule_verified=True credential for CII substances",
+          "Medication is Schedule II controlled substance",
+          "FHIR-lite instance is reachable at <base_url>"
+        ],
+        "actions": [
+          "Construct a CII MedicationRequest payload",
+          "Attach schedule verification extension to the payload",
+          "POST /MedicationRequest with Authorization header carrying schedule-verified token",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType == 'MedicationRequest'",
+          "Response body contains status == 'active'",
+          "Response body contains an id field",
+          "Pharmacy notification event recorded"
+        ],
+        "trace": [
+          "R-HLT-033: requests for controlled substances shall require schedule verification",
+          "R-HLT-033: decision table row \u2013 CII + schedule verified = 201 allowed"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_medication_request_decision_table_cii_with_schedule_verification_allowed(\n        base_url, prescriber_auth_fixture):\n    token = prescriber_auth_fixture(role=\"prescriber\", schedule_verified=True)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"extension\": [{\n            \"url\": \"http://fhir-lite.example/StructureDefinition/schedule-verification\",\n            \"valueBoolean\": True\n        }],\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049683\", \"display\": \"Oxycodone 5 MG (CII)\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-001\"},\n        \"authoredOn\": \"2024-06-01T08:00:00Z\",\n        \"dosageInstruction\": [{\"doseAndRate\": [{\"doseQuantity\": {\"value\": 1, \"unit\": \"tablet\"}}]}]\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"MedicationRequest\"\n    assert body.get(\"status\") == \"active\"\n    assert \"id\" in body\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-033",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 998,
+    "output_tokens": 4462,
+    "latency_ms": 51675,
+    "wall_ms": 51675,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-033\",\n  \"reasoning\": \"The requirement covers three distinct test axes: (1) a happy-path POST by a credentialed prescriber for a non-controlled substance (EP \u2013 valid partition), (2) a forbidden path where a prescriber attempts to issue a CII controlled-substance request without schedule verification (NEG/DT \u2013 decision table row: CII + no schedule cert = 403), and (3) boundary values on the numeric dosage quantity and the ISO-8601 authoredOn timestamp (BVA \u2013 min/max quantity, midnight timestamp edge). A fourth State Transition test is added to verify the resource moves from 'active' to 'completed' after pharmacy acknowledgement (STC). All tests use a shared <prescriber_auth_fixture> that returns a bearer token and a <base_url> fixture pointing at the fhir-lite test instance.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_medication_request_non_controlled_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds role:prescriber\",\n        \"Bearer token issued by <prescriber_auth_fixture>\",\n        \"Medication is non-controlled (Schedule V or unscheduled)\",\n        \"FHIR-lite instance is reachable at <base_url>\"\n      ],\n      \"actions\": [\n        \"Construct a MedicationRequest payload with a valid non-controlled medicationCodeableConcept\",\n        \"POST /MedicationRequest with Authorization header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType == 'MedicationRequest'\",\n        \"Response body contains status == 'active'\",\n        \"Response body contains an id field (server-assigned)\",\n        \"Pharmacy notification event recorded (location header or notification stub)\"\n      ],\n      \"trace\": [\n        \"R-HLT-033: prescribing clinician shall issue a MedicationRequest\",\n        \"R-HLT-033: expected outcome \u2013 request stored; pharmacy notified\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_medication_request_non_controlled_success(base_url, prescriber_auth_fixture):\\n    token = prescriber_auth_fixture(role=\\\"prescriber\\\")\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\", \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    payload = {\\n        \\\"resourceType\\\": \\\"MedicationRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"medicationCodeableConcept\\\": {\\n            \\\"coding\\\": [{\\\"system\\\": \\\"http://www.nlm.nih.gov/research/umls/rxnorm\\\",\\n                        \\\"code\\\": \\\"1049502\\\", \\\"display\\\": \\\"Amoxicillin 500 MG\\\"}]\\n        },\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/test-patient-001\\\"},\\n        \\\"requester\\\": {\\\"reference\\\": \\\"Practitioner/test-prescriber-001\\\"},\\n        \\\"authoredOn\\\": \\\"2024-06-01T08:00:00Z\\\",\\n        \\\"dosageInstruction\\\": [{\\\"doseAndRate\\\": [{\\\"doseQuantity\\\": {\\\"value\\\": 1, \\\"unit\\\": \\\"tablet\\\"}}]}]\\n    }\\n    resp = requests.post(f\\\"{base_url}/MedicationRequest\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"MedicationRequest\\\"\\n    assert body.get(\\\"status\\\") == \\\"active\\\"\\n    assert \\\"id\\\" in body\\n\"\n    },\n    {\n      \"name\": \"test_create_cii_medication_request_without_schedule_verification_forbidden\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role:prescriber\",\n        \"Bearer token issued by <prescriber_auth_fixture>\",\n        \"Medication is Schedule II controlled substance (CII)\",\n        \"No schedule verification credential attached to the token or request\",\n        \"FHIR-lite instance is reachable at <base_url>\"\n      ],\n      \"actions\": [\n        \"Construct a MedicationRequest payload with a CII medicationCodeableConcept (e.g., oxycodone)\",\n        \"Omit any scheduleVerification extension or header\",\n        \"POST /Medicat"
+  }
+}

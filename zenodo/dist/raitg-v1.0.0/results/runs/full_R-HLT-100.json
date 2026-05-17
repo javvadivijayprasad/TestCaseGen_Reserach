@@ -1,0 +1,167 @@
+{
+  "req": {
+    "id": "R-HLT-100",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider (audit)",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-100",
+    "reasoning": "The requirement covers three distinct test dimensions: (1) a valid message with a clean attachment reaches the provider and emits an AuditEvent (positive / EP), (2) a message carrying a disallowed PHI exfiltration pattern is blocked and the block itself is audited (negative / NEG + DT), and (3) a message whose text body sits exactly at the system maximum character boundary exercises the edge of the input domain (boundary / BVA). A fourth test covers the full state transition from unauthenticated \u2192 authenticated \u2192 message-sent \u2192 audit-confirmed (STC). Together the four cases give positive, negative, and boundary coverage as required by the task, while mapping every case back to R-HLT-100.",
+    "tests": [
+      {
+        "name": "test_send_clean_message_stores_and_audits",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated via <auth_fixture>",
+          "Provider account exists in fhir-lite test data",
+          "No prior messages exist for the test patient in this session"
+        ],
+        "actions": [
+          "POST /messages with a valid text body and a clean PDF attachment",
+          "Assert HTTP 201 response",
+          "GET /messages/{id} to confirm message is stored",
+          "GET /AuditEvent?entity={message_id} to retrieve audit record"
+        ],
+        "expected": [
+          "HTTP 201 returned with message resource body",
+          "Message retrievable via GET with status=delivered or queued",
+          "At least one AuditEvent exists with action=create and outcome=success",
+          "Provider notification endpoint receives a call (stubbed via <notify_stub>)"
+        ],
+        "trace": [
+          "R-HLT-100 \u2013 message stored",
+          "R-HLT-100 \u2013 AuditEvent emitted for every operation",
+          "R-HLT-100 \u2013 provider notified"
+        ],
+        "executable": "import pytest\n\ndef test_send_clean_message_stores_and_audits(auth_client, clean_pdf_attachment, notify_stub):\n    payload = {\n        \"recipient\": \"provider-001\",\n        \"body\": \"Follow-up question about my prescription.\",\n        \"attachment\": clean_pdf_attachment\n    }\n\n    resp = auth_client.post(\"/messages\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n\n    msg_id = resp.json()[\"id\"]\n\n    fetch = auth_client.get(f\"/messages/{msg_id}\")\n    assert fetch.status_code == 200\n    assert fetch.json()[\"status\"] in (\"delivered\", \"queued\")\n\n    audit_resp = auth_client.get(\"/AuditEvent\", params={\"entity\": msg_id})\n    assert audit_resp.status_code == 200\n    events = audit_resp.json().get(\"entry\", [])\n    assert any(\n        e[\"resource\"][\"action\"] == \"C\" and e[\"resource\"][\"outcome\"] == \"0\"\n        for e in events\n    ), \"No successful create AuditEvent found\"\n\n    assert notify_stub.called, \"Provider notification was not triggered\""
+      },
+      {
+        "name": "test_blocked_phi_attachment_returns_403_and_audits_block",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated via <auth_fixture>",
+          "Attachment scanner is enabled in fhir-lite configuration",
+          "Attachment fixture <phi_attachment> contains a disallowed SSN pattern"
+        ],
+        "actions": [
+          "POST /messages with a text body and an attachment embedding a raw SSN (disallowed PHI pattern)",
+          "Assert HTTP 403 response",
+          "Confirm message is NOT stored via GET /messages",
+          "GET /AuditEvent?entity={correlation_id} to verify block event is audited"
+        ],
+        "expected": [
+          "HTTP 403 returned with error code PHI_EXFILTRATION_DETECTED",
+          "Message is absent from /messages collection",
+          "AuditEvent exists with action=create and outcome=8 (serious failure) or equivalent rejection code",
+          "Provider notification endpoint is NOT called"
+        ],
+        "trace": [
+          "R-HLT-100 \u2013 blocked when disallowed attachment detected",
+          "R-HLT-100 \u2013 AuditEvent emitted for every operation (including rejections)"
+        ],
+        "executable": "import pytest\n\ndef test_blocked_phi_attachment_returns_403_and_audits_block(auth_client, phi_attachment, notify_stub):\n    payload = {\n        \"recipient\": \"provider-001\",\n        \"body\": \"Please see attached.\",\n        \"attachment\": phi_attachment\n    }\n\n    resp = auth_client.post(\"/messages\", json=payload)\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n    error_body = resp.json()\n    assert error_body.get(\"code\") == \"PHI_EXFILTRATION_DETECTED\"\n\n    correlation_id = error_body.get(\"correlationId\")\n    assert correlation_id, \"Response must include a correlationId for audit tracing\"\n\n    list_resp = auth_client.get(\"/messages\", params={\"recipient\": \"provider-001\"})\n    ids = [e[\"resource\"][\"id\"] for e in list_resp.json().get(\"entry\", [])]\n    assert correlation_id not in ids, \"Blocked message must not be persisted\"\n\n    audit_resp = auth_client.get(\"/AuditEvent\", params={\"entity\": correlation_id})\n    assert audit_resp.status_code == 200\n    events = audit_resp.json().get(\"entry\", [])\n    assert any(\n        e[\"resource\"][\"outcome\"] in (\"4\", \"8\")\n        for e in events\n    ), \"No rejection AuditEvent found for blocked message\"\n\n    assert not notify_stub.called, \"Provider must NOT be notified for blocked messages\""
+      },
+      {
+        "name": "test_message_body_at_max_character_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated via <auth_fixture>",
+          "System maximum message body length is known via <config_fixture> as MAX_BODY_LEN",
+          "No attachment included in this test to isolate body length variable"
+        ],
+        "actions": [
+          "POST /messages with body of exactly MAX_BODY_LEN characters \u2013 expect success",
+          "POST /messages with body of MAX_BODY_LEN + 1 characters \u2013 expect rejection"
+        ],
+        "expected": [
+          "Request at exactly MAX_BODY_LEN returns HTTP 201",
+          "AuditEvent with outcome=0 emitted for the accepted message",
+          "Request at MAX_BODY_LEN + 1 returns HTTP 422 with code BODY_TOO_LONG",
+          "AuditEvent with outcome=4 or 8 emitted for the rejected oversized message"
+        ],
+        "trace": [
+          "R-HLT-100 \u2013 message stored (valid boundary)",
+          "R-HLT-100 \u2013 error pathway for invalid input",
+          "R-HLT-100 \u2013 AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_message_body_at_max_character_boundary(auth_client, app_config):\n    MAX_BODY_LEN = app_config[\"messages\"][\"maxBodyLength\"]\n\n    exact_body = \"A\" * MAX_BODY_LEN\n    resp_ok = auth_client.post(\"/messages\", json={\"recipient\": \"provider-001\", \"body\": exact_body})\n    assert resp_ok.status_code == 201, f\"Exact boundary should pass; got {resp_ok.status_code}\"\n    msg_id = resp_ok.json()[\"id\"]\n\n    audit_ok = auth_client.get(\"/AuditEvent\", params={\"entity\": msg_id})\n    events_ok = audit_ok.json().get(\"entry\", [])\n    assert any(e[\"resource\"][\"outcome\"] == \"0\" for e in events_ok), \\\n        \"AuditEvent with success outcome expected for boundary-valid message\"\n\n    over_body = \"A\" * (MAX_BODY_LEN + 1)\n    resp_fail = auth_client.post(\"/messages\", json={\"recipient\": \"provider-001\", \"body\": over_body})\n    assert resp_fail.status_code == 422, f\"Over-boundary should fail; got {resp_fail.status_code}\"\n    assert resp_fail.json().get(\"code\") == \"BODY_TOO_LONG\"\n\n    corr_id = resp_fail.json().get(\"correlationId\")\n    audit_fail = auth_client.get(\"/AuditEvent\", params={\"entity\": corr_id})\n    events_fail = audit_fail.json().get(\"entry\", [])\n    assert any(e[\"resource\"][\"outcome\"] in (\"4\", \"8\") for e in events_fail), \\\n        \"AuditEvent with failure outcome expected for over-boundary message\""
+      },
+      {
+        "name": "test_state_transition_unauthenticated_to_sent_to_audited",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "No active session exists for the test patient",
+          "Valid patient credentials available via <credentials_fixture>",
+          "Provider account exists in fhir-lite test data"
+        ],
+        "actions": [
+          "Attempt POST /messages without auth token \u2013 assert 401 (state: unauthenticated)",
+          "Authenticate via POST /auth/token to obtain bearer token (state: authenticated)",
+          "POST /messages with valid body and clean attachment (state: message-sent)",
+          "Poll GET /AuditEvent until create event appears (state: audited)"
+        ],
+        "expected": [
+          "Unauthenticated attempt returns HTTP 401",
+          "Authentication returns 200 with a bearer token",
+          "Authenticated message POST returns HTTP 201",
+          "AuditEvent with action=C and outcome=0 is retrievable within timeout"
+        ],
+        "trace": [
+          "R-HLT-100 \u2013 authenticated patient precondition enforced",
+          "R-HLT-100 \u2013 message stored",
+          "R-HLT-100 \u2013 AuditEvent emitted for every operation",
+          "R-HLT-100 \u2013 end-to-end audit tested"
+        ],
+        "executable": "import pytest\nimport time\n\ndef test_state_transition_unauthenticated_to_sent_to_audited(anon_client, credentials, clean_pdf_attachment):\n    unauth_resp = anon_client.post(\"/messages\", json={\"recipient\": \"provider-001\", \"body\": \"hello\"})\n    assert unauth_resp.status_code == 401, \"Unauthenticated request must be rejected\"\n\n    token_resp = anon_client.post(\"/auth/token\", json=credentials)\n    assert token_resp.status_code == 200\n    token = token_resp.json()[\"access_token\"]\n    assert token, \"Token must be present after successful login\"\n\n    auth_client = <make_auth_client>(anon_client, token)\n    send_resp = auth_client.post(\"/messages\", json={\n        \"recipient\": \"provider-001\",\n        \"body\": \"Post-authentication test message.\",\n        \"attachment\": clean_pdf_attachment\n    })\n    assert send_resp.status_code == 201\n    msg_id = send_resp.json()[\"id\"]\n\n    deadline = time.time() + 10\n    found = False\n    while time.time() < deadline:\n        audit_resp = auth_client.get(\"/AuditEvent\", params={\"entity\": msg_id})\n        events = audit_resp.json().get(\"entry\", [])\n        if any(e[\"resource\"][\"action\"] == \"C\" and e[\"resource\"][\"outcome\"] == \"0\" for e in events):\n            found = True\n            break\n        time.sleep(0.5)\n    assert found, \"AuditEvent for sent message not found within timeout\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-100",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 3299,
+    "latency_ms": 40632,
+    "wall_ms": 40633,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-100\",\n  \"reasoning\": \"The requirement covers three distinct test dimensions: (1) a valid message with a clean attachment reaches the provider and emits an AuditEvent (positive / EP), (2) a message carrying a disallowed PHI exfiltration pattern is blocked and the block itself is audited (negative / NEG + DT), and (3) a message whose text body sits exactly at the system maximum character boundary exercises the edge of the input domain (boundary / BVA). A fourth test covers the full state transition from unauthenticated \u2192 authenticated \u2192 message-sent \u2192 audit-confirmed (STC). Together the four cases give positive, negative, and boundary coverage as required by the task, while mapping every case back to R-HLT-100.\",\n  \"tests\": [\n    {\n      \"name\": \"test_send_clean_message_stores_and_audits\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated via <auth_fixture>\",\n        \"Provider account exists in fhir-lite test data\",\n        \"No prior messages exist for the test patient in this session\"\n      ],\n      \"actions\": [\n        \"POST /messages with a valid text body and a clean PDF attachment\",\n        \"Assert HTTP 201 response\",\n        \"GET /messages/{id} to confirm message is stored\",\n        \"GET /AuditEvent?entity={message_id} to retrieve audit record\"\n      ],\n      \"expected\": [\n        \"HTTP 201 returned with message resource body\",\n        \"Message retrievable via GET with status=delivered or queued\",\n        \"At least one AuditEvent exists with action=create and outcome=success\",\n        \"Provider notification endpoint receives a call (stubbed via <notify_stub>)\"\n      ],\n      \"trace\": [\n        \"R-HLT-100 \u2013 message stored\",\n        \"R-HLT-100 \u2013 AuditEvent emitted for every operation\",\n        \"R-HLT-100 \u2013 provider notified\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_send_clean_message_stores_and_audits(auth_client, clean_pdf_attachment, notify_stub):\\n    payload = {\\n        \\\"recipient\\\": \\\"provider-001\\\",\\n        \\\"body\\\": \\\"Follow-up question about my prescription.\\\",\\n        \\\"attachment\\\": clean_pdf_attachment\\n    }\\n\\n    resp = auth_client.post(\\\"/messages\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}\\\"\\n\\n    msg_id = resp.json()[\\\"id\\\"]\\n\\n    fetch = auth_client.get(f\\\"/messages/{msg_id}\\\")\\n    assert fetch.status_code == 200\\n    assert fetch.json()[\\\"status\\\"] in (\\\"delivered\\\", \\\"queued\\\")\\n\\n    audit_resp = auth_client.get(\\\"/AuditEvent\\\", params={\\\"entity\\\": msg_id})\\n    assert audit_resp.status_code == 200\\n    events = audit_resp.json().get(\\\"entry\\\", [])\\n    assert any(\\n        e[\\\"resource\\\"][\\\"action\\\"] == \\\"C\\\" and e[\\\"resource\\\"][\\\"outcome\\\"] == \\\"0\\\"\\n        for e in events\\n    ), \\\"No successful create AuditEvent found\\\"\\n\\n    assert notify_stub.called, \\\"Provider notification was not triggered\\\"\"\n    },\n    {\n      \"name\": \"test_blocked_phi_attachment_returns_403_and_audits_block\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated via <auth_fixture>\",\n        \"Attachment scanner is enabled in fhir-lite configuration\",\n        \"Attachment fixture <phi_attachment> contains a disallowed SSN pattern\"\n      ],\n      \"actions\": [\n        \"POST /messages with a text body and an attachment embedding a raw SSN (disallowed PHI pattern)\",\n        \"Assert HTTP 403 response\",\n        \"Confirm message is NOT stored via GET /messages\",\n        \"GET /AuditEvent?entity={correlation_id} to verify block event is audited\"\n      ],\n      \"expected\": [\n        \"HTTP 403 returned with error code PHI_EXFILTRATION_DETECTED\",\n        \"Message is absent from /messages collection\",\n        \"AuditEvent exists with action=create and outcome=8 (serious failure) or equivalent rejection code\",\n        \"Provider notification endpoint is NOT called\"\n      ],\n      \"trace\": [\n        \"R-HLT-100 \u2013 blocked whe"
+  }
+}

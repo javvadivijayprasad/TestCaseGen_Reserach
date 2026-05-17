@@ -1,0 +1,219 @@
+{
+  "req": {
+    "id": "R-FIN-004",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "External ACH transfer",
+    "statement": "A customer shall transfer funds to an external ACH-linked account up to $10,000 per transfer; transfers above this shall require step-up verification.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "ach_link verified"
+    ],
+    "triggers": [
+      "customer submits transfer"
+    ],
+    "expected_outcomes": [
+      "ACH batch queued",
+      "confirmation sent"
+    ],
+    "error_pathways": [
+      "422 when amount > 10000 without step-up",
+      "409 on insufficient funds"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/ach"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-004",
+    "reasoning": "R-FIN-004 defines a threshold at $10,000 for ACH transfers. Key partitions are: (1) valid transfer \u2264 $10,000 with verified ACH link, (2) transfer > $10,000 without step-up yielding 422, (3) transfer with insufficient funds yielding 409, and (4) boundary values at exactly $10,000 and $10,001. State transitions cover the ACH batch queuing lifecycle. The test suite covers EP (valid partition), BVA (boundary at $10,000 and $10,001), NEG (amount > $10,000 without step-up, insufficient funds), DT (step-up required flag combinations), and STC (queued state confirmation). Each test is self-contained via fixtures that create and clean up test data.",
+    "tests": [
+      {
+        "name": "test_ach_transfer_valid_amount_queues_batch",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $5,000)",
+          "ACH link is verified and active",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=5000.00 and verified ACH account ID"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains transfer_id",
+          "Response body contains status='queued'",
+          "Confirmation notification is scheduled"
+        ],
+        "trace": [
+          "R-FIN-004: transfer <= $10,000 shall be accepted and ACH batch queued",
+          "R-FIN-004: confirmation sent on success"
+        ],
+        "executable": "def test_ach_transfer_valid_amount_queues_batch(api_client, verified_ach_account, funded_customer):\n    payload = {\n        \"from_account_id\": funded_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"5000.00\",\n        \"currency\": \"USD\"\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert \"transfer_id\" in body\n    assert body[\"status\"] == \"queued\"\n    assert body[\"confirmation_scheduled\"] is True"
+      },
+      {
+        "name": "test_ach_transfer_above_limit_without_stepup_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $15,000)",
+          "ACH link is verified and active",
+          "Authentication token is valid but lacks step-up verification claim"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=15000.00 and no step-up verification header"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code 'STEP_UP_REQUIRED'",
+          "No ACH batch is queued"
+        ],
+        "trace": [
+          "R-FIN-004: transfers above $10,000 shall require step-up verification",
+          "R-FIN-004: 422 when amount > 10000 without step-up"
+        ],
+        "executable": "def test_ach_transfer_above_limit_without_stepup_returns_422(api_client, verified_ach_account, funded_customer):\n    payload = {\n        \"from_account_id\": funded_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"15000.00\",\n        \"currency\": \"USD\"\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"error_code\") == \"STEP_UP_REQUIRED\"\n    assert \"transfer_id\" not in body"
+      },
+      {
+        "name": "test_ach_transfer_at_exact_limit_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $10,000)",
+          "ACH link is verified and active",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=10000.00 (exactly at the limit)"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains transfer_id",
+          "Response body contains status='queued'"
+        ],
+        "trace": [
+          "R-FIN-004: up to $10,000 per transfer shall be accepted",
+          "BVA upper boundary: $10,000.00 is the maximum allowed without step-up"
+        ],
+        "executable": "def test_ach_transfer_at_exact_limit_accepted(api_client, verified_ach_account, funded_customer):\n    payload = {\n        \"from_account_id\": funded_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"10000.00\",\n        \"currency\": \"USD\"\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"status\"] == \"queued\"\n    assert \"transfer_id\" in body"
+      },
+      {
+        "name": "test_ach_transfer_one_cent_above_limit_requires_stepup",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $10,001)",
+          "ACH link is verified and active",
+          "Authentication token is valid but lacks step-up verification claim"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=10000.01 (one cent above the limit)"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code 'STEP_UP_REQUIRED'"
+        ],
+        "trace": [
+          "R-FIN-004: transfers above $10,000 shall require step-up verification",
+          "BVA: $10,000.01 is the first value above the threshold"
+        ],
+        "executable": "def test_ach_transfer_one_cent_above_limit_requires_stepup(api_client, verified_ach_account, funded_customer):\n    payload = {\n        \"from_account_id\": funded_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"10000.01\",\n        \"currency\": \"USD\"\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"error_code\") == \"STEP_UP_REQUIRED\""
+      },
+      {
+        "name": "test_ach_transfer_insufficient_funds_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with balance of $100.00",
+          "ACH link is verified and active",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=5000.00 against account with insufficient balance"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains error code 'INSUFFICIENT_FUNDS'",
+          "No ACH batch is queued"
+        ],
+        "trace": [
+          "R-FIN-004: 409 on insufficient funds error pathway"
+        ],
+        "executable": "def test_ach_transfer_insufficient_funds_returns_409(api_client, verified_ach_account, low_balance_customer):\n    payload = {\n        \"from_account_id\": low_balance_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"5000.00\",\n        \"currency\": \"USD\"\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload)\n    assert resp.status_code == 409\n    body = resp.json()\n    assert body.get(\"error_code\") == \"INSUFFICIENT_FUNDS\"\n    assert \"transfer_id\" not in body"
+      },
+      {
+        "name": "test_ach_transfer_above_limit_with_stepup_queues_batch",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $15,000)",
+          "ACH link is verified and active",
+          "Authentication token includes a valid step-up verification claim"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=15000.00 and step-up verification header present"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains transfer_id",
+          "Response body contains status='queued'"
+        ],
+        "trace": [
+          "R-FIN-004: transfers above $10,000 WITH step-up verification shall be accepted",
+          "DT: step-up flag TRUE + amount > 10000 = accepted"
+        ],
+        "executable": "def test_ach_transfer_above_limit_with_stepup_queues_batch(api_client, verified_ach_account, funded_customer, stepup_token):\n    payload = {\n        \"from_account_id\": funded_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"15000.00\",\n        \"currency\": \"USD\"\n    }\n    headers = {\"Authorization\": f\"Bearer {stepup_token}\"}\n    resp = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"status\"] == \"queued\"\n    assert \"transfer_id\" in body"
+      },
+      {
+        "name": "test_ach_transfer_state_transitions_queued_to_processing",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $1,000)",
+          "ACH link is verified and active",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "POST /transfers/ach with amount=1000.00 to initiate transfer",
+          "GET /transfers/ach/{transfer_id} to observe status transition"
+        ],
+        "expected": [
+          "Initial POST returns status='queued'",
+          "Subsequent GET returns status in ['queued', 'processing', 'completed']",
+          "Status does not regress from 'processing' back to 'queued'"
+        ],
+        "trace": [
+          "R-FIN-004: ACH batch queued on successful submission",
+          "STC: queued -> processing state transition is valid"
+        ],
+        "executable": "def test_ach_transfer_state_transitions_queued_to_processing(api_client, verified_ach_account, funded_customer):\n    payload = {\n        \"from_account_id\": funded_customer[\"account_id\"],\n        \"to_ach_id\": verified_ach_account[\"ach_id\"],\n        \"amount\": \"1000.00\",\n        \"currency\": \"USD\"\n    }\n    post_resp = api_client.post(\"/transfers/ach\", json=payload)\n    assert post_resp.status_code == 202\n    transfer_id = post_resp.json()[\"transfer_id\"]\n    assert post_resp.json()[\"status\"] == \"queued\"\n    get_resp = api_client.get(f\"/transfers/ach/{transfer_id}\")\n    assert get_resp.status_code == 200\n    valid_states = {\"queued\", \"processing\", \"completed\"}\n    assert get_resp.json()[\"status\"] in valid_states"
+      }
+    ]
+  },
+  "req_id": "R-FIN-004",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 3320,
+    "latency_ms": 35961,
+    "wall_ms": 35961,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-004\",\n  \"reasoning\": \"R-FIN-004 defines a threshold at $10,000 for ACH transfers. Key partitions are: (1) valid transfer \u2264 $10,000 with verified ACH link, (2) transfer > $10,000 without step-up yielding 422, (3) transfer with insufficient funds yielding 409, and (4) boundary values at exactly $10,000 and $10,001. State transitions cover the ACH batch queuing lifecycle. The test suite covers EP (valid partition), BVA (boundary at $10,000 and $10,001), NEG (amount > $10,000 without step-up, insufficient funds), DT (step-up required flag combinations), and STC (queued state confirmation). Each test is self-contained via fixtures that create and clean up test data.\",\n  \"tests\": [\n    {\n      \"name\": \"test_ach_transfer_valid_amount_queues_batch\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance (>= $5,000)\",\n        \"ACH link is verified and active\",\n        \"Authentication token is valid\"\n      ],\n      \"actions\": [\n        \"POST /transfers/ach with amount=5000.00 and verified ACH account ID\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains transfer_id\",\n        \"Response body contains status='queued'\",\n        \"Confirmation notification is scheduled\"\n      ],\n      \"trace\": [\n        \"R-FIN-004: transfer <= $10,000 shall be accepted and ACH batch queued\",\n        \"R-FIN-004: confirmation sent on success\"\n      ],\n      \"executable\": \"def test_ach_transfer_valid_amount_queues_batch(api_client, verified_ach_account, funded_customer):\\n    payload = {\\n        \\\"from_account_id\\\": funded_customer[\\\"account_id\\\"],\\n        \\\"to_ach_id\\\": verified_ach_account[\\\"ach_id\\\"],\\n        \\\"amount\\\": \\\"5000.00\\\",\\n        \\\"currency\\\": \\\"USD\\\"\\n    }\\n    resp = api_client.post(\\\"/transfers/ach\\\", json=payload)\\n    assert resp.status_code == 202\\n    body = resp.json()\\n    assert \\\"transfer_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"queued\\\"\\n    assert body[\\\"confirmation_scheduled\\\"] is True\"\n    },\n    {\n      \"name\": \"test_ach_transfer_above_limit_without_stepup_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance (>= $15,000)\",\n        \"ACH link is verified and active\",\n        \"Authentication token is valid but lacks step-up verification claim\"\n      ],\n      \"actions\": [\n        \"POST /transfers/ach with amount=15000.00 and no step-up verification header\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains error code 'STEP_UP_REQUIRED'\",\n        \"No ACH batch is queued\"\n      ],\n      \"trace\": [\n        \"R-FIN-004: transfers above $10,000 shall require step-up verification\",\n        \"R-FIN-004: 422 when amount > 10000 without step-up\"\n      ],\n      \"executable\": \"def test_ach_transfer_above_limit_without_stepup_returns_422(api_client, verified_ach_account, funded_customer):\\n    payload = {\\n        \\\"from_account_id\\\": funded_customer[\\\"account_id\\\"],\\n        \\\"to_ach_id\\\": verified_ach_account[\\\"ach_id\\\"],\\n        \\\"amount\\\": \\\"15000.00\\\",\\n        \\\"currency\\\": \\\"USD\\\"\\n    }\\n    resp = api_client.post(\\\"/transfers/ach\\\", json=payload)\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert body.get(\\\"error_code\\\") == \\\"STEP_UP_REQUIRED\\\"\\n    assert \\\"transfer_id\\\" not in body\"\n    },\n    {\n      \"name\": \"test_ach_transfer_at_exact_limit_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance (>= $10,000)\",\n        \"ACH link is verified and active\",\n        \"Authentication token is valid\"\n      ],\n      \"actions\": [\n        \"POST /transfers/ach with amount=10000.00 (exactly at the limit)\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains transfer_id\",\n        \"Response body cont"
+  }
+}

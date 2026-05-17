@@ -1,0 +1,200 @@
+{
+  "req": {
+    "id": "R-HLT-018",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Lab order routing",
+    "statement": "A clinician shall order a lab test; orders shall route to the patient's preferred lab when available.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician orders lab"
+    ],
+    "expected_outcomes": [
+      "order routed",
+      "status tracked"
+    ],
+    "error_pathways": [
+      "fallback to default lab when preferred unavailable"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ServiceRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-018",
+    "reasoning": "Lab order routing requires validation across three critical dimensions: (1) positive path\u2014clinician can successfully order a lab test routed to patient's preferred lab with status tracking; (2) negative path\u2014system gracefully handles unavailable preferred labs by falling back to default; (3) boundary conditions\u2014edge cases around lab availability state transitions and order submission timing. The test suite applies EP to partition lab availability states, BVA to test state boundaries, STC to verify routing decision transitions, and NEG to validate error pathways.",
+    "tests": [
+      {
+        "name": "test_lab_order_routes_to_preferred_lab_when_available",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "clinician role authenticated",
+          "patient has preferred lab configured",
+          "preferred lab status is AVAILABLE",
+          "patient has active insurance"
+        ],
+        "actions": [
+          "POST /ServiceRequest with test_type=GLUCOSE, patient_id=PT-001, preferred_lab=LAB-METRO",
+          "verify response status 201",
+          "retrieve order via GET /ServiceRequest/{order_id}",
+          "poll status until ROUTED or timeout"
+        ],
+        "expected": [
+          "HTTP 201 response with order_id",
+          "order.routing_lab == LAB-METRO",
+          "order.status == ROUTED",
+          "order.timestamp_routed exists and is recent"
+        ],
+        "trace": [
+          "R-HLT-018: clinician orders lab test",
+          "R-HLT-018: order routed to preferred lab",
+          "R-HLT-018: status tracked (ROUTED)"
+        ],
+        "executable": "import requests\nimport time\nimport pytest\n\ndef test_lab_order_routes_to_preferred_lab_when_available():\n    api_base = 'http://localhost:8080'\n    headers = {'Authorization': 'Bearer <clinician_token>'}\n    \n    payload = {\n        'test_type': 'GLUCOSE',\n        'patient_id': 'PT-001',\n        'preferred_lab': 'LAB-METRO'\n    }\n    \n    resp = requests.post(\n        f'{api_base}/ServiceRequest',\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    order_id = resp.json()['order_id']\n    \n    max_polls = 10\n    for _ in range(max_polls):\n        get_resp = requests.get(\n            f'{api_base}/ServiceRequest/{order_id}',\n            headers=headers\n        )\n        assert get_resp.status_code == 200\n        order = get_resp.json()\n        if order['status'] == 'ROUTED':\n            break\n        time.sleep(0.5)\n    \n    assert order['status'] == 'ROUTED'\n    assert order['routing_lab'] == 'LAB-METRO'\n    assert 'timestamp_routed' in order"
+      },
+      {
+        "name": "test_lab_order_falls_back_to_default_lab_when_preferred_unavailable",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "clinician role authenticated",
+          "patient has preferred lab configured",
+          "preferred lab status is UNAVAILABLE",
+          "system has default lab configured"
+        ],
+        "actions": [
+          "set preferred lab to UNAVAILABLE state via test admin API",
+          "POST /ServiceRequest with test_type=URINALYSIS, patient_id=PT-002, preferred_lab=LAB-UPTOWN",
+          "verify response status 201",
+          "retrieve order and poll until ROUTED"
+        ],
+        "expected": [
+          "HTTP 201 response with order_id",
+          "order.routing_lab == DEFAULT_LAB (not LAB-UPTOWN)",
+          "order.status == ROUTED",
+          "order.fallback_reason == PREFERRED_UNAVAILABLE"
+        ],
+        "trace": [
+          "R-HLT-018: clinician orders lab test",
+          "R-HLT-018: preferred lab unavailable",
+          "R-HLT-018: error pathway\u2014fallback to default lab",
+          "R-HLT-018: order routed; status tracked"
+        ],
+        "executable": "import requests\nimport time\n\ndef test_lab_order_falls_back_to_default_lab_when_preferred_unavailable():\n    api_base = 'http://localhost:8080'\n    headers = {'Authorization': 'Bearer <clinician_token>'}\n    admin_headers = {'Authorization': 'Bearer <admin_token>'}\n    \n    requests.patch(\n        f'{api_base}/admin/lab/LAB-UPTOWN',\n        json={'status': 'UNAVAILABLE'},\n        headers=admin_headers\n    )\n    \n    payload = {\n        'test_type': 'URINALYSIS',\n        'patient_id': 'PT-002',\n        'preferred_lab': 'LAB-UPTOWN'\n    }\n    \n    resp = requests.post(\n        f'{api_base}/ServiceRequest',\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    order_id = resp.json()['order_id']\n    \n    for _ in range(10):\n        get_resp = requests.get(\n            f'{api_base}/ServiceRequest/{order_id}',\n            headers=headers\n        )\n        order = get_resp.json()\n        if order['status'] == 'ROUTED':\n            break\n        time.sleep(0.5)\n    \n    assert order['status'] == 'ROUTED'\n    assert order['routing_lab'] != 'LAB-UPTOWN'\n    assert order['fallback_reason'] == 'PREFERRED_UNAVAILABLE'"
+      },
+      {
+        "name": "test_lab_order_routing_with_empty_preferred_lab_list",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "clinician role authenticated",
+          "patient has empty preferred_labs list",
+          "system has default lab configured",
+          "default lab status is AVAILABLE"
+        ],
+        "actions": [
+          "POST /ServiceRequest with test_type=LIPID_PANEL, patient_id=PT-003, preferred_lab=null",
+          "verify response status 201",
+          "retrieve order and validate routing"
+        ],
+        "expected": [
+          "HTTP 201 response with order_id",
+          "order.routing_lab == DEFAULT_LAB",
+          "order.status == ROUTED",
+          "order.preferred_lab_requested == null or absent"
+        ],
+        "trace": [
+          "R-HLT-018: clinician orders lab test",
+          "R-HLT-018: no preferred lab specified (boundary: empty state)",
+          "R-HLT-018: order routed to default lab",
+          "R-HLT-018: status tracked"
+        ],
+        "executable": "import requests\n\ndef test_lab_order_routing_with_empty_preferred_lab_list():\n    api_base = 'http://localhost:8080'\n    headers = {'Authorization': 'Bearer <clinician_token>'}\n    \n    payload = {\n        'test_type': 'LIPID_PANEL',\n        'patient_id': 'PT-003',\n        'preferred_lab': None\n    }\n    \n    resp = requests.post(\n        f'{api_base}/ServiceRequest',\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    order_id = resp.json()['order_id']\n    \n    get_resp = requests.get(\n        f'{api_base}/ServiceRequest/{order_id}',\n        headers=headers\n    )\n    order = get_resp.json()\n    \n    assert order['status'] == 'ROUTED'\n    assert order['routing_lab'] is not None\n    assert 'DEFAULT_LAB' in order['routing_lab']"
+      },
+      {
+        "name": "test_lab_order_missing_required_patient_id_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "clinician role authenticated",
+          "valid test_type specified"
+        ],
+        "actions": [
+          "POST /ServiceRequest with test_type=GLUCOSE, patient_id=null, preferred_lab=LAB-METRO",
+          "verify response status 400 or 422"
+        ],
+        "expected": [
+          "HTTP 400 or 422 response",
+          "error message contains 'patient_id'",
+          "no order_id generated",
+          "no routing attempted"
+        ],
+        "trace": [
+          "R-HLT-018: clinician attempts lab order",
+          "R-HLT-018: missing required patient_id",
+          "R-HLT-018: request rejected; no routing"
+        ],
+        "executable": "import requests\n\ndef test_lab_order_missing_required_patient_id_rejected():\n    api_base = 'http://localhost:8080'\n    headers = {'Authorization': 'Bearer <clinician_token>'}\n    \n    payload = {\n        'test_type': 'GLUCOSE',\n        'patient_id': None,\n        'preferred_lab': 'LAB-METRO'\n    }\n    \n    resp = requests.post(\n        f'{api_base}/ServiceRequest',\n        json=payload,\n        headers=headers\n    )\n    \n    assert resp.status_code in (400, 422)\n    assert 'patient_id' in resp.json().get('error', '').lower()\n    assert 'order_id' not in resp.json()"
+      },
+      {
+        "name": "test_lab_order_status_transitions_from_pending_to_routed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "clinician role authenticated",
+          "patient has preferred lab configured and available",
+          "no concurrent orders for same patient"
+        ],
+        "actions": [
+          "POST /ServiceRequest to create order",
+          "immediately poll GET /ServiceRequest/{order_id} to capture initial state",
+          "continue polling until state == ROUTED",
+          "record all state transitions"
+        ],
+        "expected": [
+          "initial order.status in (PENDING, SUBMITTED)",
+          "order transitions through expected states",
+          "final order.status == ROUTED",
+          "order.routing_lab populated after transition",
+          "total transition time < 5 seconds"
+        ],
+        "trace": [
+          "R-HLT-018: order created in PENDING state",
+          "R-HLT-018: order status transitions to ROUTED",
+          "R-HLT-018: routing_lab assigned during transition",
+          "R-HLT-018: status tracked throughout"
+        ],
+        "executable": "import requests\nimport time\n\ndef test_lab_order_status_transitions_from_pending_to_routed():\n    api_base = 'http://localhost:8080'\n    headers = {'Authorization': 'Bearer <clinician_token>'}\n    \n    payload = {\n        'test_type': 'TSH',\n        'patient_id': 'PT-004',\n        'preferred_lab': 'LAB-DOWNTOWN'\n    }\n    \n    resp = requests.post(\n        f'{api_base}/ServiceRequest',\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    order_id = resp.json()['order_id']\n    \n    initial_resp = requests.get(\n        f'{api_base}/ServiceRequest/{order_id}',\n        headers=headers\n    )\n    initial_status = initial_resp.json()['status']\n    assert initial_status in ('PENDING', 'SUBMITTED')\n    \n    start = time.time()\n    for _ in range(20):\n        get_resp = requests.get(\n            f'{api_base}/ServiceRequest/{order_id}',\n            headers=headers\n        )\n        order = get_resp.json()\n        if order['status'] == 'ROUTED':\n            elapsed = time.time() - start\n            assert elapsed < 5.0\n            assert order['routing_lab'] is not None\n            break\n        time.sleep(0.25)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-018",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1022,
+    "output_tokens": 3287,
+    "latency_ms": 17257,
+    "wall_ms": 17257,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-018\",\n  \"reasoning\": \"Lab order routing requires validation across three critical dimensions: (1) positive path\u2014clinician can successfully order a lab test routed to patient's preferred lab with status tracking; (2) negative path\u2014system gracefully handles unavailable preferred labs by falling back to default; (3) boundary conditions\u2014edge cases around lab availability state transitions and order submission timing. The test suite applies EP to partition lab availability states, BVA to test state boundaries, STC to verify routing decision transitions, and NEG to validate error pathways.\",\n  \"tests\": [\n    {\n      \"name\": \"test_lab_order_routes_to_preferred_lab_when_available\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"clinician role authenticated\",\n        \"patient has preferred lab configured\",\n        \"preferred lab status is AVAILABLE\",\n        \"patient has active insurance\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with test_type=GLUCOSE, patient_id=PT-001, preferred_lab=LAB-METRO\",\n        \"verify response status 201\",\n        \"retrieve order via GET /ServiceRequest/{order_id}\",\n        \"poll status until ROUTED or timeout\"\n      ],\n      \"expected\": [\n        \"HTTP 201 response with order_id\",\n        \"order.routing_lab == LAB-METRO\",\n        \"order.status == ROUTED\",\n        \"order.timestamp_routed exists and is recent\"\n      ],\n      \"trace\": [\n        \"R-HLT-018: clinician orders lab test\",\n        \"R-HLT-018: order routed to preferred lab\",\n        \"R-HLT-018: status tracked (ROUTED)\"\n      ],\n      \"executable\": \"import requests\\nimport time\\nimport pytest\\n\\ndef test_lab_order_routes_to_preferred_lab_when_available():\\n    api_base = 'http://localhost:8080'\\n    headers = {'Authorization': 'Bearer <clinician_token>'}\\n    \\n    payload = {\\n        'test_type': 'GLUCOSE',\\n        'patient_id': 'PT-001',\\n        'preferred_lab': 'LAB-METRO'\\n    }\\n    \\n    resp = requests.post(\\n        f'{api_base}/ServiceRequest',\\n        json=payload,\\n        headers=headers\\n    )\\n    assert resp.status_code == 201\\n    order_id = resp.json()['order_id']\\n    \\n    max_polls = 10\\n    for _ in range(max_polls):\\n        get_resp = requests.get(\\n            f'{api_base}/ServiceRequest/{order_id}',\\n            headers=headers\\n        )\\n        assert get_resp.status_code == 200\\n        order = get_resp.json()\\n        if order['status'] == 'ROUTED':\\n            break\\n        time.sleep(0.5)\\n    \\n    assert order['status'] == 'ROUTED'\\n    assert order['routing_lab'] == 'LAB-METRO'\\n    assert 'timestamp_routed' in order\"\n    },\n    {\n      \"name\": \"test_lab_order_falls_back_to_default_lab_when_preferred_unavailable\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"clinician role authenticated\",\n        \"patient has preferred lab configured\",\n        \"preferred lab status is UNAVAILABLE\",\n        \"system has default lab configured\"\n      ],\n      \"actions\": [\n        \"set preferred lab to UNAVAILABLE state via test admin API\",\n        \"POST /ServiceRequest with test_type=URINALYSIS, patient_id=PT-002, preferred_lab=LAB-UPTOWN\",\n        \"verify response status 201\",\n        \"retrieve order and poll until ROUTED\"\n      ],\n      \"expected\": [\n        \"HTTP 201 response with order_id\",\n        \"order.routing_lab == DEFAULT_LAB (not LAB-UPTOWN)\",\n        \"order.status == ROUTED\",\n        \"order.fallback_reason == PREFERRED_UNAVAILABLE\"\n      ],\n      \"trace\": [\n        \"R-HLT-018: clinician orders lab test\",\n        \"R-HLT-018: preferred lab unavailable\",\n        \"R-HLT-018: error pathway\u2014fallback to default lab\",\n        \"R-HLT-018: order routed; status tracked\"\n      ],\n      \"executable\": \"import requests\\nimport time\\n\\ndef test_lab_order_falls_back_to_default_lab_when_preferred_unavailable():\\n    api_base = 'http://localhost:8080'\\n    headers = {'Authorization': 'Bearer <clinician_toke"
+  }
+}

@@ -1,0 +1,203 @@
+{
+  "req": {
+    "id": "R-HLT-070",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "auth",
+    "title": "Data retention (negative)",
+    "statement": "Resources shall be retained per policy; expired resources shall be purged on a nightly job with full audit trail. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "nightly job runs"
+    ],
+    "expected_outcomes": [
+      "expired resources purged",
+      "audit log written"
+    ],
+    "error_pathways": [
+      "incident raised on policy mismatch"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/cron/retention"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-070",
+    "reasoning": "The requirement covers a nightly retention job on /cron/retention that must purge expired resources and write an audit trail. Tests are designed using EP (normal expired-resource purge), NEG (permission denial, missing mandatory elements, conflicting state), BVA (resource expiring exactly at boundary midnight), STC (state transition: active -> expired -> purged \u2014 positive kind because it traces the happy-path lifecycle through valid states), and DT (decision table combining expiry flag and retention-policy match). The violation was test[4] having kind=negative with heuristic=STC; STC is a state-transition coverage technique that traces valid state sequences and must be classified as positive. Fixed by changing kind to positive for the STC test while preserving all other tests unchanged.",
+    "tests": [
+      {
+        "name": "test_retention_job_purges_expired_resources_and_writes_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "At least one resource with expiry_date < NOW() exists in the DB",
+          "Retention policy is configured and active",
+          "Caller holds SYSTEM_CRON role with valid token"
+        ],
+        "actions": [
+          "Seed DB with N expired resources via <seed_expired_resources> fixture",
+          "POST /cron/retention with valid SYSTEM_CRON bearer token",
+          "Capture response body and HTTP status",
+          "Query audit log for purge events",
+          "Query resource table to verify records removed"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains purged_count == N",
+          "Audit log contains one entry per purged resource with action=PURGED",
+          "Resource table contains zero rows for the seeded resource IDs"
+        ],
+        "trace": [
+          "R-HLT-070: expired resources purged",
+          "R-HLT-070: audit log written"
+        ],
+        "executable": "import pytest\nfrom <fixtures> import cron_auth_headers, db_session\nfrom <helper_fn> import seed_expired_resources, query_audit_log, query_resources\n\nBASE_URL = \"http://fhir-lite/cron/retention\"\nSEED_COUNT = 3\n\n@pytest.fixture(autouse=True)\ndef cleanup(db_session):\n    yield\n    db_session.execute(\"DELETE FROM resources WHERE tag='ep_test'\")\n    db_session.execute(\"DELETE FROM audit_log WHERE tag='ep_test'\")\n    db_session.commit()\n\ndef test_retention_job_purges_expired_resources_and_writes_audit(\n    requests_session, cron_auth_headers, db_session\n):\n    ids = seed_expired_resources(db_session, count=SEED_COUNT, tag=\"ep_test\")\n\n    resp = requests_session.post(BASE_URL, headers=cron_auth_headers)\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"purged_count\"] >= SEED_COUNT\n\n    audit_rows = query_audit_log(db_session, resource_ids=ids, action=\"PURGED\")\n    assert len(audit_rows) == SEED_COUNT\n\n    remaining = query_resources(db_session, resource_ids=ids)\n    assert len(remaining) == 0"
+      },
+      {
+        "name": "test_retention_job_denied_without_cron_permission",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A valid user token exists but the user holds PATIENT role only (no SYSTEM_CRON)",
+          "Expired resources exist in the DB (to confirm they are NOT purged)"
+        ],
+        "actions": [
+          "Seed DB with one expired resource via <seed_expired_resources> fixture",
+          "POST /cron/retention with PATIENT-role bearer token",
+          "Capture response body and HTTP status",
+          "Query resource table to confirm resource still present",
+          "Query audit log to confirm no PURGED entry written",
+          "Query incident table to confirm incident raised on policy mismatch"
+        ],
+        "expected": [
+          "HTTP 403 returned",
+          "Response body contains error code PERMISSION_DENIED",
+          "Expired resource record still exists in DB",
+          "No PURGED audit entry written for the seeded resource",
+          "Incident record created with severity POLICY_MISMATCH"
+        ],
+        "trace": [
+          "R-HLT-070: permission denial negative path",
+          "R-HLT-070: incident raised on policy mismatch"
+        ],
+        "executable": "import pytest\nfrom <fixtures> import patient_auth_headers, db_session\nfrom <helper_fn> import seed_expired_resources, query_audit_log, query_resources, query_incidents\n\nBASE_URL = \"http://fhir-lite/cron/retention\"\n\n@pytest.fixture(autouse=True)\ndef cleanup(db_session):\n    yield\n    db_session.execute(\"DELETE FROM resources WHERE tag='neg_perm_test'\")\n    db_session.execute(\"DELETE FROM audit_log WHERE tag='neg_perm_test'\")\n    db_session.execute(\"DELETE FROM incidents WHERE tag='neg_perm_test'\")\n    db_session.commit()\n\ndef test_retention_job_denied_without_cron_permission(\n    requests_session, patient_auth_headers, db_session\n):\n    ids = seed_expired_resources(db_session, count=1, tag=\"neg_perm_test\")\n\n    resp = requests_session.post(BASE_URL, headers=patient_auth_headers)\n\n    assert resp.status_code == 403\n    assert resp.json().get(\"error\") == \"PERMISSION_DENIED\"\n\n    remaining = query_resources(db_session, resource_ids=ids)\n    assert len(remaining) == 1\n\n    audit_rows = query_audit_log(db_session, resource_ids=ids, action=\"PURGED\")\n    assert len(audit_rows) == 0\n\n    incidents = query_incidents(db_session, tag=\"neg_perm_test\", severity=\"POLICY_MISMATCH\")\n    assert len(incidents) >= 1"
+      },
+      {
+        "name": "test_retention_job_boundary_resource_expiring_exactly_at_midnight",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds SYSTEM_CRON role",
+          "One resource has expiry_date == current-day T00:00:00 (boundary: expired by one second)",
+          "One resource has expiry_date == current-day T00:00:01 (boundary: still valid by one second)"
+        ],
+        "actions": [
+          "Seed DB with a resource expiring at MIDNIGHT (T00:00:00) via <seed_boundary_resource>",
+          "Seed DB with a resource expiring at MIDNIGHT+1s (T00:00:01) via <seed_boundary_resource>",
+          "POST /cron/retention with SYSTEM_CRON bearer token",
+          "Query DB for both resource IDs"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Resource with expiry_date == T00:00:00 is purged (not present in DB)",
+          "Resource with expiry_date == T00:00:01 is NOT purged (still present in DB)",
+          "Audit log contains PURGED entry only for the midnight resource"
+        ],
+        "trace": [
+          "R-HLT-070: retention policy boundary \u2014 expired at exactly midnight is purged",
+          "R-HLT-070: resource one second past midnight boundary is retained"
+        ],
+        "executable": "import pytest\nfrom datetime import date, datetime, timedelta\nfrom <fixtures> import cron_auth_headers, db_session\nfrom <helper_fn> import seed_resource_with_expiry, query_audit_log, query_resources\n\nBASE_URL = \"http://fhir-lite/cron/retention\"\n\n@pytest.fixture(autouse=True)\ndef cleanup(db_session):\n    yield\n    db_session.execute(\"DELETE FROM resources WHERE tag='bva_test'\")\n    db_session.execute(\"DELETE FROM audit_log WHERE tag='bva_test'\")\n    db_session.commit()\n\ndef test_retention_job_boundary_resource_expiring_exactly_at_midnight(\n    requests_session, cron_auth_headers, db_session\n):\n    midnight = datetime.combine(date.today(), datetime.min.time())\n    one_second_after = midnight + timedelta(seconds=1)\n\n    id_expired = seed_resource_with_expiry(db_session, expiry=midnight, tag=\"bva_test\")\n    id_valid = seed_resource_with_expiry(db_session, expiry=one_second_after, tag=\"bva_test\")\n\n    resp = requests_session.post(BASE_URL, headers=cron_auth_headers)\n    assert resp.status_code == 200\n\n    expired_rows = query_resources(db_session, resource_ids=[id_expired])\n    valid_rows = query_resources(db_session, resource_ids=[id_valid])\n\n    assert len(expired_rows) == 0, \"Midnight-boundary resource must be purged\"\n    assert len(valid_rows) == 1, \"One-second-after-midnight resource must be retained\"\n\n    audit = query_audit_log(db_session, resource_ids=[id_expired], action=\"PURGED\")\n    assert len(audit) == 1\n    no_audit = query_audit_log(db_session, resource_ids=[id_valid], action=\"PURGED\")\n    assert len(no_audit) == 0"
+      },
+      {
+        "name": "test_retention_job_raises_incident_on_missing_mandatory_policy_element",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Retention policy record exists but is missing mandatory field `retention_days`",
+          "Expired resources exist that would normally be evaluated",
+          "Caller holds SYSTEM_CRON role"
+        ],
+        "actions": [
+          "Corrupt the policy record by nulling retention_days via <corrupt_policy_fixture>",
+          "Seed one expired resource",
+          "POST /cron/retention with SYSTEM_CRON bearer token",
+          "Capture HTTP status and response body",
+          "Query incident table for POLICY_MISMATCH record",
+          "Query resource table to confirm no unintended purge occurred",
+          "Restore policy record via <restore_policy_fixture>"
+        ],
+        "expected": [
+          "HTTP 422 or 500 returned indicating job could not complete cleanly",
+          "Response body contains error referencing missing policy configuration",
+          "Incident record created with type POLICY_MISMATCH",
+          "Expired resource is NOT purged due to missing policy element",
+          "Audit log contains no PURGED entry for the seeded resource"
+        ],
+        "trace": [
+          "R-HLT-070: missing mandatory element negative path",
+          "R-HLT-070: incident raised on policy mismatch"
+        ],
+        "executable": "import pytest\nfrom <fixtures> import cron_auth_headers, db_session\nfrom <helper_fn> import seed_expired_resources, query_audit_log, query_resources, query_incidents, corrupt_policy, restore_policy\n\nBASE_URL = \"http://fhir-lite/cron/retention\"\n\n@pytest.fixture(autouse=True)\ndef cleanup(db_session):\n    restore_policy(db_session)\n    yield\n    db_session.execute(\"DELETE FROM resources WHERE tag='dt_missing_policy_test'\")\n    db_session.execute(\"DELETE FROM audit_log WHERE tag='dt_missing_policy_test'\")\n    db_session.execute(\"DELETE FROM incidents WHERE tag='dt_missing_policy_test'\")\n    restore_policy(db_session)\n    db_session.commit()\n\ndef test_retention_job_raises_incident_on_missing_mandatory_policy_element(\n    requests_session, cron_auth_headers, db_session\n):\n    corrupt_policy(db_session, null_field=\"retention_days\")\n    ids = seed_expired_resources(db_session, count=1, tag=\"dt_missing_policy_test\")\n\n    resp = requests_session.post(BASE_URL, headers=cron_auth_headers)\n\n    assert resp.status_code in (422, 500)\n    body = resp.json()\n    assert \"policy\" in str(body).lower() or \"retention_days\" in str(body).lower()\n\n    incidents = query_incidents(db_session, tag=\"dt_missing_policy_test\", severity=\"POLICY_MISMATCH\")\n    assert len(incidents) >= 1\n\n    remaining = query_resources(db_session, resource_ids=ids)\n    assert len(remaining) == 1\n\n    audit_rows = query_audit_log(db_session, resource_ids=ids, action=\"PURGED\")\n    assert len(audit_rows) == 0"
+      },
+      {
+        "name": "test_retention_job_state_transition_active_to_expired_to_purged",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds SYSTEM_CRON role",
+          "A resource exists in state ACTIVE with a future expiry_date",
+          "System clock can be advanced or expiry_date can be back-dated to simulate state transition",
+          "Retention policy is configured and active"
+        ],
+        "actions": [
+          "Seed a resource in state ACTIVE with expiry_date = NOW() - 1 second to represent just-expired via <seed_resource_with_state>",
+          "Confirm resource state is EXPIRED in DB after seeding",
+          "POST /cron/retention with SYSTEM_CRON bearer token",
+          "Query DB for resource state and existence",
+          "Query audit log for state transition entries"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Resource transitions from ACTIVE through EXPIRED to PURGED (record removed from resources table)",
+          "Audit log records state transition entries: ACTIVE->EXPIRED and EXPIRED->PURGED",
+          "Response body purged_count includes the transitioned resource",
+          "No resource record remains in the resources table for the seeded ID"
+        ],
+        "trace": [
+          "R-HLT-070: state transition active to expired to purged",
+          "R-HLT-070: audit log written for each state transition",
+          "R-HLT-070: expired resources purged"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timedelta\nfrom <fixtures> import cron_auth_headers, db_session\nfrom <helper_fn> import seed_resource_with_state, query_audit_log, query_resources\n\nBASE_URL = \"http://fhir-lite/cron/retention\"\n\n@pytest.fixture(autouse=True)\ndef cleanup(db_session):\n    yield\n    db_session.execute(\"DELETE FROM resources WHERE tag='stc_test'\")\n    db_session.execute(\"DELETE FROM audit_log WHERE tag='stc_test'\")\n    db_session.commit()\n\ndef test_retention_job_state_transition_active_to_expired_to_purged(\n    requests_session, cron_auth_headers, db_session\n):\n    just_expired = datetime.utcnow() - timedelta(seconds=1)\n    resource_id = seed_resource_with_state(\n        db_session,\n        initial_state=\"ACTIVE\",\n        expiry=just_expired,\n        tag=\"stc_test\"\n    )\n\n    pre_rows = query_resources(db_session, resource_ids=[resource_id])\n    assert len(pre_rows) == 1, \"Resource must exist before job runs\"\n\n    resp = requests_session.post(BASE_URL, headers=cron_auth_headers)\n    assert resp.status_code == 200\n    assert resp.json()[\"purged_count\"] >= 1\n\n    post_rows = query_resources(db_session, resource_ids=[resource_id])\n    assert len(post_rows) == 0, \"Resource must be purged after state transition\"\n\n    audit_rows = query_audit_log(db_session, resource_ids=[resource_id], action=\"PURGED\")\n    assert len(audit_rows) >= 1, \"Audit log must record PURGED transition\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-070",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 4097,
+    "latency_ms": 46502,
+    "wall_ms": 46502,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-070\",\n  \"reasoning\": \"The requirement covers a nightly retention job on /cron/retention that must purge expired resources and write an audit trail. Tests are designed using EP (normal expired-resource purge), NEG (permission denial, missing mandatory elements, conflicting state), BVA (resource expiring exactly at boundary midnight), STC (state transition: active -> expired -> purged), and DT (decision table combining expiry flag and retention-policy match). Each test seeds deterministic data via fixtures, calls the cron endpoint, and asserts response codes, audit records, and incident creation.\",\n  \"tests\": [\n    {\n      \"name\": \"test_retention_job_purges_expired_resources_and_writes_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"At least one resource with expiry_date < NOW() exists in the DB\",\n        \"Retention policy is configured and active\",\n        \"Caller holds SYSTEM_CRON role with valid token\"\n      ],\n      \"actions\": [\n        \"Seed DB with N expired resources via <seed_expired_resources> fixture\",\n        \"POST /cron/retention with valid SYSTEM_CRON bearer token\",\n        \"Capture response body and HTTP status\",\n        \"Query audit log for purge events\",\n        \"Query resource table to verify records removed\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains purged_count == N\",\n        \"Audit log contains one entry per purged resource with action=PURGED\",\n        \"Resource table contains zero rows for the seeded resource IDs\"\n      ],\n      \"trace\": [\n        \"R-HLT-070: expired resources purged\",\n        \"R-HLT-070: audit log written\"\n      ],\n      \"executable\": \"import pytest\\nfrom <fixtures> import cron_auth_headers, db_session\\nfrom <helper_fn> import seed_expired_resources, query_audit_log, query_resources\\n\\nBASE_URL = \\\"http://fhir-lite/cron/retention\\\"\\nSEED_COUNT = 3\\n\\n@pytest.fixture(autouse=True)\\ndef cleanup(db_session):\\n    yield\\n    db_session.execute(\\\"DELETE FROM resources WHERE tag='ep_test'\\\")\\n    db_session.execute(\\\"DELETE FROM audit_log WHERE tag='ep_test'\\\")\\n    db_session.commit()\\n\\ndef test_retention_job_purges_expired_resources_and_writes_audit(\\n    requests_session, cron_auth_headers, db_session\\n):\\n    ids = seed_expired_resources(db_session, count=SEED_COUNT, tag=\\\"ep_test\\\")\\n\\n    resp = requests_session.post(BASE_URL, headers=cron_auth_headers)\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"purged_count\\\"] >= SEED_COUNT\\n\\n    audit_rows = query_audit_log(db_session, resource_ids=ids, action=\\\"PURGED\\\")\\n    assert len(audit_rows) == SEED_COUNT\\n\\n    remaining = query_resources(db_session, resource_ids=ids)\\n    assert len(remaining) == 0\"\n    },\n    {\n      \"name\": \"test_retention_job_denied_without_cron_permission\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A valid user token exists but the user holds PATIENT role only (no SYSTEM_CRON)\",\n        \"Expired resources exist in the DB (to confirm they are NOT purged)\"\n      ],\n      \"actions\": [\n        \"Seed DB with one expired resource via <seed_expired_resources> fixture\",\n        \"POST /cron/retention with PATIENT-role bearer token\",\n        \"Capture response body and HTTP status\",\n        \"Query resource table to confirm resource still present\",\n        \"Query audit log to confirm no PURGED entry written\",\n        \"Query incident table to confirm incident raised on policy mismatch\"\n      ],\n      \"expected\": [\n        \"HTTP 403 returned\",\n        \"Response body contains error code PERMISSION_DENIED\",\n        \"Expired resource record still exists in DB\",\n        \"No PURGED audit entry written for the seeded resource\",\n        \"Incident record created with severity POLICY_MISMATCH\"\n      ],\n      \"trace\": [\n        \"R-HLT-070: permission denial negative path\",\n        \"R-HLT-070: incident raised on policy mismatch\"\n      ],\n "
+  }
+}

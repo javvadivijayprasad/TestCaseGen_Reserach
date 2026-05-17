@@ -1,0 +1,149 @@
+{
+  "req": {
+    "id": "R-FIN-048",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration (boundary variant)",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-048",
+    "reasoning": "R-FIN-048 governs biller registration with a mandatory 24-hour hold and deferred withdrawals. Key test dimensions are: (1) EP \u2014 a valid new biller lands in 'hold' state (positive path); (2) NEG \u2014 a duplicate biller registration returns HTTP 409 (error pathway); (3) BVA \u2014 the exact 24-hour boundary distinguishes 'hold' from 'active', so we test at t=24h-1s (still hold) and t=24h (eligible for active). An additional STC test covers the state machine arc from 'hold' to 'active' once the hold expires. Together these four cases give positive, negative, and two boundary variants, satisfying the minimum three required and providing full traceability to the requirement statement.",
+    "tests": [
+      {
+        "name": "test_register_new_biller_enters_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Biller with the generated account number does not already exist for this customer"
+        ],
+        "actions": [
+          "Generate a unique biller payload via <unique_biller_payload>",
+          "POST /billers with the payload and Authorization header"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status == 'hold'",
+          "Response body contains a hold_until timestamp approximately 24 hours from now",
+          "Withdrawal is not permitted immediately (deferred)"
+        ],
+        "trace": [
+          "R-FIN-048: 'A customer shall register a biller only after a 24-hour hold'",
+          "R-FIN-048: 'biller in hold state' (expected outcome)"
+        ],
+        "executable": "def test_register_new_biller_enters_hold_state(auth_headers, api_base_url, unique_biller_payload):\n    import requests, datetime\n    payload = unique_biller_payload()\n    resp = requests.post(f\"{api_base_url}/billers\", json=payload, headers=auth_headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"hold\"\n    hold_until = datetime.datetime.fromisoformat(body[\"hold_until\"])\n    now = datetime.datetime.now(datetime.timezone.utc)\n    delta = hold_until - now\n    assert datetime.timedelta(hours=23, minutes=59) <= delta <= datetime.timedelta(hours=24, minutes=1)\n    # Cleanup: remove biller so test is idempotent\n    biller_id = body[\"id\"]\n    requests.delete(f\"{api_base_url}/billers/{biller_id}\", headers=auth_headers)"
+      },
+      {
+        "name": "test_duplicate_biller_registration_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "A biller with the target account number has already been registered for this customer"
+        ],
+        "actions": [
+          "Register a biller via <register_biller_fixture> to ensure it exists",
+          "Immediately POST /billers again with the identical payload"
+        ],
+        "expected": [
+          "Second POST returns HTTP 409 Conflict",
+          "Response body contains an error code indicating duplicate biller",
+          "No second biller record is created"
+        ],
+        "trace": [
+          "R-FIN-048: '409 if duplicate biller' (error pathway)"
+        ],
+        "executable": "def test_duplicate_biller_registration_returns_409(auth_headers, api_base_url, register_biller_fixture):\n    import requests\n    payload = register_biller_fixture()  # creates biller and returns its payload\n    # Attempt duplicate registration\n    resp = requests.post(f\"{api_base_url}/billers\", json=payload, headers=auth_headers)\n    assert resp.status_code == 409\n    body = resp.json()\n    assert \"duplicate\" in body.get(\"error\", \"\").lower() or body.get(\"code\") == \"BILLER_DUPLICATE\""
+      },
+      {
+        "name": "test_biller_still_on_hold_at_24h_minus_1_second",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "A biller was registered exactly 24 hours minus 1 second ago (simulated via <time_travel_fixture>)"
+        ],
+        "actions": [
+          "Register a biller and set its created_at to now - (24h - 1s) via <time_travel_fixture>",
+          "GET /billers/{id} to retrieve current status"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body contains status == 'hold'",
+          "Withdrawals to this biller are still deferred"
+        ],
+        "trace": [
+          "R-FIN-048: boundary behaviour at exact min/max thresholds",
+          "R-FIN-048: '24-hour hold' \u2014 one second before boundary must remain in hold"
+        ],
+        "executable": "def test_biller_still_on_hold_at_24h_minus_1_second(auth_headers, api_base_url, time_travel_fixture, unique_biller_payload):\n    import requests, datetime\n    payload = unique_biller_payload()\n    create_resp = requests.post(f\"{api_base_url}/billers\", json=payload, headers=auth_headers)\n    assert create_resp.status_code == 201\n    biller_id = create_resp.json()[\"id\"]\n    # Move clock to 24h - 1s after registration\n    offset = datetime.timedelta(hours=24) - datetime.timedelta(seconds=1)\n    time_travel_fixture(offset)\n    get_resp = requests.get(f\"{api_base_url}/billers/{biller_id}\", headers=auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"hold\"\n    # Cleanup\n    time_travel_fixture(datetime.timedelta(0))\n    requests.delete(f\"{api_base_url}/billers/{biller_id}\", headers=auth_headers)"
+      },
+      {
+        "name": "test_biller_transitions_to_active_at_exact_24h_boundary",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "A biller was registered and its created_at is set to exactly 24 hours ago via <time_travel_fixture>"
+        ],
+        "actions": [
+          "Register a biller and advance time by exactly 24 hours via <time_travel_fixture>",
+          "GET /billers/{id} to retrieve current status",
+          "Optionally attempt a withdrawal to confirm it is no longer deferred"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body contains status == 'active'",
+          "Withdrawal is no longer deferred at the exact 24-hour mark"
+        ],
+        "trace": [
+          "R-FIN-048: boundary behaviour at exact min/max thresholds",
+          "R-FIN-048: state transition from 'hold' to 'active' at t == 24h"
+        ],
+        "executable": "def test_biller_transitions_to_active_at_exact_24h_boundary(auth_headers, api_base_url, time_travel_fixture, unique_biller_payload):\n    import requests, datetime\n    payload = unique_biller_payload()\n    create_resp = requests.post(f\"{api_base_url}/billers\", json=payload, headers=auth_headers)\n    assert create_resp.status_code == 201\n    biller_id = create_resp.json()[\"id\"]\n    # Advance clock to exactly 24 hours after registration\n    time_travel_fixture(datetime.timedelta(hours=24))\n    get_resp = requests.get(f\"{api_base_url}/billers/{biller_id}\", headers=auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\"\n    # Cleanup\n    time_travel_fixture(datetime.timedelta(0))\n    requests.delete(f\"{api_base_url}/billers/{biller_id}\", headers=auth_headers)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-048",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 2242,
+    "latency_ms": 24649,
+    "wall_ms": 24649,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-048\",\n  \"reasoning\": \"R-FIN-048 governs biller registration with a mandatory 24-hour hold and deferred withdrawals. Key test dimensions are: (1) EP \u2014 a valid new biller lands in 'hold' state (positive path); (2) NEG \u2014 a duplicate biller registration returns HTTP 409 (error pathway); (3) BVA \u2014 the exact 24-hour boundary distinguishes 'hold' from 'active', so we test at t=24h-1s (still hold) and t=24h (eligible for active). An additional STC test covers the state machine arc from 'hold' to 'active' once the hold expires. Together these four cases give positive, negative, and two boundary variants, satisfying the minimum three required and providing full traceability to the requirement statement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_register_new_biller_enters_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"Biller with the generated account number does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"Generate a unique biller payload via <unique_biller_payload>\",\n        \"POST /billers with the payload and Authorization header\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status == 'hold'\",\n        \"Response body contains a hold_until timestamp approximately 24 hours from now\",\n        \"Withdrawal is not permitted immediately (deferred)\"\n      ],\n      \"trace\": [\n        \"R-FIN-048: 'A customer shall register a biller only after a 24-hour hold'\",\n        \"R-FIN-048: 'biller in hold state' (expected outcome)\"\n      ],\n      \"executable\": \"def test_register_new_biller_enters_hold_state(auth_headers, api_base_url, unique_biller_payload):\\n    import requests, datetime\\n    payload = unique_biller_payload()\\n    resp = requests.post(f\\\"{api_base_url}/billers\\\", json=payload, headers=auth_headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"hold\\\"\\n    hold_until = datetime.datetime.fromisoformat(body[\\\"hold_until\\\"])\\n    now = datetime.datetime.now(datetime.timezone.utc)\\n    delta = hold_until - now\\n    assert datetime.timedelta(hours=23, minutes=59) <= delta <= datetime.timedelta(hours=24, minutes=1)\\n    # Cleanup: remove biller so test is idempotent\\n    biller_id = body[\\\"id\\\"]\\n    requests.delete(f\\\"{api_base_url}/billers/{biller_id}\\\", headers=auth_headers)\"\n    },\n    {\n      \"name\": \"test_duplicate_biller_registration_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"A biller with the target account number has already been registered for this customer\"\n      ],\n      \"actions\": [\n        \"Register a biller via <register_biller_fixture> to ensure it exists\",\n        \"Immediately POST /billers again with the identical payload\"\n      ],\n      \"expected\": [\n        \"Second POST returns HTTP 409 Conflict\",\n        \"Response body contains an error code indicating duplicate biller\",\n        \"No second biller record is created\"\n      ],\n      \"trace\": [\n        \"R-FIN-048: '409 if duplicate biller' (error pathway)\"\n      ],\n      \"executable\": \"def test_duplicate_biller_registration_returns_409(auth_headers, api_base_url, register_biller_fixture):\\n    import requests\\n    payload = register_biller_fixture()  # creates biller and returns its payload\\n    # Attempt duplicate registration\\n    resp = requests.post(f\\\"{api_base_url}/billers\\\", json=payload, headers=auth_headers)\\n    assert resp.status_code == 409\\n    body = resp.json()\\n    assert \\\"duplicate\\\" in body.get(\\\"error\\\", \\\"\\\").lower() or body.get(\\\"code\\\") == \\\"BILLER_DUPLICATE\\\"\"\n    },\n    {\n      \"name\": \"test_biller_still_on_hold_at_24h_minus_1_second\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"A biller was r"
+  }
+}

@@ -1,0 +1,223 @@
+{
+  "req": {
+    "id": "R-WEB-077",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Upload onboarding document",
+    "statement": "An employee shall upload onboarding documents up to 10MB in PDF, PNG, or JPG format; files outside this must be rejected.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "employee uploads file"
+    ],
+    "expected_outcomes": [
+      "document stored",
+      "virus scan queued"
+    ],
+    "error_pathways": [
+      "413 when size > 10MB",
+      "415 when mime not in allow-list"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents/upload"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-077",
+    "reasoning": "The requirement defines three distinct equivalence classes for file uploads: (1) valid files <=10MB in PDF/PNG/JPG, (2) files exceeding 10MB (HTTP 413), and (3) files with disallowed MIME types (HTTP 415). Boundary Value Analysis drives tests at exactly 10MB and 10MB+1 byte. A Decision Table covers the cross-product of size x mime_type for error pathways. State Transition Coverage validates the post-upload state change (document stored, virus scan queued). Negative Path tests confirm proper rejection messaging. The test suite uses pytest with a shared authenticated session fixture and a file-factory helper to keep each test self-contained and idempotent.",
+    "tests": [
+      {
+        "name": "test_upload_valid_pdf_under_limit_stores_document_and_queues_scan",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "A well-formed PDF file of 5MB is available"
+        ],
+        "actions": [
+          "Generate a 5MB in-memory PDF-like binary blob with valid PDF header",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture the HTTP response status and JSON body"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Response JSON contains 'document_id' field",
+          "Response JSON contains 'virus_scan_status' equal to 'queued'",
+          "Response JSON contains 'stored' equal to true"
+        ],
+        "trace": [
+          "R-WEB-077: valid PDF <=10MB must be stored and virus scan queued"
+        ],
+        "executable": "import pytest\nimport io\n\ndef test_upload_valid_pdf_under_limit_stores_document_and_queues_scan(\n    auth_session,       # <fixture>: requests.Session with auth headers\n    upload_url,         # <fixture>: str base URL to /documents/upload\n    make_file_payload,  # <helper_fn>: (size_bytes, mime, ext) -> (filename, BytesIO, mime)\n):\n    filename, data, mime = make_file_payload(5 * 1024 * 1024, \"application/pdf\", \"pdf\")\n    resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, mime)},\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"document_id\" in body\n    assert body.get(\"virus_scan_status\") == \"queued\"\n    assert body.get(\"stored\") is True\n"
+      },
+      {
+        "name": "test_upload_file_exceeding_10mb_returns_413",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "A PDF file strictly greater than 10MB is prepared"
+        ],
+        "actions": [
+          "Generate an in-memory binary blob of 10MB + 1 byte with PDF header",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 413 Request Entity Too Large is returned",
+          "Response body contains an error message indicating file size limit exceeded"
+        ],
+        "trace": [
+          "R-WEB-077: error pathway - 413 when size > 10MB"
+        ],
+        "executable": "def test_upload_file_exceeding_10mb_returns_413(\n    auth_session,\n    upload_url,\n    make_file_payload,\n):\n    oversized = 10 * 1024 * 1024 + 1  # 10MB + 1 byte\n    filename, data, mime = make_file_payload(oversized, \"application/pdf\", \"pdf\")\n    resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, mime)},\n    )\n    assert resp.status_code == 413\n    body = resp.text.lower()\n    assert any(kw in body for kw in (\"size\", \"too large\", \"limit\", \"413\"))\n"
+      },
+      {
+        "name": "test_upload_disallowed_mime_type_returns_415",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "A file with an unsupported MIME type (text/csv) under 10MB is prepared"
+        ],
+        "actions": [
+          "Generate a 1MB in-memory binary blob with Content-Type text/csv and .csv extension",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 415 Unsupported Media Type is returned",
+          "Response body contains an error message indicating unsupported file type"
+        ],
+        "trace": [
+          "R-WEB-077: error pathway - 415 when mime not in allow-list"
+        ],
+        "executable": "def test_upload_disallowed_mime_type_returns_415(\n    auth_session,\n    upload_url,\n    make_file_payload,\n):\n    filename, data, mime = make_file_payload(1 * 1024 * 1024, \"text/csv\", \"csv\")\n    resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, mime)},\n    )\n    assert resp.status_code == 415\n    body = resp.text.lower()\n    assert any(kw in body for kw in (\"unsupported\", \"mime\", \"type\", \"format\", \"415\"))\n"
+      },
+      {
+        "name": "test_upload_file_at_exact_10mb_boundary_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "A PNG file of exactly 10485760 bytes (10 * 1024 * 1024) is prepared"
+        ],
+        "actions": [
+          "Generate an in-memory binary blob of exactly 10485760 bytes with image/png MIME",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture the HTTP response status and JSON body"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned (boundary value must be accepted)",
+          "Response JSON contains 'document_id' field",
+          "Response JSON contains 'virus_scan_status' equal to 'queued'"
+        ],
+        "trace": [
+          "R-WEB-077: BVA upper boundary - exactly 10MB must be accepted, not rejected"
+        ],
+        "executable": "def test_upload_file_at_exact_10mb_boundary_is_accepted(\n    auth_session,\n    upload_url,\n    make_file_payload,\n):\n    exact_limit = 10 * 1024 * 1024  # 10485760 bytes\n    filename, data, mime = make_file_payload(exact_limit, \"image/png\", \"png\")\n    resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, mime)},\n    )\n    assert resp.status_code == 201, (\n        f\"Expected 201 at exact 10MB boundary, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"document_id\" in body\n    assert body.get(\"virus_scan_status\") == \"queued\"\n"
+      },
+      {
+        "name": "test_upload_file_at_10mb_plus_one_byte_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "A JPG file of exactly 10485761 bytes (10MB + 1 byte) is prepared"
+        ],
+        "actions": [
+          "Generate an in-memory binary blob of 10485761 bytes with image/jpeg MIME",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture the HTTP response status"
+        ],
+        "expected": [
+          "HTTP 413 is returned (one byte over the boundary must be rejected)",
+          "Response body references the size limit"
+        ],
+        "trace": [
+          "R-WEB-077: BVA upper boundary+1 - 10MB+1 byte must yield HTTP 413"
+        ],
+        "executable": "def test_upload_file_at_10mb_plus_one_byte_is_rejected(\n    auth_session,\n    upload_url,\n    make_file_payload,\n):\n    over_limit = 10 * 1024 * 1024 + 1  # 10485761 bytes\n    filename, data, mime = make_file_payload(over_limit, \"image/jpeg\", \"jpg\")\n    resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, mime)},\n    )\n    assert resp.status_code == 413, (\n        f\"Expected 413 at 10MB+1 byte, got {resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_upload_transitions_document_state_to_stored_then_scan_queued",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "GET /documents/{id} endpoint is available to query document state",
+          "A valid JPG file under 10MB is available"
+        ],
+        "actions": [
+          "POST a 1MB JPG file to /documents/upload",
+          "Assert initial response indicates document_id and virus_scan_status=queued",
+          "GET /documents/{document_id} to verify persisted state reflects stored=true"
+        ],
+        "expected": [
+          "POST returns HTTP 201 with document_id and virus_scan_status queued",
+          "Subsequent GET returns HTTP 200 with stored=true and virus_scan_status in (queued, scanning, clean)",
+          "Document state has transitioned from non-existent to stored"
+        ],
+        "trace": [
+          "R-WEB-077: expected outcome - document stored; virus scan queued; state transition coverage"
+        ],
+        "executable": "def test_upload_transitions_document_state_to_stored_then_scan_queued(\n    auth_session,\n    upload_url,\n    documents_url,      # <fixture>: str base URL for /documents\n    make_file_payload,\n):\n    filename, data, mime = make_file_payload(1 * 1024 * 1024, \"image/jpeg\", \"jpg\")\n    post_resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, mime)},\n    )\n    assert post_resp.status_code == 201\n    body = post_resp.json()\n    doc_id = body[\"document_id\"]\n    assert body.get(\"virus_scan_status\") == \"queued\"\n\n    get_resp = auth_session.get(f\"{documents_url}/{doc_id}\")\n    assert get_resp.status_code == 200\n    doc = get_resp.json()\n    assert doc.get(\"stored\") is True\n    assert doc.get(\"virus_scan_status\") in (\"queued\", \"scanning\", \"clean\")\n"
+      },
+      {
+        "name": "test_upload_all_allowed_mime_types_are_accepted",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "Small representative files for PDF, PNG, and JPG MIME types are available"
+        ],
+        "actions": [
+          "For each of (application/pdf/.pdf), (image/png/.png), (image/jpeg/.jpg): POST a 512KB file",
+          "Capture HTTP status code for each upload"
+        ],
+        "expected": [
+          "All three uploads return HTTP 201",
+          "Each response contains a unique document_id"
+        ],
+        "trace": [
+          "R-WEB-077: all three allowed MIME types must be accepted (equivalence class: valid mime)"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"mime,ext\", [\n    (\"application/pdf\", \"pdf\"),\n    (\"image/png\",       \"png\"),\n    (\"image/jpeg\",      \"jpg\"),\n])\ndef test_upload_all_allowed_mime_types_are_accepted(\n    auth_session,\n    upload_url,\n    make_file_payload,\n    mime,\n    ext,\n):\n    filename, data, content_type = make_file_payload(512 * 1024, mime, ext)\n    resp = auth_session.post(\n        upload_url,\n        files={\"file\": (filename, data, content_type)},\n    )\n    assert resp.status_code == 201, (\n        f\"MIME {mime} should be accepted, got {resp.status_code}\"\n    )\n    assert \"document_id\" in resp.json()\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-077",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 3666,
+    "latency_ms": 39558,
+    "wall_ms": 39558,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-077\",\n  \"reasoning\": \"The requirement defines three distinct equivalence classes for file uploads: (1) valid files <=10MB in PDF/PNG/JPG, (2) files exceeding 10MB (HTTP 413), and (3) files with disallowed MIME types (HTTP 415). Boundary Value Analysis drives tests at exactly 10MB and 10MB+1 byte. A Decision Table covers the cross-product of size x mime_type for error pathways. State Transition Coverage validates the post-upload state change (document stored, virus scan queued). Negative Path tests confirm proper rejection messaging. The test suite uses pytest with a shared authenticated session fixture and a file-factory helper to keep each test self-contained and idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_upload_valid_pdf_under_limit_stores_document_and_queues_scan\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"Target endpoint /documents/upload is reachable\",\n        \"A well-formed PDF file of 5MB is available\"\n      ],\n      \"actions\": [\n        \"Generate a 5MB in-memory PDF-like binary blob with valid PDF header\",\n        \"POST the file to /documents/upload with Content-Type multipart/form-data\",\n        \"Capture the HTTP response status and JSON body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created is returned\",\n        \"Response JSON contains 'document_id' field\",\n        \"Response JSON contains 'virus_scan_status' equal to 'queued'\",\n        \"Response JSON contains 'stored' equal to true\"\n      ],\n      \"trace\": [\n        \"R-WEB-077: valid PDF <=10MB must be stored and virus scan queued\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\n\\ndef test_upload_valid_pdf_under_limit_stores_document_and_queues_scan(\\n    auth_session,       # <fixture>: requests.Session with auth headers\\n    upload_url,         # <fixture>: str base URL to /documents/upload\\n    make_file_payload,  # <helper_fn>: (size_bytes, mime, ext) -> (filename, BytesIO, mime)\\n):\\n    filename, data, mime = make_file_payload(5 * 1024 * 1024, \\\"application/pdf\\\", \\\"pdf\\\")\\n    resp = auth_session.post(\\n        upload_url,\\n        files={\\\"file\\\": (filename, data, mime)},\\n    )\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"document_id\\\" in body\\n    assert body.get(\\\"virus_scan_status\\\") == \\\"queued\\\"\\n    assert body.get(\\\"stored\\\") is True\\n\"\n    },\n    {\n      \"name\": \"test_upload_file_exceeding_10mb_returns_413\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"Target endpoint /documents/upload is reachable\",\n        \"A PDF file strictly greater than 10MB is prepared\"\n      ],\n      \"actions\": [\n        \"Generate an in-memory binary blob of 10MB + 1 byte with PDF header\",\n        \"POST the file to /documents/upload with Content-Type multipart/form-data\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 413 Request Entity Too Large is returned\",\n        \"Response body contains an error message indicating file size limit exceeded\"\n      ],\n      \"trace\": [\n        \"R-WEB-077: error pathway - 413 when size > 10MB\"\n      ],\n      \"executable\": \"def test_upload_file_exceeding_10mb_returns_413(\\n    auth_session,\\n    upload_url,\\n    make_file_payload,\\n):\\n    oversized = 10 * 1024 * 1024 + 1  # 10MB + 1 byte\\n    filename, data, mime = make_file_payload(oversized, \\\"application/pdf\\\", \\\"pdf\\\")\\n    resp = auth_session.post(\\n        upload_url,\\n        files={\\\"file\\\": (filename, data, mime)},\\n    )\\n    assert resp.status_code == 413\\n    body = resp.text.lower()\\n    assert any(kw in body for kw in (\\\"size\\\", \\\"too large\\\", \\\"limit\\\", \\\"413\\\"))\\n\"\n    },\n    {\n      \"name\": \"test_upload_disallowed_mime_type_returns_415\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"User is authenticate"
+  }
+}

@@ -1,0 +1,180 @@
+{
+  "req": {
+    "id": "R-HLT-101",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create patient (consent)",
+    "statement": "A registered clinician shall create a patient resource with validated demographics; creation with missing mandatory elements shall be rejected. Consent state at the time of the operation must be tested, including post-revocation timing windows.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician creates patient"
+    ],
+    "expected_outcomes": [
+      "patient resource stored"
+    ],
+    "error_pathways": [
+      "422 when mandatory element missing"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-101",
+    "reasoning": "The requirement covers patient resource creation by a clinician via POST /Patient. We must test: (1) a valid creation with all mandatory demographics (EP positive), (2) rejection when a mandatory element is absent (NEG/DT negative), (3) a boundary case on a field length or consent timing window (BVA boundary), (4) consent revocation state transition (STC boundary). Five tests are provided to satisfy the minimum of three while covering all heuristic categories cited in the requirement. Each test uses a shared 'clinician_token' fixture and a 'fhir_client' fixture that wraps requests.Session with base URL and auth header. Idempotency is achieved by deleting any created resource in teardown via the returned Location header.",
+    "tests": [
+      {
+        "name": "test_create_patient_all_mandatory_fields_returns_201",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds role:clinician with a valid bearer token",
+          "FHIR-lite service is reachable at BASE_URL",
+          "Active consent record exists for the patient identity"
+        ],
+        "actions": [
+          "Build a Patient FHIR payload containing all mandatory elements: resourceType, name (family+given), gender, birthDate",
+          "POST payload to /Patient with Authorization: Bearer <clinician_token>",
+          "Capture response status and Location header"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Location header references newly created Patient resource",
+          "Response body contains an id field"
+        ],
+        "trace": [
+          "R-HLT-101: registered clinician creates patient resource with validated demographics",
+          "R-HLT-101: patient resource stored on success"
+        ],
+        "executable": "def test_create_patient_all_mandatory_fields_returns_201(fhir_client, clinician_token):\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"family\": \"Doe\", \"given\": [\"Jane\"]}],\n        \"gender\": \"female\",\n        \"birthDate\": \"1990-06-15\"\n    }\n    resp = fhir_client.post(\n        \"/Patient\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    assert \"Location\" in resp.headers, \"Location header missing\"\n    body = resp.json()\n    assert \"id\" in body, \"Response body must contain 'id'\"\n    # Teardown: remove created resource to keep environment clean\n    resource_id = body[\"id\"]\n    fhir_client.delete(\n        f\"/Patient/{resource_id}\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )"
+      },
+      {
+        "name": "test_create_patient_missing_birthdate_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role:clinician with a valid bearer token",
+          "FHIR-lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Build a Patient FHIR payload that omits the mandatory 'birthDate' field",
+          "POST payload to /Patient with Authorization: Bearer <clinician_token>",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an OperationOutcome or error message referencing 'birthDate'"
+        ],
+        "trace": [
+          "R-HLT-101: creation with missing mandatory elements shall be rejected",
+          "R-HLT-101: error pathway 422 when mandatory element missing"
+        ],
+        "executable": "def test_create_patient_missing_birthdate_returns_422(fhir_client, clinician_token):\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"family\": \"Smith\", \"given\": [\"John\"]}],\n        \"gender\": \"male\"\n        # birthDate intentionally omitted\n    }\n    resp = fhir_client.post(\n        \"/Patient\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    # Server must surface a diagnostic referencing the missing field\n    body_text = str(body).lower()\n    assert \"birthdate\" in body_text or \"birth_date\" in body_text or \"mandatory\" in body_text, \\\n        f\"Response should mention missing field, got: {body}\""
+      },
+      {
+        "name": "test_create_patient_family_name_at_max_length_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role:clinician with a valid bearer token",
+          "FHIR-lite service is reachable at BASE_URL",
+          "System imposes a maximum family-name length (assumed 64 characters per spec)"
+        ],
+        "actions": [
+          "Build a Patient payload with family name exactly 64 characters long (max allowed boundary)",
+          "POST payload to /Patient with Authorization: Bearer <clinician_token>",
+          "Record status; if 201 clean up; assert acceptance"
+        ],
+        "expected": [
+          "HTTP 201 Created \u2014 exactly-64-char name is at the valid boundary and must be accepted",
+          "Patient resource id returned in response body"
+        ],
+        "trace": [
+          "R-HLT-101: validated demographics must accept values at field length boundary",
+          "BVA on maximum allowed length of family name element"
+        ],
+        "executable": "def test_create_patient_family_name_at_max_length_boundary(fhir_client, clinician_token):\n    MAX_LEN = 64\n    boundary_name = \"A\" * MAX_LEN\n    assert len(boundary_name) == MAX_LEN\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"family\": boundary_name, \"given\": [\"Test\"]}],\n        \"gender\": \"unknown\",\n        \"birthDate\": \"2000-01-01\"\n    }\n    resp = fhir_client.post(\n        \"/Patient\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code == 201, \\\n        f\"Expected 201 for max-length name ({MAX_LEN} chars), got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"id\" in body\n    fhir_client.delete(\n        f\"/Patient/{body['id']}\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )"
+      },
+      {
+        "name": "test_create_patient_after_consent_revocation_is_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds role:clinician with a valid bearer token",
+          "A consent record exists that can be revoked via <revoke_consent> helper",
+          "System enforces consent state before allowing patient creation"
+        ],
+        "actions": [
+          "Revoke consent for the test subject identity using <revoke_consent> fixture",
+          "Wait for revocation propagation using <wait_for_consent_propagation> helper (timing window)",
+          "Attempt POST /Patient with full mandatory payload",
+          "Capture response status"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden or 422 Unprocessable Entity \u2014 system must reject creation after consent revocation",
+          "Response body indicates consent or authorization failure"
+        ],
+        "trace": [
+          "R-HLT-101: consent state at time of operation must be tested",
+          "R-HLT-101: post-revocation timing windows",
+          "STC: Active-consent -> Consent-revoked state transition coverage"
+        ],
+        "executable": "def test_create_patient_after_consent_revocation_is_rejected(\n    fhir_client, clinician_token, revoke_consent, wait_for_consent_propagation\n):\n    subject_ref = \"urn:test:consent-subject-001\"\n    revoke_consent(subject_ref)          # <revoke_consent> fixture\n    wait_for_consent_propagation()       # <wait_for_consent_propagation> fixture\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"family\": \"Revoked\", \"given\": [\"Consent\"]}],\n        \"gender\": \"male\",\n        \"birthDate\": \"1985-03-22\",\n        \"extension\": [{\n            \"url\": \"urn:fhir-lite:consent-subject\",\n            \"valueString\": subject_ref\n        }]\n    }\n    resp = fhir_client.post(\n        \"/Patient\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code in (403, 422), \\\n        f\"Expected 403 or 422 post-revocation, got {resp.status_code}: {resp.text}\"\n    body_text = str(resp.json()).lower()\n    assert \"consent\" in body_text or \"forbidden\" in body_text or \"unauthorized\" in body_text, \\\n        f\"Response must reference consent failure: {resp.json()}\""
+      },
+      {
+        "name": "test_create_patient_decision_table_gender_values",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role:clinician with a valid bearer token",
+          "FHIR-lite service is reachable at BASE_URL",
+          "FHIR R4 restricts gender to male|female|other|unknown"
+        ],
+        "actions": [
+          "Iterate over invalid gender value 'nonbinary' (outside FHIR ValueSet)",
+          "POST Patient payload with that invalid gender to /Patient",
+          "Assert rejection; separately POST with valid gender 'other' and assert acceptance"
+        ],
+        "expected": [
+          "Invalid gender value returns HTTP 422",
+          "Valid gender value 'other' returns HTTP 201"
+        ],
+        "trace": [
+          "R-HLT-101: validated demographics \u2014 gender field must conform to FHIR ValueSet",
+          "DT: cartesian coverage of valid vs invalid gender column"
+        ],
+        "executable": "import pytest\n\ndef test_create_patient_decision_table_gender_values(fhir_client, clinician_token):\n    base = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"family\": \"DTTest\", \"given\": [\"Gender\"]}],\n        \"birthDate\": \"1975-11-30\"\n    }\n    # Decision: invalid gender -> reject\n    bad_payload = {**base, \"gender\": \"nonbinary\"}\n    bad_resp = fhir_client.post(\n        \"/Patient\",\n        json=bad_payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert bad_resp.status_code == 422, \\\n        f\"Expected 422 for invalid gender, got {bad_resp.status_code}: {bad_resp.text}\"\n    # Decision: valid gender -> accept\n    good_payload = {**base, \"gender\": \"other\"}\n    good_resp = fhir_client.post(\n        \"/Patient\",\n        json=good_payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert good_resp.status_code == 201, \\\n        f\"Expected 201 for valid gender 'other', got {good_resp.status_code}: {good_resp.text}\"\n    body = good_resp.json()\n    fhir_client.delete(\n        f\"/Patient/{body['id']}\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )"
+      }
+    ]
+  },
+  "req_id": "R-HLT-101",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 3270,
+    "latency_ms": 44293,
+    "wall_ms": 44293,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-101\",\n  \"reasoning\": \"The requirement covers patient resource creation by a clinician via POST /Patient. We must test: (1) a valid creation with all mandatory demographics (EP positive), (2) rejection when a mandatory element is absent (NEG/DT negative), (3) a boundary case on a field length or consent timing window (BVA boundary), (4) consent revocation state transition (STC boundary). Five tests are provided to satisfy the minimum of three while covering all heuristic categories cited in the requirement. Each test uses a shared 'clinician_token' fixture and a 'fhir_client' fixture that wraps requests.Session with base URL and auth header. Idempotency is achieved by deleting any created resource in teardown via the returned Location header.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_patient_all_mandatory_fields_returns_201\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds role:clinician with a valid bearer token\",\n        \"FHIR-lite service is reachable at BASE_URL\",\n        \"Active consent record exists for the patient identity\"\n      ],\n      \"actions\": [\n        \"Build a Patient FHIR payload containing all mandatory elements: resourceType, name (family+given), gender, birthDate\",\n        \"POST payload to /Patient with Authorization: Bearer <clinician_token>\",\n        \"Capture response status and Location header\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Location header references newly created Patient resource\",\n        \"Response body contains an id field\"\n      ],\n      \"trace\": [\n        \"R-HLT-101: registered clinician creates patient resource with validated demographics\",\n        \"R-HLT-101: patient resource stored on success\"\n      ],\n      \"executable\": \"def test_create_patient_all_mandatory_fields_returns_201(fhir_client, clinician_token):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"name\\\": [{\\\"family\\\": \\\"Doe\\\", \\\"given\\\": [\\\"Jane\\\"]}],\\n        \\\"gender\\\": \\\"female\\\",\\n        \\\"birthDate\\\": \\\"1990-06-15\\\"\\n    }\\n    resp = fhir_client.post(\\n        \\\"/Patient\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    assert \\\"Location\\\" in resp.headers, \\\"Location header missing\\\"\\n    body = resp.json()\\n    assert \\\"id\\\" in body, \\\"Response body must contain 'id'\\\"\\n    # Teardown: remove created resource to keep environment clean\\n    resource_id = body[\\\"id\\\"]\\n    fhir_client.delete(\\n        f\\\"/Patient/{resource_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n    )\"\n    },\n    {\n      \"name\": \"test_create_patient_missing_birthdate_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role:clinician with a valid bearer token\",\n        \"FHIR-lite service is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"Build a Patient FHIR payload that omits the mandatory 'birthDate' field\",\n        \"POST payload to /Patient with Authorization: Bearer <clinician_token>\",\n        \"Capture response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an OperationOutcome or error message referencing 'birthDate'\"\n      ],\n      \"trace\": [\n        \"R-HLT-101: creation with missing mandatory elements shall be rejected\",\n        \"R-HLT-101: error pathway 422 when mandatory element missing\"\n      ],\n      \"executable\": \"def test_create_patient_missing_birthdate_returns_422(fhir_client, clinician_token):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"name\\\": [{\\\"family\\\": \\\"Smith\\\", \\\"given\\\": [\\\"John\\\"]}],\\n        \\\"gender\\\": \\\"male\\\"\\n        # birthDate intentionally omitted\\n    }\\n    resp = fhir_client.post(\\n        \\\"/Patient\\\",\\n        json=payload,\\n        head"
+  }
+}

@@ -1,0 +1,210 @@
+{
+  "req": {
+    "id": "R-WEB-092",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Schedule performance review",
+    "statement": "A manager shall schedule a performance review with the reviewee at least 7 days in advance; past or sub-7-day dates shall be rejected.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager"
+    ],
+    "triggers": [
+      "manager schedules review"
+    ],
+    "expected_outcomes": [
+      "review scheduled",
+      "participants notified"
+    ],
+    "error_pathways": [
+      "422 when scheduled_at < now + 7d"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/performance-reviews/schedule"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-092",
+    "reasoning": "The requirement defines a strict temporal validation rule: scheduled_at must be >= now + 7 days. This yields three natural partitions: (1) dates clearly beyond 7 days (valid EP), (2) dates clearly in the past or too near (invalid EP/NEG), and (3) the exact 7-day boundary (BVA, split into exactly 7d which is valid and exactly 7d-1s which is invalid). A State Transition case covers the workflow: unauthenticated -> authenticated manager -> review scheduled -> notifications sent. A Decision Table case exercises the combination of role=manager vs non-manager crossing the date validity axis. Together these give positive, negative, and boundary coverage with determinism guaranteed by freezing time via a server-side fixture or a fixed UTC offset.",
+    "tests": [
+      {
+        "name": "test_schedule_review_valid_date_beyond_7_days",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as role:manager",
+          "Reviewee account exists",
+          "System clock is frozen to a known UTC instant via <freeze_time_fixture>"
+        ],
+        "actions": [
+          "Compute scheduled_at = frozen_now + 14 days (well inside valid partition)",
+          "POST /performance-reviews/schedule with manager credentials and scheduled_at"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains review_id",
+          "Response body scheduled_at matches submitted value",
+          "Notification records created for manager and reviewee"
+        ],
+        "trace": [
+          "R-WEB-092: review scheduled",
+          "R-WEB-092: participants notified",
+          "EP valid partition: scheduled_at >= now + 7d"
+        ],
+        "executable": "import pytest\nfrom datetime import timezone\nfrom dateutil.relativedelta import relativedelta\n\ndef test_schedule_review_valid_date_beyond_7_days(\n    manager_client,        # <fixture> authenticated HTTP client for role:manager\n    reviewee_user,         # <fixture> returns {\"id\": ..., \"email\": ...}\n    freeze_time,           # <fixture> freezes server + client clock, yields frozen_now (datetime)\n    assert_notifications,  # <helper_fn> asserts notification rows exist for given review_id\n):\n    frozen_now = freeze_time\n    scheduled_at = frozen_now.replace(tzinfo=timezone.utc) + relativedelta(days=14)\n\n    payload = {\n        \"reviewee_id\": reviewee_user[\"id\"],\n        \"scheduled_at\": scheduled_at.isoformat(),\n    }\n    response = manager_client.post(\"/performance-reviews/schedule\", json=payload)\n\n    assert response.status_code == 201\n    body = response.json()\n    assert \"review_id\" in body\n    assert body[\"scheduled_at\"] == scheduled_at.isoformat()\n    assert_notifications(body[\"review_id\"], expected_recipients=2)\n"
+      },
+      {
+        "name": "test_schedule_review_past_date_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as role:manager",
+          "Reviewee account exists",
+          "System clock is frozen to a known UTC instant via <freeze_time_fixture>"
+        ],
+        "actions": [
+          "Compute scheduled_at = frozen_now - 1 day (clearly in the past, invalid partition)",
+          "POST /performance-reviews/schedule with manager credentials and scheduled_at"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code referencing scheduled_at constraint",
+          "No review record created in database",
+          "No notifications dispatched"
+        ],
+        "trace": [
+          "R-WEB-092: past dates shall be rejected",
+          "R-WEB-092: 422 when scheduled_at < now + 7d",
+          "NEG: invalid partition scheduled_at < now"
+        ],
+        "executable": "import pytest\nfrom datetime import timezone\nfrom dateutil.relativedelta import relativedelta\n\ndef test_schedule_review_past_date_rejected(\n    manager_client,\n    reviewee_user,\n    freeze_time,\n    assert_no_review_exists,   # <helper_fn> asserts no DB row for given payload\n    assert_no_notifications,   # <helper_fn> asserts zero notification rows dispatched\n):\n    frozen_now = freeze_time\n    scheduled_at = frozen_now.replace(tzinfo=timezone.utc) - relativedelta(days=1)\n\n    payload = {\n        \"reviewee_id\": reviewee_user[\"id\"],\n        \"scheduled_at\": scheduled_at.isoformat(),\n    }\n    response = manager_client.post(\"/performance-reviews/schedule\", json=payload)\n\n    assert response.status_code == 422\n    body = response.json()\n    assert \"scheduled_at\" in str(body).lower()\n    assert_no_review_exists(payload)\n    assert_no_notifications()\n"
+      },
+      {
+        "name": "test_schedule_review_exactly_7_days_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as role:manager",
+          "Reviewee account exists",
+          "System clock is frozen to a known UTC instant via <freeze_time_fixture>"
+        ],
+        "actions": [
+          "Compute scheduled_at = frozen_now + exactly 7 days (lower valid boundary)",
+          "POST /performance-reviews/schedule with manager credentials and scheduled_at"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains review_id",
+          "Review is persisted with correct scheduled_at"
+        ],
+        "trace": [
+          "R-WEB-092: at least 7 days in advance",
+          "BVA: lower inclusive boundary scheduled_at == now + 7d"
+        ],
+        "executable": "import pytest\nfrom datetime import timezone\nfrom dateutil.relativedelta import relativedelta\n\ndef test_schedule_review_exactly_7_days_accepted(\n    manager_client,\n    reviewee_user,\n    freeze_time,\n):\n    frozen_now = freeze_time\n    scheduled_at = frozen_now.replace(tzinfo=timezone.utc) + relativedelta(days=7)\n\n    payload = {\n        \"reviewee_id\": reviewee_user[\"id\"],\n        \"scheduled_at\": scheduled_at.isoformat(),\n    }\n    response = manager_client.post(\"/performance-reviews/schedule\", json=payload)\n\n    assert response.status_code == 201\n    body = response.json()\n    assert \"review_id\" in body\n    assert body[\"scheduled_at\"] == scheduled_at.isoformat()\n"
+      },
+      {
+        "name": "test_schedule_review_one_second_under_7_days_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as role:manager",
+          "Reviewee account exists",
+          "System clock is frozen to a known UTC instant via <freeze_time_fixture>"
+        ],
+        "actions": [
+          "Compute scheduled_at = frozen_now + 7 days - 1 second (just below valid boundary)",
+          "POST /performance-reviews/schedule with manager credentials and scheduled_at"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Error message references scheduled_at or minimum advance notice"
+        ],
+        "trace": [
+          "R-WEB-092: sub-7-day dates shall be rejected",
+          "R-WEB-092: 422 when scheduled_at < now + 7d",
+          "BVA: upper invalid boundary scheduled_at == now + 7d - 1s"
+        ],
+        "executable": "import pytest\nfrom datetime import timezone, timedelta\nfrom dateutil.relativedelta import relativedelta\n\ndef test_schedule_review_one_second_under_7_days_rejected(\n    manager_client,\n    reviewee_user,\n    freeze_time,\n):\n    frozen_now = freeze_time\n    scheduled_at = (\n        frozen_now.replace(tzinfo=timezone.utc)\n        + relativedelta(days=7)\n        - timedelta(seconds=1)\n    )\n\n    payload = {\n        \"reviewee_id\": reviewee_user[\"id\"],\n        \"scheduled_at\": scheduled_at.isoformat(),\n    }\n    response = manager_client.post(\"/performance-reviews/schedule\", json=payload)\n\n    assert response.status_code == 422\n    body = response.json()\n    assert \"scheduled_at\" in str(body).lower()\n"
+      },
+      {
+        "name": "test_schedule_review_non_manager_role_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as role:employee (non-manager)",
+          "Reviewee account exists",
+          "scheduled_at is valid (now + 14 days)"
+        ],
+        "actions": [
+          "Compute scheduled_at = frozen_now + 14 days",
+          "POST /performance-reviews/schedule with employee credentials and valid scheduled_at"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "No review record created",
+          "No notifications dispatched"
+        ],
+        "trace": [
+          "R-WEB-092: precondition role:manager",
+          "DT: role=employee x valid_date -> rejected",
+          "NEG: unauthorized actor"
+        ],
+        "executable": "import pytest\nfrom datetime import timezone\nfrom dateutil.relativedelta import relativedelta\n\ndef test_schedule_review_non_manager_role_rejected(\n    employee_client,       # <fixture> authenticated HTTP client for role:employee\n    reviewee_user,\n    freeze_time,\n    assert_no_review_exists,\n):\n    frozen_now = freeze_time\n    scheduled_at = frozen_now.replace(tzinfo=timezone.utc) + relativedelta(days=14)\n\n    payload = {\n        \"reviewee_id\": reviewee_user[\"id\"],\n        \"scheduled_at\": scheduled_at.isoformat(),\n    }\n    response = employee_client.post(\"/performance-reviews/schedule\", json=payload)\n\n    assert response.status_code == 403\n    assert_no_review_exists(payload)\n"
+      },
+      {
+        "name": "test_schedule_review_workflow_state_transitions",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "No active session exists",
+          "Manager credentials are available",
+          "Reviewee account exists"
+        ],
+        "actions": [
+          "Start from unauthenticated state",
+          "Authenticate as manager (state: authenticated)",
+          "Submit valid schedule request with scheduled_at = now + 14 days (state: review_pending)",
+          "Assert review transitions to state: review_scheduled",
+          "Assert notifications transition to state: notifications_dispatched"
+        ],
+        "expected": [
+          "HTTP 201 after scheduling",
+          "Review status field equals 'scheduled'",
+          "Notification status for each participant equals 'sent'"
+        ],
+        "trace": [
+          "R-WEB-092: review scheduled",
+          "R-WEB-092: participants notified",
+          "STC: unauthenticated -> authenticated -> review_scheduled -> notifications_dispatched"
+        ],
+        "executable": "import pytest\nfrom datetime import timezone\nfrom dateutil.relativedelta import relativedelta\n\ndef test_schedule_review_workflow_state_transitions(\n    unauthenticated_client,  # <fixture> bare HTTP client with no session\n    manager_credentials,     # <fixture> returns {\"username\": ..., \"password\": ...}\n    reviewee_user,\n    freeze_time,\n    login,                   # <helper_fn>(client, credentials) -> authenticated client\n    get_review_status,       # <helper_fn>(review_id) -> str\n    get_notification_status, # <helper_fn>(review_id) -> list[str]\n):\n    frozen_now = freeze_time\n    scheduled_at = frozen_now.replace(tzinfo=timezone.utc) + relativedelta(days=14)\n\n    authed_client = login(unauthenticated_client, manager_credentials)\n\n    payload = {\n        \"reviewee_id\": reviewee_user[\"id\"],\n        \"scheduled_at\": scheduled_at.isoformat(),\n    }\n    response = authed_client.post(\"/performance-reviews/schedule\", json=payload)\n\n    assert response.status_code == 201\n    review_id = response.json()[\"review_id\"]\n\n    assert get_review_status(review_id) == \"scheduled\"\n    statuses = get_notification_status(review_id)\n    assert all(s == \"sent\" for s in statuses)\n    assert len(statuses) == 2\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-092",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 993,
+    "output_tokens": 3465,
+    "latency_ms": 42167,
+    "wall_ms": 42167,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-092\",\n  \"reasoning\": \"The requirement defines a strict temporal validation rule: scheduled_at must be >= now + 7 days. This yields three natural partitions: (1) dates clearly beyond 7 days (valid EP), (2) dates clearly in the past or too near (invalid EP/NEG), and (3) the exact 7-day boundary (BVA, split into exactly 7d which is valid and exactly 7d-1s which is invalid). A State Transition case covers the workflow: unauthenticated -> authenticated manager -> review scheduled -> notifications sent. A Decision Table case exercises the combination of role=manager vs non-manager crossing the date validity axis. Together these give positive, negative, and boundary coverage with determinism guaranteed by freezing time via a server-side fixture or a fixed UTC offset.\",\n  \"tests\": [\n    {\n      \"name\": \"test_schedule_review_valid_date_beyond_7_days\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as role:manager\",\n        \"Reviewee account exists\",\n        \"System clock is frozen to a known UTC instant via <freeze_time_fixture>\"\n      ],\n      \"actions\": [\n        \"Compute scheduled_at = frozen_now + 14 days (well inside valid partition)\",\n        \"POST /performance-reviews/schedule with manager credentials and scheduled_at\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains review_id\",\n        \"Response body scheduled_at matches submitted value\",\n        \"Notification records created for manager and reviewee\"\n      ],\n      \"trace\": [\n        \"R-WEB-092: review scheduled\",\n        \"R-WEB-092: participants notified\",\n        \"EP valid partition: scheduled_at >= now + 7d\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import timezone\\nfrom dateutil.relativedelta import relativedelta\\n\\ndef test_schedule_review_valid_date_beyond_7_days(\\n    manager_client,        # <fixture> authenticated HTTP client for role:manager\\n    reviewee_user,         # <fixture> returns {\\\"id\\\": ..., \\\"email\\\": ...}\\n    freeze_time,           # <fixture> freezes server + client clock, yields frozen_now (datetime)\\n    assert_notifications,  # <helper_fn> asserts notification rows exist for given review_id\\n):\\n    frozen_now = freeze_time\\n    scheduled_at = frozen_now.replace(tzinfo=timezone.utc) + relativedelta(days=14)\\n\\n    payload = {\\n        \\\"reviewee_id\\\": reviewee_user[\\\"id\\\"],\\n        \\\"scheduled_at\\\": scheduled_at.isoformat(),\\n    }\\n    response = manager_client.post(\\\"/performance-reviews/schedule\\\", json=payload)\\n\\n    assert response.status_code == 201\\n    body = response.json()\\n    assert \\\"review_id\\\" in body\\n    assert body[\\\"scheduled_at\\\"] == scheduled_at.isoformat()\\n    assert_notifications(body[\\\"review_id\\\"], expected_recipients=2)\\n\"\n    },\n    {\n      \"name\": \"test_schedule_review_past_date_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as role:manager\",\n        \"Reviewee account exists\",\n        \"System clock is frozen to a known UTC instant via <freeze_time_fixture>\"\n      ],\n      \"actions\": [\n        \"Compute scheduled_at = frozen_now - 1 day (clearly in the past, invalid partition)\",\n        \"POST /performance-reviews/schedule with manager credentials and scheduled_at\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains error code referencing scheduled_at constraint\",\n        \"No review record created in database\",\n        \"No notifications dispatched\"\n      ],\n      \"trace\": [\n        \"R-WEB-092: past dates shall be rejected\",\n        \"R-WEB-092: 422 when scheduled_at < now + 7d\",\n        \"NEG: invalid partition scheduled_at < now\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import timezone\\nfrom dateutil.relativedelta import relativedelta\\n\\ndef test_schedule_review_past_date_rejected(\\n    manager_client,\\n    reviewee_user,\\n    freeze_"
+  }
+}

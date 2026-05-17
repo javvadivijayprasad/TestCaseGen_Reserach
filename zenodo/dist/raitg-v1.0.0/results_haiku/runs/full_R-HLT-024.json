@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-024",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Appointment scheduling",
+    "statement": "A patient shall schedule an appointment at least 24 hours in advance during provider's available slots.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient books slot"
+    ],
+    "expected_outcomes": [
+      "appointment created",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "422 when slot unavailable or in past"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/appointments"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-024",
+    "reasoning": "R-HLT-024 specifies temporal and availability constraints on appointment scheduling. The requirement mandates: (1) minimum 24-hour advance booking window, (2) slot must be within provider's available times, (3) successful creation triggers provider notification, (4) 422 error for unavailable or past slots. Test suite covers happy path (EP: valid future slot), negative paths (NEG: past slot, unavailable slot), and boundary cases (BVA: exactly 24h boundary, 23h59m boundary). Tests use deterministic fixtures and frozen time to ensure idempotency.",
+    "tests": [
+      {
+        "name": "test_schedule_appointment_valid_future_slot",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "patient is authenticated (token valid)",
+          "provider 'DR_001' has slot at 2025-02-15T14:00:00Z",
+          "current time is 2025-02-10T10:00:00Z"
+        ],
+        "actions": [
+          "POST /appointments with payload: {\"provider_id\": \"DR_001\", \"slot_time\": \"2025-02-15T14:00:00Z\", \"patient_id\": \"PAT_001\"}",
+          "inspect response status and body",
+          "verify provider notification queued"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "response contains appointment_id, status='confirmed'",
+          "appointment.slot_time == 2025-02-15T14:00:00Z",
+          "provider notification event emitted"
+        ],
+        "trace": [
+          "R-HLT-024: appointment created",
+          "R-HLT-024: provider notified",
+          "R-HLT-024: 24-hour advance requirement satisfied (120 hours advance)"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timedelta\nfrom freezegun import freeze_time\n\n@freeze_time('2025-02-10T10:00:00Z')\ndef test_schedule_appointment_valid_future_slot(auth_token, base_url):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'DR_001',\n        'slot_time': '2025-02-15T14:00:00Z',\n        'patient_id': 'PAT_001'\n    }\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert 'appointment_id' in body\n    assert body['status'] == 'confirmed'\n    assert body['slot_time'] == '2025-02-15T14:00:00Z'\n    assert body['provider_notified'] is True"
+      },
+      {
+        "name": "test_schedule_appointment_slot_in_past",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "patient is authenticated",
+          "current time is 2025-02-10T10:00:00Z",
+          "requested slot_time is 2025-02-09T14:00:00Z (past)"
+        ],
+        "actions": [
+          "POST /appointments with payload: {\"provider_id\": \"DR_001\", \"slot_time\": \"2025-02-09T14:00:00Z\", \"patient_id\": \"PAT_001\"}",
+          "inspect response status and error detail"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "error_code == 'SLOT_IN_PAST'",
+          "error message references past timestamp",
+          "no appointment created"
+        ],
+        "trace": [
+          "R-HLT-024: error pathway triggered",
+          "R-HLT-024: slot unavailable (in past) -> 422"
+        ],
+        "executable": "import pytest\nimport requests\nfrom freezegun import freeze_time\n\n@freeze_time('2025-02-10T10:00:00Z')\ndef test_schedule_appointment_slot_in_past(auth_token, base_url):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'DR_001',\n        'slot_time': '2025-02-09T14:00:00Z',\n        'patient_id': 'PAT_001'\n    }\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body['error_code'] == 'SLOT_IN_PAST'"
+      },
+      {
+        "name": "test_schedule_appointment_slot_unavailable",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "patient is authenticated",
+          "current time is 2025-02-10T10:00:00Z",
+          "slot 2025-02-15T14:00:00Z is already booked by another patient"
+        ],
+        "actions": [
+          "POST /appointments with payload: {\"provider_id\": \"DR_001\", \"slot_time\": \"2025-02-15T14:00:00Z\", \"patient_id\": \"PAT_001\"}",
+          "inspect response status and error"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "error_code == 'SLOT_UNAVAILABLE'",
+          "no duplicate appointment created"
+        ],
+        "trace": [
+          "R-HLT-024: error pathway triggered",
+          "R-HLT-024: slot unavailable (already booked) -> 422"
+        ],
+        "executable": "import pytest\nimport requests\nfrom freezegun import freeze_time\n\n@freeze_time('2025-02-10T10:00:00Z')\ndef test_schedule_appointment_slot_unavailable(auth_token, base_url, occupied_slot):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'DR_001',\n        'slot_time': occupied_slot,\n        'patient_id': 'PAT_001'\n    }\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body['error_code'] == 'SLOT_UNAVAILABLE'"
+      },
+      {
+        "name": "test_schedule_appointment_exactly_24_hours_advance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "patient is authenticated",
+          "current time is 2025-02-10T10:00:00Z",
+          "slot time is 2025-02-11T10:00:00Z (exactly 24 hours later)"
+        ],
+        "actions": [
+          "POST /appointments with payload: {\"provider_id\": \"DR_001\", \"slot_time\": \"2025-02-11T10:00:00Z\", \"patient_id\": \"PAT_001\"}",
+          "inspect response status"
+        ],
+        "expected": [
+          "HTTP 201 Created (boundary condition satisfied)",
+          "appointment_id present",
+          "status == 'confirmed'"
+        ],
+        "trace": [
+          "R-HLT-024: boundary value - minimum advance window (24h exactly)",
+          "R-HLT-024: at lower bound of valid advance window"
+        ],
+        "executable": "import pytest\nimport requests\nfrom freezegun import freeze_time\n\n@freeze_time('2025-02-10T10:00:00Z')\ndef test_schedule_appointment_exactly_24_hours_advance(auth_token, base_url):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'DR_001',\n        'slot_time': '2025-02-11T10:00:00Z',\n        'patient_id': 'PAT_001'\n    }\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body['status'] == 'confirmed'"
+      },
+      {
+        "name": "test_schedule_appointment_less_than_24_hours_advance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "patient is authenticated",
+          "current time is 2025-02-10T10:00:00Z",
+          "slot time is 2025-02-11T09:59:59Z (23h59m59s advance)"
+        ],
+        "actions": [
+          "POST /appointments with payload: {\"provider_id\": \"DR_001\", \"slot_time\": \"2025-02-11T09:59:59Z\", \"patient_id\": \"PAT_001\"}",
+          "inspect response status and error"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "error_code == 'INSUFFICIENT_ADVANCE_TIME'",
+          "appointment not created"
+        ],
+        "trace": [
+          "R-HLT-024: boundary value - just below minimum window",
+          "R-HLT-024: validation rejects < 24h advance -> 422"
+        ],
+        "executable": "import pytest\nimport requests\nfrom freezegun import freeze_time\n\n@freeze_time('2025-02-10T10:00:00Z')\ndef test_schedule_appointment_less_than_24_hours_advance(auth_token, base_url):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'DR_001',\n        'slot_time': '2025-02-11T09:59:59Z',\n        'patient_id': 'PAT_001'\n    }\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert 'ADVANCE_TIME' in body.get('error_code', '')"
+      }
+    ]
+  },
+  "req_id": "R-HLT-024",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1016,
+    "output_tokens": 2728,
+    "latency_ms": 14182,
+    "wall_ms": 14182,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-024\",\n  \"reasoning\": \"R-HLT-024 specifies temporal and availability constraints on appointment scheduling. The requirement mandates: (1) minimum 24-hour advance booking window, (2) slot must be within provider's available times, (3) successful creation triggers provider notification, (4) 422 error for unavailable or past slots. Test suite covers happy path (EP: valid future slot), negative paths (NEG: past slot, unavailable slot), and boundary cases (BVA: exactly 24h boundary, 23h59m boundary). Tests use deterministic fixtures and frozen time to ensure idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_schedule_appointment_valid_future_slot\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"patient is authenticated (token valid)\",\n        \"provider 'DR_001' has slot at 2025-02-15T14:00:00Z\",\n        \"current time is 2025-02-10T10:00:00Z\"\n      ],\n      \"actions\": [\n        \"POST /appointments with payload: {\\\"provider_id\\\": \\\"DR_001\\\", \\\"slot_time\\\": \\\"2025-02-15T14:00:00Z\\\", \\\"patient_id\\\": \\\"PAT_001\\\"}\",\n        \"inspect response status and body\",\n        \"verify provider notification queued\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"response contains appointment_id, status='confirmed'\",\n        \"appointment.slot_time == 2025-02-15T14:00:00Z\",\n        \"provider notification event emitted\"\n      ],\n      \"trace\": [\n        \"R-HLT-024: appointment created\",\n        \"R-HLT-024: provider notified\",\n        \"R-HLT-024: 24-hour advance requirement satisfied (120 hours advance)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import datetime, timedelta\\nfrom freezegun import freeze_time\\n\\n@freeze_time('2025-02-10T10:00:00Z')\\ndef test_schedule_appointment_valid_future_slot(auth_token, base_url):\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {\\n        'provider_id': 'DR_001',\\n        'slot_time': '2025-02-15T14:00:00Z',\\n        'patient_id': 'PAT_001'\\n    }\\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert 'appointment_id' in body\\n    assert body['status'] == 'confirmed'\\n    assert body['slot_time'] == '2025-02-15T14:00:00Z'\\n    assert body['provider_notified'] is True\"\n    },\n    {\n      \"name\": \"test_schedule_appointment_slot_in_past\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"patient is authenticated\",\n        \"current time is 2025-02-10T10:00:00Z\",\n        \"requested slot_time is 2025-02-09T14:00:00Z (past)\"\n      ],\n      \"actions\": [\n        \"POST /appointments with payload: {\\\"provider_id\\\": \\\"DR_001\\\", \\\"slot_time\\\": \\\"2025-02-09T14:00:00Z\\\", \\\"patient_id\\\": \\\"PAT_001\\\"}\",\n        \"inspect response status and error detail\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"error_code == 'SLOT_IN_PAST'\",\n        \"error message references past timestamp\",\n        \"no appointment created\"\n      ],\n      \"trace\": [\n        \"R-HLT-024: error pathway triggered\",\n        \"R-HLT-024: slot unavailable (in past) -> 422\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom freezegun import freeze_time\\n\\n@freeze_time('2025-02-10T10:00:00Z')\\ndef test_schedule_appointment_slot_in_past(auth_token, base_url):\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {\\n        'provider_id': 'DR_001',\\n        'slot_time': '2025-02-09T14:00:00Z',\\n        'patient_id': 'PAT_001'\\n    }\\n    resp = requests.post(f'{base_url}/appointments', json=payload, headers=headers)\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert body['error_code'] == 'SLOT_IN_PAST'\"\n    },\n    {\n      \"name\": \"test_schedule_appointment_slot_unavailable\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"patient is authenticated\",\n        \"current "
+  }
+}

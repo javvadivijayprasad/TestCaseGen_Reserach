@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-054",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Delete patient (soft) (negative)",
+    "statement": "A system-admin shall soft-delete a patient resource; deletion shall not remove history. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin deletes patient"
+    ],
+    "expected_outcomes": [
+      "resource marked deleted",
+      "retrievable via _history"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-054",
+    "reasoning": "R-HLT-054 mandates soft-delete of a Patient resource by an admin, with history preservation. The negative path requires 403 for non-admin callers. Tests are organized as: (1) Positive/EP \u2013 admin successfully soft-deletes an active patient and history is retained; (2) Negative/NEG \u2013 non-admin caller receives 403; (3) Boundary/STC \u2013 deleting an already-deleted patient tests the state-transition edge (double-delete); (4) Negative/DT \u2013 DELETE on a non-existent patient ID returns 404; (5) Boundary/BVA \u2013 patient ID at minimum valid length boundary is handled correctly by the delete endpoint. Each test is self-contained via fixtures that create and clean up resources.",
+    "tests": [
+      {
+        "name": "test_admin_soft_delete_active_patient_preserves_history",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role:admin",
+          "A Patient resource exists with status active",
+          "FHIR-lite server is reachable"
+        ],
+        "actions": [
+          "Create a Patient resource via POST /Patient with admin credentials",
+          "Record the patient ID and version",
+          "Issue DELETE /Patient/{id} with admin credentials",
+          "Issue GET /Patient/{id} to confirm soft-delete",
+          "Issue GET /Patient/{id}/_history to confirm history entry exists"
+        ],
+        "expected": [
+          "DELETE returns HTTP 200 or 204",
+          "GET /Patient/{id} returns HTTP 410 Gone or resource with meta.tag indicating deleted",
+          "GET /Patient/{id}/_history returns HTTP 200 with at least one entry"
+        ],
+        "trace": [
+          "R-HLT-054 \u2013 admin soft-delete happy path",
+          "R-HLT-054 \u2013 history must be retrievable after deletion"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"<base_url_fixture>\"\n\n\n@pytest.fixture\ndef admin_headers():\n    return <get_auth_headers>(role=\"admin\")\n\n\n@pytest.fixture\ndef active_patient(admin_headers):\n    payload = {\"resourceType\": \"Patient\", \"active\": True, \"name\": [{\"family\": \"TestEP\"}]}\n    r = requests.post(f\"{BASE_URL}/Patient\", json=payload, headers=admin_headers)\n    assert r.status_code in (200, 201)\n    pid = r.json()[\"id\"]\n    yield pid\n    # idempotent cleanup \u2013 ignore errors\n    requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n\n\ndef test_admin_soft_delete_active_patient_preserves_history(admin_headers, active_patient):\n    pid = active_patient\n    del_r = requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n    assert del_r.status_code in (200, 204)\n\n    get_r = requests.get(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n    assert get_r.status_code in (410, 200)\n    if get_r.status_code == 200:\n        tags = [t.get(\"code\") for t in get_r.json().get(\"meta\", {}).get(\"tag\", [])]\n        assert \"deleted\" in tags\n\n    hist_r = requests.get(f\"{BASE_URL}/Patient/{pid}/_history\", headers=admin_headers)\n    assert hist_r.status_code == 200\n    entries = hist_r.json().get(\"entry\", [])\n    assert len(entries) >= 1\n"
+      },
+      {
+        "name": "test_non_admin_delete_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:nurse (not admin)",
+          "A Patient resource exists",
+          "FHIR-lite server is reachable"
+        ],
+        "actions": [
+          "Create a Patient resource via POST /Patient with admin credentials",
+          "Obtain auth token for a non-admin user (role:nurse)",
+          "Issue DELETE /Patient/{id} with non-admin credentials"
+        ],
+        "expected": [
+          "DELETE returns HTTP 403 Forbidden",
+          "Response body contains OperationOutcome or error descriptor",
+          "Patient resource is NOT marked deleted"
+        ],
+        "trace": [
+          "R-HLT-054 \u2013 error pathway: 403 when not admin"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"<base_url_fixture>\"\n\n\n@pytest.fixture\ndef admin_headers():\n    return <get_auth_headers>(role=\"admin\")\n\n\n@pytest.fixture\ndef nurse_headers():\n    return <get_auth_headers>(role=\"nurse\")\n\n\n@pytest.fixture\ndef existing_patient(admin_headers):\n    payload = {\"resourceType\": \"Patient\", \"active\": True, \"name\": [{\"family\": \"TestNEG\"}]}\n    r = requests.post(f\"{BASE_URL}/Patient\", json=payload, headers=admin_headers)\n    assert r.status_code in (200, 201)\n    pid = r.json()[\"id\"]\n    yield pid\n    requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n\n\ndef test_non_admin_delete_patient_returns_403(nurse_headers, existing_patient, admin_headers):\n    pid = existing_patient\n    del_r = requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=nurse_headers)\n    assert del_r.status_code == 403\n\n    get_r = requests.get(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n    assert get_r.status_code == 200\n    tags = [t.get(\"code\") for t in get_r.json().get(\"meta\", {}).get(\"tag\", [])]\n    assert \"deleted\" not in tags\n"
+      },
+      {
+        "name": "test_double_delete_already_deleted_patient",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:admin",
+          "A Patient resource exists and has already been soft-deleted",
+          "FHIR-lite server is reachable"
+        ],
+        "actions": [
+          "Create a Patient resource via POST /Patient with admin credentials",
+          "Issue first DELETE /Patient/{id} with admin credentials (transition active\u2192deleted)",
+          "Issue second DELETE /Patient/{id} with admin credentials (transition deleted\u2192deleted)"
+        ],
+        "expected": [
+          "First DELETE returns HTTP 200 or 204",
+          "Second DELETE returns HTTP 200, 204, or 410 (idempotent or gone \u2013 not 500)",
+          "GET /Patient/{id}/_history still returns at least one history entry"
+        ],
+        "trace": [
+          "R-HLT-054 \u2013 conflicting state transition: delete of already-deleted resource",
+          "R-HLT-054 \u2013 history must survive repeated delete attempts"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"<base_url_fixture>\"\n\n\n@pytest.fixture\ndef admin_headers():\n    return <get_auth_headers>(role=\"admin\")\n\n\n@pytest.fixture\ndef deletable_patient(admin_headers):\n    payload = {\"resourceType\": \"Patient\", \"active\": True, \"name\": [{\"family\": \"TestSTC\"}]}\n    r = requests.post(f\"{BASE_URL}/Patient\", json=payload, headers=admin_headers)\n    assert r.status_code in (200, 201)\n    pid = r.json()[\"id\"]\n    yield pid\n    requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n\n\ndef test_double_delete_already_deleted_patient(admin_headers, deletable_patient):\n    pid = deletable_patient\n    first = requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n    assert first.status_code in (200, 204)\n\n    second = requests.delete(f\"{BASE_URL}/Patient/{pid}\", headers=admin_headers)\n    assert second.status_code in (200, 204, 410), (\n        f\"Unexpected status on double-delete: {second.status_code}\"\n    )\n    assert second.status_code != 500\n\n    hist_r = requests.get(f\"{BASE_URL}/Patient/{pid}/_history\", headers=admin_headers)\n    assert hist_r.status_code == 200\n    assert len(hist_r.json().get(\"entry\", [])) >= 1\n"
+      },
+      {
+        "name": "test_delete_nonexistent_patient_returns_404",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller has role:admin",
+          "The patient ID used does not exist in the system",
+          "FHIR-lite server is reachable"
+        ],
+        "actions": [
+          "Construct a UUID-style patient ID guaranteed not to exist",
+          "Issue DELETE /Patient/{nonexistent_id} with admin credentials"
+        ],
+        "expected": [
+          "DELETE returns HTTP 404 Not Found",
+          "Response body describes the missing resource (OperationOutcome or equivalent)"
+        ],
+        "trace": [
+          "R-HLT-054 \u2013 missing mandatory element: resource does not exist",
+          "R-HLT-054 \u2013 negative path for invalid resource identifier"
+        ],
+        "executable": "import uuid\nimport requests\nimport pytest\n\nBASE_URL = \"<base_url_fixture>\"\n\n\n@pytest.fixture\ndef admin_headers():\n    return <get_auth_headers>(role=\"admin\")\n\n\ndef test_delete_nonexistent_patient_returns_404(admin_headers):\n    nonexistent_id = f\"nonexistent-{uuid.uuid4().hex}\"\n    del_r = requests.delete(f\"{BASE_URL}/Patient/{nonexistent_id}\", headers=admin_headers)\n    assert del_r.status_code == 404\n    body = del_r.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\" or \"error\" in body or \"issue\" in body\n"
+      },
+      {
+        "name": "test_delete_patient_with_minimum_length_id",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:admin",
+          "A Patient resource exists whose ID is exactly 1 character long (minimum FHIR id length)",
+          "FHIR-lite server is reachable"
+        ],
+        "actions": [
+          "Attempt to create a Patient with id=\"a\" (single-char minimum boundary)",
+          "If creation succeeds, issue DELETE /Patient/a with admin credentials",
+          "If creation fails (server-assigned IDs only), issue DELETE /Patient/a to confirm 404 handling"
+        ],
+        "expected": [
+          "If patient with id='a' exists: DELETE returns 200 or 204 and history is accessible",
+          "If patient with id='a' does not exist: DELETE returns 404",
+          "Response is never a 5xx server error"
+        ],
+        "trace": [
+          "R-HLT-054 \u2013 boundary value: minimum FHIR logical ID length of 1 character",
+          "R-HLT-054 \u2013 server must handle extreme ID lengths without crashing"
+        ],
+        "executable": "import requests\nimport pytest\n\nBASE_URL = \"<base_url_fixture>\"\nMIN_ID = \"a\"\n\n\n@pytest.fixture\ndef admin_headers():\n    return <get_auth_headers>(role=\"admin\")\n\n\ndef test_delete_patient_with_minimum_length_id(admin_headers):\n    # Attempt to PUT/create with explicit minimal ID\n    payload = {\"resourceType\": \"Patient\", \"id\": MIN_ID, \"active\": True}\n    put_r = requests.put(f\"{BASE_URL}/Patient/{MIN_ID}\", json=payload, headers=admin_headers)\n\n    if put_r.status_code in (200, 201):\n        del_r = requests.delete(f\"{BASE_URL}/Patient/{MIN_ID}\", headers=admin_headers)\n        assert del_r.status_code in (200, 204)\n        hist_r = requests.get(f\"{BASE_URL}/Patient/{MIN_ID}/_history\", headers=admin_headers)\n        assert hist_r.status_code == 200\n        assert len(hist_r.json().get(\"entry\", [])) >= 1\n    else:\n        # Server does not allow explicit minimal IDs \u2013 confirm DELETE gives 404 not 5xx\n        del_r = requests.delete(f\"{BASE_URL}/Patient/{MIN_ID}\", headers=admin_headers)\n        assert del_r.status_code in (404, 410)\n        assert del_r.status_code < 500\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-054",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 3502,
+    "latency_ms": 43336,
+    "wall_ms": 43336,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-054\",\n  \"reasoning\": \"R-HLT-054 mandates soft-delete of a Patient resource by an admin, with history preservation. The negative path requires 403 for non-admin callers. Tests are organized as: (1) Positive/EP \u2013 admin successfully soft-deletes an active patient and history is retained; (2) Negative/NEG \u2013 non-admin caller receives 403; (3) Boundary/STC \u2013 deleting an already-deleted patient tests the state-transition edge (double-delete); (4) Negative/DT \u2013 DELETE on a non-existent patient ID returns 404; (5) Boundary/BVA \u2013 patient ID at minimum valid length boundary is handled correctly by the delete endpoint. Each test is self-contained via fixtures that create and clean up resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_soft_delete_active_patient_preserves_history\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role:admin\",\n        \"A Patient resource exists with status active\",\n        \"FHIR-lite server is reachable\"\n      ],\n      \"actions\": [\n        \"Create a Patient resource via POST /Patient with admin credentials\",\n        \"Record the patient ID and version\",\n        \"Issue DELETE /Patient/{id} with admin credentials\",\n        \"Issue GET /Patient/{id} to confirm soft-delete\",\n        \"Issue GET /Patient/{id}/_history to confirm history entry exists\"\n      ],\n      \"expected\": [\n        \"DELETE returns HTTP 200 or 204\",\n        \"GET /Patient/{id} returns HTTP 410 Gone or resource with meta.tag indicating deleted\",\n        \"GET /Patient/{id}/_history returns HTTP 200 with at least one entry\"\n      ],\n      \"trace\": [\n        \"R-HLT-054 \u2013 admin soft-delete happy path\",\n        \"R-HLT-054 \u2013 history must be retrievable after deletion\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"<base_url_fixture>\\\"\\n\\n\\n@pytest.fixture\\ndef admin_headers():\\n    return <get_auth_headers>(role=\\\"admin\\\")\\n\\n\\n@pytest.fixture\\ndef active_patient(admin_headers):\\n    payload = {\\\"resourceType\\\": \\\"Patient\\\", \\\"active\\\": True, \\\"name\\\": [{\\\"family\\\": \\\"TestEP\\\"}]}\\n    r = requests.post(f\\\"{BASE_URL}/Patient\\\", json=payload, headers=admin_headers)\\n    assert r.status_code in (200, 201)\\n    pid = r.json()[\\\"id\\\"]\\n    yield pid\\n    # idempotent cleanup \u2013 ignore errors\\n    requests.delete(f\\\"{BASE_URL}/Patient/{pid}\\\", headers=admin_headers)\\n\\n\\ndef test_admin_soft_delete_active_patient_preserves_history(admin_headers, active_patient):\\n    pid = active_patient\\n    del_r = requests.delete(f\\\"{BASE_URL}/Patient/{pid}\\\", headers=admin_headers)\\n    assert del_r.status_code in (200, 204)\\n\\n    get_r = requests.get(f\\\"{BASE_URL}/Patient/{pid}\\\", headers=admin_headers)\\n    assert get_r.status_code in (410, 200)\\n    if get_r.status_code == 200:\\n        tags = [t.get(\\\"code\\\") for t in get_r.json().get(\\\"meta\\\", {}).get(\\\"tag\\\", [])]\\n        assert \\\"deleted\\\" in tags\\n\\n    hist_r = requests.get(f\\\"{BASE_URL}/Patient/{pid}/_history\\\", headers=admin_headers)\\n    assert hist_r.status_code == 200\\n    entries = hist_r.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_delete_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:nurse (not admin)\",\n        \"A Patient resource exists\",\n        \"FHIR-lite server is reachable\"\n      ],\n      \"actions\": [\n        \"Create a Patient resource via POST /Patient with admin credentials\",\n        \"Obtain auth token for a non-admin user (role:nurse)\",\n        \"Issue DELETE /Patient/{id} with non-admin credentials\"\n      ],\n      \"expected\": [\n        \"DELETE returns HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome or error descriptor\",\n        \"Patient resource is NOT marked deleted\"\n      ],\n      \"trace\": [\n        \"R-HLT-054 \u2013 error pathway: 403 when not admin\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"<"
+  }
+}

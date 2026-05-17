@@ -1,0 +1,176 @@
+{
+  "req": {
+    "id": "R-FIN-091",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual (idempotency variant)",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-091",
+    "reasoning": "R-FIN-091 specifies three testable concerns: (1) normal month-end interest accrual produces a ledger credit, (2) duplicate submission with the same Idempotency-Key returns the original result without double-crediting, and (3) boundary conditions around the last business day (e.g., Friday vs Saturday month-end). We cover these with EP for the happy-path accrual, NEG for a missing/invalid Idempotency-Key, BVA for the last-business-day boundary, STC for the idempotency state transition (initial -> processed -> replay), and DT for the tier-rate decision table. Tests are self-contained via fixtures and helpers, deterministic through fixed seed data, and idempotent because each test uses unique account IDs and keys that are cleaned up in teardown.",
+    "tests": [
+      {
+        "name": "test_monthly_interest_credited_on_last_business_day",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Savings account exists with balance in a standard tier (e.g., $1,000-$9,999)",
+          "System date is set to the last business day of the month",
+          "No prior interest run exists for this account/period"
+        ],
+        "actions": [
+          "POST /cron/interest with valid Idempotency-Key and account reference",
+          "Retrieve account ledger entries via GET /accounts/{id}/ledger"
+        ],
+        "expected": [
+          "HTTP 200 from /cron/interest",
+          "Response body contains 'status': 'processed'",
+          "Ledger contains exactly one interest credit entry for the current period",
+          "Credit amount matches expected tier-rate calculation"
+        ],
+        "trace": [
+          "R-FIN-091: interest credited monthly on last business day",
+          "R-FIN-091: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom decimal import Decimal\n\ndef test_monthly_interest_credited_on_last_business_day(\n    api_client,           # <fixture>: authenticated HTTP session against banking-api\n    last_business_day,    # <fixture>: freezes system clock to last business day\n    savings_account,      # <fixture>: creates & tears down a $5000 savings account\n    tier_rate_for,        # <helper_fn>: returns expected rate Decimal for a balance\n):\n    idempotency_key = str(uuid.uuid4())\n    balance = Decimal(\"5000.00\")\n    expected_interest = (balance * tier_rate_for(balance) / 365).quantize(Decimal(\"0.01\"))\n\n    resp = api_client.post(\n        \"/cron/interest\",\n        json={\"account_id\": savings_account[\"id\"], \"period\": last_business_day},\n        headers={\"Idempotency-Key\": idempotency_key},\n    )\n    assert resp.status_code == 200\n    assert resp.json()[\"status\"] == \"processed\"\n\n    ledger = api_client.get(f\"/accounts/{savings_account['id']}/ledger\").json()\n    credits = [e for e in ledger[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"\n               and e[\"period\"] == last_business_day]\n    assert len(credits) == 1\n    assert Decimal(str(credits[0][\"amount\"])) == expected_interest\n"
+      },
+      {
+        "name": "test_idempotent_duplicate_submission_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Savings account exists with a known balance",
+          "First interest accrual POST has already succeeded for this account/period",
+          "Idempotency-Key from the first call is retained"
+        ],
+        "actions": [
+          "Re-POST /cron/interest with the same Idempotency-Key and same payload",
+          "Retrieve account ledger entries to verify no double credit"
+        ],
+        "expected": [
+          "HTTP 200 returned on duplicate call",
+          "Response body is identical to the original response",
+          "Ledger still contains exactly one interest credit entry (no duplicate)",
+          "Account balance unchanged relative to post-first-call state"
+        ],
+        "trace": [
+          "R-FIN-091: duplicate submission with same Idempotency-Key must return original result",
+          "R-FIN-091: idempotency variant"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_idempotent_duplicate_submission_returns_original_result(\n    api_client,\n    last_business_day,\n    savings_account,\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"account_id\": savings_account[\"id\"], \"period\": last_business_day}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    first = api_client.post(\"/cron/interest\", json=payload, headers=headers)\n    assert first.status_code == 200\n    first_body = first.json()\n\n    second = api_client.post(\"/cron/interest\", json=payload, headers=headers)\n    assert second.status_code == 200\n    assert second.json() == first_body, \"Duplicate must return identical original response\"\n\n    ledger = api_client.get(f\"/accounts/{savings_account['id']}/ledger\").json()\n    credits = [e for e in ledger[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"\n               and e[\"period\"] == last_business_day]\n    assert len(credits) == 1, \"Duplicate submission must not create a second ledger entry\"\n"
+      },
+      {
+        "name": "test_interest_accrual_rejected_when_idempotency_key_missing",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Savings account exists with a valid balance",
+          "No Idempotency-Key header is included in the request"
+        ],
+        "actions": [
+          "POST /cron/interest without the Idempotency-Key header"
+        ],
+        "expected": [
+          "HTTP 400 or 422 returned",
+          "Response body contains an error code referencing missing Idempotency-Key",
+          "No ledger entry created for the account"
+        ],
+        "trace": [
+          "R-FIN-091: idempotency variant \u2014 key is mandatory for safe retries",
+          "R-FIN-091: error pathway \u2014 reconciliation variance reported"
+        ],
+        "executable": "import pytest\n\ndef test_interest_accrual_rejected_when_idempotency_key_missing(\n    api_client,\n    last_business_day,\n    savings_account,\n):\n    payload = {\"account_id\": savings_account[\"id\"], \"period\": last_business_day}\n\n    resp = api_client.post(\"/cron/interest\", json=payload)  # no Idempotency-Key\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400/422 for missing key, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"idempotency\" in str(body).lower() or \"key\" in str(body).lower()\n\n    ledger = api_client.get(f\"/accounts/{savings_account['id']}/ledger\").json()\n    credits = [e for e in ledger[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"\n               and e[\"period\"] == last_business_day]\n    assert len(credits) == 0, \"No ledger entry must be created when key is absent\"\n"
+      },
+      {
+        "name": "test_interest_not_credited_on_non_last_business_day",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Savings account exists with a valid balance",
+          "System date is the second-to-last business day of the month (boundary - 1)"
+        ],
+        "actions": [
+          "POST /cron/interest with a valid Idempotency-Key and the penultimate business day as period",
+          "Retrieve ledger to confirm no credit was applied"
+        ],
+        "expected": [
+          "HTTP 422 or a response with status 'skipped' / 'not_last_business_day'",
+          "No interest credit ledger entry for the given period",
+          "Response body indicates the period is not eligible"
+        ],
+        "trace": [
+          "R-FIN-091: credit interest monthly on the LAST business day",
+          "BVA: period = last_biz_day - 1 is outside the valid trigger boundary"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_interest_not_credited_on_non_last_business_day(\n    api_client,\n    penultimate_business_day,  # <fixture>: returns last_business_day - 1 business day\n    savings_account,\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"account_id\": savings_account[\"id\"], \"period\": penultimate_business_day}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp = api_client.post(\"/cron/interest\", json=payload, headers=headers)\n    assert resp.status_code in (200, 422)\n\n    if resp.status_code == 200:\n        status = resp.json().get(\"status\", \"\")\n        assert status in (\"skipped\", \"not_last_business_day\"), (\n            f\"Non-last-business-day must be skipped, got status='{status}'\"\n        )\n\n    ledger = api_client.get(f\"/accounts/{savings_account['id']}/ledger\").json()\n    credits = [e for e in ledger[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"\n               and e[\"period\"] == penultimate_business_day]\n    assert len(credits) == 0, \"No credit must be applied before last business day\"\n"
+      },
+      {
+        "name": "test_tier_rate_applied_per_decision_table_across_balances",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Three savings accounts exist with balances in distinct tiers: $500 (low), $5000 (mid), $50000 (high)",
+          "System date is the last business day of the month"
+        ],
+        "actions": [
+          "POST /cron/interest for each account with a unique Idempotency-Key",
+          "Retrieve each ledger and compare credited interest to expected tier rate"
+        ],
+        "expected": [
+          "Each POST returns HTTP 200 with status 'processed'",
+          "Low-tier account credited at low-tier rate",
+          "Mid-tier account credited at mid-tier rate",
+          "High-tier account credited at high-tier rate"
+        ],
+        "trace": [
+          "R-FIN-091: accrue interest daily using the tier rate",
+          "DT: decision table rows map balance band -> applicable tier rate"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom decimal import Decimal\n\n@pytest.mark.parametrize(\"balance_str,tier_label\", [\n    (\"500.00\",   \"low\"),\n    (\"5000.00\",  \"mid\"),\n    (\"50000.00\", \"high\"),\n])\ndef test_tier_rate_applied_per_decision_table_across_balances(\n    balance_str, tier_label,\n    api_client,\n    last_business_day,\n    create_savings_account,  # <helper_fn>: creates account with given balance, returns dict\n    tier_rate_for,\n    days_in_period,          # <helper_fn>: returns days accrued for the period\n):\n    account = create_savings_account(balance=balance_str)\n    balance = Decimal(balance_str)\n    rate = tier_rate_for(balance)\n    expected = (balance * rate / Decimal(str(days_in_period(last_business_day)))).quantize(Decimal(\"0.01\"))\n\n    resp = api_client.post(\n        \"/cron/interest\",\n        json={\"account_id\": account[\"id\"], \"period\": last_business_day},\n        headers={\"Idempotency-Key\": str(uuid.uuid4())},\n    )\n    assert resp.status_code == 200\n    assert resp.json()[\"status\"] == \"processed\"\n\n    ledger = api_client.get(f\"/accounts/{account['id']}/ledger\").json()\n    credits = [e for e in ledger[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"]\n    assert len(credits) == 1\n    assert Decimal(str(credits[0][\"amount\"])) == expected, (\n        f\"{tier_label} tier: expected {expected}, got {credits[0]['amount']}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-091",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 3516,
+    "latency_ms": 39175,
+    "wall_ms": 39175,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-091\",\n  \"reasoning\": \"R-FIN-091 specifies three testable concerns: (1) normal month-end interest accrual produces a ledger credit, (2) duplicate submission with the same Idempotency-Key returns the original result without double-crediting, and (3) boundary conditions around the last business day (e.g., Friday vs Saturday month-end). We cover these with EP for the happy-path accrual, NEG for a missing/invalid Idempotency-Key, BVA for the last-business-day boundary, STC for the idempotency state transition (initial -> processed -> replay), and DT for the tier-rate decision table. Tests are self-contained via fixtures and helpers, deterministic through fixed seed data, and idempotent because each test uses unique account IDs and keys that are cleaned up in teardown.\",\n  \"tests\": [\n    {\n      \"name\": \"test_monthly_interest_credited_on_last_business_day\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Savings account exists with balance in a standard tier (e.g., $1,000-$9,999)\",\n        \"System date is set to the last business day of the month\",\n        \"No prior interest run exists for this account/period\"\n      ],\n      \"actions\": [\n        \"POST /cron/interest with valid Idempotency-Key and account reference\",\n        \"Retrieve account ledger entries via GET /accounts/{id}/ledger\"\n      ],\n      \"expected\": [\n        \"HTTP 200 from /cron/interest\",\n        \"Response body contains 'status': 'processed'\",\n        \"Ledger contains exactly one interest credit entry for the current period\",\n        \"Credit amount matches expected tier-rate calculation\"\n      ],\n      \"trace\": [\n        \"R-FIN-091: interest credited monthly on last business day\",\n        \"R-FIN-091: ledger entry per account\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom decimal import Decimal\\n\\ndef test_monthly_interest_credited_on_last_business_day(\\n    api_client,           # <fixture>: authenticated HTTP session against banking-api\\n    last_business_day,    # <fixture>: freezes system clock to last business day\\n    savings_account,      # <fixture>: creates & tears down a $5000 savings account\\n    tier_rate_for,        # <helper_fn>: returns expected rate Decimal for a balance\\n):\\n    idempotency_key = str(uuid.uuid4())\\n    balance = Decimal(\\\"5000.00\\\")\\n    expected_interest = (balance * tier_rate_for(balance) / 365).quantize(Decimal(\\\"0.01\\\"))\\n\\n    resp = api_client.post(\\n        \\\"/cron/interest\\\",\\n        json={\\\"account_id\\\": savings_account[\\\"id\\\"], \\\"period\\\": last_business_day},\\n        headers={\\\"Idempotency-Key\\\": idempotency_key},\\n    )\\n    assert resp.status_code == 200\\n    assert resp.json()[\\\"status\\\"] == \\\"processed\\\"\\n\\n    ledger = api_client.get(f\\\"/accounts/{savings_account['id']}/ledger\\\").json()\\n    credits = [e for e in ledger[\\\"entries\\\"] if e[\\\"type\\\"] == \\\"INTEREST_CREDIT\\\"\\n               and e[\\\"period\\\"] == last_business_day]\\n    assert len(credits) == 1\\n    assert Decimal(str(credits[0][\\\"amount\\\"])) == expected_interest\\n\"\n    },\n    {\n      \"name\": \"test_idempotent_duplicate_submission_returns_original_result\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Savings account exists with a known balance\",\n        \"First interest accrual POST has already succeeded for this account/period\",\n        \"Idempotency-Key from the first call is retained\"\n      ],\n      \"actions\": [\n        \"Re-POST /cron/interest with the same Idempotency-Key and same payload\",\n        \"Retrieve account ledger entries to verify no double credit\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned on duplicate call\",\n        \"Response body is identical to the original response\",\n        \"Ledger still contains exactly one interest credit entry (no duplicate)\",\n        \"Account balance unchanged relative to post-first-call state\"\n      ],\n      \"trace\": [\n        \"R-FIN-091: duplicate submission with same Idempote"
+  }
+}

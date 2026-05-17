@@ -1,0 +1,223 @@
+{
+  "req": {
+    "id": "R-HLT-069",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation (negative)",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-069",
+    "reasoning": "The requirement covers vital-signs Observation validation across four concern areas: (1) normal in-range values accepted, (2) out-of-range values flagged, (3) boundary values at clinical thresholds, (4) missing mandatory elements rejected, and (5) permission denial and conflicting state transitions. Tests are distributed across EP, BVA, STC, DT, and NEG heuristics. Heart-rate (8-300 bpm) is used as the representative vital sign because its range produces clear partition boundaries. Each test is self-contained via a clinician-auth fixture and cleans up any created resources at teardown.",
+    "tests": [
+      {
+        "name": "test_vital_signs_normal_heart_rate_stored_without_flag",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "FHIR-lite /Observation endpoint is reachable",
+          "Heart rate value 75 bpm is within clinically plausible range (8-300 bpm)"
+        ],
+        "actions": [
+          "POST /Observation with category vital-signs, code LOINC 8867-4, valueQuantity 75 bpm",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains id field",
+          "Response body status equals 'final'",
+          "No review Task is created for this Observation"
+        ],
+        "trace": [
+          "R-HLT-069: observation stored",
+          "R-HLT-069: flag raised only if out of range"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_normal_heart_rate_stored_without_flag(<clinician_auth_headers>, <base_url>, <cleanup_observation>):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 75, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{<base_url>}/Observation\", json=payload, headers=<clinician_auth_headers>)\n    assert resp.status_code == 201\n    body = resp.json()\n    obs_id = body.get(\"id\")\n    assert obs_id, \"Expected id in response\"\n    <cleanup_observation>(obs_id)\n    task_resp = requests.get(\n        f\"{<base_url>}/Task\",\n        params={\"focus\": f\"Observation/{obs_id}\", \"code\": \"review\"},\n        headers=<clinician_auth_headers>\n    )\n    tasks = task_resp.json().get(\"entry\", [])\n    assert len(tasks) == 0, \"No review task expected for in-range value\""
+      },
+      {
+        "name": "test_vital_signs_out_of_range_heart_rate_creates_review_task",
+        "kind": "negative",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "Heart rate value 400 bpm is outside clinically plausible range (> 300 bpm)"
+        ],
+        "actions": [
+          "POST /Observation with category vital-signs, code LOINC 8867-4, valueQuantity 400 bpm",
+          "Capture HTTP response status and created Observation id",
+          "Query /Task filtering on the created Observation"
+        ],
+        "expected": [
+          "HTTP 201 Created (observation is stored but flagged)",
+          "A review Task resource exists referencing the new Observation",
+          "Task status is 'requested'"
+        ],
+        "trace": [
+          "R-HLT-069: out-of-range shall be flagged for review",
+          "R-HLT-069: review task created"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_out_of_range_heart_rate_creates_review_task(<clinician_auth_headers>, <base_url>, <cleanup_observation>, <cleanup_task>):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"valueQuantity\": {\"value\": 400, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{<base_url>}/Observation\", json=payload, headers=<clinician_auth_headers>)\n    assert resp.status_code == 201\n    obs_id = resp.json()[\"id\"]\n    <cleanup_observation>(obs_id)\n    task_resp = requests.get(\n        f\"{<base_url>}/Task\",\n        params={\"focus\": f\"Observation/{obs_id}\", \"code\": \"review\"},\n        headers=<clinician_auth_headers>\n    )\n    assert task_resp.status_code == 200\n    entries = task_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"Expected a review Task for out-of-range value\"\n    task = entries[0][\"resource\"]\n    assert task[\"status\"] == \"requested\"\n    <cleanup_task>(task[\"id\"])"
+      },
+      {
+        "name": "test_vital_signs_boundary_heart_rate_upper_limit_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "Heart rate value 300 bpm is the upper inclusive boundary of clinical range"
+        ],
+        "actions": [
+          "POST /Observation with valueQuantity exactly 300 bpm",
+          "Verify storage without flag",
+          "POST /Observation with valueQuantity exactly 301 bpm",
+          "Verify flag is raised"
+        ],
+        "expected": [
+          "300 bpm: HTTP 201, no review Task created",
+          "301 bpm: HTTP 201, review Task created"
+        ],
+        "trace": [
+          "R-HLT-069: boundary between plausible and out-of-range"
+        ],
+        "executable": "import requests\n\ndef test_vital_signs_boundary_heart_rate_upper_limit(<clinician_auth_headers>, <base_url>, <cleanup_observation>, <cleanup_task>):\n    def post_hr(value):\n        return requests.post(\n            f\"{<base_url>}/Observation\",\n            json={\n                \"resourceType\": \"Observation\",\n                \"status\": \"preliminary\",\n                \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n                \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n                \"valueQuantity\": {\"value\": value, \"unit\": \"bpm\"}\n            },\n            headers=<clinician_auth_headers>\n        )\n    resp_ok = post_hr(300)\n    assert resp_ok.status_code == 201\n    obs_id_ok = resp_ok.json()[\"id\"]\n    <cleanup_observation>(obs_id_ok)\n    tasks_ok = requests.get(f\"{<base_url>}/Task\", params={\"focus\": f\"Observation/{obs_id_ok}\", \"code\": \"review\"}, headers=<clinician_auth_headers>)\n    assert len(tasks_ok.json().get(\"entry\", [])) == 0, \"300 bpm should not create a review task\"\n    resp_oor = post_hr(301)\n    assert resp_oor.status_code == 201\n    obs_id_oor = resp_oor.json()[\"id\"]\n    <cleanup_observation>(obs_id_oor)\n    tasks_oor = requests.get(f\"{<base_url>}/Task\", params={\"focus\": f\"Observation/{obs_id_oor}\", \"code\": \"review\"}, headers=<clinician_auth_headers>)\n    entries = tasks_oor.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"301 bpm should create a review task\"\n    <cleanup_task>(entries[0][\"resource\"][\"id\"])"
+      },
+      {
+        "name": "test_vital_signs_missing_mandatory_code_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "Observation payload deliberately omits the mandatory 'code' element"
+        ],
+        "actions": [
+          "POST /Observation with category vital-signs but no 'code' field",
+          "Capture HTTP response status and OperationOutcome"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "OperationOutcome.issue[].severity == 'error'",
+          "OperationOutcome.issue[].details references missing 'code' element"
+        ],
+        "trace": [
+          "R-HLT-069: missing mandatory elements must be tested"
+        ],
+        "executable": "import requests\n\ndef test_vital_signs_missing_mandatory_code_returns_422(<clinician_auth_headers>, <base_url>):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}]\n    }\n    resp = requests.post(f\"{<base_url>}/Observation\", json=payload, headers=<clinician_auth_headers>)\n    assert resp.status_code == 422, f\"Expected 422 but got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i[\"severity\"] == \"error\" for i in issues), \"Expected at least one error-severity issue\"\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") + i.get(\"details\", {}).get(\"text\", \"\") for i in issues)\n    assert \"code\" in diagnostics.lower(), \"Expected issue to reference missing 'code' element\""
+      },
+      {
+        "name": "test_vital_signs_permission_denied_for_unauthenticated_caller",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller presents no Authorization header (unauthenticated)",
+          "FHIR-lite enforces role-based access control"
+        ],
+        "actions": [
+          "POST /Observation with valid vital-signs payload but no auth token",
+          "Capture HTTP response status"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "No Observation is persisted"
+        ],
+        "trace": [
+          "R-HLT-069: permission denial must be tested",
+          "R-HLT-069: precondition role:clinician required"
+        ],
+        "executable": "import requests\n\ndef test_vital_signs_permission_denied_unauthenticated(<base_url>):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\"}\n    }\n    resp = requests.post(f\"{<base_url>}/Observation\", json=payload)\n    assert resp.status_code in (401, 403), f\"Expected 401/403 but got {resp.status_code}\""
+      },
+      {
+        "name": "test_vital_signs_conflicting_state_transition_final_to_preliminary_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "An Observation with status 'final' has been previously created"
+        ],
+        "actions": [
+          "POST /Observation with status 'final' to create a finalized record",
+          "Attempt PUT /Observation/{id} to change status back to 'preliminary'",
+          "Capture HTTP response status"
+        ],
+        "expected": [
+          "Initial POST: HTTP 201 Created",
+          "PUT reverting to 'preliminary': HTTP 409 Conflict or 422 Unprocessable Entity",
+          "State remains 'final'"
+        ],
+        "trace": [
+          "R-HLT-069: conflicting state transitions must be tested"
+        ],
+        "executable": "import requests\n\ndef test_vital_signs_conflicting_state_final_to_preliminary(<clinician_auth_headers>, <base_url>, <cleanup_observation>):\n    create_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"valueQuantity\": {\"value\": 80, \"unit\": \"bpm\"}\n    }\n    create_resp = requests.post(f\"{<base_url>}/Observation\", json=create_payload, headers=<clinician_auth_headers>)\n    assert create_resp.status_code == 201\n    obs_id = create_resp.json()[\"id\"]\n    <cleanup_observation>(obs_id)\n    revert_payload = {**create_payload, \"id\": obs_id, \"status\": \"preliminary\"}\n    put_resp = requests.put(f\"{<base_url>}/Observation/{obs_id}\", json=revert_payload, headers=<clinician_auth_headers>)\n    assert put_resp.status_code in (409, 422), f\"Expected 409 or 422 for illegal state transition, got {put_resp.status_code}\"\n    get_resp = requests.get(f\"{<base_url>}/Observation/{obs_id}\", headers=<clinician_auth_headers>)\n    assert get_resp.json()[\"status\"] == \"final\", \"Status must remain 'final' after rejected transition\""
+      },
+      {
+        "name": "test_vital_signs_decision_table_all_mandatory_fields_present_vs_absent",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "Three decision conditions: has category, has code, has valueQuantity"
+        ],
+        "actions": [
+          "POST payload missing only category: expect 422",
+          "POST payload missing only valueQuantity: expect 422 or 200 with dataAbsentReason",
+          "POST payload with all three present: expect 201"
+        ],
+        "expected": [
+          "Missing category: HTTP 422",
+          "Missing valueQuantity without dataAbsentReason: HTTP 422",
+          "All fields present: HTTP 201"
+        ],
+        "trace": [
+          "R-HLT-069: missing mandatory elements must be tested",
+          "R-HLT-069: observation stored when valid"
+        ],
+        "executable": "import requests\n\ndef test_vital_signs_decision_table_mandatory_fields(<clinician_auth_headers>, <base_url>, <cleanup_observation>):\n    base = {\"resourceType\": \"Observation\", \"status\": \"preliminary\",\n            \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n            \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n            \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\"}}\n    no_category = {k: v for k, v in base.items() if k != \"category\"}\n    r1 = requests.post(f\"{<base_url>}/Observation\", json=no_category, headers=<clinician_auth_headers>)\n    assert r1.status_code == 422, f\"Missing category: expected 422, got {r1.status_code}\"\n    no_value = {k: v for k, v in base.items() if k != \"valueQuantity\"}\n    r2 = requests.post(f\"{<base_url>}/Observation\", json=no_value, headers=<clinician_auth_headers>)\n    assert r2.status_code in (201, 422), f\"Missing value: expected 201 or 422, got {r2.status_code}\"\n    if r2.status_code == 201:\n        obs_id2 = r2.json().get(\"id\")\n        <cleanup_observation>(obs_id2)\n    r3 = requests.post(f\"{<base_url>}/Observation\", json=base, headers=<clinician_auth_headers>)\n    assert r3.status_code == 201, f\"All fields present: expected 201, got {r3.status_code}\"\n    <cleanup_observation>(r3.json()[\"id\"])"
+      }
+    ]
+  },
+  "req_id": "R-HLT-069",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[1] negative kind but heuristic=EP",
+    "[logical] test[5] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 4920,
+    "latency_ms": 46475,
+    "wall_ms": 46475,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-069\",\n  \"reasoning\": \"The requirement covers vital-signs Observation validation across four concern areas: (1) normal in-range values accepted, (2) out-of-range values flagged, (3) boundary values at clinical thresholds, (4) missing mandatory elements rejected, and (5) permission denial and conflicting state transitions. Tests are distributed across EP, BVA, STC, DT, and NEG heuristics. Heart-rate (8-300 bpm) is used as the representative vital sign because its range produces clear partition boundaries. Each test is self-contained via a clinician-auth fixture and cleans up any created resources at teardown.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vital_signs_normal_heart_rate_stored_without_flag\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as role:clinician\",\n        \"FHIR-lite /Observation endpoint is reachable\",\n        \"Heart rate value 75 bpm is within clinically plausible range (8-300 bpm)\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category vital-signs, code LOINC 8867-4, valueQuantity 75 bpm\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains id field\",\n        \"Response body status equals 'final'\",\n        \"No review Task is created for this Observation\"\n      ],\n      \"trace\": [\n        \"R-HLT-069: observation stored\",\n        \"R-HLT-069: flag raised only if out of range\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vital_signs_normal_heart_rate_stored_without_flag(<clinician_auth_headers>, <base_url>, <cleanup_observation>):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"preliminary\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 75, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{<base_url>}/Observation\\\", json=payload, headers=<clinician_auth_headers>)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    obs_id = body.get(\\\"id\\\")\\n    assert obs_id, \\\"Expected id in response\\\"\\n    <cleanup_observation>(obs_id)\\n    task_resp = requests.get(\\n        f\\\"{<base_url>}/Task\\\",\\n        params={\\\"focus\\\": f\\\"Observation/{obs_id}\\\", \\\"code\\\": \\\"review\\\"},\\n        headers=<clinician_auth_headers>\\n    )\\n    tasks = task_resp.json().get(\\\"entry\\\", [])\\n    assert len(tasks) == 0, \\\"No review task expected for in-range value\\\"\"\n    },\n    {\n      \"name\": \"test_vital_signs_out_of_range_heart_rate_creates_review_task\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as role:clinician\",\n        \"Heart rate value 400 bpm is outside clinically plausible range (> 300 bpm)\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category vital-signs, code LOINC 8867-4, valueQuantity 400 bpm\",\n        \"Capture HTTP response status and created Observation id\",\n        \"Query /Task filtering on the created Observation\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (observation is stored but flagged)\",\n        \"A review Task resource exists referencing the new Observation\",\n        \"Task status is 'requested'\"\n      ],\n      \"trace\": [\n        \"R-HLT-069: out-of-range shall be flagged for review\",\n        \"R-HLT-069: review task created\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vital_signs_out_of_range_heart_rate_creates_review_task(<clinician_auth_headers>, <base_url>, <cleanup_observation>, <cleanup_task>):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"preliminary\\\",\\n        \\\"cat"
+  }
+}

@@ -1,0 +1,176 @@
+{
+  "req": {
+    "id": "R-FIN-088",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Fraud alert response (idempotency variant)",
+    "statement": "A customer shall confirm or deny a suspected-fraud alert within 24 hours; unacknowledged alerts shall auto-freeze the account. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "alert active"
+    ],
+    "triggers": [
+      "customer responds"
+    ],
+    "expected_outcomes": [
+      "alert closed",
+      "card reissued if fraud"
+    ],
+    "error_pathways": [
+      "410 when alert expired"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/alerts/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-088",
+    "reasoning": "R-FIN-088 covers four distinct behaviours: (1) confirming fraud closes the alert and triggers card reissuance, (2) denying fraud closes the alert without reissuance, (3) duplicate submissions with the same Idempotency-Key return the original response (idempotency), (4) responding to an expired/auto-frozen alert returns HTTP 410. I selected five tests to achieve full coverage of the happy-path EP partitions (confirm vs deny), the idempotency invariant (STC \u2013 same state must be re-entered safely), the 24-hour expiry boundary (BVA), and the expired-alert error pathway (NEG). Each test is self-contained via fixtures that create and tear down alert resources, uses a deterministic idempotency key derived from the test name, and makes no assumptions about pre-existing server state.",
+    "tests": [
+      {
+        "name": "test_confirm_fraud_closes_alert_and_reissues_card",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A fraud alert exists in state=active for a known customer account",
+          "The customer holds a valid auth token",
+          "No prior response has been submitted for this alert"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} and a unique Idempotency-Key header",
+          "Inspect the HTTP response status and body",
+          "GET /alerts/{id} to verify final alert state",
+          "GET /cards?account={account_id} to verify a new card was issued"
+        ],
+        "expected": [
+          "HTTP 200 with body containing status=closed and fraud_confirmed=true",
+          "Subsequent GET /alerts/{id} returns status=closed",
+          "A new card record exists with issued_reason=fraud_replacement"
+        ],
+        "trace": [
+          "R-FIN-088: customer confirms suspected fraud -> alert closed, card reissued"
+        ],
+        "executable": "def test_confirm_fraud_closes_alert_and_reissues_card(active_alert, auth_headers, api_client):\n    alert_id = active_alert[\"id\"]\n    account_id = active_alert[\"account_id\"]\n    idem_key = <generate_idempotency_key>(\"confirm_fraud\", alert_id)\n\n    resp = api_client.patch(\n        f\"/alerts/{alert_id}\",\n        json={\"response\": \"confirm\"},\n        headers={**auth_headers, \"Idempotency-Key\": idem_key},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"closed\"\n    assert body[\"fraud_confirmed\"] is True\n\n    alert_resp = api_client.get(f\"/alerts/{alert_id}\", headers=auth_headers)\n    assert alert_resp.json()[\"status\"] == \"closed\"\n\n    cards_resp = api_client.get(\n        f\"/cards\", params={\"account_id\": account_id}, headers=auth_headers\n    )\n    new_cards = [\n        c for c in cards_resp.json()[\"cards\"]\n        if c.get(\"issued_reason\") == \"fraud_replacement\"\n    ]\n    assert len(new_cards) >= 1\n"
+      },
+      {
+        "name": "test_deny_fraud_closes_alert_without_card_reissuance",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "A fraud alert exists in state=active for a known customer account",
+          "The customer holds a valid auth token",
+          "No prior response has been submitted for this alert"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"deny\"} and a unique Idempotency-Key header",
+          "Inspect the HTTP response status and body",
+          "GET /cards?account={account_id} to confirm no new card was issued"
+        ],
+        "expected": [
+          "HTTP 200 with body containing status=closed and fraud_confirmed=false",
+          "No new card with issued_reason=fraud_replacement exists on the account"
+        ],
+        "trace": [
+          "R-FIN-088: customer denies suspected fraud -> alert closed, card NOT reissued"
+        ],
+        "executable": "def test_deny_fraud_closes_alert_without_card_reissuance(active_alert, auth_headers, api_client):\n    alert_id = active_alert[\"id\"]\n    account_id = active_alert[\"account_id\"]\n    idem_key = <generate_idempotency_key>(\"deny_fraud\", alert_id)\n\n    cards_before = api_client.get(\n        \"/cards\", params={\"account_id\": account_id}, headers=auth_headers\n    ).json()[\"cards\"]\n    card_ids_before = {c[\"id\"] for c in cards_before}\n\n    resp = api_client.patch(\n        f\"/alerts/{alert_id}\",\n        json={\"response\": \"deny\"},\n        headers={**auth_headers, \"Idempotency-Key\": idem_key},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"closed\"\n    assert body[\"fraud_confirmed\"] is False\n\n    cards_after = api_client.get(\n        \"/cards\", params={\"account_id\": account_id}, headers=auth_headers\n    ).json()[\"cards\"]\n    new_fraud_cards = [\n        c for c in cards_after\n        if c[\"id\"] not in card_ids_before\n        and c.get(\"issued_reason\") == \"fraud_replacement\"\n    ]\n    assert len(new_fraud_cards) == 0\n"
+      },
+      {
+        "name": "test_duplicate_submission_same_idempotency_key_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A fraud alert exists in state=active for a known customer account",
+          "The customer holds a valid auth token",
+          "A first PATCH confirm response has already been recorded for a specific Idempotency-Key"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} using Idempotency-Key K (first call)",
+          "Record response body and ETag/request-id from first call",
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} using the same Idempotency-Key K (second call)",
+          "Compare second response body and status code with first"
+        ],
+        "expected": [
+          "Both calls return HTTP 200",
+          "Response bodies are byte-for-byte identical (or semantically equivalent)",
+          "No duplicate card reissuance occurs (card count unchanged between call 1 and call 2)"
+        ],
+        "trace": [
+          "R-FIN-088: idempotency invariant - duplicate Idempotency-Key must return original result"
+        ],
+        "executable": "def test_duplicate_submission_same_idempotency_key_returns_original_result(active_alert, auth_headers, api_client):\n    alert_id = active_alert[\"id\"]\n    account_id = active_alert[\"account_id\"]\n    idem_key = <generate_idempotency_key>(\"idem_confirm\", alert_id)\n    payload = {\"response\": \"confirm\"}\n    headers = {**auth_headers, \"Idempotency-Key\": idem_key}\n\n    first = api_client.patch(f\"/alerts/{alert_id}\", json=payload, headers=headers)\n    assert first.status_code == 200\n    first_body = first.json()\n\n    cards_after_first = api_client.get(\n        \"/cards\", params={\"account_id\": account_id}, headers=auth_headers\n    ).json()[\"cards\"]\n\n    second = api_client.patch(f\"/alerts/{alert_id}\", json=payload, headers=headers)\n    assert second.status_code == 200\n    second_body = second.json()\n\n    assert first_body[\"status\"] == second_body[\"status\"]\n    assert first_body[\"fraud_confirmed\"] == second_body[\"fraud_confirmed\"]\n\n    cards_after_second = api_client.get(\n        \"/cards\", params={\"account_id\": account_id}, headers=auth_headers\n    ).json()[\"cards\"]\n    replacement_after_first = sum(1 for c in cards_after_first if c.get(\"issued_reason\") == \"fraud_replacement\")\n    replacement_after_second = sum(1 for c in cards_after_second if c.get(\"issued_reason\") == \"fraud_replacement\")\n    assert replacement_after_first == replacement_after_second\n"
+      },
+      {
+        "name": "test_response_at_exactly_24h_boundary_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A fraud alert exists whose created_at timestamp is exactly 24 hours ago (within the SLA window, at the boundary)",
+          "The system clock used by the API is controlled or mocked via <freeze_time_fixture>",
+          "The customer holds a valid auth token"
+        ],
+        "actions": [
+          "Set system time to exactly created_at + 23h59m59s (last valid second)",
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} and a unique Idempotency-Key",
+          "Assert the response is accepted (HTTP 200)"
+        ],
+        "expected": [
+          "HTTP 200 returned at T = created_at + 23h59m59s",
+          "Alert status transitions to closed"
+        ],
+        "trace": [
+          "R-FIN-088: unacknowledged alerts auto-freeze after 24 hours; boundary is last valid moment"
+        ],
+        "executable": "def test_response_at_exactly_24h_boundary_is_accepted(boundary_alert_23h59m59s, auth_headers, api_client):\n    alert_id = boundary_alert_23h59m59s[\"id\"]\n    idem_key = <generate_idempotency_key>(\"bva_boundary\", alert_id)\n\n    with <freeze_time_fixture>(boundary_alert_23h59m59s[\"expires_at_minus_1s\"]):\n        resp = api_client.patch(\n            f\"/alerts/{alert_id}\",\n            json={\"response\": \"confirm\"},\n            headers={**auth_headers, \"Idempotency-Key\": idem_key},\n        )\n\n    assert resp.status_code == 200\n    assert resp.json()[\"status\"] == \"closed\"\n"
+      },
+      {
+        "name": "test_response_to_expired_alert_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A fraud alert that was created more than 24 hours ago exists and has been auto-frozen (state=expired)",
+          "The account associated with the alert has been auto-frozen",
+          "The customer holds a valid auth token"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} against an expired alert id",
+          "Inspect the HTTP status code and error body"
+        ],
+        "expected": [
+          "HTTP 410 Gone is returned",
+          "Response body contains error code ALERT_EXPIRED or equivalent machine-readable code",
+          "Account remains in frozen state (no state change induced by the late response)"
+        ],
+        "trace": [
+          "R-FIN-088: error pathway - 410 when alert expired"
+        ],
+        "executable": "def test_response_to_expired_alert_returns_410(expired_alert, auth_headers, api_client):\n    alert_id = expired_alert[\"id\"]\n    account_id = expired_alert[\"account_id\"]\n    idem_key = <generate_idempotency_key>(\"neg_expired\", alert_id)\n\n    resp = api_client.patch(\n        f\"/alerts/{alert_id}\",\n        json={\"response\": \"confirm\"},\n        headers={**auth_headers, \"Idempotency-Key\": idem_key},\n    )\n    assert resp.status_code == 410\n    error_body = resp.json()\n    assert error_body.get(\"error_code\") == \"ALERT_EXPIRED\"\n\n    account_resp = api_client.get(f\"/accounts/{account_id}\", headers=auth_headers)\n    assert account_resp.json()[\"status\"] == \"frozen\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-088",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1018,
+    "output_tokens": 3369,
+    "latency_ms": 42633,
+    "wall_ms": 42633,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-088\",\n  \"reasoning\": \"R-FIN-088 covers four distinct behaviours: (1) confirming fraud closes the alert and triggers card reissuance, (2) denying fraud closes the alert without reissuance, (3) duplicate submissions with the same Idempotency-Key return the original response (idempotency), (4) responding to an expired/auto-frozen alert returns HTTP 410. I selected five tests to achieve full coverage of the happy-path EP partitions (confirm vs deny), the idempotency invariant (STC \u2013 same state must be re-entered safely), the 24-hour expiry boundary (BVA), and the expired-alert error pathway (NEG). Each test is self-contained via fixtures that create and tear down alert resources, uses a deterministic idempotency key derived from the test name, and makes no assumptions about pre-existing server state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_confirm_fraud_closes_alert_and_reissues_card\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A fraud alert exists in state=active for a known customer account\",\n        \"The customer holds a valid auth token\",\n        \"No prior response has been submitted for this alert\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"confirm\\\"} and a unique Idempotency-Key header\",\n        \"Inspect the HTTP response status and body\",\n        \"GET /alerts/{id} to verify final alert state\",\n        \"GET /cards?account={account_id} to verify a new card was issued\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body containing status=closed and fraud_confirmed=true\",\n        \"Subsequent GET /alerts/{id} returns status=closed\",\n        \"A new card record exists with issued_reason=fraud_replacement\"\n      ],\n      \"trace\": [\n        \"R-FIN-088: customer confirms suspected fraud -> alert closed, card reissued\"\n      ],\n      \"executable\": \"def test_confirm_fraud_closes_alert_and_reissues_card(active_alert, auth_headers, api_client):\\n    alert_id = active_alert[\\\"id\\\"]\\n    account_id = active_alert[\\\"account_id\\\"]\\n    idem_key = <generate_idempotency_key>(\\\"confirm_fraud\\\", alert_id)\\n\\n    resp = api_client.patch(\\n        f\\\"/alerts/{alert_id}\\\",\\n        json={\\\"response\\\": \\\"confirm\\\"},\\n        headers={**auth_headers, \\\"Idempotency-Key\\\": idem_key},\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"closed\\\"\\n    assert body[\\\"fraud_confirmed\\\"] is True\\n\\n    alert_resp = api_client.get(f\\\"/alerts/{alert_id}\\\", headers=auth_headers)\\n    assert alert_resp.json()[\\\"status\\\"] == \\\"closed\\\"\\n\\n    cards_resp = api_client.get(\\n        f\\\"/cards\\\", params={\\\"account_id\\\": account_id}, headers=auth_headers\\n    )\\n    new_cards = [\\n        c for c in cards_resp.json()[\\\"cards\\\"]\\n        if c.get(\\\"issued_reason\\\") == \\\"fraud_replacement\\\"\\n    ]\\n    assert len(new_cards) >= 1\\n\"\n    },\n    {\n      \"name\": \"test_deny_fraud_closes_alert_without_card_reissuance\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"A fraud alert exists in state=active for a known customer account\",\n        \"The customer holds a valid auth token\",\n        \"No prior response has been submitted for this alert\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"deny\\\"} and a unique Idempotency-Key header\",\n        \"Inspect the HTTP response status and body\",\n        \"GET /cards?account={account_id} to confirm no new card was issued\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body containing status=closed and fraud_confirmed=false\",\n        \"No new card with issued_reason=fraud_replacement exists on the account\"\n      ],\n      \"trace\": [\n        \"R-FIN-088: customer denies suspected fraud -> alert closed, card NOT reissued\"\n      ],\n      \"executable\": \"def test_deny_fraud_closes_alert_without_card_reissuance(active_alert, auth_headers, api_client):\\n    alert_id = active_alert[\\\"id\\\"]\\n    account_i"
+  }
+}

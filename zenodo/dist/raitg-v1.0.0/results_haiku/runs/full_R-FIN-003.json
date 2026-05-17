@@ -1,0 +1,158 @@
+{
+  "req": {
+    "id": "R-FIN-003",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Transfer funds between own accounts",
+    "statement": "A customer shall transfer up to $25,000 per day between their own accounts; transfers above this shall be declined.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "source.owner == target.owner"
+    ],
+    "triggers": [
+      "customer submits transfer"
+    ],
+    "expected_outcomes": [
+      "funds moved atomically"
+    ],
+    "error_pathways": [
+      "422 when daily limit exceeded",
+      "409 on insufficient funds"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/internal"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-003",
+    "reasoning": "R-FIN-003 specifies that customers may transfer up to $25,000 per day between own accounts; transfers exceeding this limit must be declined with 422. The test suite covers: (1) a positive case within the daily limit to verify successful atomic transfer; (2) a negative case exceeding the daily limit to verify rejection; (3) a boundary case at exactly $25,000 to verify the inclusive upper bound; and (4) an additional negative case for insufficient funds (409). These tests apply Equivalence Partitioning (valid vs. invalid amounts), Boundary Value Analysis (at and above the $25,000 threshold), and Negative Path analysis (error conditions). All tests are deterministic, idempotent, and self-contained using parameterized fixtures.",
+    "tests": [
+      {
+        "name": "test_transfer_within_daily_limit_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account A exists with balance >= $10,000",
+          "Customer account B exists, owned by same customer",
+          "No transfers have been made today for this customer"
+        ],
+        "actions": [
+          "POST /transfers/internal with source=A, target=B, amount=$10,000"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Transfer record created with status=completed",
+          "Source account A balance decreased by $10,000",
+          "Target account B balance increased by $10,000",
+          "Transaction is atomic (both debit and credit present)"
+        ],
+        "trace": [
+          "R-FIN-003: Transfer amount $10,000 is within $25,000 daily limit",
+          "Precondition: source.owner == target.owner verified",
+          "Expected outcome: funds moved atomically"
+        ],
+        "executable": "import requests\nimport pytest\n\ndef test_transfer_within_daily_limit_succeeds(api_base, customer_token, acct_a_id, acct_b_id):\n    payload = {\n        \"source_account_id\": acct_a_id,\n        \"target_account_id\": acct_b_id,\n        \"amount\": 10000,\n        \"currency\": \"USD\"\n    }\n    headers = {\"Authorization\": f\"Bearer {customer_token}\"}\n    resp = requests.post(f\"{api_base}/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code in [200, 201], f\"Expected 200/201, got {resp.status_code}: {resp.text}\"\n    data = resp.json()\n    assert data.get(\"status\") == \"completed\"\n    assert data.get(\"amount\") == 10000\n    resp_a = requests.get(f\"{api_base}/accounts/{acct_a_id}\", headers=headers)\n    resp_b = requests.get(f\"{api_base}/accounts/{acct_b_id}\", headers=headers)\n    assert resp_a.json().get(\"balance\") == 90000\n    assert resp_b.json().get(\"balance\") == 10000"
+      },
+      {
+        "name": "test_transfer_exceeding_daily_limit_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account A exists with balance >= $30,000",
+          "Customer account B exists, owned by same customer",
+          "No transfers have been made today for this customer"
+        ],
+        "actions": [
+          "POST /transfers/internal with source=A, target=B, amount=$26,000"
+        ],
+        "expected": [
+          "HTTP 422 response (Unprocessable Entity)",
+          "Error code indicates daily_limit_exceeded or similar",
+          "Source and target account balances unchanged",
+          "No transfer record created"
+        ],
+        "trace": [
+          "R-FIN-003: Transfer amount $26,000 exceeds $25,000 daily limit",
+          "Error pathway: 422 when daily limit exceeded",
+          "Accounts remain locked to prevent partial execution"
+        ],
+        "executable": "import requests\nimport pytest\n\ndef test_transfer_exceeding_daily_limit_rejected(api_base, customer_token, acct_a_id, acct_b_id):\n    payload = {\n        \"source_account_id\": acct_a_id,\n        \"target_account_id\": acct_b_id,\n        \"amount\": 26000,\n        \"currency\": \"USD\"\n    }\n    headers = {\"Authorization\": f\"Bearer {customer_token}\"}\n    resp = requests.post(f\"{api_base}/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}\"\n    error_data = resp.json()\n    assert \"daily_limit\" in error_data.get(\"error_code\", \"\").lower()\n    resp_a = requests.get(f\"{api_base}/accounts/{acct_a_id}\", headers=headers)\n    resp_b = requests.get(f\"{api_base}/accounts/{acct_b_id}\", headers=headers)\n    assert resp_a.json().get(\"balance\") == 100000\n    assert resp_b.json().get(\"balance\") == 0"
+      },
+      {
+        "name": "test_transfer_at_daily_limit_boundary_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account A exists with balance >= $25,000",
+          "Customer account B exists, owned by same customer",
+          "No transfers have been made today for this customer"
+        ],
+        "actions": [
+          "POST /transfers/internal with source=A, target=B, amount=$25,000 (exactly at limit)"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Transfer record created with status=completed",
+          "Source account A balance decreased by exactly $25,000",
+          "Target account B balance increased by exactly $25,000"
+        ],
+        "trace": [
+          "R-FIN-003: Boundary Value Analysis at upper inclusive bound ($25,000)",
+          "Requirement states 'up to $25,000' meaning $25,000 is included",
+          "Expected outcome: transfer accepted and atomic"
+        ],
+        "executable": "import requests\nimport pytest\n\ndef test_transfer_at_daily_limit_boundary_succeeds(api_base, customer_token, acct_a_id, acct_b_id):\n    payload = {\n        \"source_account_id\": acct_a_id,\n        \"target_account_id\": acct_b_id,\n        \"amount\": 25000,\n        \"currency\": \"USD\"\n    }\n    headers = {\"Authorization\": f\"Bearer {customer_token}\"}\n    resp = requests.post(f\"{api_base}/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code in [200, 201], f\"Expected 200/201, got {resp.status_code}: {resp.text}\"\n    data = resp.json()\n    assert data.get(\"status\") == \"completed\"\n    assert data.get(\"amount\") == 25000\n    resp_a = requests.get(f\"{api_base}/accounts/{acct_a_id}\", headers=headers)\n    resp_b = requests.get(f\"{api_base}/accounts/{acct_b_id}\", headers=headers)\n    assert resp_a.json().get(\"balance\") == 75000\n    assert resp_b.json().get(\"balance\") == 25000"
+      },
+      {
+        "name": "test_transfer_insufficient_funds_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account A exists with balance = $5,000",
+          "Customer account B exists, owned by same customer",
+          "Transfer amount requested = $10,000 (exceeds available balance)"
+        ],
+        "actions": [
+          "POST /transfers/internal with source=A, target=B, amount=$10,000"
+        ],
+        "expected": [
+          "HTTP 409 response (Conflict)",
+          "Error code indicates insufficient_funds",
+          "Source and target account balances unchanged",
+          "No transfer record created"
+        ],
+        "trace": [
+          "R-FIN-003: Error pathway 409 on insufficient funds",
+          "Precondition check: source balance < requested amount",
+          "Transfer rejected before execution to maintain data integrity"
+        ],
+        "executable": "import requests\nimport pytest\n\ndef test_transfer_insufficient_funds_rejected(api_base, customer_token, acct_low_balance_id, acct_b_id):\n    payload = {\n        \"source_account_id\": acct_low_balance_id,\n        \"target_account_id\": acct_b_id,\n        \"amount\": 10000,\n        \"currency\": \"USD\"\n    }\n    headers = {\"Authorization\": f\"Bearer {customer_token}\"}\n    resp = requests.post(f\"{api_base}/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}\"\n    error_data = resp.json()\n    assert \"insufficient\" in error_data.get(\"error_code\", \"\").lower()\n    resp_src = requests.get(f\"{api_base}/accounts/{acct_low_balance_id}\", headers=headers)\n    resp_tgt = requests.get(f\"{api_base}/accounts/{acct_b_id}\", headers=headers)\n    assert resp_src.json().get(\"balance\") == 5000\n    assert resp_tgt.json().get(\"balance\") == 0"
+      }
+    ]
+  },
+  "req_id": "R-FIN-003",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1032,
+    "output_tokens": 2591,
+    "latency_ms": 13659,
+    "wall_ms": 13659,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-003\",\n  \"reasoning\": \"R-FIN-003 specifies that customers may transfer up to $25,000 per day between own accounts; transfers exceeding this limit must be declined with 422. The test suite covers: (1) a positive case within the daily limit to verify successful atomic transfer; (2) a negative case exceeding the daily limit to verify rejection; (3) a boundary case at exactly $25,000 to verify the inclusive upper bound; and (4) an additional negative case for insufficient funds (409). These tests apply Equivalence Partitioning (valid vs. invalid amounts), Boundary Value Analysis (at and above the $25,000 threshold), and Negative Path analysis (error conditions). All tests are deterministic, idempotent, and self-contained using parameterized fixtures.\",\n  \"tests\": [\n    {\n      \"name\": \"test_transfer_within_daily_limit_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account A exists with balance >= $10,000\",\n        \"Customer account B exists, owned by same customer\",\n        \"No transfers have been made today for this customer\"\n      ],\n      \"actions\": [\n        \"POST /transfers/internal with source=A, target=B, amount=$10,000\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Transfer record created with status=completed\",\n        \"Source account A balance decreased by $10,000\",\n        \"Target account B balance increased by $10,000\",\n        \"Transaction is atomic (both debit and credit present)\"\n      ],\n      \"trace\": [\n        \"R-FIN-003: Transfer amount $10,000 is within $25,000 daily limit\",\n        \"Precondition: source.owner == target.owner verified\",\n        \"Expected outcome: funds moved atomically\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\n\\ndef test_transfer_within_daily_limit_succeeds(api_base, customer_token, acct_a_id, acct_b_id):\\n    payload = {\\n        \\\"source_account_id\\\": acct_a_id,\\n        \\\"target_account_id\\\": acct_b_id,\\n        \\\"amount\\\": 10000,\\n        \\\"currency\\\": \\\"USD\\\"\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {customer_token}\\\"}\\n    resp = requests.post(f\\\"{api_base}/transfers/internal\\\", json=payload, headers=headers)\\n    assert resp.status_code in [200, 201], f\\\"Expected 200/201, got {resp.status_code}: {resp.text}\\\"\\n    data = resp.json()\\n    assert data.get(\\\"status\\\") == \\\"completed\\\"\\n    assert data.get(\\\"amount\\\") == 10000\\n    resp_a = requests.get(f\\\"{api_base}/accounts/{acct_a_id}\\\", headers=headers)\\n    resp_b = requests.get(f\\\"{api_base}/accounts/{acct_b_id}\\\", headers=headers)\\n    assert resp_a.json().get(\\\"balance\\\") == 90000\\n    assert resp_b.json().get(\\\"balance\\\") == 10000\"\n    },\n    {\n      \"name\": \"test_transfer_exceeding_daily_limit_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account A exists with balance >= $30,000\",\n        \"Customer account B exists, owned by same customer\",\n        \"No transfers have been made today for this customer\"\n      ],\n      \"actions\": [\n        \"POST /transfers/internal with source=A, target=B, amount=$26,000\"\n      ],\n      \"expected\": [\n        \"HTTP 422 response (Unprocessable Entity)\",\n        \"Error code indicates daily_limit_exceeded or similar\",\n        \"Source and target account balances unchanged\",\n        \"No transfer record created\"\n      ],\n      \"trace\": [\n        \"R-FIN-003: Transfer amount $26,000 exceeds $25,000 daily limit\",\n        \"Error pathway: 422 when daily limit exceeded\",\n        \"Accounts remain locked to prevent partial execution\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\n\\ndef test_transfer_exceeding_daily_limit_rejected(api_base, customer_token, acct_a_id, acct_b_id):\\n    payload = {\\n        \\\"source_account_id\\\": acct_a_id,\\n        \\\"target_account_id\\\": acct_b_id,\\n        \\\"amount\\\": 26000,\\n        \\\"currency\\\": \\\"USD\\\"\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {cu"
+  }
+}

@@ -1,0 +1,183 @@
+{
+  "req": {
+    "id": "R-WEB-066",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Approve leave request \u2014 variant 5",
+    "statement": "A manager shall approve or reject leave requests assigned to them within 5 business days; unactioned requests auto-escalate to hr-admin. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager",
+      "request assigned to manager"
+    ],
+    "triggers": [
+      "manager clicks approve"
+    ],
+    "expected_outcomes": [
+      "request state=approved",
+      "employee notified",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if manager not the assignee",
+      "409 if already actioned"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/{id}/approve"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-066",
+    "reasoning": "The requirement covers: (1) a manager approving an assigned leave request with 2FA confirmation yielding state=approved, employee notification, and audit entry (positive/EP); (2) a non-assignee manager attempting approval returning 403 (negative/NEG); (3) approving a request on the 5th business day boundary \u2014 the last valid day before auto-escalation (boundary/BVA); (4) attempting to approve an already-actioned request returning 409 \u2014 this is a state-transition conflict test, correctly classified as negative/NEG since it exercises an invalid state transition error pathway; (5) a decision-table case where 2FA is skipped causing rejection (negative/DT). Together these provide EP, BVA, NEG, and DT coverage aligned with ISO/IEC/IEEE 29119-4. Test[3] was previously miscategorised as negative/STC; STC applies to positive state-transition sequences, not error pathways. The 409 conflict scenario is an error pathway (negative/NEG) per the requirement's error_pathways field.",
+    "tests": [
+      {
+        "name": "test_manager_approves_assigned_request_with_2fa",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated user has role=manager",
+          "Leave request exists with state=pending and is assigned to this manager",
+          "2FA token is valid and available"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with valid manager session and 2FA token"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains state=approved",
+          "Employee receives notification",
+          "Audit log entry created for the action"
+        ],
+        "trace": [
+          "R-WEB-066: manager approves assigned request",
+          "R-WEB-066: 2FA confirmation required",
+          "R-WEB-066: request state transitions to approved",
+          "R-WEB-066: employee notified",
+          "R-WEB-066: audit entry created"
+        ],
+        "executable": "import pytest\n\ndef test_manager_approves_assigned_request_with_2fa(\n    manager_session,        # <fixture>: authenticated manager HTTP session\n    pending_leave_request,  # <fixture>: returns {\"id\": <id>, \"assignee_id\": manager_id}\n    valid_2fa_token,        # <fixture>: returns current TOTP token for manager\n    audit_log_client,       # <fixture>: client to query audit service\n    notification_sink,      # <fixture>: captures outbound notifications\n):\n    req_id = pending_leave_request[\"id\"]\n    payload = {\"otp\": valid_2fa_token}\n\n    resp = manager_session.post(\n        f\"/leave-requests/{req_id}/approve\",\n        json=payload,\n    )\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"state\"] == \"approved\"\n\n    audit_entries = audit_log_client.get_entries(resource_id=req_id)\n    assert any(e[\"action\"] == \"approve\" for e in audit_entries)\n\n    notifications = notification_sink.received_for(pending_leave_request[\"employee_id\"])\n    assert any(n[\"type\"] == \"leave_approved\" for n in notifications)\n"
+      },
+      {
+        "name": "test_non_assignee_manager_approve_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user has role=manager",
+          "Leave request exists with state=pending and is assigned to a DIFFERENT manager",
+          "Valid 2FA token available for the acting manager"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with non-assignee manager session and valid 2FA token"
+        ],
+        "expected": [
+          "HTTP 403 returned",
+          "Response body contains error code indicating forbidden/not-assignee",
+          "Request state remains pending",
+          "No audit entry created for approval"
+        ],
+        "trace": [
+          "R-WEB-066: error pathway \u2014 403 if manager not the assignee"
+        ],
+        "executable": "import pytest\n\ndef test_non_assignee_manager_approve_returns_403(\n    other_manager_session,          # <fixture>: session for manager B\n    pending_leave_request,          # <fixture>: request assigned to manager A\n    valid_2fa_token_other_manager,  # <fixture>: TOTP token for manager B\n    api_client,                     # <fixture>: unauthenticated read client\n):\n    req_id = pending_leave_request[\"id\"]\n    payload = {\"otp\": valid_2fa_token_other_manager}\n\n    resp = other_manager_session.post(\n        f\"/leave-requests/{req_id}/approve\",\n        json=payload,\n    )\n\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"not_assignee\" in body.get(\"error_code\", \"\") or \\\n           \"forbidden\" in body.get(\"message\", \"\").lower()\n\n    state_resp = api_client.get(f\"/leave-requests/{req_id}\")\n    assert state_resp.json()[\"state\"] == \"pending\"\n"
+      },
+      {
+        "name": "test_approve_on_5th_business_day_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated user has role=manager and is the assignee",
+          "Leave request was created exactly 5 business days ago (boundary: last valid action day)",
+          "Request state=pending (not yet auto-escalated)",
+          "Valid 2FA token available"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve on the 5th business day with valid manager session and 2FA token"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains state=approved",
+          "Request is NOT escalated to hr-admin",
+          "Audit entry created"
+        ],
+        "trace": [
+          "R-WEB-066: within 5 business days \u2014 boundary upper limit of valid action window",
+          "R-WEB-066: unactioned requests auto-escalate to hr-admin (boundary: action on day 5 prevents escalation)"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone\n\ndef test_approve_on_5th_business_day_boundary(\n    manager_session,              # <fixture>: authenticated manager HTTP session\n    leave_request_aged_5_bdays,   # <fixture>: request created exactly 5 business days ago\n    valid_2fa_token,              # <fixture>: TOTP token\n    audit_log_client,             # <fixture>\n    escalation_log_client,        # <fixture>: queries hr-admin escalation records\n):\n    req_id = leave_request_aged_5_bdays[\"id\"]\n    payload = {\"otp\": valid_2fa_token}\n\n    resp = manager_session.post(\n        f\"/leave-requests/{req_id}/approve\",\n        json=payload,\n    )\n\n    assert resp.status_code == 200\n    assert resp.json()[\"state\"] == \"approved\"\n\n    escalations = escalation_log_client.get_escalations(resource_id=req_id)\n    assert not escalations, \"Request must not be escalated when approved on day 5\"\n\n    audit_entries = audit_log_client.get_entries(resource_id=req_id)\n    assert any(e[\"action\"] == \"approve\" for e in audit_entries)\n"
+      },
+      {
+        "name": "test_approve_already_actioned_request_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user has role=manager and is the assignee",
+          "Leave request already has state=approved (previously actioned)",
+          "Valid 2FA token available"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve on a request already in approved state"
+        ],
+        "expected": [
+          "HTTP 409 returned",
+          "Response body contains conflict error indicating request already actioned",
+          "Request state remains approved (unchanged)"
+        ],
+        "trace": [
+          "R-WEB-066: error pathway \u2014 409 if already actioned",
+          "R-WEB-066: re-approving an already-approved request is an invalid operation and must be rejected"
+        ],
+        "executable": "import pytest\n\ndef test_approve_already_actioned_request_returns_409(\n    manager_session,               # <fixture>: authenticated manager HTTP session\n    approved_leave_request,        # <fixture>: request already in state=approved\n    valid_2fa_token,               # <fixture>: TOTP token\n):\n    req_id = approved_leave_request[\"id\"]\n    payload = {\"otp\": valid_2fa_token}\n\n    resp = manager_session.post(\n        f\"/leave-requests/{req_id}/approve\",\n        json=payload,\n    )\n\n    assert resp.status_code == 409\n    body = resp.json()\n    assert \"already_actioned\" in body.get(\"error_code\", \"\") or \\\n           \"conflict\" in body.get(\"message\", \"\").lower()\n"
+      },
+      {
+        "name": "test_approve_without_2fa_token_is_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated user has role=manager and is the assignee",
+          "Leave request exists with state=pending",
+          "No 2FA token is provided in the request body (2FA=absent)"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with valid manager session but WITHOUT otp field"
+        ],
+        "expected": [
+          "HTTP 401 or 422 returned",
+          "Response body indicates 2FA confirmation is required",
+          "Request state remains pending",
+          "No audit entry for approval created"
+        ],
+        "trace": [
+          "R-WEB-066: action requires 2FA confirmation",
+          "R-WEB-066: DT row \u2014 manager=valid, assignee=yes, 2FA=absent => request rejected"
+        ],
+        "executable": "import pytest\n\ndef test_approve_without_2fa_token_is_rejected(\n    manager_session,        # <fixture>: authenticated manager HTTP session\n    pending_leave_request,  # <fixture>: request assigned to this manager\n    audit_log_client,       # <fixture>: client to query audit service\n    api_client,             # <fixture>: read client\n):\n    req_id = pending_leave_request[\"id\"]\n    payload = {}  # deliberately omit otp\n\n    resp = manager_session.post(\n        f\"/leave-requests/{req_id}/approve\",\n        json=payload,\n    )\n\n    assert resp.status_code in (401, 422)\n    body = resp.json()\n    assert \"2fa\" in body.get(\"message\", \"\").lower() or \\\n           \"otp\" in body.get(\"error_code\", \"\").lower() or \\\n           \"two_factor\" in body.get(\"error_code\", \"\").lower()\n\n    state_resp = api_client.get(f\"/leave-requests/{req_id}\")\n    assert state_resp.json()[\"state\"] == \"pending\"\n\n    audit_entries = audit_log_client.get_entries(resource_id=req_id)\n    assert not any(e[\"action\"] == \"approve\" for e in audit_entries)\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-066",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1030,
+    "output_tokens": 3016,
+    "latency_ms": 37057,
+    "wall_ms": 37057,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-066\",\n  \"reasoning\": \"The requirement covers: (1) a manager approving an assigned leave request with 2FA confirmation yielding state=approved, employee notification, and audit entry (positive/EP); (2) a non-assignee manager attempting approval returning 403 (negative/NEG); (3) approving a request on the 5th business day boundary \u2014 the last valid day before auto-escalation (boundary/BVA); (4) attempting to approve an already-actioned request returning 409 (negative/STC); (5) a decision-table case where 2FA is skipped causing rejection (negative/DT). Together these provide EP, BVA, STC, DT, and NEG coverage aligned with ISO/IEC/IEEE 29119-4.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_approves_assigned_request_with_2fa\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated user has role=manager\",\n        \"Leave request exists with state=pending and is assigned to this manager\",\n        \"2FA token is valid and available\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with valid manager session and 2FA token\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains state=approved\",\n        \"Employee receives notification\",\n        \"Audit log entry created for the action\"\n      ],\n      \"trace\": [\n        \"R-WEB-066: manager approves assigned request\",\n        \"R-WEB-066: 2FA confirmation required\",\n        \"R-WEB-066: request state transitions to approved\",\n        \"R-WEB-066: employee notified\",\n        \"R-WEB-066: audit entry created\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_manager_approves_assigned_request_with_2fa(\\n    manager_session,        # <fixture>: authenticated manager HTTP session\\n    pending_leave_request,  # <fixture>: returns {\\\"id\\\": <id>, \\\"assignee_id\\\": manager_id}\\n    valid_2fa_token,        # <fixture>: returns current TOTP token for manager\\n    audit_log_client,       # <fixture>: client to query audit service\\n    notification_sink,      # <fixture>: captures outbound notifications\\n):\\n    req_id = pending_leave_request[\\\"id\\\"]\\n    payload = {\\\"otp\\\": valid_2fa_token}\\n\\n    resp = manager_session.post(\\n        f\\\"/leave-requests/{req_id}/approve\\\",\\n        json=payload,\\n    )\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"state\\\"] == \\\"approved\\\"\\n\\n    audit_entries = audit_log_client.get_entries(resource_id=req_id)\\n    assert any(e[\\\"action\\\"] == \\\"approve\\\" for e in audit_entries)\\n\\n    notifications = notification_sink.received_for(pending_leave_request[\\\"employee_id\\\"])\\n    assert any(n[\\\"type\\\"] == \\\"leave_approved\\\" for n in notifications)\\n\"\n    },\n    {\n      \"name\": \"test_non_assignee_manager_approve_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated user has role=manager\",\n        \"Leave request exists with state=pending and is assigned to a DIFFERENT manager\",\n        \"Valid 2FA token available for the acting manager\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with non-assignee manager session and valid 2FA token\"\n      ],\n      \"expected\": [\n        \"HTTP 403 returned\",\n        \"Response body contains error code indicating forbidden/not-assignee\",\n        \"Request state remains pending\",\n        \"No audit entry created for approval\"\n      ],\n      \"trace\": [\n        \"R-WEB-066: error pathway \u2014 403 if manager not the assignee\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_assignee_manager_approve_returns_403(\\n    other_manager_session,          # <fixture>: session for manager B\\n    pending_leave_request,          # <fixture>: request assigned to manager A\\n    valid_2fa_token_other_manager,  # <fixture>: TOTP token for manager B\\n    api_client,                     # <fixture>: unauthenticated read client\\n):\\n    req_id = pending_leave_request[\\\"id\\\"]\\n    payload = {\\\"otp\\\": valid_2f"
+  }
+}

@@ -1,0 +1,209 @@
+{
+  "req": {
+    "id": "R-WEB-058",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Submit leave request \u2014 variant 2",
+    "statement": "A full-time employee shall be able to submit a leave request for between 1 and 30 business days; requests spanning more than 30 days require hr-admin approval. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated",
+      "employment_type:full_time"
+    ],
+    "triggers": [
+      "employee submits form"
+    ],
+    "expected_outcomes": [
+      "request created",
+      "manager notified",
+      "notification email sent",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "400 when start_date > end_date",
+      "409 when overlapping existing leave",
+      "422 when request exceeds 30 days without hr-admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-058",
+    "reasoning": "The requirement defines three equivalence partitions for leave duration: 1-30 days (valid, no extra approval), >30 days without hr-admin (invalid, 422), and the boundary at exactly 30 days. Additional error paths cover date inversion (400) and overlap (409). Idempotency under retry is a distinct positive variant. Tests are distributed across EP, BVA, NEG, DT, and STC heuristics to achieve clause-level coverage of all stated conditions.",
+    "tests": [
+      {
+        "name": "test_submit_leave_request_valid_mid_range",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as full_time employee",
+          "No existing leave overlaps the target date range",
+          "SMTP stub is active for email capture"
+        ],
+        "actions": [
+          "POST /leave-requests/new with start_date=next Monday, end_date=next Monday+9 business days (10 days)",
+          "Assert HTTP 201 and capture request_id",
+          "GET /leave-requests/{request_id} and assert status=pending",
+          "Assert manager notification record exists",
+          "Assert notification email captured by SMTP stub"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains request_id",
+          "Leave request status is 'pending'",
+          "Manager notification created",
+          "Email notification sent to employee"
+        ],
+        "trace": [
+          "R-WEB-058: positive path, 1-30 business days",
+          "R-WEB-058: request created outcome",
+          "R-WEB-058: manager notified outcome",
+          "R-WEB-058: notification email sent outcome"
+        ],
+        "executable": "def test_submit_leave_request_valid_mid_range(auth_session, smtp_stub, clean_leave_state):\n    start, end = <next_business_day>(offset=1), <next_business_day>(offset=10)\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    resp = auth_session.post(\"/leave-requests/new\", json=payload)\n    assert resp.status_code == 201\n    request_id = resp.json()[\"request_id\"]\n    assert request_id\n\n    detail = auth_session.get(f\"/leave-requests/{request_id}\").json()\n    assert detail[\"status\"] == \"pending\"\n\n    notifications = auth_session.get(\"/notifications\", params={\"ref\": request_id}).json()\n    assert any(n[\"type\"] == \"manager_notify\" for n in notifications)\n\n    emails = smtp_stub.messages(to=<employee_email>)\n    assert any(request_id in m[\"body\"] for m in emails)"
+      },
+      {
+        "name": "test_submit_leave_request_exactly_30_days_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as full_time employee",
+          "No existing leave overlaps the target date range"
+        ],
+        "actions": [
+          "POST /leave-requests/new with exactly 30 business days span",
+          "Assert HTTP 201 (no hr-admin approval required at boundary)",
+          "Assert response contains request_id and status=pending"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "No hr-admin approval flag set",
+          "Status is 'pending'"
+        ],
+        "trace": [
+          "R-WEB-058: upper inclusive boundary 30 business days",
+          "R-WEB-058: requests <=30 days do NOT require hr-admin approval"
+        ],
+        "executable": "def test_submit_leave_request_exactly_30_days_boundary(auth_session, clean_leave_state):\n    start = <next_business_day>(offset=1)\n    end = <add_business_days>(start, 29)  # start + 29 more = 30 inclusive\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    resp = auth_session.post(\"/leave-requests/new\", json=payload)\n    assert resp.status_code == 201\n\n    body = resp.json()\n    assert body[\"request_id\"]\n    assert body.get(\"requires_hr_admin\") is not True\n\n    detail = auth_session.get(f\"/leave-requests/{body['request_id']}\").json()\n    assert detail[\"status\"] == \"pending\""
+      },
+      {
+        "name": "test_submit_leave_request_31_days_without_hr_admin_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as full_time employee",
+          "User does NOT have hr-admin role"
+        ],
+        "actions": [
+          "POST /leave-requests/new with 31 business days span",
+          "Assert HTTP 422",
+          "Assert error code indicates hr-admin approval required"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Error payload references hr-admin approval requirement"
+        ],
+        "trace": [
+          "R-WEB-058: error pathway - requests >30 days without hr-admin returns 422"
+        ],
+        "executable": "def test_submit_leave_request_31_days_without_hr_admin_returns_422(auth_session, clean_leave_state):\n    start = <next_business_day>(offset=1)\n    end = <add_business_days>(start, 30)  # 31 inclusive business days\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    resp = auth_session.post(\"/leave-requests/new\", json=payload)\n    assert resp.status_code == 422\n\n    error = resp.json()\n    assert \"hr-admin\" in error.get(\"detail\", \"\").lower() or \\\n           error.get(\"error_code\") == \"HR_ADMIN_APPROVAL_REQUIRED\""
+      },
+      {
+        "name": "test_submit_leave_request_inverted_dates_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as full_time employee"
+        ],
+        "actions": [
+          "POST /leave-requests/new with start_date after end_date",
+          "Assert HTTP 400",
+          "Assert error message references date ordering"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Error payload indicates start_date must not exceed end_date"
+        ],
+        "trace": [
+          "R-WEB-058: error pathway - 400 when start_date > end_date"
+        ],
+        "executable": "def test_submit_leave_request_inverted_dates_returns_400(auth_session):\n    start = <next_business_day>(offset=5)\n    end = <next_business_day>(offset=1)  # end before start\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n\n    resp = auth_session.post(\"/leave-requests/new\", json=payload)\n    assert resp.status_code == 400\n\n    error = resp.json()\n    detail = error.get(\"detail\", \"\").lower()\n    assert \"start_date\" in detail or \"end_date\" in detail or \\\n           error.get(\"error_code\") == \"INVALID_DATE_RANGE\""
+      },
+      {
+        "name": "test_submit_leave_request_overlapping_existing_returns_409",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as full_time employee",
+          "An existing approved leave exists for next Monday to next Monday+4"
+        ],
+        "actions": [
+          "Seed an existing leave covering next Monday through next Monday+4",
+          "POST /leave-requests/new with overlapping range next Monday+2 to next Monday+7",
+          "Assert HTTP 409"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Error payload references overlapping leave period"
+        ],
+        "trace": [
+          "R-WEB-058: error pathway - 409 when overlapping existing leave"
+        ],
+        "executable": "def test_submit_leave_request_overlapping_existing_returns_409(auth_session, seed_leave):\n    base = <next_business_day>(offset=1)\n    seed_leave(start=base, end=<add_business_days>(base, 4))  # existing: days 1-5\n\n    overlap_start = <add_business_days>(base, 2)  # overlaps day 3\n    overlap_end = <add_business_days>(base, 7)\n    payload = {\"start_date\": overlap_start, \"end_date\": overlap_end, \"type\": \"annual\"}\n\n    resp = auth_session.post(\"/leave-requests/new\", json=payload)\n    assert resp.status_code == 409\n\n    error = resp.json()\n    assert \"overlap\" in error.get(\"detail\", \"\").lower() or \\\n           error.get(\"error_code\") == \"LEAVE_OVERLAP\""
+      },
+      {
+        "name": "test_submit_leave_request_idempotent_under_retry",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as full_time employee",
+          "No existing leave overlaps the target date range",
+          "Client sends a stable idempotency key header"
+        ],
+        "actions": [
+          "POST /leave-requests/new with Idempotency-Key header, 5-day span",
+          "Assert HTTP 201 and capture request_id",
+          "POST identical request again with same Idempotency-Key",
+          "Assert HTTP 200 or 201 with same request_id (no duplicate created)",
+          "GET /leave-requests and assert only one record for the period"
+        ],
+        "expected": [
+          "Second POST returns same request_id as first POST",
+          "Only one leave request record exists for the date range",
+          "State transitions from draft to pending exactly once"
+        ],
+        "trace": [
+          "R-WEB-058: idempotency under retry (variant semantics)",
+          "R-WEB-058: action must be idempotent under retry"
+        ],
+        "executable": "def test_submit_leave_request_idempotent_under_retry(auth_session, clean_leave_state):\n    import uuid\n    key = str(uuid.uuid4())\n    start = <next_business_day>(offset=1)\n    end = <add_business_days>(start, 4)\n    payload = {\"start_date\": start, \"end_date\": end, \"type\": \"annual\"}\n    headers = {\"Idempotency-Key\": key}\n\n    r1 = auth_session.post(\"/leave-requests/new\", json=payload, headers=headers)\n    assert r1.status_code == 201\n    request_id = r1.json()[\"request_id\"]\n\n    r2 = auth_session.post(\"/leave-requests/new\", json=payload, headers=headers)\n    assert r2.status_code in (200, 201)\n    assert r2.json()[\"request_id\"] == request_id\n\n    all_requests = auth_session.get(\"/leave-requests\", params={\"start\": start, \"end\": end}).json()\n    matching = [r for r in all_requests if r[\"request_id\"] == request_id]\n    assert len(matching) == 1"
+      }
+    ]
+  },
+  "req_id": "R-WEB-058",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1057,
+    "output_tokens": 3108,
+    "latency_ms": 41858,
+    "wall_ms": 41858,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-058\",\n  \"reasoning\": \"The requirement defines three equivalence partitions for leave duration: 1-30 days (valid, no extra approval), >30 days without hr-admin (invalid, 422), and the boundary at exactly 30 days. Additional error paths cover date inversion (400) and overlap (409). Idempotency under retry is a distinct positive variant. Tests are distributed across EP, BVA, NEG, DT, and STC heuristics to achieve clause-level coverage of all stated conditions.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_leave_request_valid_mid_range\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as full_time employee\",\n        \"No existing leave overlaps the target date range\",\n        \"SMTP stub is active for email capture\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/new with start_date=next Monday, end_date=next Monday+9 business days (10 days)\",\n        \"Assert HTTP 201 and capture request_id\",\n        \"GET /leave-requests/{request_id} and assert status=pending\",\n        \"Assert manager notification record exists\",\n        \"Assert notification email captured by SMTP stub\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains request_id\",\n        \"Leave request status is 'pending'\",\n        \"Manager notification created\",\n        \"Email notification sent to employee\"\n      ],\n      \"trace\": [\n        \"R-WEB-058: positive path, 1-30 business days\",\n        \"R-WEB-058: request created outcome\",\n        \"R-WEB-058: manager notified outcome\",\n        \"R-WEB-058: notification email sent outcome\"\n      ],\n      \"executable\": \"def test_submit_leave_request_valid_mid_range(auth_session, smtp_stub, clean_leave_state):\\n    start, end = <next_business_day>(offset=1), <next_business_day>(offset=10)\\n    payload = {\\\"start_date\\\": start, \\\"end_date\\\": end, \\\"type\\\": \\\"annual\\\"}\\n\\n    resp = auth_session.post(\\\"/leave-requests/new\\\", json=payload)\\n    assert resp.status_code == 201\\n    request_id = resp.json()[\\\"request_id\\\"]\\n    assert request_id\\n\\n    detail = auth_session.get(f\\\"/leave-requests/{request_id}\\\").json()\\n    assert detail[\\\"status\\\"] == \\\"pending\\\"\\n\\n    notifications = auth_session.get(\\\"/notifications\\\", params={\\\"ref\\\": request_id}).json()\\n    assert any(n[\\\"type\\\"] == \\\"manager_notify\\\" for n in notifications)\\n\\n    emails = smtp_stub.messages(to=<employee_email>)\\n    assert any(request_id in m[\\\"body\\\"] for m in emails)\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_exactly_30_days_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated as full_time employee\",\n        \"No existing leave overlaps the target date range\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/new with exactly 30 business days span\",\n        \"Assert HTTP 201 (no hr-admin approval required at boundary)\",\n        \"Assert response contains request_id and status=pending\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"No hr-admin approval flag set\",\n        \"Status is 'pending'\"\n      ],\n      \"trace\": [\n        \"R-WEB-058: upper inclusive boundary 30 business days\",\n        \"R-WEB-058: requests <=30 days do NOT require hr-admin approval\"\n      ],\n      \"executable\": \"def test_submit_leave_request_exactly_30_days_boundary(auth_session, clean_leave_state):\\n    start = <next_business_day>(offset=1)\\n    end = <add_business_days>(start, 29)  # start + 29 more = 30 inclusive\\n    payload = {\\\"start_date\\\": start, \\\"end_date\\\": end, \\\"type\\\": \\\"annual\\\"}\\n\\n    resp = auth_session.post(\\\"/leave-requests/new\\\", json=payload)\\n    assert resp.status_code == 201\\n\\n    body = resp.json()\\n    assert body[\\\"request_id\\\"]\\n    assert body.get(\\\"requires_hr_admin\\\") is not True\\n\\n    detail = auth_session.get(f\\\"/leave-requests/{body['request_id']}\\\").json()\\n    assert detail[\\\"status\\\"] == \\\"pending\\\"\"\n    },\n    {\n    "
+  }
+}

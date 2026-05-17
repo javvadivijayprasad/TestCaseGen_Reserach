@@ -1,0 +1,197 @@
+{
+  "req": {
+    "id": "R-WEB-078",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Upload onboarding document \u2014 variant 2",
+    "statement": "An employee shall upload onboarding documents up to 10MB in PDF, PNG, or JPG format; files outside this must be rejected. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "employee uploads file"
+    ],
+    "expected_outcomes": [
+      "document stored",
+      "virus scan queued",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "413 when size > 10MB",
+      "415 when mime not in allow-list"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents/upload"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-078",
+    "reasoning": "The requirement defines three key dimensions: (1) allowed MIME types (PDF, PNG, JPG), (2) a hard size ceiling of 10 MB, and (3) idempotency under retry. Equivalence Partitioning yields valid-type and invalid-type partitions. Boundary Value Analysis targets exactly 10 MB (on-boundary), 10 MB+1 byte (over-boundary), and a minimal 1-byte file. A Decision Table covers the cross-product of size \u00d7 MIME. Negative Path covers each error code (413, 415). State Transition Coverage handles the retry/idempotency contract. The suite is kept to six focused tests that together satisfy the minimum three (positive, negative, boundary) while providing fuller coverage. Each test uses lightweight fixtures and helper placeholders to stay within the 40-line limit.",
+    "tests": [
+      {
+        "name": "test_upload_valid_pdf_under_limit_returns_200",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated (valid session token available via <auth_fixture>)",
+          "A well-formed PDF file of 1 MB exists at <valid_pdf_path>"
+        ],
+        "actions": [
+          "POST multipart/form-data to /documents/upload with the 1 MB PDF file",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code",
+          "Response body contains a document ID",
+          "Response body indicates virus_scan_status is 'queued'"
+        ],
+        "trace": [
+          "R-WEB-078: allowed formats include PDF",
+          "R-WEB-078: file <= 10 MB must be accepted",
+          "R-WEB-078: virus scan must be queued on success"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_upload_valid_pdf_under_limit_returns_200(auth_session, tmp_pdf_1mb):\n    url = auth_session.base_url + \"/documents/upload\"\n    with open(tmp_pdf_1mb, \"rb\") as fh:\n        resp = auth_session.post(\n            url,\n            files={\"file\": (\"onboarding.pdf\", fh, \"application/pdf\")},\n        )\n    assert resp.status_code in (200, 201), f\"Unexpected status: {resp.status_code}\"\n    body = resp.json()\n    assert \"document_id\" in body, \"Missing document_id in response\"\n    assert body.get(\"virus_scan_status\") == \"queued\", \"Virus scan not queued\"\n"
+      },
+      {
+        "name": "test_upload_file_exceeding_10mb_returns_413",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated (valid session token available via <auth_fixture>)",
+          "A PDF file of exactly 10 MB + 1 byte exists at <oversized_pdf_path>"
+        ],
+        "actions": [
+          "POST multipart/form-data to /documents/upload with the oversized PDF file",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 413 status code",
+          "Response body contains an error message referencing file size limit"
+        ],
+        "trace": [
+          "R-WEB-078: files outside the 10 MB limit must be rejected",
+          "R-WEB-078: error pathway 413 when size > 10 MB"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_upload_file_exceeding_10mb_returns_413(auth_session, tmp_file_10mb_plus_1):\n    url = auth_session.base_url + \"/documents/upload\"\n    with open(tmp_file_10mb_plus_1, \"rb\") as fh:\n        resp = auth_session.post(\n            url,\n            files={\"file\": (\"big.pdf\", fh, \"application/pdf\")},\n        )\n    assert resp.status_code == 413, f\"Expected 413, got {resp.status_code}\"\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, \"Missing error detail in body\"\n"
+      },
+      {
+        "name": "test_upload_file_at_exact_10mb_boundary_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated (valid session token available via <auth_fixture>)",
+          "A PDF file of exactly 10 485 760 bytes (10 MiB) exists at <boundary_pdf_path>"
+        ],
+        "actions": [
+          "POST multipart/form-data to /documents/upload with the exactly-10-MB PDF file",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code",
+          "Response body contains a document ID",
+          "File is not rejected with 413"
+        ],
+        "trace": [
+          "R-WEB-078: files up to 10 MB must be accepted (boundary inclusive)",
+          "R-WEB-078: error pathway 413 applies only when size > 10 MB"
+        ],
+        "executable": "import pytest\nimport requests\n\nTEN_MB = 10 * 1024 * 1024\n\ndef test_upload_file_at_exact_10mb_boundary_is_accepted(auth_session, tmp_path):\n    boundary_file = tmp_path / \"boundary.pdf\"\n    boundary_file.write_bytes(b\"%PDF-1.4\\n\" + b\"0\" * (TEN_MB - 9))\n    assert boundary_file.stat().st_size == TEN_MB\n    url = auth_session.base_url + \"/documents/upload\"\n    with open(boundary_file, \"rb\") as fh:\n        resp = auth_session.post(\n            url,\n            files={\"file\": (\"boundary.pdf\", fh, \"application/pdf\")},\n        )\n    assert resp.status_code in (200, 201), f\"Boundary file rejected with {resp.status_code}\"\n    assert \"document_id\" in resp.json(), \"Missing document_id at boundary\"\n"
+      },
+      {
+        "name": "test_upload_disallowed_mime_type_returns_415",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated (valid session token available via <auth_fixture>)",
+          "A small GIF file (not in allow-list) exists or is generated in-memory"
+        ],
+        "actions": [
+          "POST multipart/form-data to /documents/upload with a GIF file declared as image/gif",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 415 status code",
+          "Response body contains an error message referencing unsupported media type"
+        ],
+        "trace": [
+          "R-WEB-078: allowed formats are PDF, PNG, JPG only",
+          "R-WEB-078: error pathway 415 when MIME not in allow-list"
+        ],
+        "executable": "import pytest\nimport io\nimport requests\n\nGIF_HEADER = b\"GIF89a\\x01\\x00\\x01\\x00\\x00\\xff\\x00,\\x00\\x00\\x00\\x00\\x01\\x00\\x01\\x00\\x00\\x02\\x00;\"\n\ndef test_upload_disallowed_mime_type_returns_415(auth_session):\n    url = auth_session.base_url + \"/documents/upload\"\n    resp = auth_session.post(\n        url,\n        files={\"file\": (\"sneaky.gif\", io.BytesIO(GIF_HEADER), \"image/gif\")},\n    )\n    assert resp.status_code == 415, f\"Expected 415, got {resp.status_code}\"\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, \"Missing error detail for 415\"\n"
+      },
+      {
+        "name": "test_upload_png_and_jpg_are_accepted",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated (valid session token available via <auth_fixture>)",
+          "Minimal valid PNG and JPG byte sequences available via <minimal_png_bytes> and <minimal_jpg_bytes>"
+        ],
+        "actions": [
+          "POST PNG file to /documents/upload; assert 200/201",
+          "POST JPG file to /documents/upload; assert 200/201"
+        ],
+        "expected": [
+          "Both uploads return HTTP 200 or 201",
+          "Both responses contain a document_id",
+          "Both virus_scan_status values equal 'queued'"
+        ],
+        "trace": [
+          "R-WEB-078: PNG and JPG are explicitly allowed formats",
+          "R-WEB-078: document stored and virus scan queued for all valid types"
+        ],
+        "executable": "import pytest\nimport io\nimport requests\n\nMINIMAL_PNG = bytes.fromhex(\n    \"89504e470d0a1a0a0000000d49484452000000010000000108000000003a7e9b55\"\n    \"0000000a49444154789c6260000000020001e221bc330000000049454e44ae426082\"\n)\nMINIMAL_JPG = bytes.fromhex(\"ffd8ffe000104a46494600010100000100010000ffdb004300\"\n    \"08060606070605080707070909080a0c140d0c0b0b0c1912130f141d1a1f1e1d\"\n    \"1a1c1c20242e2720222c231c1c2837292c30313434341f27393d38323c2e3334\"\n    \"32ffc0000b080001000101011100ffc4001f000001050101010101000000000000\"\n    \"00000102030405060708090a0bffda00080101000003f0ffd9\")\n\n@pytest.mark.parametrize(\"fname,data,mime\", [\n    (\"doc.png\", MINIMAL_PNG, \"image/png\"),\n    (\"doc.jpg\", MINIMAL_JPG, \"image/jpeg\"),\n])\ndef test_upload_png_and_jpg_are_accepted(auth_session, fname, data, mime):\n    url = auth_session.base_url + \"/documents/upload\"\n    resp = auth_session.post(url, files={\"file\": (fname, io.BytesIO(data), mime)})\n    assert resp.status_code in (200, 201), f\"{mime} rejected: {resp.status_code}\"\n    body = resp.json()\n    assert \"document_id\" in body\n    assert body.get(\"virus_scan_status\") == \"queued\"\n"
+      },
+      {
+        "name": "test_upload_is_idempotent_under_retry",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated (valid session token available via <auth_fixture>)",
+          "A valid 1 MB PDF file exists at <valid_pdf_path>",
+          "The API supports an idempotency key header (e.g. X-Idempotency-Key)"
+        ],
+        "actions": [
+          "POST the same PDF file with identical X-Idempotency-Key header twice",
+          "Capture both response statuses and document IDs"
+        ],
+        "expected": [
+          "Both requests return HTTP 200 or 201",
+          "Both responses return the same document_id",
+          "Second request does not create a duplicate document"
+        ],
+        "trace": [
+          "R-WEB-078: action must be idempotent under retry",
+          "R-WEB-078: variant 2 additional semantics \u2014 retry safety"
+        ],
+        "executable": "import pytest\nimport uuid\nimport requests\n\ndef test_upload_is_idempotent_under_retry(auth_session, tmp_pdf_1mb):\n    url = auth_session.base_url + \"/documents/upload\"\n    idem_key = str(uuid.uuid4())\n    headers = {\"X-Idempotency-Key\": idem_key}\n    def do_upload():\n        with open(tmp_pdf_1mb, \"rb\") as fh:\n            return auth_session.post(\n                url,\n                files={\"file\": (\"onboarding.pdf\", fh, \"application/pdf\")},\n                headers=headers,\n            )\n    resp1 = do_upload()\n    resp2 = do_upload()\n    assert resp1.status_code in (200, 201)\n    assert resp2.status_code in (200, 201)\n    doc_id_1 = resp1.json().get(\"document_id\")\n    doc_id_2 = resp2.json().get(\"document_id\")\n    assert doc_id_1 == doc_id_2, f\"Idempotency broken: {doc_id_1} != {doc_id_2}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-078",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 3503,
+    "latency_ms": 40662,
+    "wall_ms": 40662,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-078\",\n  \"reasoning\": \"The requirement defines three key dimensions: (1) allowed MIME types (PDF, PNG, JPG), (2) a hard size ceiling of 10 MB, and (3) idempotency under retry. Equivalence Partitioning yields valid-type and invalid-type partitions. Boundary Value Analysis targets exactly 10 MB (on-boundary), 10 MB+1 byte (over-boundary), and a minimal 1-byte file. A Decision Table covers the cross-product of size \u00d7 MIME. Negative Path covers each error code (413, 415). State Transition Coverage handles the retry/idempotency contract. The suite is kept to six focused tests that together satisfy the minimum three (positive, negative, boundary) while providing fuller coverage. Each test uses lightweight fixtures and helper placeholders to stay within the 40-line limit.\",\n  \"tests\": [\n    {\n      \"name\": \"test_upload_valid_pdf_under_limit_returns_200\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated (valid session token available via <auth_fixture>)\",\n        \"A well-formed PDF file of 1 MB exists at <valid_pdf_path>\"\n      ],\n      \"actions\": [\n        \"POST multipart/form-data to /documents/upload with the 1 MB PDF file\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 status code\",\n        \"Response body contains a document ID\",\n        \"Response body indicates virus_scan_status is 'queued'\"\n      ],\n      \"trace\": [\n        \"R-WEB-078: allowed formats include PDF\",\n        \"R-WEB-078: file <= 10 MB must be accepted\",\n        \"R-WEB-078: virus scan must be queued on success\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_upload_valid_pdf_under_limit_returns_200(auth_session, tmp_pdf_1mb):\\n    url = auth_session.base_url + \\\"/documents/upload\\\"\\n    with open(tmp_pdf_1mb, \\\"rb\\\") as fh:\\n        resp = auth_session.post(\\n            url,\\n            files={\\\"file\\\": (\\\"onboarding.pdf\\\", fh, \\\"application/pdf\\\")},\\n        )\\n    assert resp.status_code in (200, 201), f\\\"Unexpected status: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"document_id\\\" in body, \\\"Missing document_id in response\\\"\\n    assert body.get(\\\"virus_scan_status\\\") == \\\"queued\\\", \\\"Virus scan not queued\\\"\\n\"\n    },\n    {\n      \"name\": \"test_upload_file_exceeding_10mb_returns_413\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated (valid session token available via <auth_fixture>)\",\n        \"A PDF file of exactly 10 MB + 1 byte exists at <oversized_pdf_path>\"\n      ],\n      \"actions\": [\n        \"POST multipart/form-data to /documents/upload with the oversized PDF file\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 413 status code\",\n        \"Response body contains an error message referencing file size limit\"\n      ],\n      \"trace\": [\n        \"R-WEB-078: files outside the 10 MB limit must be rejected\",\n        \"R-WEB-078: error pathway 413 when size > 10 MB\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_upload_file_exceeding_10mb_returns_413(auth_session, tmp_file_10mb_plus_1):\\n    url = auth_session.base_url + \\\"/documents/upload\\\"\\n    with open(tmp_file_10mb_plus_1, \\\"rb\\\") as fh:\\n        resp = auth_session.post(\\n            url,\\n            files={\\\"file\\\": (\\\"big.pdf\\\", fh, \\\"application/pdf\\\")},\\n        )\\n    assert resp.status_code == 413, f\\\"Expected 413, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"message\\\" in body, \\\"Missing error detail in body\\\"\\n\"\n    },\n    {\n      \"name\": \"test_upload_file_at_exact_10mb_boundary_is_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated (valid session token available via <auth_fixture>)\",\n        \"A PDF file of exactly 10 485 760 bytes (10 MiB) exists at <boundary_pdf_path>\"\n      ]"
+  }
+}

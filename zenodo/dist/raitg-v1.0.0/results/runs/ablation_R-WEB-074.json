@@ -1,0 +1,191 @@
+{
+  "req": {
+    "id": "R-WEB-074",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Run payroll \u2014 variant 3",
+    "statement": "An hr-admin shall run a monthly payroll that computes gross pay, deductions, and net pay for each active employee; a failed run shall not partially commit. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin triggers payroll run"
+    ],
+    "expected_outcomes": [
+      "payroll-run state=completed",
+      "pay-stub records created",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "409 if another run is in progress",
+      "500 rolled back atomically on failure"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/payroll-runs"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-074",
+    "reasoning": "R-WEB-074 specifies a payroll-run endpoint with five distinct concerns: (1) happy-path full computation and record creation, (2) webhook emission, (3) 409 conflict when a run is already in progress, (4) atomic rollback on internal failure, and (5) boundary of exactly one active employee. I selected EP for the normal success path (valid hr-admin role, active employees), NEG for the 409 conflict and 500 rollback paths, STC to verify the state machine transition idle\u2192running\u2192completed, DT to cross the decision of concurrent-run guard, and BVA for the single-employee boundary. Each test is self-contained via fixtures that reset state before execution and uses deterministic employee/payroll IDs seeded per test.",
+    "tests": [
+      {
+        "name": "test_payroll_run_happy_path_creates_stubs_and_webhook",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated hr-admin session token available via <hr_admin_token> fixture",
+          "At least two active employees exist, seeded by <seed_active_employees> fixture",
+          "No payroll run is currently in progress",
+          "Webhook receiver mock is active via <webhook_mock> fixture"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with valid period payload using hr-admin token",
+          "Poll or await response for completed status",
+          "GET /api/payroll-runs/{run_id}/pay-stubs to retrieve created stubs",
+          "GET /api/audit-log?resource=payroll-run&id={run_id}",
+          "Assert webhook_mock received the payroll.completed event"
+        ],
+        "expected": [
+          "POST returns HTTP 201 with body containing state=completed",
+          "Each active employee has exactly one pay-stub with gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions",
+          "Audit log contains one entry for the run",
+          "Webhook mock captured exactly one event with type=payroll.completed and matching run_id"
+        ],
+        "trace": [
+          "R-WEB-074: payroll-run state=completed",
+          "R-WEB-074: pay-stub records created",
+          "R-WEB-074: audit entry",
+          "R-WEB-074: emit webhook event for external consumers"
+        ],
+        "executable": "def test_payroll_run_happy_path_creates_stubs_and_webhook(\n    hr_admin_token, seed_active_employees, webhook_mock, api_client, cleanup_payroll_runs\n):\n    employees = seed_active_employees(count=2)\n    payload = {\"period\": \"2024-05\", \"type\": \"monthly\"}\n\n    resp = api_client.post(\n        \"/api/payroll-runs\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    run_id = body[\"id\"]\n    assert body[\"state\"] == \"completed\"\n\n    stubs_resp = api_client.get(\n        f\"/api/payroll-runs/{run_id}/pay-stubs\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert stubs_resp.status_code == 200\n    stubs = stubs_resp.json()[\"items\"]\n    assert len(stubs) == len(employees)\n    for stub in stubs:\n        assert stub[\"gross_pay\"] > 0\n        assert stub[\"deductions\"] >= 0\n        assert stub[\"net_pay\"] == stub[\"gross_pay\"] - stub[\"deductions\"]\n\n    audit_resp = api_client.get(\n        f\"/api/audit-log?resource=payroll-run&id={run_id}\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json()[\"entries\"]) >= 1\n\n    events = webhook_mock.received_events()\n    payroll_events = [e for e in events if e[\"type\"] == \"payroll.completed\"]\n    assert len(payroll_events) == 1\n    assert payroll_events[0][\"data\"][\"run_id\"] == run_id"
+      },
+      {
+        "name": "test_payroll_run_409_when_run_already_in_progress",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated hr-admin session token available via <hr_admin_token> fixture",
+          "A payroll run for the same period is already in state=running, created by <seed_in_progress_run> fixture"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with the same period while an in-progress run exists"
+        ],
+        "expected": [
+          "HTTP 409 Conflict is returned",
+          "Response body contains an error code indicating concurrent run conflict",
+          "No new payroll-run record is created"
+        ],
+        "trace": [
+          "R-WEB-074: 409 if another run is in progress"
+        ],
+        "executable": "def test_payroll_run_409_when_run_already_in_progress(\n    hr_admin_token, seed_in_progress_run, api_client\n):\n    in_progress_id = seed_in_progress_run(period=\"2024-06\")\n    assert in_progress_id is not None\n\n    payload = {\"period\": \"2024-06\", \"type\": \"monthly\"}\n    resp = api_client.post(\n        \"/api/payroll-runs\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code == 409\n    body = resp.json()\n    assert \"error\" in body\n    assert body[\"error\"][\"code\"] in (\"CONCURRENT_RUN\", \"RUN_IN_PROGRESS\")\n\n    runs_resp = api_client.get(\n        \"/api/payroll-runs?period=2024-06\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert runs_resp.status_code == 200\n    runs = runs_resp.json()[\"items\"]\n    assert len(runs) == 1\n    assert runs[0][\"id\"] == in_progress_id"
+      },
+      {
+        "name": "test_payroll_run_500_rolls_back_atomically",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated hr-admin session token available via <hr_admin_token> fixture",
+          "Active employees seeded via <seed_active_employees> fixture",
+          "Fault injection configured via <inject_payroll_fault> fixture to simulate mid-run DB error"
+        ],
+        "actions": [
+          "Enable fault injection that causes a DB error after partial stub writes",
+          "POST /api/payroll-runs",
+          "Query pay-stubs and payroll-run state after the 500 response"
+        ],
+        "expected": [
+          "HTTP 500 is returned",
+          "No pay-stub records exist for the failed run (full rollback)",
+          "No payroll-run record persists in completed or partial state",
+          "Audit log does not contain a completed entry for this run"
+        ],
+        "trace": [
+          "R-WEB-074: 500 rolled back atomically on failure",
+          "R-WEB-074: a failed run shall not partially commit"
+        ],
+        "executable": "def test_payroll_run_500_rolls_back_atomically(\n    hr_admin_token, seed_active_employees, inject_payroll_fault, api_client\n):\n    seed_active_employees(count=3)\n    inject_payroll_fault(error_type=\"db_write\", after_stubs=1)\n\n    payload = {\"period\": \"2024-07\", \"type\": \"monthly\"}\n    resp = api_client.post(\n        \"/api/payroll-runs\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code == 500\n    body = resp.json()\n    run_id = body.get(\"run_id\")\n\n    if run_id:\n        stubs_resp = api_client.get(\n            f\"/api/payroll-runs/{run_id}/pay-stubs\",\n            headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n        )\n        stubs = stubs_resp.json().get(\"items\", [])\n        assert len(stubs) == 0, \"Partial stubs found \u2014 rollback failed\"\n\n    runs_resp = api_client.get(\n        \"/api/payroll-runs?period=2024-07\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    completed = [\n        r for r in runs_resp.json().get(\"items\", [])\n        if r[\"state\"] in (\"completed\", \"partial\")\n    ]\n    assert len(completed) == 0"
+      },
+      {
+        "name": "test_payroll_run_state_transitions_idle_to_completed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated hr-admin session token available via <hr_admin_token> fixture",
+          "One active employee seeded via <seed_active_employees> fixture",
+          "No payroll run exists for the target period",
+          "Endpoint supports state query while run is in flight via <slow_payroll_mode> fixture"
+        ],
+        "actions": [
+          "Enable slow_payroll_mode to pause the run mid-processing",
+          "POST /api/payroll-runs (async, non-blocking)",
+          "GET /api/payroll-runs/{run_id} immediately \u2014 capture state",
+          "Resume the run via <resume_payroll_run>",
+          "GET /api/payroll-runs/{run_id} after completion \u2014 capture final state"
+        ],
+        "expected": [
+          "Initial state after POST is running or accepted (not completed)",
+          "Final state after resume is completed",
+          "State sequence follows idle -> running -> completed with no skipped states"
+        ],
+        "trace": [
+          "R-WEB-074: payroll-run state=completed",
+          "R-WEB-074: triggers payroll run (state machine coverage)"
+        ],
+        "executable": "def test_payroll_run_state_transitions_idle_to_completed(\n    hr_admin_token, seed_active_employees, slow_payroll_mode,\n    resume_payroll_run, api_client, cleanup_payroll_runs\n):\n    seed_active_employees(count=1)\n    slow_payroll_mode.enable()\n\n    payload = {\"period\": \"2024-08\", \"type\": \"monthly\"}\n    resp = api_client.post(\n        \"/api/payroll-runs\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code in (201, 202)\n    run_id = resp.json()[\"id\"]\n\n    mid_resp = api_client.get(\n        f\"/api/payroll-runs/{run_id}\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert mid_resp.status_code == 200\n    mid_state = mid_resp.json()[\"state\"]\n    assert mid_state in (\"running\", \"accepted\", \"pending\")\n\n    slow_payroll_mode.disable()\n    resume_payroll_run(run_id)\n\n    final_resp = api_client.get(\n        f\"/api/payroll-runs/{run_id}\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert final_resp.status_code == 200\n    assert final_resp.json()[\"state\"] == \"completed\""
+      },
+      {
+        "name": "test_payroll_run_boundary_single_active_employee",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated hr-admin session token available via <hr_admin_token> fixture",
+          "Exactly one active employee exists, seeded by <seed_active_employees> fixture",
+          "No payroll run is currently in progress for the target period"
+        ],
+        "actions": [
+          "POST /api/payroll-runs for a period with exactly one active employee",
+          "GET /api/payroll-runs/{run_id}/pay-stubs"
+        ],
+        "expected": [
+          "HTTP 201 with state=completed",
+          "Exactly one pay-stub record is created",
+          "Pay-stub has gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions",
+          "Webhook emits exactly one payroll.completed event"
+        ],
+        "trace": [
+          "R-WEB-074: pay-stub records created (boundary: minimum active employee count = 1)",
+          "R-WEB-074: BVA lower boundary on active employee set"
+        ],
+        "executable": "def test_payroll_run_boundary_single_active_employee(\n    hr_admin_token, seed_active_employees, webhook_mock, api_client, cleanup_payroll_runs\n):\n    employees = seed_active_employees(count=1)\n    assert len(employees) == 1\n\n    payload = {\"period\": \"2024-09\", \"type\": \"monthly\"}\n    resp = api_client.post(\n        \"/api/payroll-runs\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    run_id = body[\"id\"]\n    assert body[\"state\"] == \"completed\"\n\n    stubs_resp = api_client.get(\n        f\"/api/payroll-runs/{run_id}/pay-stubs\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert stubs_resp.status_code == 200\n    stubs = stubs_resp.json()[\"items\"]\n    assert len(stubs) == 1\n    stub = stubs[0]\n    assert stub[\"gross_pay\"] > 0\n    assert stub[\"deductions\"] >= 0\n    assert stub[\"net_pay\"] == stub[\"gross_pay\"] - stub[\"deductions\"]\n\n    events = webhook_mock.received_events()\n    matching = [e for e in events if e[\"type\"] == \"payroll.completed\" and e[\"data\"][\"run_id\"] == run_id]\n    assert len(matching) == 1"
+      }
+    ]
+  },
+  "req_id": "R-WEB-074",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1042,
+    "output_tokens": 3979,
+    "latency_ms": 40470,
+    "wall_ms": 40470,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-074\",\n  \"reasoning\": \"R-WEB-074 specifies a payroll-run endpoint with five distinct concerns: (1) happy-path full computation and record creation, (2) webhook emission, (3) 409 conflict when a run is already in progress, (4) atomic rollback on internal failure, and (5) boundary of exactly one active employee. I selected EP for the normal success path (valid hr-admin role, active employees), NEG for the 409 conflict and 500 rollback paths, STC to verify the state machine transition idle\u2192running\u2192completed, DT to cross the decision of concurrent-run guard, and BVA for the single-employee boundary. Each test is self-contained via fixtures that reset state before execution and uses deterministic employee/payroll IDs seeded per test.\",\n  \"tests\": [\n    {\n      \"name\": \"test_payroll_run_happy_path_creates_stubs_and_webhook\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated hr-admin session token available via <hr_admin_token> fixture\",\n        \"At least two active employees exist, seeded by <seed_active_employees> fixture\",\n        \"No payroll run is currently in progress\",\n        \"Webhook receiver mock is active via <webhook_mock> fixture\"\n      ],\n      \"actions\": [\n        \"POST /api/payroll-runs with valid period payload using hr-admin token\",\n        \"Poll or await response for completed status\",\n        \"GET /api/payroll-runs/{run_id}/pay-stubs to retrieve created stubs\",\n        \"GET /api/audit-log?resource=payroll-run&id={run_id}\",\n        \"Assert webhook_mock received the payroll.completed event\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 201 with body containing state=completed\",\n        \"Each active employee has exactly one pay-stub with gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions\",\n        \"Audit log contains one entry for the run\",\n        \"Webhook mock captured exactly one event with type=payroll.completed and matching run_id\"\n      ],\n      \"trace\": [\n        \"R-WEB-074: payroll-run state=completed\",\n        \"R-WEB-074: pay-stub records created\",\n        \"R-WEB-074: audit entry\",\n        \"R-WEB-074: emit webhook event for external consumers\"\n      ],\n      \"executable\": \"def test_payroll_run_happy_path_creates_stubs_and_webhook(\\n    hr_admin_token, seed_active_employees, webhook_mock, api_client, cleanup_payroll_runs\\n):\\n    employees = seed_active_employees(count=2)\\n    payload = {\\\"period\\\": \\\"2024-05\\\", \\\"type\\\": \\\"monthly\\\"}\\n\\n    resp = api_client.post(\\n        \\\"/api/payroll-runs\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {hr_admin_token}\\\"},\\n    )\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    run_id = body[\\\"id\\\"]\\n    assert body[\\\"state\\\"] == \\\"completed\\\"\\n\\n    stubs_resp = api_client.get(\\n        f\\\"/api/payroll-runs/{run_id}/pay-stubs\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {hr_admin_token}\\\"},\\n    )\\n    assert stubs_resp.status_code == 200\\n    stubs = stubs_resp.json()[\\\"items\\\"]\\n    assert len(stubs) == len(employees)\\n    for stub in stubs:\\n        assert stub[\\\"gross_pay\\\"] > 0\\n        assert stub[\\\"deductions\\\"] >= 0\\n        assert stub[\\\"net_pay\\\"] == stub[\\\"gross_pay\\\"] - stub[\\\"deductions\\\"]\\n\\n    audit_resp = api_client.get(\\n        f\\\"/api/audit-log?resource=payroll-run&id={run_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {hr_admin_token}\\\"},\\n    )\\n    assert audit_resp.status_code == 200\\n    assert len(audit_resp.json()[\\\"entries\\\"]) >= 1\\n\\n    events = webhook_mock.received_events()\\n    payroll_events = [e for e in events if e[\\\"type\\\"] == \\\"payroll.completed\\\"]\\n    assert len(payroll_events) == 1\\n    assert payroll_events[0][\\\"data\\\"][\\\"run_id\\\"] == run_id\"\n    },\n    {\n      \"name\": \"test_payroll_run_409_when_run_already_in_progress\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated hr-admin session token available via <hr_admin_tok"
+  }
+}

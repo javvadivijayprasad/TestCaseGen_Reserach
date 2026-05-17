@@ -1,0 +1,201 @@
+{
+  "req": {
+    "id": "R-WEB-060",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Submit leave request \u2014 variant 4",
+    "statement": "A full-time employee shall be able to submit a leave request for between 1 and 30 business days; requests spanning more than 30 days require hr-admin approval. Additionally, the operation must be rate-limited per user.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated",
+      "employment_type:full_time"
+    ],
+    "triggers": [
+      "employee submits form"
+    ],
+    "expected_outcomes": [
+      "request created",
+      "manager notified",
+      "notification email sent",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "400 when start_date > end_date",
+      "409 when overlapping existing leave",
+      "422 when request exceeds 30 days without hr-admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-060",
+    "reasoning": "The requirement defines a leave-request submission flow with four distinct concern areas: (1) valid submissions within 1-30 business days, (2) boundary at exactly 30 days, (3) invalid date ordering, (4) overlapping leave detection, and (5) requests exceeding 30 days without hr-admin role. I additionally cover rate-limiting as a negative path. Heuristics applied: EP for the normal valid case, BVA for the 30-day boundary, NEG for invalid date order and overlap, DT for the >30-day approval-gate rule, and STC for the rate-limit state transition.",
+    "tests": [
+      {
+        "name": "test_submit_leave_request_valid_within_30_days",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlaps the target date range",
+          "Target date range spans 10 business days"
+        ],
+        "actions": [
+          "POST /leave-requests/new with start_date=next Monday, end_date=+10 business days, type=annual"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains request_id",
+          "Response body status equals 'pending'",
+          "Manager notification event is recorded",
+          "Notification email is dispatched"
+        ],
+        "trace": [
+          "R-WEB-060: employee submits form",
+          "R-WEB-060: request created",
+          "R-WEB-060: manager notified",
+          "R-WEB-060: notification email sent"
+        ],
+        "executable": "def test_submit_leave_request_valid_within_30_days(auth_client, clean_leave_state, next_business_day, assert_email_sent):\n    start = next_business_day(offset=1)\n    end = next_business_day(offset=10)\n    payload = {\"start_date\": start, \"end_date\": end, \"leave_type\": \"annual\"}\n\n    resp = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"request_id\" in body\n    assert body[\"status\"] == \"pending\"\n    assert_email_sent(to=auth_client.user_email, subject_contains=\"Leave Request\")\n    assert <notification_store>.manager_notified(body[\"request_id\"])"
+      },
+      {
+        "name": "test_submit_leave_request_exactly_30_business_days",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlaps the target date range",
+          "Target date range spans exactly 30 business days"
+        ],
+        "actions": [
+          "POST /leave-requests/new with start_date=next Monday, end_date=+30 business days, type=annual"
+        ],
+        "expected": [
+          "HTTP 201 Created without requiring hr-admin approval",
+          "Response body status equals 'pending'",
+          "Response body does not contain hr_approval_required flag set to true"
+        ],
+        "trace": [
+          "R-WEB-060: between 1 and 30 business days \u2014 upper boundary",
+          "R-WEB-060: requests spanning more than 30 days require hr-admin approval (30 is inclusive, no escalation)"
+        ],
+        "executable": "def test_submit_leave_request_exactly_30_business_days(auth_client, clean_leave_state, next_business_day, business_days_end):\n    start = next_business_day(offset=1)\n    end = business_days_end(start, count=30)\n    payload = {\"start_date\": start, \"end_date\": end, \"leave_type\": \"annual\"}\n\n    resp = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"hr_approval_required\", False) is False"
+      },
+      {
+        "name": "test_submit_leave_request_start_after_end_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee"
+        ],
+        "actions": [
+          "POST /leave-requests/new with start_date > end_date"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Response body error code equals 'INVALID_DATE_RANGE'",
+          "No leave record is created in the database"
+        ],
+        "trace": [
+          "R-WEB-060: error pathway \u2014 400 when start_date > end_date"
+        ],
+        "executable": "def test_submit_leave_request_start_after_end_returns_400(auth_client, next_business_day, assert_no_leave_created):\n    start = next_business_day(offset=5)\n    end = next_business_day(offset=1)\n    payload = {\"start_date\": start, \"end_date\": end, \"leave_type\": \"annual\"}\n\n    resp = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body.get(\"error_code\") == \"INVALID_DATE_RANGE\"\n    assert_no_leave_created(auth_client.user_id, start, end)"
+      },
+      {
+        "name": "test_submit_leave_request_overlapping_existing_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "An approved leave record already exists for the target date range"
+        ],
+        "actions": [
+          "POST /leave-requests/new with date range overlapping the existing approved leave"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body error code equals 'OVERLAPPING_LEAVE'"
+        ],
+        "trace": [
+          "R-WEB-060: error pathway \u2014 409 when overlapping existing leave"
+        ],
+        "executable": "def test_submit_leave_request_overlapping_existing_returns_409(auth_client, create_leave_record, next_business_day):\n    start = next_business_day(offset=1)\n    end = next_business_day(offset=5)\n    create_leave_record(user_id=auth_client.user_id, start=start, end=end, status=\"approved\")\n\n    overlap_start = next_business_day(offset=3)\n    overlap_end = next_business_day(offset=7)\n    payload = {\"start_date\": overlap_start, \"end_date\": overlap_end, \"leave_type\": \"annual\"}\n\n    resp = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert resp.status_code == 409\n    body = resp.json()\n    assert body.get(\"error_code\") == \"OVERLAPPING_LEAVE\""
+      },
+      {
+        "name": "test_submit_leave_request_exceeds_30_days_without_hr_admin_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "User does NOT have hr-admin role",
+          "No existing leave overlaps the target date range",
+          "Target date range spans 31 business days"
+        ],
+        "actions": [
+          "POST /leave-requests/new with start_date=next Monday, end_date=+31 business days, type=annual"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body error code equals 'HR_ADMIN_APPROVAL_REQUIRED'",
+          "No leave record is created"
+        ],
+        "trace": [
+          "R-WEB-060: requests spanning more than 30 days require hr-admin approval",
+          "R-WEB-060: error pathway \u2014 422 when request exceeds 30 days without hr-admin"
+        ],
+        "executable": "def test_submit_leave_request_exceeds_30_days_without_hr_admin_returns_422(auth_client, clean_leave_state, next_business_day, business_days_end, assert_no_leave_created):\n    start = next_business_day(offset=1)\n    end = business_days_end(start, count=31)\n    payload = {\"start_date\": start, \"end_date\": end, \"leave_type\": \"annual\"}\n\n    resp = auth_client.post(\"/leave-requests/new\", json=payload)\n\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"error_code\") == \"HR_ADMIN_APPROVAL_REQUIRED\"\n    assert_no_leave_created(auth_client.user_id, start, end)"
+      },
+      {
+        "name": "test_leave_request_rate_limit_triggers_after_threshold",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "Rate-limit counter for the user is at threshold (state: saturated)"
+        ],
+        "actions": [
+          "Submit N+1 leave requests in rapid succession where N equals the per-user rate limit",
+          "Observe the final request response"
+        ],
+        "expected": [
+          "First N requests return HTTP 201",
+          "N+1 request returns HTTP 429 Too Many Requests",
+          "Response includes Retry-After header"
+        ],
+        "trace": [
+          "R-WEB-060: operation must be rate-limited per user",
+          "State transition: allowed -> saturated -> blocked"
+        ],
+        "executable": "def test_leave_request_rate_limit_triggers_after_threshold(auth_client, clean_leave_state, next_business_day, business_days_end, rate_limit_config):\n    limit = rate_limit_config(\"leave_requests_per_window\")\n    responses = []\n    for i in range(limit):\n        start = next_business_day(offset=1 + i * 2)\n        end = business_days_end(start, count=1)\n        r = auth_client.post(\"/leave-requests/new\", json={\"start_date\": start, \"end_date\": end, \"leave_type\": \"annual\"})\n        responses.append(r)\n\n    assert all(r.status_code == 201 for r in responses), \"Expected all requests within limit to succeed\"\n\n    start_extra = next_business_day(offset=1 + limit * 2)\n    end_extra = business_days_end(start_extra, count=1)\n    final = auth_client.post(\"/leave-requests/new\", json={\"start_date\": start_extra, \"end_date\": end_extra, \"leave_type\": \"annual\"})\n\n    assert final.status_code == 429\n    assert \"Retry-After\" in final.headers"
+      }
+    ]
+  },
+  "req_id": "R-WEB-060",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[5] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1056,
+    "output_tokens": 2969,
+    "latency_ms": 35333,
+    "wall_ms": 35333,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-060\",\n  \"reasoning\": \"The requirement defines a leave-request submission flow with four distinct concern areas: (1) valid submissions within 1-30 business days, (2) boundary at exactly 30 days, (3) invalid date ordering, (4) overlapping leave detection, and (5) requests exceeding 30 days without hr-admin role. I additionally cover rate-limiting as a negative path. Heuristics applied: EP for the normal valid case, BVA for the 30-day boundary, NEG for invalid date order and overlap, DT for the >30-day approval-gate rule, and STC for the rate-limit state transition.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_leave_request_valid_within_30_days\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"No existing leave overlaps the target date range\",\n        \"Target date range spans 10 business days\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/new with start_date=next Monday, end_date=+10 business days, type=annual\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains request_id\",\n        \"Response body status equals 'pending'\",\n        \"Manager notification event is recorded\",\n        \"Notification email is dispatched\"\n      ],\n      \"trace\": [\n        \"R-WEB-060: employee submits form\",\n        \"R-WEB-060: request created\",\n        \"R-WEB-060: manager notified\",\n        \"R-WEB-060: notification email sent\"\n      ],\n      \"executable\": \"def test_submit_leave_request_valid_within_30_days(auth_client, clean_leave_state, next_business_day, assert_email_sent):\\n    start = next_business_day(offset=1)\\n    end = next_business_day(offset=10)\\n    payload = {\\\"start_date\\\": start, \\\"end_date\\\": end, \\\"leave_type\\\": \\\"annual\\\"}\\n\\n    resp = auth_client.post(\\\"/leave-requests/new\\\", json=payload)\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"request_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert_email_sent(to=auth_client.user_email, subject_contains=\\\"Leave Request\\\")\\n    assert <notification_store>.manager_notified(body[\\\"request_id\\\"])\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_exactly_30_business_days\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"No existing leave overlaps the target date range\",\n        \"Target date range spans exactly 30 business days\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/new with start_date=next Monday, end_date=+30 business days, type=annual\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created without requiring hr-admin approval\",\n        \"Response body status equals 'pending'\",\n        \"Response body does not contain hr_approval_required flag set to true\"\n      ],\n      \"trace\": [\n        \"R-WEB-060: between 1 and 30 business days \u2014 upper boundary\",\n        \"R-WEB-060: requests spanning more than 30 days require hr-admin approval (30 is inclusive, no escalation)\"\n      ],\n      \"executable\": \"def test_submit_leave_request_exactly_30_business_days(auth_client, clean_leave_state, next_business_day, business_days_end):\\n    start = next_business_day(offset=1)\\n    end = business_days_end(start, count=30)\\n    payload = {\\\"start_date\\\": start, \\\"end_date\\\": end, \\\"leave_type\\\": \\\"annual\\\"}\\n\\n    resp = auth_client.post(\\\"/leave-requests/new\\\", json=payload)\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert body.get(\\\"hr_approval_required\\\", False) is False\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_start_after_end_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/new with start_date > end_date\"\n      ],\n      \"expected\": [\n   "
+  }
+}

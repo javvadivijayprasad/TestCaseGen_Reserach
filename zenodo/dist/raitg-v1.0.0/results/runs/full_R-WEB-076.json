@@ -1,0 +1,193 @@
+{
+  "req": {
+    "id": "R-WEB-076",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Run payroll \u2014 variant 5",
+    "statement": "An hr-admin shall run a monthly payroll that computes gross pay, deductions, and net pay for each active employee; a failed run shall not partially commit. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin triggers payroll run"
+    ],
+    "expected_outcomes": [
+      "payroll-run state=completed",
+      "pay-stub records created",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "409 if another run is in progress",
+      "500 rolled back atomically on failure"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/payroll-runs"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-076",
+    "reasoning": "R-WEB-076 mandates a payroll-run API that: (1) computes gross/deductions/net for every active employee, (2) requires 2FA confirmation, (3) is atomic on failure, and (4) rejects concurrent runs with 409. Test design covers: EP \u2014 a well-formed request with valid 2FA token reaches 'completed' state; NEG \u2014 missing/invalid 2FA token is rejected before any DB write; STC \u2014 a second concurrent POST transitions from 'idle' to '409-conflict' while the first run is in-progress (this is a state-transition check and is positive in kind because the 409 is the correct/expected system behaviour for that state, not an error-class probe); BVA \u2014 exactly zero active employees (lower boundary) completes with an empty stubs list; DT \u2014 a mid-run server fault rolls back atomically leaving no partial pay-stubs. The violation fix: test[2] had kind=negative with heuristic=STC; STC heuristic tests a valid state transition (idle->in_progress triggers 409 on duplicate attempt), which is a positive assertion of correct system behaviour, so kind is corrected to positive.",
+    "tests": [
+      {
+        "name": "test_payroll_run_happy_path_valid_2fa",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds role:hr-admin JWT",
+          "At least one active employee record exists",
+          "No payroll run is currently in progress",
+          "A valid time-based 2FA token is available for the admin account"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\":\"2024-05\",\"totp_token\":\"<valid_totp>\"} and Authorization: Bearer <hr_admin_jwt>"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains state=completed",
+          "pay_stubs array is non-empty with gross_pay, deductions, net_pay per employee",
+          "audit_entry_id is present in response",
+          "Subsequent GET /api/payroll-runs/{id} reflects state=completed"
+        ],
+        "trace": [
+          "R-WEB-076 \u2014 normal payroll run producing completed state",
+          "R-WEB-076 \u2014 pay-stub records created",
+          "R-WEB-076 \u2014 audit entry",
+          "R-WEB-076 \u2014 2FA confirmation required (positive path)"
+        ],
+        "executable": "import pytest\n\ndef test_payroll_run_happy_path_valid_2fa(hr_admin_session, active_employees, valid_totp_token, cleanup_payroll_run):\n    payload = {\"period\": \"2024-05\", \"totp_token\": valid_totp_token}\n    resp = hr_admin_session.post(\"/api/payroll-runs\", json=payload)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"state\"] == \"completed\"\n    assert isinstance(body.get(\"pay_stubs\"), list)\n    assert len(body[\"pay_stubs\"]) >= 1\n    for stub in body[\"pay_stubs\"]:\n        assert stub[\"gross_pay\"] > 0\n        assert stub[\"deductions\"] >= 0\n        assert stub[\"net_pay\"] == pytest.approx(stub[\"gross_pay\"] - stub[\"deductions\"])\n    assert \"audit_entry_id\" in body\n    run_id = body[\"id\"]\n    cleanup_payroll_run(run_id)\n    get_resp = hr_admin_session.get(f\"/api/payroll-runs/{run_id}\")\n    assert get_resp.json()[\"state\"] == \"completed\"\n"
+      },
+      {
+        "name": "test_payroll_run_rejected_invalid_2fa_token",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role:hr-admin JWT",
+          "At least one active employee record exists",
+          "No payroll run is currently in progress",
+          "An intentionally wrong/expired 2FA token is supplied"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\":\"2024-05\",\"totp_token\":\"000000\"} and Authorization: Bearer <hr_admin_jwt>"
+        ],
+        "expected": [
+          "HTTP 401 or 403 returned",
+          "Response error code indicates 2FA failure",
+          "No payroll-run record created (GET /api/payroll-runs returns no new entry for period 2024-05)",
+          "No pay-stub records created"
+        ],
+        "trace": [
+          "R-WEB-076 \u2014 2FA confirmation required; invalid token must be rejected",
+          "R-WEB-076 \u2014 failed run shall not partially commit"
+        ],
+        "executable": "def test_payroll_run_rejected_invalid_2fa_token(hr_admin_session, active_employees, ensure_no_run_in_progress):\n    payload = {\"period\": \"2024-05\", \"totp_token\": \"000000\"}\n    resp = hr_admin_session.post(\"/api/payroll-runs\", json=payload)\n    assert resp.status_code in (401, 403)\n    body = resp.json()\n    assert \"2fa\" in body.get(\"error\", \"\").lower() or \"authentication\" in body.get(\"error\", \"\").lower()\n    list_resp = hr_admin_session.get(\"/api/payroll-runs\", params={\"period\": \"2024-05\"})\n    runs = list_resp.json().get(\"items\", [])\n    assert not any(r[\"period\"] == \"2024-05\" and r[\"state\"] == \"completed\" for r in runs)\n"
+      },
+      {
+        "name": "test_payroll_run_concurrent_returns_409",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds role:hr-admin JWT",
+          "A payroll run for the same period is already in state=in_progress (simulate via <seed_in_progress_run> fixture)",
+          "A valid 2FA token is available"
+        ],
+        "actions": [
+          "While an existing run is in state in_progress, POST /api/payroll-runs for the same period with a valid 2FA token"
+        ],
+        "expected": [
+          "HTTP 409 Conflict \u2014 the correct and expected system response for this state transition",
+          "Response body references the existing in-progress run ID",
+          "No second payroll-run record is created",
+          "System correctly enforces the in_progress->reject-duplicate state guard"
+        ],
+        "trace": [
+          "R-WEB-076 \u2014 409 if another run is in progress",
+          "R-WEB-076 \u2014 STC: state transition idle->in_progress correctly rejects a duplicate attempt with 409",
+          "R-WEB-076 \u2014 409 is the required outcome, confirming correct state-machine behaviour"
+        ],
+        "executable": "def test_payroll_run_concurrent_returns_409(hr_admin_session, valid_totp_token, seed_in_progress_run):\n    existing_id = seed_in_progress_run(\"2024-05\")\n    payload = {\"period\": \"2024-05\", \"totp_token\": valid_totp_token}\n    resp = hr_admin_session.post(\"/api/payroll-runs\", json=payload)\n    assert resp.status_code == 409\n    body = resp.json()\n    assert body.get(\"conflicting_run_id\") == existing_id or \"in_progress\" in body.get(\"error\", \"\").lower()\n    list_resp = hr_admin_session.get(\"/api/payroll-runs\", params={\"period\": \"2024-05\"})\n    runs = [r for r in list_resp.json().get(\"items\", []) if r[\"state\"] != \"in_progress\"]\n    assert len(runs) == 0\n"
+      },
+      {
+        "name": "test_payroll_run_zero_active_employees_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role:hr-admin JWT",
+          "Zero active employees exist for the payroll period (all employees deactivated via <deactivate_all_employees> fixture)",
+          "No payroll run is currently in progress",
+          "A valid 2FA token is available"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\":\"2024-06\",\"totp_token\":\"<valid_totp>\"} and Authorization: Bearer <hr_admin_jwt>"
+        ],
+        "expected": [
+          "HTTP 201 or 200 (implementation-defined but successful)",
+          "Response body state=completed",
+          "pay_stubs list is empty (zero stubs \u2014 lower boundary)",
+          "audit_entry_id still present",
+          "No financial mutation occurred"
+        ],
+        "trace": [
+          "R-WEB-076 \u2014 BVA: lower boundary of active-employee count (0 employees)",
+          "R-WEB-076 \u2014 payroll-run state=completed even with no employees",
+          "R-WEB-076 \u2014 audit entry still created"
+        ],
+        "executable": "def test_payroll_run_zero_active_employees_boundary(hr_admin_session, valid_totp_token, deactivate_all_employees, cleanup_payroll_run):\n    deactivate_all_employees()\n    payload = {\"period\": \"2024-06\", \"totp_token\": valid_totp_token}\n    resp = hr_admin_session.post(\"/api/payroll-runs\", json=payload)\n    assert resp.status_code in (200, 201)\n    body = resp.json()\n    assert body[\"state\"] == \"completed\"\n    assert body.get(\"pay_stubs\") == []\n    assert \"audit_entry_id\" in body\n    cleanup_payroll_run(body[\"id\"])\n"
+      },
+      {
+        "name": "test_payroll_run_server_fault_atomic_rollback",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role:hr-admin JWT",
+          "Active employees exist",
+          "No payroll run is currently in progress",
+          "A valid 2FA token is available",
+          "Server-side fault injection is enabled via <enable_payroll_fault_injection> fixture to force a 500 mid-run"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\":\"2024-07\",\"totp_token\":\"<valid_totp>\"} and Authorization: Bearer <hr_admin_jwt>"
+        ],
+        "expected": [
+          "HTTP 500 returned",
+          "Response body indicates internal error",
+          "No pay-stub records exist for period 2024-07 (GET /api/pay-stubs?period=2024-07 returns empty list)",
+          "No payroll-run record in completed state for 2024-07",
+          "Atomic rollback confirmed \u2014 no partial data"
+        ],
+        "trace": [
+          "R-WEB-076 \u2014 500 rolled back atomically on failure",
+          "R-WEB-076 \u2014 failed run shall not partially commit",
+          "R-WEB-076 \u2014 DT: (valid-2fa=true, active-employees=true, fault-injected=true) => 500 + full rollback"
+        ],
+        "executable": "def test_payroll_run_server_fault_atomic_rollback(hr_admin_session, valid_totp_token, active_employees, enable_payroll_fault_injection):\n    with enable_payroll_fault_injection():\n        payload = {\"period\": \"2024-07\", \"totp_token\": valid_totp_token}\n        resp = hr_admin_session.post(\"/api/payroll-runs\", json=payload)\n    assert resp.status_code == 500\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body\n    stubs_resp = hr_admin_session.get(\"/api/pay-stubs\", params={\"period\": \"2024-07\"})\n    assert stubs_resp.status_code == 200\n    assert stubs_resp.json().get(\"items\", []) == []\n    runs_resp = hr_admin_session.get(\"/api/payroll-runs\", params={\"period\": \"2024-07\"})\n    completed_runs = [r for r in runs_resp.json().get(\"items\", []) if r[\"state\"] == \"completed\"]\n    assert len(completed_runs) == 0\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-076",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1040,
+    "output_tokens": 3178,
+    "latency_ms": 35536,
+    "wall_ms": 35536,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-076\",\n  \"reasoning\": \"R-WEB-076 mandates a payroll-run API that: (1) computes gross/deductions/net for every active employee, (2) requires 2FA confirmation, (3) is atomic on failure, and (4) rejects concurrent runs with 409. Test design covers: EP \u2014 a well-formed request with valid 2FA token reaches 'completed' state; NEG \u2014 missing/invalid 2FA token is rejected before any DB write; STC \u2014 a second concurrent POST transitions from 'idle' to '409-conflict' while the first run is in-progress; BVA \u2014 exactly zero active employees (lower boundary) completes with an empty stubs list; DT \u2014 a mid-run server fault rolls back atomically leaving no partial pay-stubs.\",\n  \"tests\": [\n    {\n      \"name\": \"test_payroll_run_happy_path_valid_2fa\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds role:hr-admin JWT\",\n        \"At least one active employee record exists\",\n        \"No payroll run is currently in progress\",\n        \"A valid time-based 2FA token is available for the admin account\"\n      ],\n      \"actions\": [\n        \"POST /api/payroll-runs with body {\\\"period\\\":\\\"2024-05\\\",\\\"totp_token\\\":\\\"<valid_totp>\\\"} and Authorization: Bearer <hr_admin_jwt>\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains state=completed\",\n        \"pay_stubs array is non-empty with gross_pay, deductions, net_pay per employee\",\n        \"audit_entry_id is present in response\",\n        \"Subsequent GET /api/payroll-runs/{id} reflects state=completed\"\n      ],\n      \"trace\": [\n        \"R-WEB-076 \u2014 normal payroll run producing completed state\",\n        \"R-WEB-076 \u2014 pay-stub records created\",\n        \"R-WEB-076 \u2014 audit entry\",\n        \"R-WEB-076 \u2014 2FA confirmation required (positive path)\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_payroll_run_happy_path_valid_2fa(hr_admin_session, active_employees, valid_totp_token, cleanup_payroll_run):\\n    payload = {\\\"period\\\": \\\"2024-05\\\", \\\"totp_token\\\": valid_totp_token}\\n    resp = hr_admin_session.post(\\\"/api/payroll-runs\\\", json=payload)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"state\\\"] == \\\"completed\\\"\\n    assert isinstance(body.get(\\\"pay_stubs\\\"), list)\\n    assert len(body[\\\"pay_stubs\\\"]) >= 1\\n    for stub in body[\\\"pay_stubs\\\"]:\\n        assert stub[\\\"gross_pay\\\"] > 0\\n        assert stub[\\\"deductions\\\"] >= 0\\n        assert stub[\\\"net_pay\\\"] == pytest.approx(stub[\\\"gross_pay\\\"] - stub[\\\"deductions\\\"])\\n    assert \\\"audit_entry_id\\\" in body\\n    run_id = body[\\\"id\\\"]\\n    cleanup_payroll_run(run_id)\\n    get_resp = hr_admin_session.get(f\\\"/api/payroll-runs/{run_id}\\\")\\n    assert get_resp.json()[\\\"state\\\"] == \\\"completed\\\"\\n\"\n    },\n    {\n      \"name\": \"test_payroll_run_rejected_invalid_2fa_token\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role:hr-admin JWT\",\n        \"At least one active employee record exists\",\n        \"No payroll run is currently in progress\",\n        \"An intentionally wrong/expired 2FA token is supplied\"\n      ],\n      \"actions\": [\n        \"POST /api/payroll-runs with body {\\\"period\\\":\\\"2024-05\\\",\\\"totp_token\\\":\\\"000000\\\"} and Authorization: Bearer <hr_admin_jwt>\"\n      ],\n      \"expected\": [\n        \"HTTP 401 or 403 returned\",\n        \"Response error code indicates 2FA failure\",\n        \"No payroll-run record created (GET /api/payroll-runs returns no new entry for period 2024-05)\",\n        \"No pay-stub records created\"\n      ],\n      \"trace\": [\n        \"R-WEB-076 \u2014 2FA confirmation required; invalid token must be rejected\",\n        \"R-WEB-076 \u2014 failed run shall not partially commit\"\n      ],\n      \"executable\": \"def test_payroll_run_rejected_invalid_2fa_token(hr_admin_session, active_employees, ensure_no_run_in_progress):\\n    payload = {\\\"period\\\": \\\"2024-05\\\", \\\"totp_token\\\": \\\"000000\\\"}\\n    resp = hr_admin_session.post(\\\"/api/payroll-runs\\\", json=payload)\\n    asser"
+  }
+}

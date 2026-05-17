@@ -1,0 +1,164 @@
+{
+  "req": {
+    "id": "R-HLT-078",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Update patient (audit)",
+    "statement": "A clinician shall update patient demographics; historical versions must be preserved. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician updates resource"
+    ],
+    "expected_outcomes": [
+      "new version stored",
+      "history preserved"
+    ],
+    "error_pathways": [
+      "409 on version conflict"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-078",
+    "reasoning": "R-HLT-078 demands three verifiable behaviours: (1) a successful PUT by a clinician increments the resource version and preserves history; (2) a concurrent PUT with a stale If-Match ETag yields 409; (3) an AuditEvent is emitted for every mutating operation. I selected four tests covering the positive happy-path (EP/STC), the version-conflict error path (NEG/DT), the boundary of exactly one prior history entry after a single update (BVA), and the audit-event emission (STC). Each test creates its own patient via a POST fixture call, operates independently, and cleans up via a DELETE to remain idempotent.",
+    "tests": [
+      {
+        "name": "test_update_patient_demographics_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "FHIR-lite server is reachable",
+          "Caller holds role:clinician (token via <clinician_token> fixture)",
+          "A patient resource exists (created by <create_patient> fixture)"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with updated family name and correct If-Match ETag",
+          "Assert HTTP 200 and meta.versionId incremented",
+          "Assert response body reflects new family name"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "meta.versionId == '2'",
+          "name[0].family == 'UpdatedFamily'",
+          "Previous version accessible at /Patient/{id}/_history/1"
+        ],
+        "trace": [
+          "R-HLT-078 / Expected outcome: new version stored",
+          "R-HLT-078 / Actor: clinician"
+        ],
+        "executable": "def test_update_patient_demographics_success(clinician_token, create_patient, fhir_base_url):\n    patient_id, etag_v1 = create_patient\n    headers = {\n        \"Authorization\": f\"Bearer {clinician_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        \"If-Match\": etag_v1,\n    }\n    payload = <build_patient_payload>(patient_id, version=\"1\", family=\"UpdatedFamily\")\n    resp = <http_client>.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"meta\"][\"versionId\"] == \"2\"\n    assert body[\"name\"][0][\"family\"] == \"UpdatedFamily\"\n    hist = <http_client>.get(\n        f\"{fhir_base_url}/Patient/{patient_id}/_history/1\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert hist.status_code == 200\n    assert hist.json()[\"meta\"][\"versionId\"] == \"1\""
+      },
+      {
+        "name": "test_update_patient_version_conflict_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "FHIR-lite server is reachable",
+          "Caller holds role:clinician (token via <clinician_token> fixture)",
+          "A patient resource exists at version 1 (created by <create_patient> fixture)",
+          "A second clinician has already updated the patient to version 2 (via <advance_patient_version> helper)"
+        ],
+        "actions": [
+          "PUT /Patient/{id} supplying stale If-Match ETag pointing to version 1",
+          "Assert HTTP 409 Conflict",
+          "Assert OperationOutcome issue.code == 'conflict'"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body is an OperationOutcome",
+          "issue[0].code == 'conflict'"
+        ],
+        "trace": [
+          "R-HLT-078 / Error pathway: 409 on version conflict",
+          "R-HLT-078 / Decision Table: stale ETag -> conflict"
+        ],
+        "executable": "def test_update_patient_version_conflict_returns_409(clinician_token, create_patient, fhir_base_url):\n    patient_id, etag_v1 = create_patient\n    <advance_patient_version>(patient_id, clinician_token, fhir_base_url)\n    headers = {\n        \"Authorization\": f\"Bearer {clinician_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        \"If-Match\": etag_v1,\n    }\n    payload = <build_patient_payload>(patient_id, version=\"1\", family=\"ConflictFamily\")\n    resp = <http_client>.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 409\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    assert body[\"issue\"][0][\"code\"] == \"conflict\""
+      },
+      {
+        "name": "test_history_contains_exactly_one_prior_version_after_single_update",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "FHIR-lite server is reachable",
+          "Caller holds role:clinician (token via <clinician_token> fixture)",
+          "A patient resource exists at version 1 (created by <create_patient> fixture)",
+          "No prior updates have been made to this patient"
+        ],
+        "actions": [
+          "PUT /Patient/{id} once with valid If-Match ETag",
+          "GET /Patient/{id}/_history",
+          "Assert history bundle contains exactly 2 entries (version 1 and version 2)"
+        ],
+        "expected": [
+          "HTTP 200 on history GET",
+          "Bundle.total == 2",
+          "Oldest entry versionId == '1'",
+          "Newest entry versionId == '2'"
+        ],
+        "trace": [
+          "R-HLT-078 / Expected outcome: history preserved",
+          "R-HLT-078 / BVA: boundary of 1 previous version after exactly 1 update"
+        ],
+        "executable": "def test_history_contains_exactly_one_prior_version_after_single_update(clinician_token, create_patient, fhir_base_url):\n    patient_id, etag_v1 = create_patient\n    auth = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    put_headers = {**auth, \"Content-Type\": \"application/fhir+json\", \"If-Match\": etag_v1}\n    payload = <build_patient_payload>(patient_id, version=\"1\", family=\"BoundaryFamily\")\n    put_resp = <http_client>.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=put_headers,\n    )\n    assert put_resp.status_code == 200\n    hist_resp = <http_client>.get(\n        f\"{fhir_base_url}/Patient/{patient_id}/_history\",\n        headers=auth,\n    )\n    assert hist_resp.status_code == 200\n    bundle = hist_resp.json()\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 2\n    versions = sorted([e[\"resource\"][\"meta\"][\"versionId\"] for e in entries])\n    assert versions == [\"1\", \"2\"]"
+      },
+      {
+        "name": "test_audit_event_emitted_after_patient_update",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "FHIR-lite server is reachable",
+          "Caller holds role:clinician (token via <clinician_token> fixture)",
+          "A patient resource exists (created by <create_patient> fixture)",
+          "AuditEvent search endpoint is accessible to clinician or admin"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with valid If-Match ETag",
+          "GET /AuditEvent?entity={id}&action=U&_sort=-date&_count=1",
+          "Assert at least one AuditEvent matches the update operation"
+        ],
+        "expected": [
+          "HTTP 200 on PUT",
+          "AuditEvent bundle total >= 1",
+          "AuditEvent.action == 'U'",
+          "AuditEvent.entity references Patient/{id}",
+          "AuditEvent.agent reflects clinician identity"
+        ],
+        "trace": [
+          "R-HLT-078 / Expected outcome: AuditEvent emitted for every operation",
+          "R-HLT-078 / STC: state transition clinician-authenticated -> resource-updated -> audit-recorded"
+        ],
+        "executable": "def test_audit_event_emitted_after_patient_update(clinician_token, create_patient, fhir_base_url):\n    patient_id, etag_v1 = create_patient\n    auth = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    put_headers = {**auth, \"Content-Type\": \"application/fhir+json\", \"If-Match\": etag_v1}\n    payload = <build_patient_payload>(patient_id, version=\"1\", family=\"AuditFamily\")\n    put_resp = <http_client>.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=put_headers,\n    )\n    assert put_resp.status_code == 200\n    audit_resp = <http_client>.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\", \"action\": \"U\", \"_sort\": \"-date\", \"_count\": \"1\"},\n        headers=auth,\n    )\n    assert audit_resp.status_code == 200\n    bundle = audit_resp.json()\n    assert bundle.get(\"total\", 0) >= 1\n    event = bundle[\"entry\"][0][\"resource\"]\n    assert event[\"action\"] == \"U\"\n    entity_refs = [e.get(\"what\", {}).get(\"reference\", \"\") for e in event.get(\"entity\", [])]\n    assert any(f\"Patient/{patient_id}\" in ref for ref in entity_refs)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-078",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 2839,
+    "latency_ms": 35412,
+    "wall_ms": 35412,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-078\",\n  \"reasoning\": \"R-HLT-078 demands three verifiable behaviours: (1) a successful PUT by a clinician increments the resource version and preserves history; (2) a concurrent PUT with a stale If-Match ETag yields 409; (3) an AuditEvent is emitted for every mutating operation. I selected four tests covering the positive happy-path (EP/STC), the version-conflict error path (NEG/DT), the boundary of exactly one prior history entry after a single update (BVA), and the audit-event emission (STC). Each test creates its own patient via a POST fixture call, operates independently, and cleans up via a DELETE to remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_update_patient_demographics_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"FHIR-lite server is reachable\",\n        \"Caller holds role:clinician (token via <clinician_token> fixture)\",\n        \"A patient resource exists (created by <create_patient> fixture)\"\n      ],\n      \"actions\": [\n        \"PUT /Patient/{id} with updated family name and correct If-Match ETag\",\n        \"Assert HTTP 200 and meta.versionId incremented\",\n        \"Assert response body reflects new family name\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"meta.versionId == '2'\",\n        \"name[0].family == 'UpdatedFamily'\",\n        \"Previous version accessible at /Patient/{id}/_history/1\"\n      ],\n      \"trace\": [\n        \"R-HLT-078 / Expected outcome: new version stored\",\n        \"R-HLT-078 / Actor: clinician\"\n      ],\n      \"executable\": \"def test_update_patient_demographics_success(clinician_token, create_patient, fhir_base_url):\\n    patient_id, etag_v1 = create_patient\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\",\\n        \\\"Content-Type\\\": \\\"application/fhir+json\\\",\\n        \\\"If-Match\\\": etag_v1,\\n    }\\n    payload = <build_patient_payload>(patient_id, version=\\\"1\\\", family=\\\"UpdatedFamily\\\")\\n    resp = <http_client>.put(\\n        f\\\"{fhir_base_url}/Patient/{patient_id}\\\",\\n        json=payload,\\n        headers=headers,\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"meta\\\"][\\\"versionId\\\"] == \\\"2\\\"\\n    assert body[\\\"name\\\"][0][\\\"family\\\"] == \\\"UpdatedFamily\\\"\\n    hist = <http_client>.get(\\n        f\\\"{fhir_base_url}/Patient/{patient_id}/_history/1\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"},\\n    )\\n    assert hist.status_code == 200\\n    assert hist.json()[\\\"meta\\\"][\\\"versionId\\\"] == \\\"1\\\"\"\n    },\n    {\n      \"name\": \"test_update_patient_version_conflict_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"FHIR-lite server is reachable\",\n        \"Caller holds role:clinician (token via <clinician_token> fixture)\",\n        \"A patient resource exists at version 1 (created by <create_patient> fixture)\",\n        \"A second clinician has already updated the patient to version 2 (via <advance_patient_version> helper)\"\n      ],\n      \"actions\": [\n        \"PUT /Patient/{id} supplying stale If-Match ETag pointing to version 1\",\n        \"Assert HTTP 409 Conflict\",\n        \"Assert OperationOutcome issue.code == 'conflict'\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response body is an OperationOutcome\",\n        \"issue[0].code == 'conflict'\"\n      ],\n      \"trace\": [\n        \"R-HLT-078 / Error pathway: 409 on version conflict\",\n        \"R-HLT-078 / Decision Table: stale ETag -> conflict\"\n      ],\n      \"executable\": \"def test_update_patient_version_conflict_returns_409(clinician_token, create_patient, fhir_base_url):\\n    patient_id, etag_v1 = create_patient\\n    <advance_patient_version>(patient_id, clinician_token, fhir_base_url)\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\",\\n        \\\"Content-Type\\\": \\\"application/fhir+json\\\",\\n        \\\"If-Match\\\": etag_v1,\\n    }\\n    payload = <build_patient_payload>(patient_"
+  }
+}

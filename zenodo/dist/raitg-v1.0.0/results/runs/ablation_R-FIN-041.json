@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-FIN-041",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual (boundary variant)",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-041",
+    "reasoning": "R-FIN-041 mandates daily interest accrual using tier rates, monthly crediting on the last business day, and correct boundary behaviour at min/max thresholds. The test suite covers: (1) a positive EP case where a mid-tier balance accrues and credits correctly; (2) a negative NEG case where a reconciliation variance is detected and reported; (3) a BVA boundary case at the exact minimum tier threshold; (4) a BVA boundary case at the exact maximum tier threshold; (5) a STC case verifying state transitions from ACCRUING to CREDITED. Each test is self-contained via fixtures that create and teardown account state, posts to /cron/interest, and asserts ledger outcomes deterministically.",
+    "tests": [
+      {
+        "name": "test_monthly_interest_credited_mid_tier_balance",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A savings account exists with a mid-tier balance (e.g. 5000.00)",
+          "Daily accruals have been posted for the full month",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_savings_account> with balance=5000.00 and tier='MID'",
+          "Seed daily accruals for the month via <helper_fn: seed_daily_accruals>",
+          "POST /cron/interest with valid cron auth header"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains account_id with status='CREDITED'",
+          "Ledger entry of type 'INTEREST_CREDIT' exists for the account",
+          "Credited amount equals sum of daily accruals for the period"
+        ],
+        "trace": [
+          "R-FIN-041: interest credited monthly on last business day",
+          "R-FIN-041: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_ENDPOINT = f\"{BASE_URL}/cron/interest\"\nCRON_HEADERS = {\"X-Cron-Auth\": \"<cron_secret>\"}\n\n\ndef test_monthly_interest_credited_mid_tier_balance(\n    seed_savings_account, seed_daily_accruals, fetch_ledger_entry, cleanup_account\n):\n    account_id = seed_savings_account(balance=5000.00, tier=\"MID\")\n    expected_interest = seed_daily_accruals(account_id=account_id, tier=\"MID\", balance=5000.00)\n\n    response = requests.post(CRON_ENDPOINT, headers=CRON_HEADERS)\n    assert response.status_code == 200\n\n    payload = response.json()\n    credited = [r for r in payload[\"results\"] if r[\"account_id\"] == account_id]\n    assert len(credited) == 1\n    assert credited[0][\"status\"] == \"CREDITED\"\n\n    ledger = fetch_ledger_entry(account_id=account_id, entry_type=\"INTEREST_CREDIT\")\n    assert ledger is not None\n    assert abs(ledger[\"amount\"] - expected_interest) < 0.01\n\n    cleanup_account(account_id)"
+      },
+      {
+        "name": "test_reconciliation_variance_reported_on_accrual_mismatch",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A savings account exists with deliberately corrupted accrual records (sum does not match recomputed amount)",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_savings_account> with balance=3000.00 and tier='LOW'",
+          "Seed corrupted daily accruals via <helper_fn: seed_corrupted_accruals> that introduce a variance",
+          "POST /cron/interest with valid cron auth header"
+        ],
+        "expected": [
+          "HTTP 200 returned (job completes)",
+          "Response body contains account_id with status='VARIANCE_REPORTED'",
+          "Reconciliation record created with non-zero variance_amount",
+          "No INTEREST_CREDIT ledger entry written for the account"
+        ],
+        "trace": [
+          "R-FIN-041: reconciliation variance reported (error pathway)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_ENDPOINT = f\"{BASE_URL}/cron/interest\"\nCRON_HEADERS = {\"X-Cron-Auth\": \"<cron_secret>\"}\n\n\ndef test_reconciliation_variance_reported_on_accrual_mismatch(\n    seed_savings_account, seed_corrupted_accruals,\n    fetch_ledger_entry, fetch_reconciliation_record, cleanup_account\n):\n    account_id = seed_savings_account(balance=3000.00, tier=\"LOW\")\n    seed_corrupted_accruals(account_id=account_id, variance=99.99)\n\n    response = requests.post(CRON_ENDPOINT, headers=CRON_HEADERS)\n    assert response.status_code == 200\n\n    payload = response.json()\n    results = [r for r in payload[\"results\"] if r[\"account_id\"] == account_id]\n    assert len(results) == 1\n    assert results[0][\"status\"] == \"VARIANCE_REPORTED\"\n\n    recon = fetch_reconciliation_record(account_id=account_id)\n    assert recon is not None\n    assert recon[\"variance_amount\"] != 0\n\n    ledger = fetch_ledger_entry(account_id=account_id, entry_type=\"INTEREST_CREDIT\")\n    assert ledger is None\n\n    cleanup_account(account_id)"
+      },
+      {
+        "name": "test_interest_accrual_at_exact_minimum_tier_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Tier boundary: minimum balance for MID tier is exactly 1000.00",
+          "Account seeded with balance == 1000.00 (on-boundary)",
+          "Daily accruals seeded using MID tier rate",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_savings_account> with balance=1000.00 and tier='MID'",
+          "Seed daily accruals via <helper_fn: seed_daily_accruals> at MID tier rate",
+          "POST /cron/interest with valid cron auth header"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Account credited using MID tier rate (not LOW tier rate)",
+          "Ledger entry amount equals MID-tier computed interest for 1000.00",
+          "Status is 'CREDITED'"
+        ],
+        "trace": [
+          "R-FIN-041: boundary behaviour at exact min threshold",
+          "R-FIN-041: tier rate applied correctly at threshold"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_ENDPOINT = f\"{BASE_URL}/cron/interest\"\nCRON_HEADERS = {\"X-Cron-Auth\": \"<cron_secret>\"}\nMIN_MID_TIER_BALANCE = 1000.00\n\n\ndef test_interest_accrual_at_exact_minimum_tier_threshold(\n    seed_savings_account, seed_daily_accruals,\n    fetch_ledger_entry, get_tier_rate, cleanup_account\n):\n    account_id = seed_savings_account(balance=MIN_MID_TIER_BALANCE, tier=\"MID\")\n    expected_interest = seed_daily_accruals(\n        account_id=account_id, tier=\"MID\", balance=MIN_MID_TIER_BALANCE\n    )\n\n    response = requests.post(CRON_ENDPOINT, headers=CRON_HEADERS)\n    assert response.status_code == 200\n\n    payload = response.json()\n    results = [r for r in payload[\"results\"] if r[\"account_id\"] == account_id]\n    assert results[0][\"status\"] == \"CREDITED\"\n    assert results[0][\"tier_applied\"] == \"MID\"\n\n    ledger = fetch_ledger_entry(account_id=account_id, entry_type=\"INTEREST_CREDIT\")\n    assert abs(ledger[\"amount\"] - expected_interest) < 0.01\n\n    cleanup_account(account_id)"
+      },
+      {
+        "name": "test_interest_accrual_at_exact_maximum_tier_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Tier boundary: maximum balance for HIGH tier is exactly 100000.00",
+          "Account seeded with balance == 100000.00 (on-boundary)",
+          "Daily accruals seeded using HIGH tier rate",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_savings_account> with balance=100000.00 and tier='HIGH'",
+          "Seed daily accruals via <helper_fn: seed_daily_accruals> at HIGH tier rate",
+          "POST /cron/interest with valid cron auth header"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Account credited using HIGH tier rate (not PREMIUM rate)",
+          "Ledger entry amount equals HIGH-tier computed interest for 100000.00",
+          "Status is 'CREDITED'"
+        ],
+        "trace": [
+          "R-FIN-041: boundary behaviour at exact max threshold",
+          "R-FIN-041: tier rate applied correctly at maximum boundary"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_ENDPOINT = f\"{BASE_URL}/cron/interest\"\nCRON_HEADERS = {\"X-Cron-Auth\": \"<cron_secret>\"}\nMAX_HIGH_TIER_BALANCE = 100000.00\n\n\ndef test_interest_accrual_at_exact_maximum_tier_threshold(\n    seed_savings_account, seed_daily_accruals,\n    fetch_ledger_entry, cleanup_account\n):\n    account_id = seed_savings_account(balance=MAX_HIGH_TIER_BALANCE, tier=\"HIGH\")\n    expected_interest = seed_daily_accruals(\n        account_id=account_id, tier=\"HIGH\", balance=MAX_HIGH_TIER_BALANCE\n    )\n\n    response = requests.post(CRON_ENDPOINT, headers=CRON_HEADERS)\n    assert response.status_code == 200\n\n    payload = response.json()\n    results = [r for r in payload[\"results\"] if r[\"account_id\"] == account_id]\n    assert results[0][\"status\"] == \"CREDITED\"\n    assert results[0][\"tier_applied\"] == \"HIGH\"\n\n    ledger = fetch_ledger_entry(account_id=account_id, entry_type=\"INTEREST_CREDIT\")\n    assert abs(ledger[\"amount\"] - expected_interest) < 0.01\n\n    cleanup_account(account_id)"
+      },
+      {
+        "name": "test_account_transitions_from_accruing_to_credited_state",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Account is in ACCRUING state after daily accrual job has run",
+          "Today is the last business day of the month",
+          "No prior INTEREST_CREDIT entry exists for current month"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_savings_account> with balance=7500.00 and tier='MID', state='ACCRUING'",
+          "Confirm account state is 'ACCRUING' via <helper_fn: fetch_account_state>",
+          "POST /cron/interest with valid cron auth header",
+          "Fetch updated account state via <helper_fn: fetch_account_state>"
+        ],
+        "expected": [
+          "Pre-job state is 'ACCRUING'",
+          "HTTP 200 returned",
+          "Post-job state is 'CREDITED'",
+          "Exactly one INTEREST_CREDIT ledger entry exists for the current month"
+        ],
+        "trace": [
+          "R-FIN-041: interest credited monthly on last business day",
+          "R-FIN-041: state transition ACCRUING -> CREDITED"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_ENDPOINT = f\"{BASE_URL}/cron/interest\"\nCRON_HEADERS = {\"X-Cron-Auth\": \"<cron_secret>\"}\n\n\ndef test_account_transitions_from_accruing_to_credited_state(\n    seed_savings_account, seed_daily_accruals,\n    fetch_account_state, fetch_ledger_entries, cleanup_account\n):\n    account_id = seed_savings_account(balance=7500.00, tier=\"MID\", state=\"ACCRUING\")\n    seed_daily_accruals(account_id=account_id, tier=\"MID\", balance=7500.00)\n\n    pre_state = fetch_account_state(account_id=account_id)\n    assert pre_state == \"ACCRUING\"\n\n    response = requests.post(CRON_ENDPOINT, headers=CRON_HEADERS)\n    assert response.status_code == 200\n\n    post_state = fetch_account_state(account_id=account_id)\n    assert post_state == \"CREDITED\"\n\n    ledger_entries = fetch_ledger_entries(\n        account_id=account_id, entry_type=\"INTEREST_CREDIT\", period=\"CURRENT_MONTH\"\n    )\n    assert len(ledger_entries) == 1\n\n    cleanup_account(account_id)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-041",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 995,
+    "output_tokens": 3778,
+    "latency_ms": 37939,
+    "wall_ms": 37939,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-041\",\n  \"reasoning\": \"R-FIN-041 mandates daily interest accrual using tier rates, monthly crediting on the last business day, and correct boundary behaviour at min/max thresholds. The test suite covers: (1) a positive EP case where a mid-tier balance accrues and credits correctly; (2) a negative NEG case where a reconciliation variance is detected and reported; (3) a BVA boundary case at the exact minimum tier threshold; (4) a BVA boundary case at the exact maximum tier threshold; (5) a STC case verifying state transitions from ACCRUING to CREDITED. Each test is self-contained via fixtures that create and teardown account state, posts to /cron/interest, and asserts ledger outcomes deterministically.\",\n  \"tests\": [\n    {\n      \"name\": \"test_monthly_interest_credited_mid_tier_balance\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A savings account exists with a mid-tier balance (e.g. 5000.00)\",\n        \"Daily accruals have been posted for the full month\",\n        \"Today is the last business day of the month\"\n      ],\n      \"actions\": [\n        \"Seed account via <fixture: seed_savings_account> with balance=5000.00 and tier='MID'\",\n        \"Seed daily accruals for the month via <helper_fn: seed_daily_accruals>\",\n        \"POST /cron/interest with valid cron auth header\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains account_id with status='CREDITED'\",\n        \"Ledger entry of type 'INTEREST_CREDIT' exists for the account\",\n        \"Credited amount equals sum of daily accruals for the period\"\n      ],\n      \"trace\": [\n        \"R-FIN-041: interest credited monthly on last business day\",\n        \"R-FIN-041: ledger entry per account\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://localhost:8080\\\"\\nCRON_ENDPOINT = f\\\"{BASE_URL}/cron/interest\\\"\\nCRON_HEADERS = {\\\"X-Cron-Auth\\\": \\\"<cron_secret>\\\"}\\n\\n\\ndef test_monthly_interest_credited_mid_tier_balance(\\n    seed_savings_account, seed_daily_accruals, fetch_ledger_entry, cleanup_account\\n):\\n    account_id = seed_savings_account(balance=5000.00, tier=\\\"MID\\\")\\n    expected_interest = seed_daily_accruals(account_id=account_id, tier=\\\"MID\\\", balance=5000.00)\\n\\n    response = requests.post(CRON_ENDPOINT, headers=CRON_HEADERS)\\n    assert response.status_code == 200\\n\\n    payload = response.json()\\n    credited = [r for r in payload[\\\"results\\\"] if r[\\\"account_id\\\"] == account_id]\\n    assert len(credited) == 1\\n    assert credited[0][\\\"status\\\"] == \\\"CREDITED\\\"\\n\\n    ledger = fetch_ledger_entry(account_id=account_id, entry_type=\\\"INTEREST_CREDIT\\\")\\n    assert ledger is not None\\n    assert abs(ledger[\\\"amount\\\"] - expected_interest) < 0.01\\n\\n    cleanup_account(account_id)\"\n    },\n    {\n      \"name\": \"test_reconciliation_variance_reported_on_accrual_mismatch\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A savings account exists with deliberately corrupted accrual records (sum does not match recomputed amount)\",\n        \"Today is the last business day of the month\"\n      ],\n      \"actions\": [\n        \"Seed account via <fixture: seed_savings_account> with balance=3000.00 and tier='LOW'\",\n        \"Seed corrupted daily accruals via <helper_fn: seed_corrupted_accruals> that introduce a variance\",\n        \"POST /cron/interest with valid cron auth header\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned (job completes)\",\n        \"Response body contains account_id with status='VARIANCE_REPORTED'\",\n        \"Reconciliation record created with non-zero variance_amount\",\n        \"No INTEREST_CREDIT ledger entry written for the account\"\n      ],\n      \"trace\": [\n        \"R-FIN-041: reconciliation variance reported (error pathway)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://localhost:8080\\\"\\nCRON_ENDPOINT = f\\\"{BASE_URL}/cron/interest\\\"\\nCRON_HEADERS = {\\\"X-"
+  }
+}

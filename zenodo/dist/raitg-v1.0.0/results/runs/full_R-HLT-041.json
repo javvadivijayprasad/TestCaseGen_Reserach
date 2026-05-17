@@ -1,0 +1,209 @@
+{
+  "req": {
+    "id": "R-HLT-041",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Bulk data export (boundary)",
+    "statement": "A provisioned client shall request a FHIR bulk export; large datasets shall be paginated with NDJSON output. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authorized bulk-client"
+    ],
+    "triggers": [
+      "client requests export"
+    ],
+    "expected_outcomes": [
+      "export job queued",
+      "NDJSON stream produced"
+    ],
+    "error_pathways": [
+      "403 when unauthorised"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/$export"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-041",
+    "reasoning": "R-HLT-041 mandates FHIR bulk export via /$export for authorised clients, with NDJSON pagination, and 403 for unauthorised access. Boundary cases cover timestamp extremes and numeric limits. Tests are designed using: EP for the happy-path authorised export, NEG for unauthorised access, BVA for timestamp and numeric boundary values at min/max edges, STC for the job lifecycle (queued\u2192in-progress\u2192complete), and DT for combinations of optional parameters. Each test is self-contained via fixtures that create/teardown state.",
+    "tests": [
+      {
+        "name": "test_bulk_export_authorised_client_queues_job",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Client is provisioned and holds a valid bearer token",
+          "At least one FHIR resource exists in the data store"
+        ],
+        "actions": [
+          "Send GET /$export with Accept: application/fhir+json and Prefer: respond-async headers using authorised token",
+          "Capture HTTP response status and Content-Location header"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Content-Location header is present and points to a polling URL",
+          "Response body is empty or contains a valid OperationOutcome"
+        ],
+        "trace": [
+          "R-HLT-041: export job queued for authorised client",
+          "FHIR Async Pattern: https://hl7.org/fhir/async.html"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_bulk_export_authorised_client_queues_job(bulk_auth_headers, fhir_base_url):\n    headers = {\n        **bulk_auth_headers,\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    resp = requests.get(f\"{fhir_base_url}/$export\", headers=headers)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}: {resp.text}\"\n    assert \"Content-Location\" in resp.headers, \"Missing Content-Location polling URL\"\n    poll_url = resp.headers[\"Content-Location\"]\n    assert poll_url.startswith(fhir_base_url), \"Polling URL outside expected base\"\n"
+      },
+      {
+        "name": "test_bulk_export_unauthorised_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running",
+          "No valid bearer token is provided (missing or revoked)"
+        ],
+        "actions": [
+          "Send GET /$export with Accept: application/fhir+json and Prefer: respond-async headers but NO Authorization header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an OperationOutcome with severity 'error'"
+        ],
+        "trace": [
+          "R-HLT-041: error pathway \u2013 403 when unauthorised",
+          "FHIR Security: https://hl7.org/fhir/security.html"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_bulk_export_unauthorised_returns_403(fhir_base_url):\n    headers = {\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    resp = requests.get(f\"{fhir_base_url}/$export\", headers=headers)\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    issues = body.get(\"issue\", [])\n    severities = [i.get(\"severity\") for i in issues]\n    assert \"error\" in severities or \"fatal\" in severities, (\n        f\"Expected error-severity OperationOutcome, got: {body}\"\n    )\n"
+      },
+      {
+        "name": "test_bulk_export_boundary_timestamp_min_epoch",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Client is provisioned and holds a valid bearer token",
+          "Data store contains resources with timestamps at or after 1970-01-01T00:00:00Z"
+        ],
+        "actions": [
+          "Send GET /$export?_since=1970-01-01T00:00:00Z with authorised headers",
+          "Poll Content-Location until job completes or times out",
+          "Fetch the NDJSON output URLs from the manifest"
+        ],
+        "expected": [
+          "HTTP 202 on initial request",
+          "Job eventually reaches 'complete' state (200 on poll URL)",
+          "Manifest output array is non-empty",
+          "Each output URL returns valid NDJSON (one JSON object per line)"
+        ],
+        "trace": [
+          "R-HLT-041: boundary case on timestamps \u2013 minimum epoch value",
+          "FHIR _since parameter: https://hl7.org/fhir/parameters.html"
+        ],
+        "executable": "import pytest\nimport requests\nimport time\n\ndef test_bulk_export_boundary_timestamp_min_epoch(bulk_auth_headers, fhir_base_url):\n    headers = {\n        **bulk_auth_headers,\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    resp = requests.get(\n        f\"{fhir_base_url}/$export\",\n        params={\"_since\": \"1970-01-01T00:00:00Z\"},\n        headers=headers,\n    )\n    assert resp.status_code == 202\n    poll_url = resp.headers[\"Content-Location\"]\n    manifest = <poll_until_complete>(poll_url, bulk_auth_headers, timeout=60)\n    assert manifest[\"status\"] == \"complete\"\n    outputs = manifest.get(\"output\", [])\n    assert len(outputs) > 0, \"Expected at least one output file in manifest\"\n    ndjson_url = outputs[0][\"url\"]\n    ndjson_resp = requests.get(ndjson_url, headers=bulk_auth_headers)\n    assert ndjson_resp.status_code == 200\n    lines = [ln for ln in ndjson_resp.text.splitlines() if ln.strip()]\n    assert len(lines) > 0, \"NDJSON output must not be empty\"\n    import json\n    for line in lines:\n        json.loads(line)\n"
+      },
+      {
+        "name": "test_bulk_export_boundary_max_count_pagination",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Client is provisioned and holds a valid bearer token",
+          "Data store contains resources whose count exceeds the server's single-page NDJSON limit"
+        ],
+        "actions": [
+          "Pre-load enough resources to exceed one NDJSON page via <seed_large_dataset> fixture",
+          "Send GET /$export with authorised headers",
+          "Poll until job complete",
+          "Inspect manifest output array length"
+        ],
+        "expected": [
+          "HTTP 202 on kick-off",
+          "Job completes successfully",
+          "Manifest output array contains more than one entry (pagination occurred)",
+          "Total line count across all NDJSON files equals seeded resource count"
+        ],
+        "trace": [
+          "R-HLT-041: large datasets shall be paginated with NDJSON output",
+          "R-HLT-041: boundary cases on numeric elements"
+        ],
+        "executable": "import pytest\nimport requests\nimport json\n\ndef test_bulk_export_boundary_max_count_pagination(\n    bulk_auth_headers, fhir_base_url, seed_large_dataset\n):\n    expected_count = seed_large_dataset  # fixture returns int of seeded resources\n    headers = {\n        **bulk_auth_headers,\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    resp = requests.get(f\"{fhir_base_url}/$export\", headers=headers)\n    assert resp.status_code == 202\n    poll_url = resp.headers[\"Content-Location\"]\n    manifest = <poll_until_complete>(poll_url, bulk_auth_headers, timeout=120)\n    outputs = manifest.get(\"output\", [])\n    assert len(outputs) > 1, \"Expected multiple NDJSON pages for large dataset\"\n    total_lines = 0\n    for entry in outputs:\n        ndjson_resp = requests.get(entry[\"url\"], headers=bulk_auth_headers)\n        assert ndjson_resp.status_code == 200\n        lines = [ln for ln in ndjson_resp.text.splitlines() if ln.strip()]\n        for line in lines:\n            json.loads(line)  # validate each line is valid JSON\n        total_lines += len(lines)\n    assert total_lines == expected_count, (\n        f\"Line count {total_lines} != seeded count {expected_count}\"\n    )\n"
+      },
+      {
+        "name": "test_bulk_export_job_state_transitions",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Client is provisioned and holds a valid bearer token"
+        ],
+        "actions": [
+          "Send GET /$export to kick off job (state: queued)",
+          "Immediately poll Content-Location and verify in-progress state (HTTP 202 with X-Progress header)",
+          "Continue polling until HTTP 200 is returned (state: complete)",
+          "Verify manifest structure"
+        ],
+        "expected": [
+          "Initial kick-off returns 202 with Content-Location",
+          "At least one intermediate poll returns 202 with X-Progress header indicating in-progress",
+          "Final poll returns 200 with a valid manifest JSON body",
+          "Manifest contains 'transactionTime', 'request', 'requiresAccessToken', 'output' fields"
+        ],
+        "trace": [
+          "R-HLT-041: export job queued; NDJSON stream produced",
+          "FHIR Async lifecycle: queued -> in-progress -> complete"
+        ],
+        "executable": "import pytest\nimport requests\nimport time\n\ndef test_bulk_export_job_state_transitions(bulk_auth_headers, fhir_base_url):\n    headers = {\n        **bulk_auth_headers,\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    kick_resp = requests.get(f\"{fhir_base_url}/$export\", headers=headers)\n    assert kick_resp.status_code == 202, \"Kick-off must return 202\"\n    poll_url = kick_resp.headers[\"Content-Location\"]\n    saw_in_progress = False\n    for _ in range(30):\n        poll_resp = requests.get(poll_url, headers=bulk_auth_headers)\n        if poll_resp.status_code == 202:\n            saw_in_progress = True\n            time.sleep(2)\n        elif poll_resp.status_code == 200:\n            break\n        else:\n            pytest.fail(f\"Unexpected poll status: {poll_resp.status_code}\")\n    else:\n        pytest.fail(\"Job did not complete within timeout\")\n    assert saw_in_progress, \"Expected at least one in-progress 202 poll response\"\n    manifest = poll_resp.json()\n    for field in (\"transactionTime\", \"request\", \"requiresAccessToken\", \"output\"):\n        assert field in manifest, f\"Manifest missing field: {field}\"\n"
+      },
+      {
+        "name": "test_bulk_export_optional_type_filter_decision_table",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Client is provisioned and holds a valid bearer token",
+          "Data store contains Patient, Observation, and Condition resources"
+        ],
+        "actions": [
+          "Send GET /$export?_type=Patient with authorised headers",
+          "Poll until complete and retrieve manifest",
+          "Assert only Patient resources appear in NDJSON output",
+          "Repeat with _type=Observation and verify only Observation resources returned"
+        ],
+        "expected": [
+          "Both requests return 202 and complete successfully",
+          "_type=Patient manifest output contains only resourceType=='Patient' lines",
+          "_type=Observation manifest output contains only resourceType=='Observation' lines",
+          "No cross-contamination of resource types between filtered exports"
+        ],
+        "trace": [
+          "R-HLT-041: large datasets shall be paginated; boundary cases on numeric/timestamp elements",
+          "Decision table: _type filter present vs absent, resource type combinations"
+        ],
+        "executable": "import pytest\nimport requests\nimport json\n\ndef <assert_single_resource_type>(manifest, expected_type, auth_headers):\n    for entry in manifest.get(\"output\", []):\n        resp = requests.get(entry[\"url\"], headers=auth_headers)\n        assert resp.status_code == 200\n        for line in resp.text.splitlines():\n            if line.strip():\n                obj = json.loads(line)\n                assert obj[\"resourceType\"] == expected_type\n\ndef test_bulk_export_optional_type_filter_decision_table(\n    bulk_auth_headers, fhir_base_url\n):\n    headers = {\n        **bulk_auth_headers,\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    for rtype in (\"Patient\", \"Observation\"):\n        resp = requests.get(\n            f\"{fhir_base_url}/$export\",\n            params={\"_type\": rtype},\n            headers=headers,\n        )\n        assert resp.status_code == 202, f\"Kick-off failed for _type={rtype}\"\n        poll_url = resp.headers[\"Content-Location\"]\n        manifest = <poll_until_complete>(poll_url, bulk_auth_headers, timeout=60)\n        <assert_single_resource_type>(manifest, rtype, bulk_auth_headers)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-041",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 3879,
+    "latency_ms": 41234,
+    "wall_ms": 41234,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-041\",\n  \"reasoning\": \"R-HLT-041 mandates FHIR bulk export via /$export for authorised clients, with NDJSON pagination, and 403 for unauthorised access. Boundary cases cover timestamp extremes and numeric limits. Tests are designed using: EP for the happy-path authorised export, NEG for unauthorised access, BVA for timestamp and numeric boundary values at min/max edges, STC for the job lifecycle (queued\u2192in-progress\u2192complete), and DT for combinations of optional parameters. Each test is self-contained via fixtures that create/teardown state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_export_authorised_client_queues_job\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"Client is provisioned and holds a valid bearer token\",\n        \"At least one FHIR resource exists in the data store\"\n      ],\n      \"actions\": [\n        \"Send GET /$export with Accept: application/fhir+json and Prefer: respond-async headers using authorised token\",\n        \"Capture HTTP response status and Content-Location header\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Content-Location header is present and points to a polling URL\",\n        \"Response body is empty or contains a valid OperationOutcome\"\n      ],\n      \"trace\": [\n        \"R-HLT-041: export job queued for authorised client\",\n        \"FHIR Async Pattern: https://hl7.org/fhir/async.html\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_bulk_export_authorised_client_queues_job(bulk_auth_headers, fhir_base_url):\\n    headers = {\\n        **bulk_auth_headers,\\n        \\\"Accept\\\": \\\"application/fhir+json\\\",\\n        \\\"Prefer\\\": \\\"respond-async\\\",\\n    }\\n    resp = requests.get(f\\\"{fhir_base_url}/$export\\\", headers=headers)\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}: {resp.text}\\\"\\n    assert \\\"Content-Location\\\" in resp.headers, \\\"Missing Content-Location polling URL\\\"\\n    poll_url = resp.headers[\\\"Content-Location\\\"]\\n    assert poll_url.startswith(fhir_base_url), \\\"Polling URL outside expected base\\\"\\n\"\n    },\n    {\n      \"name\": \"test_bulk_export_unauthorised_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"No valid bearer token is provided (missing or revoked)\"\n      ],\n      \"actions\": [\n        \"Send GET /$export with Accept: application/fhir+json and Prefer: respond-async headers but NO Authorization header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an OperationOutcome with severity 'error'\"\n      ],\n      \"trace\": [\n        \"R-HLT-041: error pathway \u2013 403 when unauthorised\",\n        \"FHIR Security: https://hl7.org/fhir/security.html\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_bulk_export_unauthorised_returns_403(fhir_base_url):\\n    headers = {\\n        \\\"Accept\\\": \\\"application/fhir+json\\\",\\n        \\\"Prefer\\\": \\\"respond-async\\\",\\n    }\\n    resp = requests.get(f\\\"{fhir_base_url}/$export\\\", headers=headers)\\n    assert resp.status_code == 403, f\\\"Expected 403, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    issues = body.get(\\\"issue\\\", [])\\n    severities = [i.get(\\\"severity\\\") for i in issues]\\n    assert \\\"error\\\" in severities or \\\"fatal\\\" in severities, (\\n        f\\\"Expected error-severity OperationOutcome, got: {body}\\\"\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_bulk_export_boundary_timestamp_min_epoch\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"Client is provisioned and holds a valid bearer token\",\n        \"Data store contains resources with timestamps at or after 1970-01-01T00:00:00Z\"\n      ],\n      \"actions\": [\n        \"Send GET /$export?_since=1970-01-01T00:00:00Z with aut"
+  }
+}

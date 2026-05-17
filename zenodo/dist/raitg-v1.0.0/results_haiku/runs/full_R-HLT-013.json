@@ -1,0 +1,297 @@
+{
+  "req": {
+    "id": "R-HLT-013",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-013",
+    "reasoning": "R-HLT-013 mandates clinician-scoped patient search by name, MRN, or DOB with access control and error handling. Test suite validates: (1) positive case\u2014successful search returning only in-scope patients; (2) negative case\u2014malformed query rejection with 400; (3) boundary case\u2014edge values in DOB and name filters; (4) access control\u2014unauthorized clinician receives empty result; (5) logging\u2014access audit trail recorded. Design applies EP (search parameter types), BVA (date boundaries, name length), NEG (malformed input), and STC (role-based access state).",
+    "tests": [
+      {
+        "name": "test_search_by_name_returns_in_scope_patients",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated as clinician with ID: CLIN-001",
+          "clinician manages patients: MRN-P001 (name: John Smith), MRN-P002 (name: Jane Smith)",
+          "system contains unrelated patient MRN-OTHER (name: John Doe)",
+          "access control list configured for CLIN-001"
+        ],
+        "actions": [
+          "GET /Patient?name=Smith with Authorization header",
+          "parse response as FHIR Bundle"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "response.resourceType == 'Bundle'",
+          "response.entry contains exactly 2 patients (MRN-P001, MRN-P002)",
+          "response.entry does not contain MRN-OTHER",
+          "all returned patients have name matching 'Smith'"
+        ],
+        "trace": [
+          "R-HLT-013: filtered bundle returned",
+          "R-HLT-013: only patients in care returned (access control enforced)"
+        ],
+        "executable": "def test_search_by_name_returns_in_scope_patients():\n    auth_token = <get_token_for_clinician('CLIN-001')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': 'Smith'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle['resourceType'] == 'Bundle'\n    assert len(bundle.get('entry', [])) == 2\n    mrns = [e['resource']['identifier'][0]['value'] for e in bundle['entry']]\n    assert 'MRN-P001' in mrns and 'MRN-P002' in mrns\n    assert 'MRN-OTHER' not in mrns"
+      },
+      {
+        "name": "test_search_by_mrn_returns_single_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated as clinician CLIN-002",
+          "clinician manages patient with MRN: MRN-UNIQUE-123",
+          "patient record exists and is in scope"
+        ],
+        "actions": [
+          "GET /Patient?identifier=MRN-UNIQUE-123",
+          "extract entry from Bundle"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "response is valid FHIR Bundle",
+          "response.entry has length 1",
+          "returned patient identifier matches 'MRN-UNIQUE-123'"
+        ],
+        "trace": [
+          "R-HLT-013: search by MRN parameter supported",
+          "R-HLT-013: filtered bundle returned"
+        ],
+        "executable": "def test_search_by_mrn_returns_single_patient():\n    auth_token = <get_token_for_clinician('CLIN-002')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'identifier': 'MRN-UNIQUE-123'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle['resourceType'] == 'Bundle'\n    assert len(bundle.get('entry', [])) == 1\n    mrn = bundle['entry'][0]['resource']['identifier'][0]['value']\n    assert mrn == 'MRN-UNIQUE-123'"
+      },
+      {
+        "name": "test_search_by_dob_returns_matching_patients",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated as clinician CLIN-003",
+          "clinician manages 3 patients: all with birthDate 1985-06-15",
+          "system contains 2 unrelated patients with different birth dates"
+        ],
+        "actions": [
+          "GET /Patient?birthdate=1985-06-15",
+          "count entries in response"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "response.entry length equals 3",
+          "all returned patients have birthDate == 1985-06-15",
+          "unrelated patients excluded"
+        ],
+        "trace": [
+          "R-HLT-013: search by DOB parameter supported",
+          "R-HLT-013: access control enforced on results"
+        ],
+        "executable": "def test_search_by_dob_returns_matching_patients():\n    auth_token = <get_token_for_clinician('CLIN-003')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'birthdate': '1985-06-15'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert len(bundle.get('entry', [])) == 3\n    for entry in bundle['entry']:\n        assert entry['resource']['birthDate'] == '1985-06-15'"
+      },
+      {
+        "name": "test_malformed_query_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated as clinician",
+          "API expects valid FHIR query syntax"
+        ],
+        "actions": [
+          "GET /Patient with query: name=<invalid-unicode-sequence>",
+          "observe response status and error body"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "response contains OperationOutcome resource",
+          "OperationOutcome.issue[0].code == 'invalid'",
+          "OperationOutcome.issue[0].diagnostics contains 'malformed' or similar"
+        ],
+        "trace": [
+          "R-HLT-013: error pathway\u2014400 when query malformed"
+        ],
+        "executable": "def test_malformed_query_returns_400():\n    auth_token = <get_token_for_clinician('CLIN-001')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': '\\\\xFF\\\\xFE'},\n        headers=headers\n    )\n    assert resp.status_code == 400\n    outcome = resp.json()\n    assert outcome.get('resourceType') == 'OperationOutcome'\n    assert len(outcome.get('issue', [])) > 0\n    assert outcome['issue'][0]['code'] == 'invalid'"
+      },
+      {
+        "name": "test_empty_query_parameter_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated as clinician",
+          "at least one search parameter required"
+        ],
+        "actions": [
+          "GET /Patient with no search parameters",
+          "observe response"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request (or 422 Unprocessable Entity)",
+          "error indicates missing required parameter"
+        ],
+        "trace": [
+          "R-HLT-013: error pathway\u2014malformed (missing required param)"
+        ],
+        "executable": "def test_empty_query_parameter_returns_400():\n    auth_token = <get_token_for_clinician('CLIN-001')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        headers=headers\n    )\n    assert resp.status_code in [400, 422]\n    outcome = resp.json()\n    assert 'issue' in outcome or 'error' in outcome"
+      },
+      {
+        "name": "test_unauthorized_clinician_returns_empty_bundle",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "authenticated as clinician CLIN-UNAUTH",
+          "CLIN-UNAUTH has no patients in care",
+          "patient MRN-P001 exists but is managed by CLIN-001 only"
+        ],
+        "actions": [
+          "GET /Patient?name=Smith as CLIN-UNAUTH",
+          "inspect Bundle.entry array"
+        ],
+        "expected": [
+          "HTTP 200 OK (graceful degradation)",
+          "response.entry is empty array",
+          "no patient data leaked to unauthorized clinician"
+        ],
+        "trace": [
+          "R-HLT-013: access control enforced\u2014only patients in care",
+          "R-HLT-013: unauthorized scope returns empty result"
+        ],
+        "executable": "def test_unauthorized_clinician_returns_empty_bundle():\n    auth_token = <get_token_for_clinician('CLIN-UNAUTH')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': 'Smith'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert len(bundle.get('entry', [])) == 0"
+      },
+      {
+        "name": "test_search_with_special_characters_in_name",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "authenticated as clinician",
+          "patient exists with name containing apostrophe: O'Brien",
+          "patient exists with name containing hyphen: Smith-Jones"
+        ],
+        "actions": [
+          "GET /Patient?name=O'Brien",
+          "GET /Patient?name=Smith-Jones"
+        ],
+        "expected": [
+          "HTTP 200 OK for both queries",
+          "first query returns O'Brien record",
+          "second query returns Smith-Jones record",
+          "special characters properly escaped/handled"
+        ],
+        "trace": [
+          "R-HLT-013: boundary\u2014special characters in name parameter",
+          "R-HLT-013: robustness of search parser"
+        ],
+        "executable": "def test_search_with_special_characters_in_name():\n    auth_token = <get_token_for_clinician('CLIN-001')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp1 = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': \"O'Brien\"},\n        headers=headers\n    )\n    assert resp1.status_code == 200\n    assert len(resp1.json().get('entry', [])) > 0\n    resp2 = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': 'Smith-Jones'},\n        headers=headers\n    )\n    assert resp2.status_code == 200"
+      },
+      {
+        "name": "test_search_dob_boundary_leap_year",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "authenticated as clinician",
+          "patient exists with birthDate on leap year: 2000-02-29",
+          "system handles leap year dates correctly"
+        ],
+        "actions": [
+          "GET /Patient?birthdate=2000-02-29"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "response contains patient with exact birthDate 2000-02-29",
+          "no date normalization errors"
+        ],
+        "trace": [
+          "R-HLT-013: boundary\u2014leap year date handling in DOB search"
+        ],
+        "executable": "def test_search_dob_boundary_leap_year():\n    auth_token = <get_token_for_clinician('CLIN-001')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'birthdate': '2000-02-29'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    if len(bundle.get('entry', [])) > 0:\n        assert bundle['entry'][0]['resource']['birthDate'] == '2000-02-29'"
+      },
+      {
+        "name": "test_search_with_minimum_name_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "authenticated as clinician",
+          "patient exists with single-character name: 'X'",
+          "patient exists with two-character name: 'Al'"
+        ],
+        "actions": [
+          "GET /Patient?name=X",
+          "GET /Patient?name=Al"
+        ],
+        "expected": [
+          "HTTP 200 OK for both",
+          "first query matches patient 'X' (if configured to)",
+          "second query matches patient 'Al'",
+          "minimum search string length respected"
+        ],
+        "trace": [
+          "R-HLT-013: boundary\u2014minimum search string length"
+        ],
+        "executable": "def test_search_with_minimum_name_length():\n    auth_token = <get_token_for_clinician('CLIN-001')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': 'Al'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert isinstance(bundle.get('entry'), list)"
+      },
+      {
+        "name": "test_search_access_logged_in_audit_trail",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "authenticated as clinician CLIN-AUDIT",
+          "audit logging enabled and writable",
+          "audit table accessible via <query_audit_log>"
+        ],
+        "actions": [
+          "GET /Patient?name=Test",
+          "query audit log for access record"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "audit log contains entry for CLIN-AUDIT",
+          "log entry includes: timestamp, clinician ID, query params, result count",
+          "log entry marked with action 'PATIENT_SEARCH'"
+        ],
+        "trace": [
+          "R-HLT-013: access logged"
+        ],
+        "executable": "def test_search_access_logged_in_audit_trail():\n    auth_token = <get_token_for_clinician('CLIN-AUDIT')>\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp = requests.get(\n        'http://localhost:8080/Patient',\n        params={'name': 'Test'},\n        headers=headers\n    )\n    assert resp.status_code == 200\n    log_entry = <query_audit_log>(\n        clinician='CLIN-AUDIT',\n        action='PATIENT_SEARCH',\n        limit=1\n    )\n    assert log_entry is not None\n    assert 'name=Test' in str(log_entry.get('query_params', ''))"
+      }
+    ]
+  },
+  "req_id": "R-HLT-013",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1023,
+    "output_tokens": 4195,
+    "latency_ms": 23942,
+    "wall_ms": 23942,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-013\",\n  \"reasoning\": \"R-HLT-013 mandates clinician-scoped patient search by name, MRN, or DOB with access control and error handling. Test suite validates: (1) positive case\u2014successful search returning only in-scope patients; (2) negative case\u2014malformed query rejection with 400; (3) boundary case\u2014edge values in DOB and name filters; (4) access control\u2014unauthorized clinician receives empty result; (5) logging\u2014access audit trail recorded. Design applies EP (search parameter types), BVA (date boundaries, name length), NEG (malformed input), and STC (role-based access state).\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_by_name_returns_in_scope_patients\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"authenticated as clinician with ID: CLIN-001\",\n        \"clinician manages patients: MRN-P001 (name: John Smith), MRN-P002 (name: Jane Smith)\",\n        \"system contains unrelated patient MRN-OTHER (name: John Doe)\",\n        \"access control list configured for CLIN-001\"\n      ],\n      \"actions\": [\n        \"GET /Patient?name=Smith with Authorization header\",\n        \"parse response as FHIR Bundle\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"response.resourceType == 'Bundle'\",\n        \"response.entry contains exactly 2 patients (MRN-P001, MRN-P002)\",\n        \"response.entry does not contain MRN-OTHER\",\n        \"all returned patients have name matching 'Smith'\"\n      ],\n      \"trace\": [\n        \"R-HLT-013: filtered bundle returned\",\n        \"R-HLT-013: only patients in care returned (access control enforced)\"\n      ],\n      \"executable\": \"def test_search_by_name_returns_in_scope_patients():\\n    auth_token = <get_token_for_clinician('CLIN-001')>\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    resp = requests.get(\\n        'http://localhost:8080/Patient',\\n        params={'name': 'Smith'},\\n        headers=headers\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle['resourceType'] == 'Bundle'\\n    assert len(bundle.get('entry', [])) == 2\\n    mrns = [e['resource']['identifier'][0]['value'] for e in bundle['entry']]\\n    assert 'MRN-P001' in mrns and 'MRN-P002' in mrns\\n    assert 'MRN-OTHER' not in mrns\"\n    },\n    {\n      \"name\": \"test_search_by_mrn_returns_single_patient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"authenticated as clinician CLIN-002\",\n        \"clinician manages patient with MRN: MRN-UNIQUE-123\",\n        \"patient record exists and is in scope\"\n      ],\n      \"actions\": [\n        \"GET /Patient?identifier=MRN-UNIQUE-123\",\n        \"extract entry from Bundle\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"response is valid FHIR Bundle\",\n        \"response.entry has length 1\",\n        \"returned patient identifier matches 'MRN-UNIQUE-123'\"\n      ],\n      \"trace\": [\n        \"R-HLT-013: search by MRN parameter supported\",\n        \"R-HLT-013: filtered bundle returned\"\n      ],\n      \"executable\": \"def test_search_by_mrn_returns_single_patient():\\n    auth_token = <get_token_for_clinician('CLIN-002')>\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    resp = requests.get(\\n        'http://localhost:8080/Patient',\\n        params={'identifier': 'MRN-UNIQUE-123'},\\n        headers=headers\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle['resourceType'] == 'Bundle'\\n    assert len(bundle.get('entry', [])) == 1\\n    mrn = bundle['entry'][0]['resource']['identifier'][0]['value']\\n    assert mrn == 'MRN-UNIQUE-123'\"\n    },\n    {\n      \"name\": \"test_search_by_dob_returns_matching_patients\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"authenticated as clinician CLIN-003\",\n        \"clinician manages 3 patients: all with birthDate 1985-06-15\",\n        \"system contains 2 unrelated patients with different birth dates\"\n      ],\n      \"actions\": [\n        \"GE"
+  }
+}

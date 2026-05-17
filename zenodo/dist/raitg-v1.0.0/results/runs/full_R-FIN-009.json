@@ -1,0 +1,200 @@
+{
+  "req": {
+    "id": "R-FIN-009",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Transaction dispute",
+    "statement": "A customer shall dispute a transaction within 60 days of posting; disputes beyond 60 days shall be rejected.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "transaction.age < 60d"
+    ],
+    "triggers": [
+      "customer files dispute"
+    ],
+    "expected_outcomes": [
+      "dispute created",
+      "provisional credit applied"
+    ],
+    "error_pathways": [
+      "422 when transaction.age > 60d"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/disputes"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-009",
+    "reasoning": "The requirement defines a 60-day hard cutoff for transaction disputes. Three partitions exist: (1) age < 60 days \u2014 valid dispute window, (2) age > 60 days \u2014 rejection zone, (3) age == 60 days \u2014 the exact boundary, which must be clarified as inclusive or exclusive. BVA demands testing at day 59 (last valid day), day 60 (boundary), and day 61 (first invalid day). EP covers the interior of each partition. STC captures the state change from 'undisputed' to 'disputed' with provisional credit applied. NEG covers the error pathway producing HTTP 422. A Decision Table test combines multiple conditions (valid auth + expired transaction) to verify the rejection rule fires correctly even when other inputs are valid.",
+    "tests": [
+      {
+        "name": "test_dispute_created_for_transaction_within_60_days",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Transaction posted 30 days ago (well within 60-day window)",
+          "Transaction has no existing dispute"
+        ],
+        "actions": [
+          "POST /disputes with valid customer auth token and transaction_id of 30-day-old transaction"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains dispute_id",
+          "Response body contains status = 'open'",
+          "Response body contains provisional_credit = true"
+        ],
+        "trace": [
+          "R-FIN-009: dispute created",
+          "R-FIN-009: provisional credit applied",
+          "R-FIN-009: precondition transaction.age < 60d satisfied"
+        ],
+        "executable": "def test_dispute_created_for_transaction_within_60_days(api_client, create_transaction):\n    txn = create_transaction(age_days=30)\n    payload = {\"transaction_id\": txn[\"id\"], \"reason\": \"unauthorized_charge\"}\n\n    resp = api_client.post(\"/disputes\", json=payload)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"dispute_id\" in body\n    assert body[\"status\"] == \"open\"\n    assert body[\"provisional_credit\"] is True"
+      },
+      {
+        "name": "test_dispute_rejected_for_transaction_older_than_60_days",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Transaction posted 90 days ago (beyond 60-day window)",
+          "Transaction has no existing dispute"
+        ],
+        "actions": [
+          "POST /disputes with valid customer auth token and transaction_id of 90-day-old transaction"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code referencing dispute window exceeded",
+          "No dispute record created",
+          "No provisional credit applied"
+        ],
+        "trace": [
+          "R-FIN-009: error pathway \u2014 422 when transaction.age > 60d"
+        ],
+        "executable": "def test_dispute_rejected_for_transaction_older_than_60_days(api_client, create_transaction):\n    txn = create_transaction(age_days=90)\n    payload = {\"transaction_id\": txn[\"id\"], \"reason\": \"unauthorized_charge\"}\n\n    resp = api_client.post(\"/disputes\", json=payload)\n\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"error\" in body\n    assert \"dispute_window\" in body[\"error\"].get(\"code\", \"\").lower() or \\\n           \"60\" in body[\"error\"].get(\"message\", \"\")"
+      },
+      {
+        "name": "test_dispute_at_exactly_60_days_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Transaction posted exactly 60 days ago (boundary value)",
+          "Transaction has no existing dispute"
+        ],
+        "actions": [
+          "POST /disputes with valid customer auth token and transaction_id of exactly-60-day-old transaction"
+        ],
+        "expected": [
+          "HTTP 201 Created (inclusive boundary) OR HTTP 422 (exclusive boundary)",
+          "Response is deterministic and consistent with server-side boundary definition",
+          "If 201: dispute_id present and provisional_credit = true",
+          "If 422: error body references 60-day window"
+        ],
+        "trace": [
+          "R-FIN-009: boundary condition at transaction.age == 60d",
+          "R-FIN-009: BVA on 60-day cutoff"
+        ],
+        "executable": "def test_dispute_at_exactly_60_days_boundary(api_client, create_transaction):\n    txn = create_transaction(age_days=60)\n    payload = {\"transaction_id\": txn[\"id\"], \"reason\": \"unauthorized_charge\"}\n\n    resp = api_client.post(\"/disputes\", json=payload)\n    body = resp.json()\n\n    assert resp.status_code in (201, 422), (\n        f\"Unexpected status {resp.status_code} at 60-day boundary\"\n    )\n    if resp.status_code == 201:\n        assert \"dispute_id\" in body\n        assert body[\"provisional_credit\"] is True\n    else:\n        assert \"error\" in body"
+      },
+      {
+        "name": "test_dispute_rejected_at_day_61_first_invalid_day",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Transaction posted exactly 61 days ago (first day beyond window)",
+          "Transaction has no existing dispute"
+        ],
+        "actions": [
+          "POST /disputes with valid customer auth token and transaction_id of 61-day-old transaction"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity regardless of boundary interpretation",
+          "Response body contains error referencing dispute window"
+        ],
+        "trace": [
+          "R-FIN-009: BVA \u2014 day 61 is unambiguously outside the 60-day window",
+          "R-FIN-009: error pathway \u2014 422 when transaction.age > 60d"
+        ],
+        "executable": "def test_dispute_rejected_at_day_61_first_invalid_day(api_client, create_transaction):\n    txn = create_transaction(age_days=61)\n    payload = {\"transaction_id\": txn[\"id\"], \"reason\": \"unauthorized_charge\"}\n\n    resp = api_client.post(\"/disputes\", json=payload)\n\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"error\" in body"
+      },
+      {
+        "name": "test_dispute_state_transitions_undisputed_to_open_with_credit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Transaction posted 10 days ago",
+          "Transaction state is 'undisputed' before the call"
+        ],
+        "actions": [
+          "GET /transactions/{id} to confirm initial state = 'undisputed'",
+          "POST /disputes with valid payload",
+          "GET /disputes/{dispute_id} to confirm terminal state"
+        ],
+        "expected": [
+          "Initial transaction state is 'undisputed'",
+          "POST /disputes returns HTTP 201",
+          "Dispute state is 'open'",
+          "provisional_credit is true in dispute response"
+        ],
+        "trace": [
+          "R-FIN-009: state transition undisputed -> disputed (open) with provisional credit",
+          "R-FIN-009: expected outcomes \u2014 dispute created; provisional credit applied"
+        ],
+        "executable": "def test_dispute_state_transitions_undisputed_to_open_with_credit(api_client, create_transaction):\n    txn = create_transaction(age_days=10)\n\n    pre = api_client.get(f\"/transactions/{txn['id']}\")\n    assert pre.status_code == 200\n    assert pre.json()[\"dispute_status\"] == \"undisputed\"\n\n    resp = api_client.post(\"/disputes\", json={\"transaction_id\": txn[\"id\"], \"reason\": \"duplicate\"})\n    assert resp.status_code == 201\n    dispute_id = resp.json()[\"dispute_id\"]\n\n    detail = api_client.get(f\"/disputes/{dispute_id}\")\n    assert detail.status_code == 200\n    body = detail.json()\n    assert body[\"status\"] == \"open\"\n    assert body[\"provisional_credit\"] is True"
+      },
+      {
+        "name": "test_dispute_decision_table_valid_auth_expired_transaction",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer session exists (auth = valid)",
+          "Transaction posted 75 days ago (age > 60d)",
+          "Reason code is valid"
+        ],
+        "actions": [
+          "POST /disputes with valid auth + valid reason + expired transaction_id"
+        ],
+        "expected": [
+          "HTTP 422 \u2014 age rule fires even when all other inputs are valid",
+          "Error message references the 60-day dispute window",
+          "No provisional credit applied"
+        ],
+        "trace": [
+          "R-FIN-009: DT \u2014 rule: auth=valid AND age>60d AND reason=valid => 422",
+          "R-FIN-009: error pathway \u2014 422 when transaction.age > 60d"
+        ],
+        "executable": "def test_dispute_decision_table_valid_auth_expired_transaction(api_client, create_transaction):\n    txn = create_transaction(age_days=75)\n    payload = {\n        \"transaction_id\": txn[\"id\"],\n        \"reason\": \"unauthorized_charge\"\n    }\n\n    resp = api_client.post(\"/disputes\", json=payload)\n\n    assert resp.status_code == 422\n    body = resp.json()\n    error_text = str(body.get(\"error\", \"\"))\n    assert \"60\" in error_text or \"window\" in error_text.lower() or \\\n           \"expired\" in error_text.lower()"
+      }
+    ]
+  },
+  "req_id": "R-FIN-009",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 981,
+    "output_tokens": 2753,
+    "latency_ms": 35040,
+    "wall_ms": 35040,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-009\",\n  \"reasoning\": \"The requirement defines a 60-day hard cutoff for transaction disputes. Three partitions exist: (1) age < 60 days \u2014 valid dispute window, (2) age > 60 days \u2014 rejection zone, (3) age == 60 days \u2014 the exact boundary, which must be clarified as inclusive or exclusive. BVA demands testing at day 59 (last valid day), day 60 (boundary), and day 61 (first invalid day). EP covers the interior of each partition. STC captures the state change from 'undisputed' to 'disputed' with provisional credit applied. NEG covers the error pathway producing HTTP 422. A Decision Table test combines multiple conditions (valid auth + expired transaction) to verify the rejection rule fires correctly even when other inputs are valid.\",\n  \"tests\": [\n    {\n      \"name\": \"test_dispute_created_for_transaction_within_60_days\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer session exists\",\n        \"Transaction posted 30 days ago (well within 60-day window)\",\n        \"Transaction has no existing dispute\"\n      ],\n      \"actions\": [\n        \"POST /disputes with valid customer auth token and transaction_id of 30-day-old transaction\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains dispute_id\",\n        \"Response body contains status = 'open'\",\n        \"Response body contains provisional_credit = true\"\n      ],\n      \"trace\": [\n        \"R-FIN-009: dispute created\",\n        \"R-FIN-009: provisional credit applied\",\n        \"R-FIN-009: precondition transaction.age < 60d satisfied\"\n      ],\n      \"executable\": \"def test_dispute_created_for_transaction_within_60_days(api_client, create_transaction):\\n    txn = create_transaction(age_days=30)\\n    payload = {\\\"transaction_id\\\": txn[\\\"id\\\"], \\\"reason\\\": \\\"unauthorized_charge\\\"}\\n\\n    resp = api_client.post(\\\"/disputes\\\", json=payload)\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"dispute_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"open\\\"\\n    assert body[\\\"provisional_credit\\\"] is True\"\n    },\n    {\n      \"name\": \"test_dispute_rejected_for_transaction_older_than_60_days\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated customer session exists\",\n        \"Transaction posted 90 days ago (beyond 60-day window)\",\n        \"Transaction has no existing dispute\"\n      ],\n      \"actions\": [\n        \"POST /disputes with valid customer auth token and transaction_id of 90-day-old transaction\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains error code referencing dispute window exceeded\",\n        \"No dispute record created\",\n        \"No provisional credit applied\"\n      ],\n      \"trace\": [\n        \"R-FIN-009: error pathway \u2014 422 when transaction.age > 60d\"\n      ],\n      \"executable\": \"def test_dispute_rejected_for_transaction_older_than_60_days(api_client, create_transaction):\\n    txn = create_transaction(age_days=90)\\n    payload = {\\\"transaction_id\\\": txn[\\\"id\\\"], \\\"reason\\\": \\\"unauthorized_charge\\\"}\\n\\n    resp = api_client.post(\\\"/disputes\\\", json=payload)\\n\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert \\\"error\\\" in body\\n    assert \\\"dispute_window\\\" in body[\\\"error\\\"].get(\\\"code\\\", \\\"\\\").lower() or \\\\\\n           \\\"60\\\" in body[\\\"error\\\"].get(\\\"message\\\", \\\"\\\")\"\n    },\n    {\n      \"name\": \"test_dispute_at_exactly_60_days_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer session exists\",\n        \"Transaction posted exactly 60 days ago (boundary value)\",\n        \"Transaction has no existing dispute\"\n      ],\n      \"actions\": [\n        \"POST /disputes with valid customer auth token and transaction_id of exactly-60-day-old transaction\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (inclusive boundary) OR HTTP 422 (exclusive boundary)\""
+  }
+}

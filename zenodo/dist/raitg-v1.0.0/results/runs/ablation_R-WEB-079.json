@@ -1,0 +1,208 @@
+{
+  "req": {
+    "id": "R-WEB-079",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Upload onboarding document \u2014 variant 3",
+    "statement": "An employee shall upload onboarding documents up to 10MB in PDF, PNG, or JPG format; files outside this must be rejected. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "employee uploads file"
+    ],
+    "expected_outcomes": [
+      "document stored",
+      "virus scan queued",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "413 when size > 10MB",
+      "415 when mime not in allow-list"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents/upload"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-079",
+    "reasoning": "The requirement defines three orthogonal concern axes: (1) file size boundary at 10MB, (2) MIME type allow-list {PDF, PNG, JPG}, and (3) webhook emission on success. EP yields one positive partition (valid size+type) and two negative partitions (oversized, wrong type). BVA refines the size axis with an at-limit case (exactly 10MB). STC covers the state change from 'no document' to 'document stored + virus-scan queued'. DT captures the combined size\u00d7type decision. NEG explicitly exercises each error pathway (413, 415). The minimum required three tests are covered; additional tests address webhook emission and the combined decision table.",
+    "tests": [
+      {
+        "name": "test_upload_valid_pdf_under_limit_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR-app is reachable at BASE_URL",
+          "A PDF file of 1 MB exists on the test agent"
+        ],
+        "actions": [
+          "POST /documents/upload with multipart/form-data containing a 1 MB PDF file",
+          "Inspect HTTP response status and body",
+          "Verify virus-scan queue entry via <get_scan_queue_entry> helper",
+          "Verify webhook payload received by <mock_webhook_server> fixture"
+        ],
+        "expected": [
+          "HTTP 201 returned",
+          "Response body contains document_id",
+          "Virus-scan queue contains the new document_id",
+          "Webhook event 'document.uploaded' is emitted with correct document_id"
+        ],
+        "trace": [
+          "R-WEB-079 positive path: valid PDF \u2264 10MB stored, scan queued, webhook fired"
+        ],
+        "executable": "def test_upload_valid_pdf_under_limit_succeeds(auth_session, mock_webhook_server):\n    file_bytes = <generate_file_bytes>(size_mb=1, fmt=\"pdf\")\n    files = {\"file\": (\"onboarding.pdf\", file_bytes, \"application/pdf\")}\n    resp = auth_session.post(\"/documents/upload\", files=files)\n    assert resp.status_code == 201\n    body = resp.json()\n    doc_id = body.get(\"document_id\")\n    assert doc_id, \"document_id missing from response\"\n    queue_entry = <get_scan_queue_entry>(doc_id)\n    assert queue_entry is not None, \"virus-scan queue entry not found\"\n    event = mock_webhook_server.wait_for_event(\"document.uploaded\", timeout=5)\n    assert event[\"document_id\"] == doc_id"
+      },
+      {
+        "name": "test_upload_file_exceeds_10mb_returns_413",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR-app is reachable at BASE_URL",
+          "A PDF file of 11 MB exists on the test agent"
+        ],
+        "actions": [
+          "POST /documents/upload with multipart/form-data containing an 11 MB PDF file",
+          "Inspect HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 413 returned",
+          "Response body contains error code 'FILE_TOO_LARGE'",
+          "No document stored in the system",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-079 error pathway: size > 10MB \u2192 413"
+        ],
+        "executable": "def test_upload_file_exceeds_10mb_returns_413(auth_session, mock_webhook_server):\n    file_bytes = <generate_file_bytes>(size_mb=11, fmt=\"pdf\")\n    files = {\"file\": (\"big.pdf\", file_bytes, \"application/pdf\")}\n    resp = auth_session.post(\"/documents/upload\", files=files)\n    assert resp.status_code == 413\n    body = resp.json()\n    assert body.get(\"error\") == \"FILE_TOO_LARGE\"\n    mock_webhook_server.assert_no_event(\"document.uploaded\", timeout=2)"
+      },
+      {
+        "name": "test_upload_exactly_10mb_pdf_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR-app is reachable at BASE_URL",
+          "A PDF file of exactly 10485760 bytes (10 MiB) exists on the test agent"
+        ],
+        "actions": [
+          "POST /documents/upload with multipart/form-data containing a 10 MiB PDF file",
+          "Inspect HTTP response status and body",
+          "Verify virus-scan queue entry via <get_scan_queue_entry> helper"
+        ],
+        "expected": [
+          "HTTP 201 returned (boundary value is within the allowed range)",
+          "Response body contains document_id",
+          "Virus-scan queue contains the new document_id"
+        ],
+        "trace": [
+          "R-WEB-079 boundary: file size == 10MB (upper inclusive boundary) must succeed"
+        ],
+        "executable": "def test_upload_exactly_10mb_pdf_is_accepted(auth_session):\n    exact_bytes = <generate_file_bytes>(size_bytes=10 * 1024 * 1024, fmt=\"pdf\")\n    files = {\"file\": (\"boundary.pdf\", exact_bytes, \"application/pdf\")}\n    resp = auth_session.post(\"/documents/upload\", files=files)\n    assert resp.status_code == 201\n    doc_id = resp.json().get(\"document_id\")\n    assert doc_id\n    queue_entry = <get_scan_queue_entry>(doc_id)\n    assert queue_entry is not None"
+      },
+      {
+        "name": "test_upload_disallowed_mime_type_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR-app is reachable at BASE_URL",
+          "A valid .exe file of 1 MB exists on the test agent"
+        ],
+        "actions": [
+          "POST /documents/upload with multipart/form-data containing a 1 MB .exe file with MIME application/octet-stream",
+          "Inspect HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 415 returned",
+          "Response body contains error code 'UNSUPPORTED_MEDIA_TYPE'",
+          "No document stored in the system",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-079 error pathway: MIME not in {PDF, PNG, JPG} \u2192 415"
+        ],
+        "executable": "def test_upload_disallowed_mime_type_returns_415(auth_session, mock_webhook_server):\n    file_bytes = <generate_file_bytes>(size_mb=1, fmt=\"exe\")\n    files = {\"file\": (\"malware.exe\", file_bytes, \"application/octet-stream\")}\n    resp = auth_session.post(\"/documents/upload\", files=files)\n    assert resp.status_code == 415\n    body = resp.json()\n    assert body.get(\"error\") == \"UNSUPPORTED_MEDIA_TYPE\"\n    mock_webhook_server.assert_no_event(\"document.uploaded\", timeout=2)"
+      },
+      {
+        "name": "test_upload_valid_png_and_jpg_both_accepted",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR-app is reachable at BASE_URL",
+          "1 MB PNG and 1 MB JPG files exist on the test agent"
+        ],
+        "actions": [
+          "POST /documents/upload with a 1 MB PNG file (image/png)",
+          "Assert HTTP 201 for PNG upload",
+          "POST /documents/upload with a 1 MB JPG file (image/jpeg)",
+          "Assert HTTP 201 for JPG upload"
+        ],
+        "expected": [
+          "HTTP 201 for PNG upload; document_id present in body",
+          "HTTP 201 for JPG upload; document_id present in body",
+          "Both document_ids found in virus-scan queue"
+        ],
+        "trace": [
+          "R-WEB-079 decision table: rows {PNG, valid size} and {JPG, valid size} both map to accepted"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"fmt,mime\", [\n    (\"png\", \"image/png\"),\n    (\"jpg\", \"image/jpeg\"),\n])\ndef test_upload_valid_png_and_jpg_both_accepted(auth_session, fmt, mime):\n    file_bytes = <generate_file_bytes>(size_mb=1, fmt=fmt)\n    files = {\"file\": (f\"doc.{fmt}\", file_bytes, mime)}\n    resp = auth_session.post(\"/documents/upload\", files=files)\n    assert resp.status_code == 201\n    doc_id = resp.json().get(\"document_id\")\n    assert doc_id\n    queue_entry = <get_scan_queue_entry>(doc_id)\n    assert queue_entry is not None"
+      },
+      {
+        "name": "test_upload_transitions_document_state_to_stored_and_scan_queued",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR-app is reachable at BASE_URL",
+          "No prior document with same name exists for this user (idempotency ensured by UUID filename)"
+        ],
+        "actions": [
+          "Confirm document does not exist before upload via <get_document_by_name> helper",
+          "POST /documents/upload with a valid 2 MB PDF file",
+          "Query document status via <get_document_status> helper",
+          "Query virus-scan queue status via <get_scan_queue_entry> helper"
+        ],
+        "expected": [
+          "Pre-upload: document absent (None returned)",
+          "Post-upload: HTTP 201 with document_id",
+          "Document status transitions to 'stored'",
+          "Scan-queue entry status is 'queued'"
+        ],
+        "trace": [
+          "R-WEB-079 state transition: absent \u2192 stored; scan-queue: none \u2192 queued"
+        ],
+        "executable": "import uuid\n\ndef test_upload_transitions_document_state_to_stored_and_scan_queued(auth_session):\n    unique_name = f\"onboarding_{uuid.uuid4().hex}.pdf\"\n    pre = <get_document_by_name>(auth_session, unique_name)\n    assert pre is None, \"document should not exist before upload\"\n    file_bytes = <generate_file_bytes>(size_mb=2, fmt=\"pdf\")\n    files = {\"file\": (unique_name, file_bytes, \"application/pdf\")}\n    resp = auth_session.post(\"/documents/upload\", files=files)\n    assert resp.status_code == 201\n    doc_id = resp.json()[\"document_id\"]\n    doc_status = <get_document_status>(doc_id)\n    assert doc_status == \"stored\"\n    scan_entry = <get_scan_queue_entry>(doc_id)\n    assert scan_entry[\"status\"] == \"queued\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-079",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 3068,
+    "latency_ms": 35193,
+    "wall_ms": 35193,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-079\",\n  \"reasoning\": \"The requirement defines three orthogonal concern axes: (1) file size boundary at 10MB, (2) MIME type allow-list {PDF, PNG, JPG}, and (3) webhook emission on success. EP yields one positive partition (valid size+type) and two negative partitions (oversized, wrong type). BVA refines the size axis with an at-limit case (exactly 10MB). STC covers the state change from 'no document' to 'document stored + virus-scan queued'. DT captures the combined size\u00d7type decision. NEG explicitly exercises each error pathway (413, 415). The minimum required three tests are covered; additional tests address webhook emission and the combined decision table.\",\n  \"tests\": [\n    {\n      \"name\": \"test_upload_valid_pdf_under_limit_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"HR-app is reachable at BASE_URL\",\n        \"A PDF file of 1 MB exists on the test agent\"\n      ],\n      \"actions\": [\n        \"POST /documents/upload with multipart/form-data containing a 1 MB PDF file\",\n        \"Inspect HTTP response status and body\",\n        \"Verify virus-scan queue entry via <get_scan_queue_entry> helper\",\n        \"Verify webhook payload received by <mock_webhook_server> fixture\"\n      ],\n      \"expected\": [\n        \"HTTP 201 returned\",\n        \"Response body contains document_id\",\n        \"Virus-scan queue contains the new document_id\",\n        \"Webhook event 'document.uploaded' is emitted with correct document_id\"\n      ],\n      \"trace\": [\n        \"R-WEB-079 positive path: valid PDF \u2264 10MB stored, scan queued, webhook fired\"\n      ],\n      \"executable\": \"def test_upload_valid_pdf_under_limit_succeeds(auth_session, mock_webhook_server):\\n    file_bytes = <generate_file_bytes>(size_mb=1, fmt=\\\"pdf\\\")\\n    files = {\\\"file\\\": (\\\"onboarding.pdf\\\", file_bytes, \\\"application/pdf\\\")}\\n    resp = auth_session.post(\\\"/documents/upload\\\", files=files)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    doc_id = body.get(\\\"document_id\\\")\\n    assert doc_id, \\\"document_id missing from response\\\"\\n    queue_entry = <get_scan_queue_entry>(doc_id)\\n    assert queue_entry is not None, \\\"virus-scan queue entry not found\\\"\\n    event = mock_webhook_server.wait_for_event(\\\"document.uploaded\\\", timeout=5)\\n    assert event[\\\"document_id\\\"] == doc_id\"\n    },\n    {\n      \"name\": \"test_upload_file_exceeds_10mb_returns_413\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"HR-app is reachable at BASE_URL\",\n        \"A PDF file of 11 MB exists on the test agent\"\n      ],\n      \"actions\": [\n        \"POST /documents/upload with multipart/form-data containing an 11 MB PDF file\",\n        \"Inspect HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 413 returned\",\n        \"Response body contains error code 'FILE_TOO_LARGE'\",\n        \"No document stored in the system\",\n        \"No webhook event emitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-079 error pathway: size > 10MB \u2192 413\"\n      ],\n      \"executable\": \"def test_upload_file_exceeds_10mb_returns_413(auth_session, mock_webhook_server):\\n    file_bytes = <generate_file_bytes>(size_mb=11, fmt=\\\"pdf\\\")\\n    files = {\\\"file\\\": (\\\"big.pdf\\\", file_bytes, \\\"application/pdf\\\")}\\n    resp = auth_session.post(\\\"/documents/upload\\\", files=files)\\n    assert resp.status_code == 413\\n    body = resp.json()\\n    assert body.get(\\\"error\\\") == \\\"FILE_TOO_LARGE\\\"\\n    mock_webhook_server.assert_no_event(\\\"document.uploaded\\\", timeout=2)\"\n    },\n    {\n      \"name\": \"test_upload_exactly_10mb_pdf_is_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"HR-app is reachable at BASE_URL\",\n        \"A PDF file of exactly 10485760 bytes (10 MiB) exists on the test agen"
+  }
+}

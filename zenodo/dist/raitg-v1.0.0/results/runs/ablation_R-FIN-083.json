@@ -1,0 +1,211 @@
+{
+  "req": {
+    "id": "R-FIN-083",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Account statement generation (idempotency variant)",
+    "statement": "A customer shall request monthly statements as PDF; statements older than 7 years shall be fetched from cold storage. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer requests statement"
+    ],
+    "expected_outcomes": [
+      "PDF delivered",
+      "retrieval logged"
+    ],
+    "error_pathways": [
+      "404 if no activity in period",
+      "503 if cold storage unavailable"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/statements/{month}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-083",
+    "reasoning": "The requirement covers four distinct test dimensions: (1) normal PDF retrieval for a recent month (EP positive path), (2) idempotency guarantee on duplicate submission (STC \u2013 state must not change on replay), (3) 404 when no activity exists in the requested period (NEG), (4) the 7-year cold-storage boundary (BVA \u2013 exactly 84 months ago vs 85 months ago), and (5) 503 propagation when cold storage is unavailable (DT \u2013 condition combination). Each test is self-contained via fixtures and uses an Idempotency-Key header to satisfy the idempotency contract. All tests target GET /statements/{month} on the banking-api service.",
+    "tests": [
+      {
+        "name": "test_statement_pdf_returned_for_active_recent_month",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as the account owner",
+          "Account has at least one transaction in the target month",
+          "Target month is within the last 7 years (warm storage)"
+        ],
+        "actions": [
+          "Send GET /statements/{month} with a valid bearer token and a unique Idempotency-Key header",
+          "Capture HTTP response status, Content-Type, and body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type header equals application/pdf",
+          "Response body is a non-empty byte stream starting with %PDF",
+          "X-Idempotency-Key header echoed back in response",
+          "Audit log entry created (verified via <log_fixture>)"
+        ],
+        "trace": [
+          "R-FIN-083: PDF delivered",
+          "R-FIN-083: retrieval logged"
+        ],
+        "executable": "import pytest\n\ndef test_statement_pdf_returned_for_active_recent_month(\n    auth_client,          # <fixture> returns requests.Session with bearer token\n    recent_active_month,  # <fixture> returns YYYY-MM string, e.g. last month\n    unique_idempotency_key,  # <fixture> returns uuid4 string\n    assert_audit_logged,  # <helper_fn>(account_id, month) -> bool\n    account_id,           # <fixture> returns str\n):\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    url = f\"/statements/{recent_active_month}\"\n\n    resp = auth_client.get(url, headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers.get(\"Content-Type\") == \"application/pdf\"\n    assert len(resp.content) > 0\n    assert resp.content[:4] == b\"%PDF\"\n    assert resp.headers.get(\"X-Idempotency-Key\") == unique_idempotency_key\n    assert assert_audit_logged(account_id, recent_active_month)\n"
+      },
+      {
+        "name": "test_idempotent_duplicate_request_returns_identical_response",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated as the account owner",
+          "Account has at least one transaction in the target month",
+          "A first successful request with the chosen Idempotency-Key has already been issued"
+        ],
+        "actions": [
+          "Send GET /statements/{month} with Idempotency-Key IK-001 (first request)",
+          "Record status code, Content-Type, ETag or Content-MD5, and body hash",
+          "Send identical GET /statements/{month} with the same Idempotency-Key IK-001 (duplicate)",
+          "Compare both responses"
+        ],
+        "expected": [
+          "Both responses return HTTP 200",
+          "Content-Type is application/pdf on both",
+          "Response body hash is identical on both requests",
+          "No additional audit log entry is created for the duplicate (idempotency replay)"
+        ],
+        "trace": [
+          "R-FIN-083: idempotent \u2013 duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "import hashlib\nimport pytest\n\ndef test_idempotent_duplicate_request_returns_identical_response(\n    auth_client,\n    recent_active_month,\n    fixed_idempotency_key,  # <fixture> returns deterministic key e.g. \"IK-IDEM-TEST-001\"\n    audit_log_count,        # <helper_fn>(account_id, month) -> int\n    account_id,\n):\n    headers = {\"Idempotency-Key\": fixed_idempotency_key}\n    url = f\"/statements/{recent_active_month}\"\n\n    resp1 = auth_client.get(url, headers=headers)\n    assert resp1.status_code == 200\n    count_after_first = audit_log_count(account_id, recent_active_month)\n    hash1 = hashlib.sha256(resp1.content).hexdigest()\n\n    resp2 = auth_client.get(url, headers=headers)\n    assert resp2.status_code == 200\n    hash2 = hashlib.sha256(resp2.content).hexdigest()\n    count_after_second = audit_log_count(account_id, recent_active_month)\n\n    assert hash1 == hash2, \"Idempotency violated: response bodies differ\"\n    assert count_after_second == count_after_first, \"Duplicate must not add audit entry\"\n"
+      },
+      {
+        "name": "test_statement_returns_404_when_no_activity_in_period",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as the account owner",
+          "Account has zero transactions in the target month",
+          "Target month is within the last 7 years"
+        ],
+        "actions": [
+          "Send GET /statements/{month} for a month with no account activity",
+          "Include a unique Idempotency-Key header"
+        ],
+        "expected": [
+          "HTTP 404 Not Found",
+          "Response body contains error code NO_ACTIVITY or equivalent",
+          "Content-Type is application/json"
+        ],
+        "trace": [
+          "R-FIN-083: 404 if no activity in period"
+        ],
+        "executable": "import pytest\n\ndef test_statement_returns_404_when_no_activity_in_period(\n    auth_client,\n    inactive_month,          # <fixture> returns YYYY-MM with no transactions\n    unique_idempotency_key,\n):\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    url = f\"/statements/{inactive_month}\"\n\n    resp = auth_client.get(url, headers=headers)\n\n    assert resp.status_code == 404\n    assert \"application/json\" in resp.headers.get(\"Content-Type\", \"\")\n    body = resp.json()\n    assert body.get(\"error\") in (\"NO_ACTIVITY\", \"NOT_FOUND\")\n"
+      },
+      {
+        "name": "test_statement_exactly_at_7_year_boundary_served_from_cold_storage",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as the account owner",
+          "Account has transactions in the month that is exactly 84 months (7 years) ago",
+          "Cold storage is available and contains the statement for that month"
+        ],
+        "actions": [
+          "Calculate the month that is exactly 84 months before the current month",
+          "Send GET /statements/{month} for that boundary month",
+          "Include a unique Idempotency-Key header"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type is application/pdf",
+          "Response body starts with %PDF",
+          "X-Storage-Tier response header equals cold (or archive)",
+          "Retrieval is logged"
+        ],
+        "trace": [
+          "R-FIN-083: statements older than 7 years fetched from cold storage",
+          "R-FIN-083: PDF delivered",
+          "R-FIN-083: retrieval logged"
+        ],
+        "executable": "import pytest\nfrom datetime import date, timedelta\nfrom dateutil.relativedelta import relativedelta\n\ndef test_statement_exactly_at_7_year_boundary_served_from_cold_storage(\n    auth_client,\n    unique_idempotency_key,\n    assert_audit_logged,\n    account_id,\n    seed_cold_storage_statement,  # <helper_fn>(account_id, month) seeds fixture data\n):\n    boundary_month = (date.today() - relativedelta(months=84)).strftime(\"%Y-%m\")\n    seed_cold_storage_statement(account_id, boundary_month)\n\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    url = f\"/statements/{boundary_month}\"\n\n    resp = auth_client.get(url, headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers.get(\"Content-Type\") == \"application/pdf\"\n    assert resp.content[:4] == b\"%PDF\"\n    storage_tier = resp.headers.get(\"X-Storage-Tier\", \"\").lower()\n    assert storage_tier in (\"cold\", \"archive\")\n    assert assert_audit_logged(account_id, boundary_month)\n"
+      },
+      {
+        "name": "test_statement_returns_503_when_cold_storage_unavailable",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as the account owner",
+          "Requested month is older than 7 years (requires cold storage)",
+          "Cold storage service is simulated as unavailable (e.g. via mock or chaos toggle)"
+        ],
+        "actions": [
+          "Enable cold-storage-unavailable chaos flag via <helper_fn>",
+          "Send GET /statements/{month} for a month older than 7 years",
+          "Include a unique Idempotency-Key header",
+          "Disable chaos flag after test"
+        ],
+        "expected": [
+          "HTTP 503 Service Unavailable",
+          "Response body contains error code COLD_STORAGE_UNAVAILABLE or equivalent",
+          "Retry-After header is present"
+        ],
+        "trace": [
+          "R-FIN-083: 503 if cold storage unavailable"
+        ],
+        "executable": "import pytest\nfrom dateutil.relativedelta import relativedelta\nfrom datetime import date\n\ndef test_statement_returns_503_when_cold_storage_unavailable(\n    auth_client,\n    unique_idempotency_key,\n    chaos_toggle,  # <fixture> context manager: chaos_toggle(\"cold_storage_down\")\n):\n    old_month = (date.today() - relativedelta(months=96)).strftime(\"%Y-%m\")\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    url = f\"/statements/{old_month}\"\n\n    with chaos_toggle(\"cold_storage_down\"):\n        resp = auth_client.get(url, headers=headers)\n\n    assert resp.status_code == 503\n    assert \"application/json\" in resp.headers.get(\"Content-Type\", \"\")\n    body = resp.json()\n    assert body.get(\"error\") in (\"COLD_STORAGE_UNAVAILABLE\", \"SERVICE_UNAVAILABLE\")\n    assert \"Retry-After\" in resp.headers\n"
+      },
+      {
+        "name": "test_statement_denied_when_caller_is_not_account_owner",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated but is NOT the owner of the requested account",
+          "Target account has transactions in the requested month"
+        ],
+        "actions": [
+          "Authenticate as a different customer (non-owner)",
+          "Send GET /statements/{month} targeting the victim account",
+          "Include a unique Idempotency-Key header"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains error indicating authorization failure",
+          "No PDF content returned",
+          "No audit log entry created for the victim account"
+        ],
+        "trace": [
+          "R-FIN-083: precondition account.owner == caller",
+          "R-FIN-083: PDF delivered only to authorized caller"
+        ],
+        "executable": "import pytest\n\ndef test_statement_denied_when_caller_is_not_account_owner(\n    non_owner_auth_client,  # <fixture> session authenticated as different customer\n    recent_active_month,\n    unique_idempotency_key,\n    victim_account_month_path,  # <fixture> returns path segment e.g. \"/statements/2024-11\" for victim\n    audit_log_count,\n    victim_account_id,      # <fixture> str\n):\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    count_before = audit_log_count(victim_account_id, recent_active_month)\n\n    resp = non_owner_auth_client.get(victim_account_month_path, headers=headers)\n\n    assert resp.status_code == 403\n    assert \"application/pdf\" not in resp.headers.get(\"Content-Type\", \"\")\n    body = resp.json()\n    assert body.get(\"error\") in (\"FORBIDDEN\", \"ACCESS_DENIED\", \"UNAUTHORIZED\")\n    assert audit_log_count(victim_account_id, recent_active_month) == count_before\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-083",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1023,
+    "output_tokens": 3629,
+    "latency_ms": 46477,
+    "wall_ms": 46477,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-083\",\n  \"reasoning\": \"The requirement covers four distinct test dimensions: (1) normal PDF retrieval for a recent month (EP positive path), (2) idempotency guarantee on duplicate submission (STC \u2013 state must not change on replay), (3) 404 when no activity exists in the requested period (NEG), (4) the 7-year cold-storage boundary (BVA \u2013 exactly 84 months ago vs 85 months ago), and (5) 503 propagation when cold storage is unavailable (DT \u2013 condition combination). Each test is self-contained via fixtures and uses an Idempotency-Key header to satisfy the idempotency contract. All tests target GET /statements/{month} on the banking-api service.\",\n  \"tests\": [\n    {\n      \"name\": \"test_statement_pdf_returned_for_active_recent_month\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as the account owner\",\n        \"Account has at least one transaction in the target month\",\n        \"Target month is within the last 7 years (warm storage)\"\n      ],\n      \"actions\": [\n        \"Send GET /statements/{month} with a valid bearer token and a unique Idempotency-Key header\",\n        \"Capture HTTP response status, Content-Type, and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Content-Type header equals application/pdf\",\n        \"Response body is a non-empty byte stream starting with %PDF\",\n        \"X-Idempotency-Key header echoed back in response\",\n        \"Audit log entry created (verified via <log_fixture>)\"\n      ],\n      \"trace\": [\n        \"R-FIN-083: PDF delivered\",\n        \"R-FIN-083: retrieval logged\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_statement_pdf_returned_for_active_recent_month(\\n    auth_client,          # <fixture> returns requests.Session with bearer token\\n    recent_active_month,  # <fixture> returns YYYY-MM string, e.g. last month\\n    unique_idempotency_key,  # <fixture> returns uuid4 string\\n    assert_audit_logged,  # <helper_fn>(account_id, month) -> bool\\n    account_id,           # <fixture> returns str\\n):\\n    headers = {\\\"Idempotency-Key\\\": unique_idempotency_key}\\n    url = f\\\"/statements/{recent_active_month}\\\"\\n\\n    resp = auth_client.get(url, headers=headers)\\n\\n    assert resp.status_code == 200\\n    assert resp.headers.get(\\\"Content-Type\\\") == \\\"application/pdf\\\"\\n    assert len(resp.content) > 0\\n    assert resp.content[:4] == b\\\"%PDF\\\"\\n    assert resp.headers.get(\\\"X-Idempotency-Key\\\") == unique_idempotency_key\\n    assert assert_audit_logged(account_id, recent_active_month)\\n\"\n    },\n    {\n      \"name\": \"test_idempotent_duplicate_request_returns_identical_response\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Caller is authenticated as the account owner\",\n        \"Account has at least one transaction in the target month\",\n        \"A first successful request with the chosen Idempotency-Key has already been issued\"\n      ],\n      \"actions\": [\n        \"Send GET /statements/{month} with Idempotency-Key IK-001 (first request)\",\n        \"Record status code, Content-Type, ETag or Content-MD5, and body hash\",\n        \"Send identical GET /statements/{month} with the same Idempotency-Key IK-001 (duplicate)\",\n        \"Compare both responses\"\n      ],\n      \"expected\": [\n        \"Both responses return HTTP 200\",\n        \"Content-Type is application/pdf on both\",\n        \"Response body hash is identical on both requests\",\n        \"No additional audit log entry is created for the duplicate (idempotency replay)\"\n      ],\n      \"trace\": [\n        \"R-FIN-083: idempotent \u2013 duplicate submission with same Idempotency-Key must return original result\"\n      ],\n      \"executable\": \"import hashlib\\nimport pytest\\n\\ndef test_idempotent_duplicate_request_returns_identical_response(\\n    auth_client,\\n    recent_active_month,\\n    fixed_idempotency_key,  # <fixture> returns deterministic key e.g. \\\"IK-IDEM-TEST-001\\\"\\n    audit_log_count,        # <helper_fn"
+  }
+}

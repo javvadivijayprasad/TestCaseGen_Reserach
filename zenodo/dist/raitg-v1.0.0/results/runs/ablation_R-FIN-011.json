@@ -1,0 +1,178 @@
+{
+  "req": {
+    "id": "R-FIN-011",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Beneficiary management",
+    "statement": "A customer shall add a beneficiary which enters a 24-hour cooling-off period before it can receive transfers.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds beneficiary"
+    ],
+    "expected_outcomes": [
+      "beneficiary saved in pending state"
+    ],
+    "error_pathways": [
+      "409 if duplicate account"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/beneficiaries"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-011",
+    "reasoning": "The requirement covers three key behaviours: (1) a valid beneficiary POST results in HTTP 201 with status='pending' and a cooling_off_until timestamp ~24 h in the future; (2) posting the same account a second time yields HTTP 409; (3) the cooling-off boundary \u2014 attempting a transfer exactly at the 24-hour mark (or just before) must still be blocked, while just after must succeed. Tests are scoped to the /beneficiaries endpoint. Each test uses a unique account number derived from a UUID so the suite is idempotent across repeated runs. Fixtures supply the authenticated HTTP session; helper stubs replace verbose setup code.",
+    "tests": [
+      {
+        "name": "test_add_beneficiary_returns_201_and_pending_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_token> fixture)",
+          "Account number does not already exist for this customer"
+        ],
+        "actions": [
+          "Generate a unique account number with <unique_account_number>",
+          "POST /beneficiaries with valid payload {account_number, name, bank_code}",
+          "Capture response status code and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status == 'pending'",
+          "Response body contains a cooling_off_until timestamp approximately 24 hours from now (within a 60-second tolerance)",
+          "Response body contains the submitted account_number"
+        ],
+        "trace": [
+          "R-FIN-011: beneficiary saved in pending state",
+          "R-FIN-011: 24-hour cooling-off period begins on add"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\nfrom dateutil.parser import parse as parse_dt\n\ndef test_add_beneficiary_returns_201_and_pending_state(api_session, unique_account_number):\n    payload = {\n        \"account_number\": unique_account_number,\n        \"name\": \"Alice Tester\",\n        \"bank_code\": \"TESTGB22\"\n    }\n    resp = api_session.post(\"/beneficiaries\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body[\"account_number\"] == unique_account_number\n\n    cooling_off = parse_dt(body[\"cooling_off_until\"])\n    now = datetime.now(timezone.utc)\n    expected_expiry = now + timedelta(hours=24)\n    delta = abs((cooling_off - expected_expiry).total_seconds())\n    assert delta <= 60, f\"cooling_off_until off by {delta}s\"\n"
+      },
+      {
+        "name": "test_add_duplicate_beneficiary_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_token> fixture)",
+          "A beneficiary with the target account number already exists for this customer"
+        ],
+        "actions": [
+          "Generate a unique account number with <unique_account_number>",
+          "POST /beneficiaries with that account number (first call \u2014 seeds the duplicate)",
+          "POST /beneficiaries again with the identical account number",
+          "Capture second response status code and body"
+        ],
+        "expected": [
+          "First POST returns HTTP 201",
+          "Second POST returns HTTP 409 Conflict",
+          "Response body contains an error code or message indicating duplicate account"
+        ],
+        "trace": [
+          "R-FIN-011: Error pathway \u2014 409 if duplicate account"
+        ],
+        "executable": "def test_add_duplicate_beneficiary_returns_409(api_session, unique_account_number):\n    payload = {\n        \"account_number\": unique_account_number,\n        \"name\": \"Bob Duplicate\",\n        \"bank_code\": \"TESTGB22\"\n    }\n    first = api_session.post(\"/beneficiaries\", json=payload)\n    assert first.status_code == 201, f\"Seed POST failed: {first.status_code}\"\n\n    second = api_session.post(\"/beneficiaries\", json=payload)\n    assert second.status_code == 409, f\"Expected 409, got {second.status_code}: {second.text}\"\n\n    body = second.json()\n    assert \"error\" in body or \"message\" in body, \"409 body must contain error detail\"\n    error_text = str(body.get(\"error\", \"\") + body.get(\"message\", \"\")).lower()\n    assert \"duplicate\" in error_text or \"already exists\" in error_text or \"conflict\" in error_text\n"
+      },
+      {
+        "name": "test_transfer_blocked_before_cooling_off_expires",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_token> fixture)",
+          "A beneficiary has been added and is still within the 24-hour cooling-off window",
+          "Transfer endpoint /transfers is reachable"
+        ],
+        "actions": [
+          "Generate a unique account number with <unique_account_number>",
+          "POST /beneficiaries to create beneficiary (status should be 'pending')",
+          "Immediately attempt POST /transfers to the newly created beneficiary",
+          "Capture response status code and body"
+        ],
+        "expected": [
+          "Beneficiary creation returns HTTP 201 with status='pending'",
+          "Transfer attempt returns HTTP 403 or HTTP 422 (transfer blocked during cooling-off)",
+          "Response body indicates cooling-off restriction is in effect"
+        ],
+        "trace": [
+          "R-FIN-011: beneficiary cannot receive transfers during 24-hour cooling-off period",
+          "R-FIN-011: boundary \u2014 t=0 (just added) is inside the restricted window"
+        ],
+        "executable": "def test_transfer_blocked_before_cooling_off_expires(api_session, unique_account_number):\n    ben_payload = {\n        \"account_number\": unique_account_number,\n        \"name\": \"Carol Boundary\",\n        \"bank_code\": \"TESTGB22\"\n    }\n    ben_resp = api_session.post(\"/beneficiaries\", json=ben_payload)\n    assert ben_resp.status_code == 201\n    beneficiary_id = ben_resp.json()[\"id\"]\n    assert ben_resp.json()[\"status\"] == \"pending\"\n\n    transfer_payload = {\n        \"beneficiary_id\": beneficiary_id,\n        \"amount\": \"1.00\",\n        \"currency\": \"GBP\",\n        \"reference\": \"BVA-boundary-test\"\n    }\n    tr_resp = api_session.post(\"/transfers\", json=transfer_payload)\n    assert tr_resp.status_code in (403, 422), (\n        f\"Expected 403 or 422 during cooling-off, got {tr_resp.status_code}: {tr_resp.text}\"\n    )\n    body = tr_resp.json()\n    body_str = str(body).lower()\n    assert \"cooling\" in body_str or \"pending\" in body_str or \"restricted\" in body_str\n"
+      },
+      {
+        "name": "test_beneficiary_state_transitions_pending_to_active",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_token> fixture)",
+          "Test environment supports time-travel or admin override to advance cooling-off clock via <advance_cooling_off> helper"
+        ],
+        "actions": [
+          "Generate a unique account number with <unique_account_number>",
+          "POST /beneficiaries \u2014 expect status='pending'",
+          "Invoke <advance_cooling_off>(beneficiary_id, hours=24) to expire the cooling-off period",
+          "GET /beneficiaries/{id} \u2014 expect status='active'",
+          "POST /transfers to the beneficiary \u2014 expect 2xx (transfer now allowed)"
+        ],
+        "expected": [
+          "Initial POST returns status='pending'",
+          "After advancing clock 24 h, GET returns status='active'",
+          "Transfer to active beneficiary returns 200 or 201"
+        ],
+        "trace": [
+          "R-FIN-011: 24-hour cooling-off period \u2014 state transition pending -> active",
+          "R-FIN-011: beneficiary can receive transfers after cooling-off expires"
+        ],
+        "executable": "def test_beneficiary_state_transitions_pending_to_active(\n    api_session, unique_account_number, advance_cooling_off\n):\n    payload = {\n        \"account_number\": unique_account_number,\n        \"name\": \"Dave Transition\",\n        \"bank_code\": \"TESTGB22\"\n    }\n    create_resp = api_session.post(\"/beneficiaries\", json=payload)\n    assert create_resp.status_code == 201\n    body = create_resp.json()\n    assert body[\"status\"] == \"pending\"\n    beneficiary_id = body[\"id\"]\n\n    advance_cooling_off(beneficiary_id, hours=24)\n\n    get_resp = api_session.get(f\"/beneficiaries/{beneficiary_id}\")\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\"\n\n    transfer_payload = {\n        \"beneficiary_id\": beneficiary_id,\n        \"amount\": \"10.00\",\n        \"currency\": \"GBP\",\n        \"reference\": \"STC-post-cooling-off\"\n    }\n    tr_resp = api_session.post(\"/transfers\", json=transfer_payload)\n    assert tr_resp.status_code in (200, 201), (\n        f\"Transfer should succeed after cooling-off; got {tr_resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_add_beneficiary_missing_required_fields_returns_400",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_token> fixture)"
+        ],
+        "actions": [
+          "POST /beneficiaries with each of the following incomplete payloads in turn: (a) missing account_number, (b) missing name, (c) missing bank_code",
+          "Capture status code and error body for each call"
+        ],
+        "expected": [
+          "All three POST calls return HTTP 400 Bad Request",
+          "Each response body identifies the missing field"
+        ],
+        "trace": [
+          "R-FIN-011: precondition \u2014 valid beneficiary data required before cooling-off can start",
+          "DT rule: any required field absent => reject before persisting"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"payload,missing_field\", [\n    ({\"name\": \"Eve Test\", \"bank_code\": \"TESTGB22\"}, \"account_number\"),\n    ({\"account_number\": \"GB00TEST12345601\", \"bank_code\": \"TESTGB22\"}, \"name\"),\n    ({\"account_number\": \"GB00TEST12345602\", \"name\": \"Frank Test\"}, \"bank_code\"),\n])\ndef test_add_beneficiary_missing_required_fields_returns_400(\n    api_session, payload, missing_field\n):\n    resp = api_session.post(\"/beneficiaries\", json=payload)\n    assert resp.status_code == 400, (\n        f\"Expected 400 for missing {missing_field}, got {resp.status_code}: {resp.text}\"\n    )\n    body_str = str(resp.json()).lower()\n    assert missing_field.replace(\"_\", \"\") in body_str.replace(\"_\", \"\") or \\\n           missing_field in body_str, \\\n           f\"Response should reference missing field '{missing_field}'\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-011",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 975,
+    "output_tokens": 3230,
+    "latency_ms": 36740,
+    "wall_ms": 36740,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-011\",\n  \"reasoning\": \"The requirement covers three key behaviours: (1) a valid beneficiary POST results in HTTP 201 with status='pending' and a cooling_off_until timestamp ~24 h in the future; (2) posting the same account a second time yields HTTP 409; (3) the cooling-off boundary \u2014 attempting a transfer exactly at the 24-hour mark (or just before) must still be blocked, while just after must succeed. Tests are scoped to the /beneficiaries endpoint. Each test uses a unique account number derived from a UUID so the suite is idempotent across repeated runs. Fixtures supply the authenticated HTTP session; helper stubs replace verbose setup code.\",\n  \"tests\": [\n    {\n      \"name\": \"test_add_beneficiary_returns_201_and_pending_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid Bearer token available via <auth_token> fixture)\",\n        \"Account number does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"Generate a unique account number with <unique_account_number>\",\n        \"POST /beneficiaries with valid payload {account_number, name, bank_code}\",\n        \"Capture response status code and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status == 'pending'\",\n        \"Response body contains a cooling_off_until timestamp approximately 24 hours from now (within a 60-second tolerance)\",\n        \"Response body contains the submitted account_number\"\n      ],\n      \"trace\": [\n        \"R-FIN-011: beneficiary saved in pending state\",\n        \"R-FIN-011: 24-hour cooling-off period begins on add\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\nfrom dateutil.parser import parse as parse_dt\\n\\ndef test_add_beneficiary_returns_201_and_pending_state(api_session, unique_account_number):\\n    payload = {\\n        \\\"account_number\\\": unique_account_number,\\n        \\\"name\\\": \\\"Alice Tester\\\",\\n        \\\"bank_code\\\": \\\"TESTGB22\\\"\\n    }\\n    resp = api_session.post(\\\"/beneficiaries\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert body[\\\"account_number\\\"] == unique_account_number\\n\\n    cooling_off = parse_dt(body[\\\"cooling_off_until\\\"])\\n    now = datetime.now(timezone.utc)\\n    expected_expiry = now + timedelta(hours=24)\\n    delta = abs((cooling_off - expected_expiry).total_seconds())\\n    assert delta <= 60, f\\\"cooling_off_until off by {delta}s\\\"\\n\"\n    },\n    {\n      \"name\": \"test_add_duplicate_beneficiary_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid Bearer token available via <auth_token> fixture)\",\n        \"A beneficiary with the target account number already exists for this customer\"\n      ],\n      \"actions\": [\n        \"Generate a unique account number with <unique_account_number>\",\n        \"POST /beneficiaries with that account number (first call \u2014 seeds the duplicate)\",\n        \"POST /beneficiaries again with the identical account number\",\n        \"Capture second response status code and body\"\n      ],\n      \"expected\": [\n        \"First POST returns HTTP 201\",\n        \"Second POST returns HTTP 409 Conflict\",\n        \"Response body contains an error code or message indicating duplicate account\"\n      ],\n      \"trace\": [\n        \"R-FIN-011: Error pathway \u2014 409 if duplicate account\"\n      ],\n      \"executable\": \"def test_add_duplicate_beneficiary_returns_409(api_session, unique_account_number):\\n    payload = {\\n        \\\"account_number\\\": unique_account_number,\\n        \\\"name\\\": \\\"Bob Duplicate\\\",\\n        \\\"bank_code\\\": \\\"TESTGB22\\\"\\n    }\\n    first = api_session.post(\\\"/beneficiaries\\\", json=payload)\\n    assert first.status_code == 201, f\\\"Seed POST failed: {first.status_code}\\\"\\n\\n  "
+  }
+}

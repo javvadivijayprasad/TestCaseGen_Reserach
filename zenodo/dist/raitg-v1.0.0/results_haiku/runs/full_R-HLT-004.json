@@ -1,0 +1,183 @@
+{
+  "req": {
+    "id": "R-HLT-004",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Delete patient (soft)",
+    "statement": "A system-admin shall soft-delete a patient resource; deletion shall not remove history.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin deletes patient"
+    ],
+    "expected_outcomes": [
+      "resource marked deleted",
+      "retrievable via _history"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-004",
+    "reasoning": "R-HLT-004 mandates soft-deletion of patient resources by system-admin actors, preserving history while marking the resource as deleted. The requirement specifies three critical paths: (1) successful soft-delete by admin (positive), (2) rejection when non-admin attempts deletion (negative), and (3) edge cases around resource state and retrieval after deletion (boundary). Test design applies Equivalence Partitioning (admin vs. non-admin roles), Decision Table (authorization matrix), Negative Path (403 rejection), State Transition Coverage (deleted\u2192history-accessible), and Boundary Value Analysis (soft vs. hard delete semantics).",
+    "tests": [
+      {
+        "name": "test_admin_soft_deletes_patient_successfully",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "system-admin role is authenticated",
+          "patient resource exists with id=PT-001",
+          "patient has historical entries"
+        ],
+        "actions": [
+          "DELETE /Patient/PT-001 with Authorization: Bearer <admin_token>",
+          "verify response status code"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned",
+          "patient resource marked with meta.versionId incremented",
+          "patient.resourceType and id remain intact"
+        ],
+        "trace": [
+          "R-HLT-004: admin role authorized",
+          "R-HLT-004: deletion marked soft (not purged)",
+          "R-HLT-004: historical entries preserved"
+        ],
+        "executable": "import requests\nimport json\n\ndef test_admin_soft_deletes_patient_successfully(base_url):\n    admin_token = '<admin_token>'\n    patient_id = 'PT-001'\n    headers = {'Authorization': f'Bearer {admin_token}'}\n    \n    response = requests.delete(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    \n    assert response.status_code in [200, 204], \\\n        f'Expected 200/204, got {response.status_code}: {response.text}'\n    \n    # Verify resource is marked deleted, not purged\n    get_resp = requests.get(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    assert get_resp.status_code == 200\n    deleted_patient = get_resp.json()\n    assert 'meta' in deleted_patient\n    assert deleted_patient.get('resourceType') == 'Patient'"
+      },
+      {
+        "name": "test_non_admin_delete_rejected_with_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "non-admin user is authenticated (e.g., clinician role)",
+          "patient resource exists with id=PT-002",
+          "system enforces role-based access control"
+        ],
+        "actions": [
+          "DELETE /Patient/PT-002 with Authorization: Bearer <clinician_token>",
+          "verify response status code and error message"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden returned",
+          "error response includes OperationOutcome with issue.code='forbidden'",
+          "patient resource remains unmodified"
+        ],
+        "trace": [
+          "R-HLT-004: error pathway triggered (non-admin)",
+          "R-HLT-004: 403 authorization failure returned",
+          "R-HLT-004: resource integrity preserved"
+        ],
+        "executable": "import requests\n\ndef test_non_admin_delete_rejected_with_403(base_url):\n    clinician_token = '<clinician_token>'\n    patient_id = 'PT-002'\n    headers = {'Authorization': f'Bearer {clinician_token}'}\n    \n    response = requests.delete(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    \n    assert response.status_code == 403, \\\n        f'Expected 403, got {response.status_code}'\n    \n    body = response.json()\n    assert body.get('resourceType') == 'OperationOutcome'\n    assert any(\n        issue.get('code') == 'forbidden'\n        for issue in body.get('issue', [])\n    ), 'No forbidden issue found in OperationOutcome'"
+      },
+      {
+        "name": "test_deleted_patient_retrievable_via_history",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "system-admin role is authenticated",
+          "patient resource exists with id=PT-003",
+          "patient has at least 2 versions in history"
+        ],
+        "actions": [
+          "DELETE /Patient/PT-003 with admin token",
+          "GET /Patient/PT-003/_history with admin token",
+          "verify version entries in response"
+        ],
+        "expected": [
+          "soft-delete succeeds (200/204)",
+          "_history endpoint returns Bundle with all historical versions",
+          "deleted version entry has meta.versionId set",
+          "bundle.entry contains \u22652 entries (pre and post-deletion)"
+        ],
+        "trace": [
+          "R-HLT-004: soft-delete does not remove history",
+          "R-HLT-004: historical retrieval after deletion succeeds",
+          "R-HLT-004: state transition from active\u2192deleted is auditable"
+        ],
+        "executable": "import requests\n\ndef test_deleted_patient_retrievable_via_history(base_url):\n    admin_token = '<admin_token>'\n    patient_id = 'PT-003'\n    headers = {'Authorization': f'Bearer {admin_token}'}\n    \n    # Soft-delete\n    del_resp = requests.delete(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    assert del_resp.status_code in [200, 204]\n    \n    # Retrieve history\n    hist_resp = requests.get(\n        f'{base_url}/Patient/{patient_id}/_history',\n        headers=headers\n    )\n    assert hist_resp.status_code == 200\n    bundle = hist_resp.json()\n    \n    assert bundle.get('resourceType') == 'Bundle'\n    entries = bundle.get('entry', [])\n    assert len(entries) >= 2, \\\n        f'Expected \u22652 history entries, got {len(entries)}'\n    \n    # Verify deleted version has versionId\n    latest = entries[-1].get('resource', {})\n    assert 'meta' in latest\n    assert 'versionId' in latest['meta']"
+      },
+      {
+        "name": "test_unauthenticated_delete_rejected_with_401",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "no valid authentication token provided",
+          "patient resource exists with id=PT-004"
+        ],
+        "actions": [
+          "DELETE /Patient/PT-004 without Authorization header",
+          "verify response status code"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized returned",
+          "error response body present",
+          "patient resource remains unmodified"
+        ],
+        "trace": [
+          "R-HLT-004: authentication failure (no token)",
+          "R-HLT-004: 401 response enforces access control",
+          "R-HLT-004: resource protection maintained"
+        ],
+        "executable": "import requests\n\ndef test_unauthenticated_delete_rejected_with_401(base_url):\n    patient_id = 'PT-004'\n    \n    response = requests.delete(\n        f'{base_url}/Patient/{patient_id}'\n    )\n    \n    assert response.status_code == 401, \\\n        f'Expected 401, got {response.status_code}'\n    assert len(response.text) > 0, 'No error body returned'"
+      },
+      {
+        "name": "test_soft_delete_idempotent_on_already_deleted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "system-admin role is authenticated",
+          "patient resource already soft-deleted with id=PT-005",
+          "resource remains accessible but marked deleted"
+        ],
+        "actions": [
+          "DELETE /Patient/PT-005 with admin token (second call)",
+          "verify response status and resource state"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned (idempotent behavior)",
+          "resource state unchanged (no additional version created or 409 conflict)",
+          "meta.versionId consistent with prior state"
+        ],
+        "trace": [
+          "R-HLT-004: soft-delete is idempotent",
+          "R-HLT-004: repeated deletes do not corrupt state",
+          "R-HLT-004: boundary case: already-deleted resource"
+        ],
+        "executable": "import requests\n\ndef test_soft_delete_idempotent_on_already_deleted(base_url):\n    admin_token = '<admin_token>'\n    patient_id = 'PT-005'\n    headers = {'Authorization': f'Bearer {admin_token}'}\n    \n    # First delete\n    resp1 = requests.delete(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    assert resp1.status_code in [200, 204]\n    \n    # Get versionId after first delete\n    get_resp1 = requests.get(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    version1 = get_resp1.json().get('meta', {}).get('versionId')\n    \n    # Second delete (idempotent)\n    resp2 = requests.delete(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    assert resp2.status_code in [200, 204, 409]\n    \n    # Verify no spurious version increment\n    get_resp2 = requests.get(\n        f'{base_url}/Patient/{patient_id}',\n        headers=headers\n    )\n    version2 = get_resp2.json().get('meta', {}).get('versionId')\n    assert version1 == version2 or resp2.status_code == 409"
+      }
+    ]
+  },
+  "req_id": "R-HLT-004",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1020,
+    "output_tokens": 2736,
+    "latency_ms": 15862,
+    "wall_ms": 15862,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-004\",\n  \"reasoning\": \"R-HLT-004 mandates soft-deletion of patient resources by system-admin actors, preserving history while marking the resource as deleted. The requirement specifies three critical paths: (1) successful soft-delete by admin (positive), (2) rejection when non-admin attempts deletion (negative), and (3) edge cases around resource state and retrieval after deletion (boundary). Test design applies Equivalence Partitioning (admin vs. non-admin roles), Decision Table (authorization matrix), Negative Path (403 rejection), State Transition Coverage (deleted\u2192history-accessible), and Boundary Value Analysis (soft vs. hard delete semantics).\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_soft_deletes_patient_successfully\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"system-admin role is authenticated\",\n        \"patient resource exists with id=PT-001\",\n        \"patient has historical entries\"\n      ],\n      \"actions\": [\n        \"DELETE /Patient/PT-001 with Authorization: Bearer <admin_token>\",\n        \"verify response status code\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 returned\",\n        \"patient resource marked with meta.versionId incremented\",\n        \"patient.resourceType and id remain intact\"\n      ],\n      \"trace\": [\n        \"R-HLT-004: admin role authorized\",\n        \"R-HLT-004: deletion marked soft (not purged)\",\n        \"R-HLT-004: historical entries preserved\"\n      ],\n      \"executable\": \"import requests\\nimport json\\n\\ndef test_admin_soft_deletes_patient_successfully(base_url):\\n    admin_token = '<admin_token>'\\n    patient_id = 'PT-001'\\n    headers = {'Authorization': f'Bearer {admin_token}'}\\n    \\n    response = requests.delete(\\n        f'{base_url}/Patient/{patient_id}',\\n        headers=headers\\n    )\\n    \\n    assert response.status_code in [200, 204], \\\\\\n        f'Expected 200/204, got {response.status_code}: {response.text}'\\n    \\n    # Verify resource is marked deleted, not purged\\n    get_resp = requests.get(\\n        f'{base_url}/Patient/{patient_id}',\\n        headers=headers\\n    )\\n    assert get_resp.status_code == 200\\n    deleted_patient = get_resp.json()\\n    assert 'meta' in deleted_patient\\n    assert deleted_patient.get('resourceType') == 'Patient'\"\n    },\n    {\n      \"name\": \"test_non_admin_delete_rejected_with_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"non-admin user is authenticated (e.g., clinician role)\",\n        \"patient resource exists with id=PT-002\",\n        \"system enforces role-based access control\"\n      ],\n      \"actions\": [\n        \"DELETE /Patient/PT-002 with Authorization: Bearer <clinician_token>\",\n        \"verify response status code and error message\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden returned\",\n        \"error response includes OperationOutcome with issue.code='forbidden'\",\n        \"patient resource remains unmodified\"\n      ],\n      \"trace\": [\n        \"R-HLT-004: error pathway triggered (non-admin)\",\n        \"R-HLT-004: 403 authorization failure returned\",\n        \"R-HLT-004: resource integrity preserved\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_non_admin_delete_rejected_with_403(base_url):\\n    clinician_token = '<clinician_token>'\\n    patient_id = 'PT-002'\\n    headers = {'Authorization': f'Bearer {clinician_token}'}\\n    \\n    response = requests.delete(\\n        f'{base_url}/Patient/{patient_id}',\\n        headers=headers\\n    )\\n    \\n    assert response.status_code == 403, \\\\\\n        f'Expected 403, got {response.status_code}'\\n    \\n    body = response.json()\\n    assert body.get('resourceType') == 'OperationOutcome'\\n    assert any(\\n        issue.get('code') == 'forbidden'\\n        for issue in body.get('issue', [])\\n    ), 'No forbidden issue found in OperationOutcome'\"\n    },\n    {\n      \"name\": \"test_deleted_patient_retrievable_via_history\",\n      \"kind\": \"boundary\",\n    "
+  }
+}

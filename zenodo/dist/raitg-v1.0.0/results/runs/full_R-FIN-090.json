@@ -1,0 +1,175 @@
+{
+  "req": {
+    "id": "R-FIN-090",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "KYC refresh (idempotency variant)",
+    "statement": "A customer shall complete a KYC refresh every 365 days; accounts beyond refresh window shall be restricted to inbound transactions only. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "refresh form submitted"
+    ],
+    "expected_outcomes": [
+      "customer.verified=true refreshed"
+    ],
+    "error_pathways": [
+      "403 when submission fails compliance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/kyc/refresh"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-090",
+    "reasoning": "The requirement has four testable facets: (1) successful KYC refresh within window sets verified=true (EP positive path); (2) idempotency \u2014 duplicate submission with same Idempotency-Key returns original response without side-effects (STC, since the system transitions from 'submitted' back to same state); (3) boundary \u2014 submission exactly on day 365 (last valid day, BVA upper boundary); (4) account beyond 365-day window restricted to inbound only (STC state restriction); (5) compliance failure returns 403 (NEG). Five tests cover all mandatory kinds (positive, negative, boundary) plus extra STC coverage for the restriction state and idempotency.",
+    "tests": [
+      {
+        "name": "test_kyc_refresh_valid_customer_sets_verified",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC refresh was fewer than 365 days ago",
+          "Compliance check will pass for the submitted data"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid KYC payload and unique Idempotency-Key header",
+          "Inspect HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code",
+          "Response body contains customer.verified=true",
+          "Response body contains a refreshed timestamp within current day"
+        ],
+        "trace": [
+          "R-FIN-090: customer.verified=true refreshed on successful submission",
+          "R-FIN-090: authenticated precondition"
+        ],
+        "executable": "import pytest\nfrom datetime import date\n\ndef test_kyc_refresh_valid_customer_sets_verified(api_client, valid_kyc_payload, auth_headers):\n    idempotency_key = <generate_idempotency_key>()\n    headers = {**auth_headers, \"Idempotency-Key\": idempotency_key}\n\n    resp = api_client.post(\"/kyc/refresh\", json=valid_kyc_payload, headers=headers)\n\n    assert resp.status_code in (200, 201), f\"Expected 200/201, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"customer\"][\"verified\"] is True\n    assert \"refreshed_at\" in body[\"customer\"]\n    refreshed_date = body[\"customer\"][\"refreshed_at\"][:10]\n    assert refreshed_date == str(date.today())\n"
+      },
+      {
+        "name": "test_kyc_refresh_duplicate_idempotency_key_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "A KYC refresh has already been submitted successfully with a specific Idempotency-Key",
+          "The same Idempotency-Key is reused for the duplicate request"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid KYC payload and Idempotency-Key X (first submission)",
+          "Record the response body and status code",
+          "POST /kyc/refresh again with identical payload and same Idempotency-Key X",
+          "Compare both responses"
+        ],
+        "expected": [
+          "Second request returns same HTTP status code as first",
+          "Second response body is identical to first response body",
+          "No duplicate KYC record is created (state unchanged after second call)"
+        ],
+        "trace": [
+          "R-FIN-090: duplicate submission with same Idempotency-Key must return the original result",
+          "R-FIN-090: idempotency variant"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_duplicate_idempotency_key_returns_original_result(api_client, valid_kyc_payload, auth_headers):\n    idempotency_key = <generate_idempotency_key>()\n    headers = {**auth_headers, \"Idempotency-Key\": idempotency_key}\n\n    first = api_client.post(\"/kyc/refresh\", json=valid_kyc_payload, headers=headers)\n    assert first.status_code in (200, 201)\n\n    second = api_client.post(\"/kyc/refresh\", json=valid_kyc_payload, headers=headers)\n\n    assert second.status_code == first.status_code\n    assert second.json() == first.json(), \"Idempotent responses must be identical\"\n\n    audit = api_client.get(\"/kyc/refresh/audit\", headers=auth_headers, params={\"key\": idempotency_key})\n    assert audit.json()[\"submission_count\"] == 1, \"Duplicate must not create a second record\"\n"
+      },
+      {
+        "name": "test_kyc_refresh_exactly_on_day_365_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC refresh timestamp is set to exactly 365 days ago (boundary day)"
+        ],
+        "actions": [
+          "Seed customer record so last_kyc_refresh = today - 365 days via <seed_kyc_date> fixture",
+          "POST /kyc/refresh with valid KYC payload and unique Idempotency-Key",
+          "Inspect HTTP response status and verified flag"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code (day 365 is still within the valid window)",
+          "Response body contains customer.verified=true"
+        ],
+        "trace": [
+          "R-FIN-090: accounts beyond refresh window restricted; day 365 is the upper inclusive boundary",
+          "BVA: test at exact boundary value of 365 days"
+        ],
+        "executable": "import pytest\nfrom datetime import date, timedelta\n\ndef test_kyc_refresh_exactly_on_day_365_is_accepted(api_client, auth_headers, seed_kyc_date):\n    boundary_date = date.today() - timedelta(days=365)\n    seed_kyc_date(boundary_date)\n\n    idempotency_key = <generate_idempotency_key>()\n    headers = {**auth_headers, \"Idempotency-Key\": idempotency_key}\n    payload = <valid_kyc_payload>()\n\n    resp = api_client.post(\"/kyc/refresh\", json=payload, headers=headers)\n\n    assert resp.status_code in (200, 201), (\n        f\"Day-365 boundary should be accepted, got {resp.status_code}\"\n    )\n    assert resp.json()[\"customer\"][\"verified\"] is True\n"
+      },
+      {
+        "name": "test_kyc_refresh_account_beyond_365_days_restricted_to_inbound_only",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC refresh timestamp is set to 366 days ago (one day past the boundary)"
+        ],
+        "actions": [
+          "Seed customer record so last_kyc_refresh = today - 366 days via <seed_kyc_date> fixture",
+          "Attempt an outbound transaction via POST /transactions (outbound)",
+          "Attempt an inbound transaction via POST /transactions (inbound)"
+        ],
+        "expected": [
+          "Outbound transaction returns HTTP 403 or 423 (account restricted)",
+          "Inbound transaction returns HTTP 200 or 201 (inbound still permitted)"
+        ],
+        "trace": [
+          "R-FIN-090: accounts beyond refresh window restricted to inbound transactions only",
+          "STC: transition from 'active' state to 'restricted' state at day 366"
+        ],
+        "executable": "import pytest\nfrom datetime import date, timedelta\n\ndef test_kyc_refresh_account_beyond_365_days_restricted_to_inbound_only(\n    api_client, auth_headers, seed_kyc_date\n):\n    expired_date = date.today() - timedelta(days=366)\n    seed_kyc_date(expired_date)\n\n    outbound_payload = <build_transaction_payload>(direction=\"outbound\", amount=100)\n    out_resp = api_client.post(\"/transactions\", json=outbound_payload, headers=auth_headers)\n    assert out_resp.status_code in (403, 423), (\n        f\"Outbound must be blocked beyond window, got {out_resp.status_code}\"\n    )\n\n    inbound_payload = <build_transaction_payload>(direction=\"inbound\", amount=100)\n    in_resp = api_client.post(\"/transactions\", json=inbound_payload, headers=auth_headers)\n    assert in_resp.status_code in (200, 201), (\n        f\"Inbound must be allowed beyond window, got {in_resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_kyc_refresh_compliance_failure_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "KYC payload contains data that will fail compliance checks (e.g. blacklisted entity)"
+        ],
+        "actions": [
+          "POST /kyc/refresh with non-compliant KYC payload and unique Idempotency-Key",
+          "Inspect HTTP response status and error body"
+        ],
+        "expected": [
+          "HTTP 403 status code",
+          "Response body contains an error code or message indicating compliance failure",
+          "customer.verified remains false or unchanged"
+        ],
+        "trace": [
+          "R-FIN-090: 403 when submission fails compliance",
+          "NEG: error pathway for compliance rejection"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_compliance_failure_returns_403(api_client, auth_headers, non_compliant_kyc_payload):\n    idempotency_key = <generate_idempotency_key>()\n    headers = {**auth_headers, \"Idempotency-Key\": idempotency_key}\n\n    resp = api_client.post(\"/kyc/refresh\", json=non_compliant_kyc_payload, headers=headers)\n\n    assert resp.status_code == 403, f\"Expected 403 for compliance failure, got {resp.status_code}\"\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, \"Response must contain error detail\"\n    error_text = body.get(\"error\", body.get(\"message\", \"\")).lower()\n    assert \"compliance\" in error_text or \"rejected\" in error_text or \"forbidden\" in error_text\n\n    profile_resp = api_client.get(\"/customers/me\", headers=auth_headers)\n    assert profile_resp.json()[\"customer\"][\"verified\"] is not True\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-090",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1015,
+    "output_tokens": 2898,
+    "latency_ms": 31219,
+    "wall_ms": 31219,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-090\",\n  \"reasoning\": \"The requirement has four testable facets: (1) successful KYC refresh within window sets verified=true (EP positive path); (2) idempotency \u2014 duplicate submission with same Idempotency-Key returns original response without side-effects (STC, since the system transitions from 'submitted' back to same state); (3) boundary \u2014 submission exactly on day 365 (last valid day, BVA upper boundary); (4) account beyond 365-day window restricted to inbound only (STC state restriction); (5) compliance failure returns 403 (NEG). Five tests cover all mandatory kinds (positive, negative, boundary) plus extra STC coverage for the restriction state and idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_kyc_refresh_valid_customer_sets_verified\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"Customer last KYC refresh was fewer than 365 days ago\",\n        \"Compliance check will pass for the submitted data\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with valid KYC payload and unique Idempotency-Key header\",\n        \"Inspect HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 status code\",\n        \"Response body contains customer.verified=true\",\n        \"Response body contains a refreshed timestamp within current day\"\n      ],\n      \"trace\": [\n        \"R-FIN-090: customer.verified=true refreshed on successful submission\",\n        \"R-FIN-090: authenticated precondition\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import date\\n\\ndef test_kyc_refresh_valid_customer_sets_verified(api_client, valid_kyc_payload, auth_headers):\\n    idempotency_key = <generate_idempotency_key>()\\n    headers = {**auth_headers, \\\"Idempotency-Key\\\": idempotency_key}\\n\\n    resp = api_client.post(\\\"/kyc/refresh\\\", json=valid_kyc_payload, headers=headers)\\n\\n    assert resp.status_code in (200, 201), f\\\"Expected 200/201, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body[\\\"customer\\\"][\\\"verified\\\"] is True\\n    assert \\\"refreshed_at\\\" in body[\\\"customer\\\"]\\n    refreshed_date = body[\\\"customer\\\"][\\\"refreshed_at\\\"][:10]\\n    assert refreshed_date == str(date.today())\\n\"\n    },\n    {\n      \"name\": \"test_kyc_refresh_duplicate_idempotency_key_returns_original_result\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"A KYC refresh has already been submitted successfully with a specific Idempotency-Key\",\n        \"The same Idempotency-Key is reused for the duplicate request\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with valid KYC payload and Idempotency-Key X (first submission)\",\n        \"Record the response body and status code\",\n        \"POST /kyc/refresh again with identical payload and same Idempotency-Key X\",\n        \"Compare both responses\"\n      ],\n      \"expected\": [\n        \"Second request returns same HTTP status code as first\",\n        \"Second response body is identical to first response body\",\n        \"No duplicate KYC record is created (state unchanged after second call)\"\n      ],\n      \"trace\": [\n        \"R-FIN-090: duplicate submission with same Idempotency-Key must return the original result\",\n        \"R-FIN-090: idempotency variant\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_kyc_refresh_duplicate_idempotency_key_returns_original_result(api_client, valid_kyc_payload, auth_headers):\\n    idempotency_key = <generate_idempotency_key>()\\n    headers = {**auth_headers, \\\"Idempotency-Key\\\": idempotency_key}\\n\\n    first = api_client.post(\\\"/kyc/refresh\\\", json=valid_kyc_payload, headers=headers)\\n    assert first.status_code in (200, 201)\\n\\n    second = api_client.post(\\\"/kyc/refresh\\\", json=valid_kyc_payload, headers=headers)\\n\\n    assert second.status_code == first.status_code\\n    assert second.json() == first.json(), \\\"Idempotent"
+  }
+}

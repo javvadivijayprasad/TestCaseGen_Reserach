@@ -1,0 +1,174 @@
+{
+  "req": {
+    "id": "R-FIN-018",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Joint account operations",
+    "statement": "A joint-account holder shall perform transactions; the secondary holder shall not be able to modify ownership.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "holder is joint"
+    ],
+    "triggers": [
+      "holder performs operation"
+    ],
+    "expected_outcomes": [
+      "operation applied"
+    ],
+    "error_pathways": [
+      "403 when secondary holder attempts ownership change"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/joint"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-018",
+    "reasoning": "The requirement defines two distinct actor roles (primary and secondary joint-account holders) and two operation categories (transactions vs. ownership changes). EP partitions actors into primary/secondary and operations into allowed/forbidden. BVA targets the role boundary where a caller is exactly one role and not another. STC covers the state transition from 'pending transaction' to 'applied'. NEG confirms 403 on forbidden ownership mutation. DT cross-maps actor x operation to expected outcome. Together these four heuristics yield a minimum suite of five deterministic, idempotent tests.",
+    "tests": [
+      {
+        "name": "test_primary_holder_can_perform_transaction",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Joint account exists with id=<ACCOUNT_ID>",
+          "Caller is authenticated as primary holder with token <PRIMARY_TOKEN>",
+          "Account has sufficient balance for the transaction"
+        ],
+        "actions": [
+          "POST /accounts/{id}/joint with body {\"type\": \"debit\", \"amount\": 100.00} using PRIMARY_TOKEN"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body contains 'status': 'applied'",
+          "Transaction id is present in response"
+        ],
+        "trace": [
+          "R-FIN-018: primary holder shall perform transactions",
+          "R-FIN-018: expected outcome = operation applied"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nACCOUNT_ID = \"<ACCOUNT_ID>\"\nPRIMARY_TOKEN = \"<PRIMARY_TOKEN>\"\n\n\ndef test_primary_holder_can_perform_transaction():\n    headers = {\"Authorization\": f\"Bearer {PRIMARY_TOKEN}\"}\n    payload = {\"type\": \"debit\", \"amount\": 100.00}\n    url = f\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\"\n\n    response = requests.post(url, json=payload, headers=headers)\n\n    assert response.status_code == 200\n    body = response.json()\n    assert body.get(\"status\") == \"applied\"\n    assert \"transaction_id\" in body"
+      },
+      {
+        "name": "test_secondary_holder_cannot_modify_ownership",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Joint account exists with id=<ACCOUNT_ID>",
+          "Caller is authenticated as secondary holder with token <SECONDARY_TOKEN>",
+          "Request payload targets ownership change (add_owner)"
+        ],
+        "actions": [
+          "PATCH /accounts/{id}/joint with body {\"action\": \"add_owner\", \"user_id\": \"<NEW_USER_ID>\"} using SECONDARY_TOKEN"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body error message indicates insufficient privileges"
+        ],
+        "trace": [
+          "R-FIN-018: secondary holder shall NOT modify ownership",
+          "R-FIN-018: error pathway = 403 when secondary holder attempts ownership change"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://banking-api\"\nACCOUNT_ID = \"<ACCOUNT_ID>\"\nSECONDARY_TOKEN = \"<SECONDARY_TOKEN>\"\nNEW_USER_ID = \"<NEW_USER_ID>\"\n\n\ndef test_secondary_holder_cannot_modify_ownership():\n    headers = {\"Authorization\": f\"Bearer {SECONDARY_TOKEN}\"}\n    payload = {\"action\": \"add_owner\", \"user_id\": NEW_USER_ID}\n    url = f\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\"\n\n    response = requests.patch(url, json=payload, headers=headers)\n\n    assert response.status_code == 403\n    body = response.json()\n    assert \"error\" in body or \"message\" in body"
+      },
+      {
+        "name": "test_secondary_holder_at_role_boundary_can_transact_not_own",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Joint account exists with id=<ACCOUNT_ID>",
+          "Caller is authenticated as secondary holder with token <SECONDARY_TOKEN>",
+          "Caller has exactly secondary-holder role (no elevated privileges)"
+        ],
+        "actions": [
+          "POST /accounts/{id}/joint with body {\"type\": \"credit\", \"amount\": 0.01} using SECONDARY_TOKEN to verify transaction is permitted",
+          "PATCH /accounts/{id}/joint with body {\"action\": \"remove_owner\", \"user_id\": \"<PRIMARY_USER_ID>\"} using SECONDARY_TOKEN to verify ownership change is blocked"
+        ],
+        "expected": [
+          "POST returns HTTP 200 with status=applied",
+          "PATCH returns HTTP 403"
+        ],
+        "trace": [
+          "R-FIN-018: boundary between allowed (transaction) and forbidden (ownership) operations for secondary holder",
+          "R-FIN-018: BVA on role permission boundary"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://banking-api\"\nACCOUNT_ID = \"<ACCOUNT_ID>\"\nSECONDARY_TOKEN = \"<SECONDARY_TOKEN>\"\nPRIMARY_USER_ID = \"<PRIMARY_USER_ID>\"\n\n\ndef test_secondary_holder_at_role_boundary_can_transact_not_own():\n    headers = {\"Authorization\": f\"Bearer {SECONDARY_TOKEN}\"}\n    url = f\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\"\n\n    txn_response = requests.post(url, json={\"type\": \"credit\", \"amount\": 0.01}, headers=headers)\n    assert txn_response.status_code == 200\n    assert txn_response.json().get(\"status\") == \"applied\"\n\n    own_payload = {\"action\": \"remove_owner\", \"user_id\": PRIMARY_USER_ID}\n    own_response = requests.patch(url, json=own_payload, headers=headers)\n    assert own_response.status_code == 403"
+      },
+      {
+        "name": "test_transaction_state_transitions_pending_to_applied",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Joint account exists with id=<ACCOUNT_ID> in state=active",
+          "Caller is authenticated as primary holder with token <PRIMARY_TOKEN>",
+          "No pending transaction exists on the account"
+        ],
+        "actions": [
+          "POST /accounts/{id}/joint with body {\"type\": \"debit\", \"amount\": 50.00} using PRIMARY_TOKEN",
+          "GET /accounts/{id}/joint/transactions/{transaction_id} to confirm final state"
+        ],
+        "expected": [
+          "POST returns HTTP 200 with status=applied",
+          "GET returns transaction with state=applied (not pending or failed)"
+        ],
+        "trace": [
+          "R-FIN-018: trigger = holder performs operation; expected outcome = operation applied",
+          "R-FIN-018: STC from transaction-initiated to transaction-applied"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://banking-api\"\nACCOUNT_ID = \"<ACCOUNT_ID>\"\nPRIMARY_TOKEN = \"<PRIMARY_TOKEN>\"\n\n\ndef test_transaction_state_transitions_pending_to_applied():\n    headers = {\"Authorization\": f\"Bearer {PRIMARY_TOKEN}\"}\n    post_url = f\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\"\n\n    post_resp = requests.post(post_url, json={\"type\": \"debit\", \"amount\": 50.00}, headers=headers)\n    assert post_resp.status_code == 200\n    body = post_resp.json()\n    assert body.get(\"status\") == \"applied\"\n\n    txn_id = body.get(\"transaction_id\")\n    assert txn_id is not None\n\n    get_url = f\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint/transactions/{txn_id}\"\n    get_resp = requests.get(get_url, headers=headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json().get(\"state\") == \"applied\""
+      },
+      {
+        "name": "test_decision_table_actor_operation_outcome_matrix",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Joint account exists with id=<ACCOUNT_ID>",
+          "Primary token <PRIMARY_TOKEN> and secondary token <SECONDARY_TOKEN> are both valid",
+          "Ownership change payload targets add_owner action"
+        ],
+        "actions": [
+          "Primary holder POSTs a transaction (allowed combination)",
+          "Secondary holder POSTs a transaction (allowed combination)",
+          "Primary holder PATCHes ownership (primary is allowed per domain rules)",
+          "Secondary holder PATCHes ownership (forbidden combination)"
+        ],
+        "expected": [
+          "Primary transaction -> 200",
+          "Secondary transaction -> 200",
+          "Primary ownership change -> 200",
+          "Secondary ownership change -> 403"
+        ],
+        "trace": [
+          "R-FIN-018: DT cross-product of {primary, secondary} x {transaction, ownership_change}",
+          "R-FIN-018: only secondary x ownership_change must be blocked"
+        ],
+        "executable": "import requests\nimport pytest\n\nBASE_URL = \"http://banking-api\"\nACCOUNT_ID = \"<ACCOUNT_ID>\"\nPRIMARY_TOKEN = \"<PRIMARY_TOKEN>\"\nSECONDARY_TOKEN = \"<SECONDARY_TOKEN>\"\nNEW_USER_ID = \"<NEW_USER_ID>\"\n\n\ndef _headers(token):\n    return {\"Authorization\": f\"Bearer {token}\"}\n\n\ndef test_decision_table_actor_operation_outcome_matrix():\n    url = f\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\"\n\n    r1 = requests.post(url, json={\"type\": \"debit\", \"amount\": 10.00}, headers=_headers(PRIMARY_TOKEN))\n    assert r1.status_code == 200, f\"primary txn failed: {r1.text}\"\n\n    r2 = requests.post(url, json={\"type\": \"debit\", \"amount\": 10.00}, headers=_headers(SECONDARY_TOKEN))\n    assert r2.status_code == 200, f\"secondary txn failed: {r2.text}\"\n\n    own_payload = {\"action\": \"add_owner\", \"user_id\": NEW_USER_ID}\n    r3 = requests.patch(url, json=own_payload, headers=_headers(PRIMARY_TOKEN))\n    assert r3.status_code == 200, f\"primary ownership change failed: {r3.text}\"\n\n    r4 = requests.patch(url, json=own_payload, headers=_headers(SECONDARY_TOKEN))\n    assert r4.status_code == 403, f\"secondary ownership change should be 403, got {r4.status_code}\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-018",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 972,
+    "output_tokens": 2996,
+    "latency_ms": 36197,
+    "wall_ms": 36197,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-018\",\n  \"reasoning\": \"The requirement defines two distinct actor roles (primary and secondary joint-account holders) and two operation categories (transactions vs. ownership changes). EP partitions actors into primary/secondary and operations into allowed/forbidden. BVA targets the role boundary where a caller is exactly one role and not another. STC covers the state transition from 'pending transaction' to 'applied'. NEG confirms 403 on forbidden ownership mutation. DT cross-maps actor x operation to expected outcome. Together these four heuristics yield a minimum suite of five deterministic, idempotent tests.\",\n  \"tests\": [\n    {\n      \"name\": \"test_primary_holder_can_perform_transaction\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Joint account exists with id=<ACCOUNT_ID>\",\n        \"Caller is authenticated as primary holder with token <PRIMARY_TOKEN>\",\n        \"Account has sufficient balance for the transaction\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/joint with body {\\\"type\\\": \\\"debit\\\", \\\"amount\\\": 100.00} using PRIMARY_TOKEN\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body contains 'status': 'applied'\",\n        \"Transaction id is present in response\"\n      ],\n      \"trace\": [\n        \"R-FIN-018: primary holder shall perform transactions\",\n        \"R-FIN-018: expected outcome = operation applied\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\nACCOUNT_ID = \\\"<ACCOUNT_ID>\\\"\\nPRIMARY_TOKEN = \\\"<PRIMARY_TOKEN>\\\"\\n\\n\\ndef test_primary_holder_can_perform_transaction():\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {PRIMARY_TOKEN}\\\"}\\n    payload = {\\\"type\\\": \\\"debit\\\", \\\"amount\\\": 100.00}\\n    url = f\\\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\\\"\\n\\n    response = requests.post(url, json=payload, headers=headers)\\n\\n    assert response.status_code == 200\\n    body = response.json()\\n    assert body.get(\\\"status\\\") == \\\"applied\\\"\\n    assert \\\"transaction_id\\\" in body\"\n    },\n    {\n      \"name\": \"test_secondary_holder_cannot_modify_ownership\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Joint account exists with id=<ACCOUNT_ID>\",\n        \"Caller is authenticated as secondary holder with token <SECONDARY_TOKEN>\",\n        \"Request payload targets ownership change (add_owner)\"\n      ],\n      \"actions\": [\n        \"PATCH /accounts/{id}/joint with body {\\\"action\\\": \\\"add_owner\\\", \\\"user_id\\\": \\\"<NEW_USER_ID>\\\"} using SECONDARY_TOKEN\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body error message indicates insufficient privileges\"\n      ],\n      \"trace\": [\n        \"R-FIN-018: secondary holder shall NOT modify ownership\",\n        \"R-FIN-018: error pathway = 403 when secondary holder attempts ownership change\"\n      ],\n      \"executable\": \"import requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\nACCOUNT_ID = \\\"<ACCOUNT_ID>\\\"\\nSECONDARY_TOKEN = \\\"<SECONDARY_TOKEN>\\\"\\nNEW_USER_ID = \\\"<NEW_USER_ID>\\\"\\n\\n\\ndef test_secondary_holder_cannot_modify_ownership():\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {SECONDARY_TOKEN}\\\"}\\n    payload = {\\\"action\\\": \\\"add_owner\\\", \\\"user_id\\\": NEW_USER_ID}\\n    url = f\\\"{BASE_URL}/accounts/{ACCOUNT_ID}/joint\\\"\\n\\n    response = requests.patch(url, json=payload, headers=headers)\\n\\n    assert response.status_code == 403\\n    body = response.json()\\n    assert \\\"error\\\" in body or \\\"message\\\" in body\"\n    },\n    {\n      \"name\": \"test_secondary_holder_at_role_boundary_can_transact_not_own\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Joint account exists with id=<ACCOUNT_ID>\",\n        \"Caller is authenticated as secondary holder with token <SECONDARY_TOKEN>\",\n        \"Caller has exactly secondary-holder role (no elevated privileges)\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/joint with body {\\\"type\\\": \\\"credit\\\", \\\"a"
+  }
+}

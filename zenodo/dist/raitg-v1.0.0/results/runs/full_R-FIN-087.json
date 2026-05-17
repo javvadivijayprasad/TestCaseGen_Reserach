@@ -1,0 +1,194 @@
+{
+  "req": {
+    "id": "R-FIN-087",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Overdraft protection (idempotency variant)",
+    "statement": "An overdraft shall trigger a draw from the linked savings account up to the linked account's available balance; otherwise the transaction shall be declined. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "overdraft linked"
+    ],
+    "triggers": [
+      "debit exceeds checking balance"
+    ],
+    "expected_outcomes": [
+      "linked savings debited",
+      "fee assessed"
+    ],
+    "error_pathways": [
+      "declined when linked balance insufficient"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/overdraft"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-087",
+    "reasoning": "R-FIN-087 defines four distinct decision branches: (1) overdraft covered by linked savings, (2) overdraft exceeds linked savings so transaction is declined, (3) debit amount exactly equals linked savings balance (boundary), and (4) duplicate submission with same Idempotency-Key returns original result (idempotency). EP partitions the input space into covered vs. uncovered overdraft amounts. BVA targets the exact-balance edge. STC models the state machine from PENDING -> APPROVED/DECLINED. DT captures all precondition combinations (checking insufficient, savings sufficient/insufficient, key reused). NEG validates the decline pathway. Each test is self-contained via fixtures that seed and tear down account state, and uses a unique Idempotency-Key generated from a UUID to remain deterministic and idempotent across runs.",
+    "tests": [
+      {
+        "name": "test_overdraft_covered_by_linked_savings",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with checking_balance=50.00",
+          "Linked savings account exists with savings_balance=200.00",
+          "Overdraft link is active between checking and savings",
+          "Overdraft fee schedule is configured (fee=10.00)"
+        ],
+        "actions": [
+          "POST /overdraft with amount=100.00, unique Idempotency-Key, checking_account_id, savings_account_id",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "response.status == 'APPROVED'",
+          "savings account debited by 50.00 (the shortfall)",
+          "overdraft_fee == 10.00 assessed on checking account",
+          "transaction_id present in response"
+        ],
+        "trace": [
+          "R-FIN-087: linked savings debited when debit exceeds checking balance",
+          "R-FIN-087: fee assessed on successful overdraft draw"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <fixture> import api_client, seed_accounts, teardown_accounts\n\ndef test_overdraft_covered_by_linked_savings(api_client, seed_accounts):\n    ctx = seed_accounts(\n        checking_balance=50.00,\n        savings_balance=200.00,\n        overdraft_linked=True\n    )\n    idem_key = str(uuid.uuid4())\n    payload = {\n        \"checking_account_id\": ctx[\"checking_id\"],\n        \"savings_account_id\": ctx[\"savings_id\"],\n        \"amount\": 100.00\n    }\n    headers = {\"Idempotency-Key\": idem_key}\n    resp = api_client.post(\"/overdraft\", json=payload, headers=headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"APPROVED\"\n    assert body[\"overdraft_draw\"] == pytest.approx(50.00)\n    assert body[\"overdraft_fee\"] == pytest.approx(10.00)\n    assert \"transaction_id\" in body\n    accts = <helper_fn>.get_balances(ctx)\n    assert accts[\"savings_balance\"] == pytest.approx(150.00)\n    teardown_accounts(ctx)\n"
+      },
+      {
+        "name": "test_overdraft_declined_when_savings_insufficient",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with checking_balance=20.00",
+          "Linked savings account exists with savings_balance=30.00",
+          "Overdraft link is active between checking and savings",
+          "Requested debit amount would require a draw of 80.00 from savings"
+        ],
+        "actions": [
+          "POST /overdraft with amount=100.00, unique Idempotency-Key, checking_account_id, savings_account_id",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity or 402 Payment Required",
+          "response.status == 'DECLINED'",
+          "error code indicates INSUFFICIENT_LINKED_BALANCE",
+          "no debit applied to either account",
+          "no overdraft fee assessed"
+        ],
+        "trace": [
+          "R-FIN-087: transaction declined when linked savings balance insufficient",
+          "R-FIN-087: error pathway - declined when linked balance insufficient"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <fixture> import api_client, seed_accounts, teardown_accounts\n\ndef test_overdraft_declined_when_savings_insufficient(api_client, seed_accounts):\n    ctx = seed_accounts(\n        checking_balance=20.00,\n        savings_balance=30.00,\n        overdraft_linked=True\n    )\n    idem_key = str(uuid.uuid4())\n    payload = {\n        \"checking_account_id\": ctx[\"checking_id\"],\n        \"savings_account_id\": ctx[\"savings_id\"],\n        \"amount\": 100.00\n    }\n    headers = {\"Idempotency-Key\": idem_key}\n    resp = api_client.post(\"/overdraft\", json=payload, headers=headers)\n    assert resp.status_code in (402, 422)\n    body = resp.json()\n    assert body[\"status\"] == \"DECLINED\"\n    assert body[\"error_code\"] == \"INSUFFICIENT_LINKED_BALANCE\"\n    accts = <helper_fn>.get_balances(ctx)\n    assert accts[\"checking_balance\"] == pytest.approx(20.00)\n    assert accts[\"savings_balance\"] == pytest.approx(30.00)\n    assert body.get(\"overdraft_fee\", 0) == 0\n    teardown_accounts(ctx)\n"
+      },
+      {
+        "name": "test_overdraft_draw_equals_exact_savings_balance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with checking_balance=0.00",
+          "Linked savings account exists with savings_balance=100.00",
+          "Overdraft link is active",
+          "Requested debit amount equals exactly checking_balance + savings_balance"
+        ],
+        "actions": [
+          "POST /overdraft with amount=100.00 (requires full savings draw), unique Idempotency-Key",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "response.status == 'APPROVED'",
+          "savings account balance reduced to exactly 0.00",
+          "overdraft_draw == 100.00",
+          "overdraft_fee assessed"
+        ],
+        "trace": [
+          "R-FIN-087: draw up to linked account available balance - boundary at exact balance",
+          "BVA: draw amount == savings_balance is the maximum valid boundary"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <fixture> import api_client, seed_accounts, teardown_accounts\n\ndef test_overdraft_draw_equals_exact_savings_balance(api_client, seed_accounts):\n    ctx = seed_accounts(\n        checking_balance=0.00,\n        savings_balance=100.00,\n        overdraft_linked=True\n    )\n    idem_key = str(uuid.uuid4())\n    payload = {\n        \"checking_account_id\": ctx[\"checking_id\"],\n        \"savings_account_id\": ctx[\"savings_id\"],\n        \"amount\": 100.00\n    }\n    headers = {\"Idempotency-Key\": idem_key}\n    resp = api_client.post(\"/overdraft\", json=payload, headers=headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"APPROVED\"\n    assert body[\"overdraft_draw\"] == pytest.approx(100.00)\n    accts = <helper_fn>.get_balances(ctx)\n    assert accts[\"savings_balance\"] == pytest.approx(0.00)\n    assert body[\"overdraft_fee\"] > 0\n    teardown_accounts(ctx)\n"
+      },
+      {
+        "name": "test_overdraft_idempotent_duplicate_submission",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists with checking_balance=50.00",
+          "Linked savings account exists with savings_balance=200.00",
+          "Overdraft link is active",
+          "A prior successful overdraft request was made with Idempotency-Key=KEY-DUPE-001"
+        ],
+        "actions": [
+          "POST /overdraft first time with amount=100.00 and Idempotency-Key=KEY-DUPE-001",
+          "Record first response body and transaction_id",
+          "POST /overdraft second time with identical payload and same Idempotency-Key=KEY-DUPE-001",
+          "Record second response body"
+        ],
+        "expected": [
+          "Both responses return HTTP 200",
+          "Both response bodies are identical (same transaction_id, status, overdraft_draw, fee)",
+          "Savings account debited only once (not twice)",
+          "Fee assessed exactly once"
+        ],
+        "trace": [
+          "R-FIN-087: idempotency - duplicate Idempotency-Key returns original result",
+          "DT: precondition combination - same key, same payload, repeated submission"
+        ],
+        "executable": "import pytest\nfrom <fixture> import api_client, seed_accounts, teardown_accounts\n\ndef test_overdraft_idempotent_duplicate_submission(api_client, seed_accounts):\n    ctx = seed_accounts(\n        checking_balance=50.00,\n        savings_balance=200.00,\n        overdraft_linked=True\n    )\n    idem_key = \"KEY-DUPE-R-FIN-087-\" + ctx[\"test_run_id\"]\n    payload = {\n        \"checking_account_id\": ctx[\"checking_id\"],\n        \"savings_account_id\": ctx[\"savings_id\"],\n        \"amount\": 100.00\n    }\n    headers = {\"Idempotency-Key\": idem_key}\n    resp1 = api_client.post(\"/overdraft\", json=payload, headers=headers)\n    assert resp1.status_code == 200\n    body1 = resp1.json()\n    resp2 = api_client.post(\"/overdraft\", json=payload, headers=headers)\n    assert resp2.status_code == 200\n    body2 = resp2.json()\n    assert body1[\"transaction_id\"] == body2[\"transaction_id\"]\n    assert body1[\"status\"] == body2[\"status\"] == \"APPROVED\"\n    assert body1[\"overdraft_draw\"] == body2[\"overdraft_draw\"]\n    assert body1[\"overdraft_fee\"] == body2[\"overdraft_fee\"]\n    accts = <helper_fn>.get_balances(ctx)\n    assert accts[\"savings_balance\"] == pytest.approx(150.00)\n    teardown_accounts(ctx)\n"
+      },
+      {
+        "name": "test_overdraft_state_transition_pending_to_approved_to_settled",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with checking_balance=10.00",
+          "Linked savings account exists with savings_balance=150.00",
+          "Overdraft link is active",
+          "Transaction lifecycle endpoint available at /overdraft/{transaction_id}"
+        ],
+        "actions": [
+          "POST /overdraft with amount=60.00 and unique Idempotency-Key",
+          "Record transaction_id from response",
+          "GET /overdraft/{transaction_id} immediately to capture PENDING or APPROVED state",
+          "Poll /overdraft/{transaction_id} until status reaches SETTLED or terminal state"
+        ],
+        "expected": [
+          "Initial POST returns HTTP 200 with status APPROVED or PENDING",
+          "Subsequent GET shows state progression: PENDING -> APPROVED -> SETTLED",
+          "No backward state transitions observed",
+          "Final state is SETTLED with correct overdraft_draw and fee"
+        ],
+        "trace": [
+          "R-FIN-087: overdraft operation lifecycle - state transition coverage",
+          "STC: models PENDING -> APPROVED -> SETTLED path for valid overdraft"
+        ],
+        "executable": "import uuid\nimport time\nimport pytest\nfrom <fixture> import api_client, seed_accounts, teardown_accounts\n\nVALID_TRANSITIONS = {\"PENDING\": {\"APPROVED\", \"DECLINED\"}, \"APPROVED\": {\"SETTLED\"}}\n\ndef test_overdraft_state_transition_pending_to_approved_to_settled(api_client, seed_accounts):\n    ctx = seed_accounts(\n        checking_balance=10.00,\n        savings_balance=150.00,\n        overdraft_linked=True\n    )\n    idem_key = str(uuid.uuid4())\n    payload = {\n        \"checking_account_id\": ctx[\"checking_id\"],\n        \"savings_account_id\": ctx[\"savings_id\"],\n        \"amount\": 60.00\n    }\n    resp = api_client.post(\"/overdraft\", json=payload, headers={\"Idempotency-Key\": idem_key})\n    assert resp.status_code == 200\n    txn_id = resp.json()[\"transaction_id\"]\n    prev_status = resp.json()[\"status\"]\n    assert prev_status in (\"PENDING\", \"APPROVED\")\n    for _ in range(10):\n        time.sleep(1)\n        poll = api_client.get(f\"/overdraft/{txn_id}\")\n        curr = poll.json()[\"status\"]\n        if prev_status in VALID_TRANSITIONS:\n            assert curr in VALID_TRANSITIONS[prev_status] or curr == prev_status\n        prev_status = curr\n        if curr == \"SETTLED\":\n            break\n    assert prev_status == \"SETTLED\"\n    teardown_accounts(ctx)\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-087",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1016,
+    "output_tokens": 3766,
+    "latency_ms": 46132,
+    "wall_ms": 46132,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-087\",\n  \"reasoning\": \"R-FIN-087 defines four distinct decision branches: (1) overdraft covered by linked savings, (2) overdraft exceeds linked savings so transaction is declined, (3) debit amount exactly equals linked savings balance (boundary), and (4) duplicate submission with same Idempotency-Key returns original result (idempotency). EP partitions the input space into covered vs. uncovered overdraft amounts. BVA targets the exact-balance edge. STC models the state machine from PENDING -> APPROVED/DECLINED. DT captures all precondition combinations (checking insufficient, savings sufficient/insufficient, key reused). NEG validates the decline pathway. Each test is self-contained via fixtures that seed and tear down account state, and uses a unique Idempotency-Key generated from a UUID to remain deterministic and idempotent across runs.\",\n  \"tests\": [\n    {\n      \"name\": \"test_overdraft_covered_by_linked_savings\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with checking_balance=50.00\",\n        \"Linked savings account exists with savings_balance=200.00\",\n        \"Overdraft link is active between checking and savings\",\n        \"Overdraft fee schedule is configured (fee=10.00)\"\n      ],\n      \"actions\": [\n        \"POST /overdraft with amount=100.00, unique Idempotency-Key, checking_account_id, savings_account_id\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"response.status == 'APPROVED'\",\n        \"savings account debited by 50.00 (the shortfall)\",\n        \"overdraft_fee == 10.00 assessed on checking account\",\n        \"transaction_id present in response\"\n      ],\n      \"trace\": [\n        \"R-FIN-087: linked savings debited when debit exceeds checking balance\",\n        \"R-FIN-087: fee assessed on successful overdraft draw\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\nfrom <fixture> import api_client, seed_accounts, teardown_accounts\\n\\ndef test_overdraft_covered_by_linked_savings(api_client, seed_accounts):\\n    ctx = seed_accounts(\\n        checking_balance=50.00,\\n        savings_balance=200.00,\\n        overdraft_linked=True\\n    )\\n    idem_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"checking_account_id\\\": ctx[\\\"checking_id\\\"],\\n        \\\"savings_account_id\\\": ctx[\\\"savings_id\\\"],\\n        \\\"amount\\\": 100.00\\n    }\\n    headers = {\\\"Idempotency-Key\\\": idem_key}\\n    resp = api_client.post(\\\"/overdraft\\\", json=payload, headers=headers)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"APPROVED\\\"\\n    assert body[\\\"overdraft_draw\\\"] == pytest.approx(50.00)\\n    assert body[\\\"overdraft_fee\\\"] == pytest.approx(10.00)\\n    assert \\\"transaction_id\\\" in body\\n    accts = <helper_fn>.get_balances(ctx)\\n    assert accts[\\\"savings_balance\\\"] == pytest.approx(150.00)\\n    teardown_accounts(ctx)\\n\"\n    },\n    {\n      \"name\": \"test_overdraft_declined_when_savings_insufficient\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists with checking_balance=20.00\",\n        \"Linked savings account exists with savings_balance=30.00\",\n        \"Overdraft link is active between checking and savings\",\n        \"Requested debit amount would require a draw of 80.00 from savings\"\n      ],\n      \"actions\": [\n        \"POST /overdraft with amount=100.00, unique Idempotency-Key, checking_account_id, savings_account_id\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity or 402 Payment Required\",\n        \"response.status == 'DECLINED'\",\n        \"error code indicates INSUFFICIENT_LINKED_BALANCE\",\n        \"no debit applied to either account\",\n        \"no overdraft fee assessed\"\n      ],\n      \"trace\": [\n        \"R-FIN-087: transaction declined when linked savings balance insufficient\",\n        \"R-FIN-087: error pa"
+  }
+}

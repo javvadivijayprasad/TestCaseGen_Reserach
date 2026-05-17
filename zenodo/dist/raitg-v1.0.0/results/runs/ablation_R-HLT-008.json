@@ -1,0 +1,163 @@
+{
+  "req": {
+    "id": "R-HLT-008",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Create medication request",
+    "statement": "A prescribing clinician shall issue a MedicationRequest; requests for controlled substances shall require schedule verification.",
+    "actors": [
+      "prescriber"
+    ],
+    "preconditions": [
+      "role:prescriber"
+    ],
+    "triggers": [
+      "clinician prescribes"
+    ],
+    "expected_outcomes": [
+      "request stored",
+      "pharmacy notified"
+    ],
+    "error_pathways": [
+      "403 without schedule verification for CII"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/MedicationRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-008",
+    "reasoning": "R-HLT-008 governs MedicationRequest creation by prescribers. Three distinct risk areas drive test selection: (1) happy-path non-controlled prescription succeeds (EP \u2013 valid prescriber partition), (2) controlled-substance CII request without schedule verification is rejected 403 (NEG/DT \u2013 error pathway), (3) boundary between CII and CIII schedule codes determines whether verification gate fires (BVA \u2013 schedule boundary). A fourth STC test covers the full lifecycle state transition from draft to active to pharmacy-notified. Each test uses a pre-seeded auth token fixture and a disposable request ID generator to remain idempotent.",
+    "tests": [
+      {
+        "name": "test_prescriber_creates_non_controlled_medication_request",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds a valid JWT with role=prescriber",
+          "Target medication is non-controlled (schedule=none)",
+          "fhir-lite service is reachable"
+        ],
+        "actions": [
+          "POST /MedicationRequest with a well-formed FHIR R4 payload for a non-controlled drug",
+          "Assert HTTP 201 and Location header",
+          "Assert stored resource contains status=active",
+          "Assert pharmacy notification event emitted"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body resourceType == MedicationRequest",
+          "Response body status == active",
+          "Pharmacy notification endpoint received the request ID"
+        ],
+        "trace": [
+          "R-HLT-008: request stored",
+          "R-HLT-008: pharmacy notified",
+          "R-HLT-008: actor=prescriber"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_prescriber_creates_non_controlled_medication_request(\n    prescriber_auth_headers,   # <fixture>\n    fhir_client,               # <fixture> wraps requests.Session\n    pharmacy_spy,              # <fixture> captures outbound notifications\n):\n    rid = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"id\": rid,\n        \"status\": \"draft\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"308460\", \"display\": \"Amoxicillin 500mg\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"extension\": [{\"url\": \"schedule\", \"valueString\": \"none\"}]\n    }\n    resp = fhir_client.post(\n        \"/MedicationRequest\",\n        json=payload,\n        headers=prescriber_auth_headers,\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"resourceType\"] == \"MedicationRequest\"\n    assert body[\"status\"] == \"active\"\n    assert pharmacy_spy.was_notified(body[\"id\"])\n"
+      },
+      {
+        "name": "test_cii_request_without_schedule_verification_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds a valid JWT with role=prescriber",
+          "No schedule-verification token is present in the request",
+          "Target medication is Schedule CII (oxycodone)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with schedule=CII and no x-schedule-verification header",
+          "Assert HTTP 403",
+          "Assert error code equals SCHEDULE_VERIFICATION_REQUIRED",
+          "Assert no resource was persisted"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body error code == SCHEDULE_VERIFICATION_REQUIRED",
+          "No MedicationRequest resource created in the store",
+          "No pharmacy notification emitted"
+        ],
+        "trace": [
+          "R-HLT-008: 403 without schedule verification for CII",
+          "R-HLT-008: controlled substances require schedule verification"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_cii_request_without_schedule_verification_returns_403(\n    prescriber_auth_headers,   # <fixture>\n    fhir_client,               # <fixture>\n    pharmacy_spy,              # <fixture>\n    fhir_store,                # <fixture> direct store query helper\n):\n    rid = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"id\": rid,\n        \"status\": \"draft\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049502\", \"display\": \"Oxycodone 10mg\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"extension\": [{\"url\": \"schedule\", \"valueString\": \"CII\"}]\n    }\n    # Intentionally omit x-schedule-verification header\n    resp = fhir_client.post(\n        \"/MedicationRequest\",\n        json=payload,\n        headers=prescriber_auth_headers,\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"error\") == \"SCHEDULE_VERIFICATION_REQUIRED\"\n    assert not fhir_store.exists(\"MedicationRequest\", rid)\n    assert not pharmacy_spy.was_notified(rid)\n"
+      },
+      {
+        "name": "test_cii_boundary_schedule_verification_gate_fires_at_exactly_cii",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds a valid JWT with role=prescriber",
+          "Two requests prepared: one at CII (boundary requiring verification), one at CIII (boundary not requiring verification)",
+          "No x-schedule-verification header is attached to either request"
+        ],
+        "actions": [
+          "POST /MedicationRequest with schedule=CIII (just below CII gate) without verification header \u2013 expect 201",
+          "POST /MedicationRequest with schedule=CII (at gate boundary) without verification header \u2013 expect 403",
+          "Assert gate fires precisely at CII and not at CIII"
+        ],
+        "expected": [
+          "CIII request returns HTTP 201 (no verification required)",
+          "CII request returns HTTP 403 (verification required)",
+          "Gate is exclusive to CII and above (boundary is inclusive)"
+        ],
+        "trace": [
+          "R-HLT-008: controlled substances schedule verification boundary",
+          "R-HLT-008: 403 without schedule verification for CII"
+        ],
+        "executable": "import pytest\nimport uuid\n\n@pytest.mark.parametrize(\"schedule,expected_status\", [\n    (\"CIII\", 201),   # just below CII gate \u2013 no verification needed\n    (\"CII\",  403),   # at gate boundary \u2013 verification required\n])\ndef test_cii_boundary_schedule_verification_gate_fires_at_exactly_cii(\n    schedule,\n    expected_status,\n    prescriber_auth_headers,   # <fixture>\n    fhir_client,               # <fixture>\n):\n    rid = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"id\": rid,\n        \"status\": \"draft\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"TEST-CTRL\", \"display\": \"Test Controlled\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"extension\": [{\"url\": \"schedule\", \"valueString\": schedule}]\n    }\n    # No x-schedule-verification header for either case\n    resp = fhir_client.post(\n        \"/MedicationRequest\",\n        json=payload,\n        headers=prescriber_auth_headers,\n    )\n    assert resp.status_code == expected_status, (\n        f\"schedule={schedule}: expected {expected_status}, got {resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_medication_request_state_transitions_draft_to_active_to_notified",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds a valid JWT with role=prescriber",
+          "Target medication is non-controlled",
+          "fhir-lite service is reachable and pharmacy stub is active"
+        ],
+        "actions": [
+          "POST /MedicationRequest with status=draft \u2013 assert stored resource status==active (draft -> active transition)",
+          "GET /MedicationRequest/{id} \u2013 assert status==active",
+          "Poll pharmacy_spy to assert notification event fired (active -> notified transition)"
+        ],
+        "expected": [
+          "Immediate POST response status == active (system auto-activates on persist)",
+          "Subsequent GET confirms persisted status == active",
+          "Pharmacy notification received within allowed window (state: notified)"
+        ],
+        "trace": [
+          "R-HLT-008: request stored",
+          "R-HLT-008: pharmacy notified",
+          "R-HLT-008: state transition draft -> active -> pharmacy-notified"
+        ],
+        "executable": "import pytest\nimport uuid\nimport time\n\ndef test_medication_request_state_transitions_draft_to_active_to_notified(\n    prescriber_auth_headers,   # <fixture>\n    fhir_client,               # <fixture>\n    pharmacy_spy,              # <fixture>\n):\n    rid = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"id\": rid,\n        \"status\": \"draft\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"308460\", \"display\": \"Amoxicillin 500mg\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"extension\": [{\"url\": \"schedule\", \"valueString\": \"none\"}]\n    }\n    post_resp = fhir_client.post(\n        \"/MedicationRequest\", json=payload, headers=prescriber_auth_headers\n    )\n    assert post_resp.status_code == 201\n    assert post_resp.json()[\"status\"] == \"active\"   # draft -> active\n\n    get_resp = fhir_client.get(\n        f\"/MedicationRequest/{rid}\", headers=prescriber_auth_headers\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\"    # persisted state confirmed\n\n    deadline = time.time() + 5\n    while time.time() < deadline:\n        if pharmacy_spy.was_notified(rid):\n            break\n        time.sleep(0.2)\n    assert pharmacy_spy.was_notified(rid), \"pharmacy not notified within 5 s\"  # active -> notified\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-008",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 983,
+    "output_tokens": 3149,
+    "latency_ms": 40311,
+    "wall_ms": 40311,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-008\",\n  \"reasoning\": \"R-HLT-008 governs MedicationRequest creation by prescribers. Three distinct risk areas drive test selection: (1) happy-path non-controlled prescription succeeds (EP \u2013 valid prescriber partition), (2) controlled-substance CII request without schedule verification is rejected 403 (NEG/DT \u2013 error pathway), (3) boundary between CII and CIII schedule codes determines whether verification gate fires (BVA \u2013 schedule boundary). A fourth STC test covers the full lifecycle state transition from draft to active to pharmacy-notified. Each test uses a pre-seeded auth token fixture and a disposable request ID generator to remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_prescriber_creates_non_controlled_medication_request\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds a valid JWT with role=prescriber\",\n        \"Target medication is non-controlled (schedule=none)\",\n        \"fhir-lite service is reachable\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with a well-formed FHIR R4 payload for a non-controlled drug\",\n        \"Assert HTTP 201 and Location header\",\n        \"Assert stored resource contains status=active\",\n        \"Assert pharmacy notification event emitted\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body resourceType == MedicationRequest\",\n        \"Response body status == active\",\n        \"Pharmacy notification endpoint received the request ID\"\n      ],\n      \"trace\": [\n        \"R-HLT-008: request stored\",\n        \"R-HLT-008: pharmacy notified\",\n        \"R-HLT-008: actor=prescriber\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_prescriber_creates_non_controlled_medication_request(\\n    prescriber_auth_headers,   # <fixture>\\n    fhir_client,               # <fixture> wraps requests.Session\\n    pharmacy_spy,              # <fixture> captures outbound notifications\\n):\\n    rid = str(uuid.uuid4())\\n    payload = {\\n        \\\"resourceType\\\": \\\"MedicationRequest\\\",\\n        \\\"id\\\": rid,\\n        \\\"status\\\": \\\"draft\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"medicationCodeableConcept\\\": {\\n            \\\"coding\\\": [{\\\"system\\\": \\\"http://www.nlm.nih.gov/research/umls/rxnorm\\\",\\n                        \\\"code\\\": \\\"308460\\\", \\\"display\\\": \\\"Amoxicillin 500mg\\\"}]\\n        },\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/test-patient-001\\\"},\\n        \\\"extension\\\": [{\\\"url\\\": \\\"schedule\\\", \\\"valueString\\\": \\\"none\\\"}]\\n    }\\n    resp = fhir_client.post(\\n        \\\"/MedicationRequest\\\",\\n        json=payload,\\n        headers=prescriber_auth_headers,\\n    )\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"MedicationRequest\\\"\\n    assert body[\\\"status\\\"] == \\\"active\\\"\\n    assert pharmacy_spy.was_notified(body[\\\"id\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_cii_request_without_schedule_verification_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds a valid JWT with role=prescriber\",\n        \"No schedule-verification token is present in the request\",\n        \"Target medication is Schedule CII (oxycodone)\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with schedule=CII and no x-schedule-verification header\",\n        \"Assert HTTP 403\",\n        \"Assert error code equals SCHEDULE_VERIFICATION_REQUIRED\",\n        \"Assert no resource was persisted\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body error code == SCHEDULE_VERIFICATION_REQUIRED\",\n        \"No MedicationRequest resource created in the store\",\n        \"No pharmacy notification emitted\"\n      ],\n      \"trace\": [\n        \"R-HLT-008: 403 without schedule verification for CII\",\n        \"R-HLT-008: controlled substances require schedule verification\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_cii_request_without_schedule_ve"
+  }
+}

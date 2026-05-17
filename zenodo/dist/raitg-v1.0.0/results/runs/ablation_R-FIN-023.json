@@ -1,0 +1,148 @@
+{
+  "req": {
+    "id": "R-FIN-023",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-023",
+    "reasoning": "R-FIN-023 mandates a 24-hour hold on newly registered billers and deferred withdrawals. Four tests are designed: (1) EP positive \u2014 a valid new biller registration returns 201 with hold state; (2) NEG negative \u2014 duplicate biller registration returns 409; (3) BVA boundary \u2014 a withdrawal attempted exactly at T+0 (before hold expires) is deferred/rejected; (4) STC state transition \u2014 after the 24-hour hold elapses the biller transitions to active and withdrawals are permitted. Tests are self-contained via fixtures that create and clean up billers, and use time-travel/mock helpers to control clock state.",
+    "tests": [
+      {
+        "name": "test_register_new_biller_enters_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid JWT in auth_headers fixture)",
+          "Biller with the test account number does not exist for this customer"
+        ],
+        "actions": [
+          "POST /billers with a valid biller payload",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status field equal to 'hold'",
+          "Response body contains hold_expires_at timestamp ~24 h in the future"
+        ],
+        "trace": [
+          "R-FIN-023: biller in hold state after registration"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_register_new_biller_enters_hold_state(auth_headers, api_client, unique_biller_payload, cleanup_biller):\n    payload = unique_biller_payload()\n    resp = api_client.post(\"/billers\", json=payload, headers=auth_headers)\n    cleanup_biller(payload[\"account_number\"])\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"hold\"\n\n    hold_expires_at = datetime.fromisoformat(body[\"hold_expires_at\"])\n    now = datetime.now(timezone.utc)\n    expected_expiry = now + timedelta(hours=24)\n    delta = abs((hold_expires_at - expected_expiry).total_seconds())\n    assert delta < 60, f\"hold_expires_at not ~24 h from now: {hold_expires_at}\"\n"
+      },
+      {
+        "name": "test_register_duplicate_biller_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated (valid JWT in auth_headers fixture)",
+          "A biller with the same account number already exists for this customer"
+        ],
+        "actions": [
+          "POST /billers with biller payload for account that already exists",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains an error code indicating duplicate biller"
+        ],
+        "trace": [
+          "R-FIN-023: error pathway \u2014 409 if duplicate biller"
+        ],
+        "executable": "import pytest\n\ndef test_register_duplicate_biller_returns_409(auth_headers, api_client, existing_biller_payload, cleanup_biller):\n    payload = existing_biller_payload()\n    # First registration (seed)\n    seed = api_client.post(\"/billers\", json=payload, headers=auth_headers)\n    assert seed.status_code in (201, 409), \"Seed step failed unexpectedly\"\n\n    # Duplicate attempt\n    resp = api_client.post(\"/billers\", json=payload, headers=auth_headers)\n    cleanup_biller(payload[\"account_number\"])\n\n    assert resp.status_code == 409\n    body = resp.json()\n    assert \"error\" in body or \"code\" in body\n    error_text = str(body.get(\"error\", body.get(\"code\", \"\"))).lower()\n    assert \"duplicate\" in error_text or \"conflict\" in error_text or \"exists\" in error_text\n"
+      },
+      {
+        "name": "test_withdrawal_deferred_before_hold_expires",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated (valid JWT in auth_headers fixture)",
+          "A biller has just been registered (T+0, hold not yet expired)",
+          "Clock has NOT been advanced past 24 hours"
+        ],
+        "actions": [
+          "POST /billers with a valid biller payload to obtain a biller_id in hold state",
+          "Immediately POST /withdrawals targeting the new biller_id",
+          "Capture withdrawal response status and body"
+        ],
+        "expected": [
+          "Withdrawal response is HTTP 202 with status 'deferred' OR HTTP 403/422 indicating withdrawal blocked during hold",
+          "No funds are transferred immediately"
+        ],
+        "trace": [
+          "R-FIN-023: withdrawals to new billers shall be deferred",
+          "R-FIN-023: 24-hour hold boundary \u2014 T+0 is inside hold window"
+        ],
+        "executable": "import pytest\n\nDEFERRED_STATUSES = {\"deferred\", \"pending\", \"blocked\"}\n\ndef test_withdrawal_deferred_before_hold_expires(auth_headers, api_client, unique_biller_payload, cleanup_biller):\n    payload = unique_biller_payload()\n    reg = api_client.post(\"/billers\", json=payload, headers=auth_headers)\n    assert reg.status_code == 201\n    biller_id = reg.json()[\"id\"]\n    cleanup_biller(payload[\"account_number\"])\n\n    withdrawal_payload = {\"biller_id\": biller_id, \"amount\": \"1.00\", \"currency\": \"USD\"}\n    resp = api_client.post(\"/withdrawals\", json=withdrawal_payload, headers=auth_headers)\n\n    if resp.status_code == 202:\n        status = resp.json().get(\"status\", \"\").lower()\n        assert status in DEFERRED_STATUSES, f\"Expected deferred status, got: {status}\"\n    else:\n        assert resp.status_code in (403, 422), (\n            f\"Expected 202/403/422 for held biller withdrawal, got {resp.status_code}\"\n        )\n"
+      },
+      {
+        "name": "test_biller_transitions_to_active_after_24h_hold",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated (valid JWT in auth_headers fixture)",
+          "A biller was registered and is in hold state",
+          "Clock or mock is advanced past 24 hours (hold_expires_at is in the past)"
+        ],
+        "actions": [
+          "POST /billers to register a new biller (biller enters hold state)",
+          "Advance system clock past 24 hours using advance_clock helper",
+          "GET /billers/{biller_id} to check updated state",
+          "POST /withdrawals targeting the biller to confirm it is accepted"
+        ],
+        "expected": [
+          "GET /billers/{biller_id} returns status 'active'",
+          "POST /withdrawals returns HTTP 200 or 201 (not deferred/blocked)"
+        ],
+        "trace": [
+          "R-FIN-023: 24-hour hold; after hold expires biller becomes usable",
+          "State transition: hold -> active"
+        ],
+        "executable": "import pytest\n\ndef test_biller_transitions_to_active_after_24h_hold(\n    auth_headers, api_client, unique_biller_payload, cleanup_biller, advance_clock\n):\n    payload = unique_biller_payload()\n    reg = api_client.post(\"/billers\", json=payload, headers=auth_headers)\n    assert reg.status_code == 201\n    biller_id = reg.json()[\"id\"]\n    assert reg.json()[\"status\"] == \"hold\"\n\n    advance_clock(hours=24, biller_id=biller_id)\n\n    get_resp = api_client.get(f\"/billers/{biller_id}\", headers=auth_headers)\n    cleanup_biller(payload[\"account_number\"])\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\"\n\n    withdrawal_payload = {\"biller_id\": biller_id, \"amount\": \"1.00\", \"currency\": \"USD\"}\n    w_resp = api_client.post(\"/withdrawals\", json=withdrawal_payload, headers=auth_headers)\n    assert w_resp.status_code in (200, 201), (\n        f\"Expected withdrawal accepted after hold, got {w_resp.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-023",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 977,
+    "output_tokens": 2364,
+    "latency_ms": 32002,
+    "wall_ms": 32002,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-023\",\n  \"reasoning\": \"R-FIN-023 mandates a 24-hour hold on newly registered billers and deferred withdrawals. Four tests are designed: (1) EP positive \u2014 a valid new biller registration returns 201 with hold state; (2) NEG negative \u2014 duplicate biller registration returns 409; (3) BVA boundary \u2014 a withdrawal attempted exactly at T+0 (before hold expires) is deferred/rejected; (4) STC state transition \u2014 after the 24-hour hold elapses the biller transitions to active and withdrawals are permitted. Tests are self-contained via fixtures that create and clean up billers, and use time-travel/mock helpers to control clock state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_register_new_biller_enters_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT in auth_headers fixture)\",\n        \"Biller with the test account number does not exist for this customer\"\n      ],\n      \"actions\": [\n        \"POST /billers with a valid biller payload\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status field equal to 'hold'\",\n        \"Response body contains hold_expires_at timestamp ~24 h in the future\"\n      ],\n      \"trace\": [\n        \"R-FIN-023: biller in hold state after registration\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_register_new_biller_enters_hold_state(auth_headers, api_client, unique_biller_payload, cleanup_biller):\\n    payload = unique_biller_payload()\\n    resp = api_client.post(\\\"/billers\\\", json=payload, headers=auth_headers)\\n    cleanup_biller(payload[\\\"account_number\\\"])\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"hold\\\"\\n\\n    hold_expires_at = datetime.fromisoformat(body[\\\"hold_expires_at\\\"])\\n    now = datetime.now(timezone.utc)\\n    expected_expiry = now + timedelta(hours=24)\\n    delta = abs((hold_expires_at - expected_expiry).total_seconds())\\n    assert delta < 60, f\\\"hold_expires_at not ~24 h from now: {hold_expires_at}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_register_duplicate_biller_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT in auth_headers fixture)\",\n        \"A biller with the same account number already exists for this customer\"\n      ],\n      \"actions\": [\n        \"POST /billers with biller payload for account that already exists\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response body contains an error code indicating duplicate biller\"\n      ],\n      \"trace\": [\n        \"R-FIN-023: error pathway \u2014 409 if duplicate biller\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_register_duplicate_biller_returns_409(auth_headers, api_client, existing_biller_payload, cleanup_biller):\\n    payload = existing_biller_payload()\\n    # First registration (seed)\\n    seed = api_client.post(\\\"/billers\\\", json=payload, headers=auth_headers)\\n    assert seed.status_code in (201, 409), \\\"Seed step failed unexpectedly\\\"\\n\\n    # Duplicate attempt\\n    resp = api_client.post(\\\"/billers\\\", json=payload, headers=auth_headers)\\n    cleanup_biller(payload[\\\"account_number\\\"])\\n\\n    assert resp.status_code == 409\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"code\\\" in body\\n    error_text = str(body.get(\\\"error\\\", body.get(\\\"code\\\", \\\"\\\"))).lower()\\n    assert \\\"duplicate\\\" in error_text or \\\"conflict\\\" in error_text or \\\"exists\\\" in error_text\\n\"\n    },\n    {\n      \"name\": \"test_withdrawal_deferred_before_hold_expires\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT in auth_headers fixture)\",\n        \"A biller has just been registered (T+0, hold not yet expired)\",\n "
+  }
+}

@@ -1,0 +1,199 @@
+{
+  "req": {
+    "id": "R-WEB-106",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Reset employee password \u2014 variant 5",
+    "statement": "An employee shall reset their password via an email link that expires after 30 minutes; expired links must be rejected. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "valid reset token"
+    ],
+    "preconditions": [
+      "valid reset token"
+    ],
+    "triggers": [
+      "employee submits new password"
+    ],
+    "expected_outcomes": [
+      "password updated",
+      "all sessions invalidated",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "410 when token expired",
+      "422 when password fails policy"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/password/reset"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-106",
+    "reasoning": "The requirement covers four key dimensions: (1) valid token + valid password + valid 2FA \u2192 success; (2) expired token \u2192 410 rejection; (3) password policy violation \u2192 422; (4) the 30-minute expiry boundary (token at exactly 30 min). Tests are allocated as: positive=happy-path with 2FA (EP/STC), negative=expired token (NEG), negative=policy violation (DT), boundary=token at expiry edge (BVA). Each test is idempotent by generating fresh tokens via fixtures and tearing down state via API cleanup.",
+    "tests": [
+      {
+        "name": "test_valid_token_2fa_resets_password_and_invalidates_sessions",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Employee account exists with known credentials",
+          "A valid, unexpired reset token has been issued within the last 5 minutes",
+          "Employee has an active session cookie stored",
+          "2FA is enrolled and TOTP code is obtainable from <totp_fixture>"
+        ],
+        "actions": [
+          "Navigate to /password/reset?token=<valid_token>",
+          "Enter a policy-compliant new password",
+          "Enter a valid TOTP code from <totp_fixture>",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 200 or redirect to /login",
+          "API GET /api/session returns 401 for previously stored session cookie",
+          "Login with new password succeeds (HTTP 200)",
+          "Login with old password returns 401"
+        ],
+        "trace": [
+          "R-WEB-106: password updated",
+          "R-WEB-106: all sessions invalidated",
+          "R-WEB-106: two-factor authentication confirmation required"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_valid_token_2fa_resets_password_and_invalidates_sessions(\n    page, <valid_reset_token_fixture>, <totp_fixture>, <api_client_fixture>, <session_cookie_fixture>\n):\n    token = <valid_reset_token_fixture>\n    old_session = <session_cookie_fixture>\n    new_password = \"NewP@ssw0rd!2024\"\n\n    page.goto(f\"/password/reset?token={token}\")\n    page.fill(\"[data-testid='new-password']\", new_password)\n    page.fill(\"[data-testid='confirm-password']\", new_password)\n    page.fill(\"[data-testid='totp-code']\", <totp_fixture>.now())\n    page.click(\"[data-testid='submit-reset']\")\n\n    expect(page).to_have_url(\"/login\", timeout=5000)\n\n    resp = <api_client_fixture>.get(\"/api/session\", cookies={\"session\": old_session})\n    assert resp.status_code == 401, \"Old session must be invalidated\"\n\n    login_resp = <api_client_fixture>.post(\"/api/login\", json={\"password\": new_password})\n    assert login_resp.status_code == 200, \"Login with new password must succeed\"\n\n    old_login = <api_client_fixture>.post(\"/api/login\", json={\"password\": \"OldP@ssword99!\"})\n    assert old_login.status_code == 401, \"Old password must be rejected\""
+      },
+      {
+        "name": "test_expired_token_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A reset token was issued more than 30 minutes ago (expired)",
+          "The token has not been used"
+        ],
+        "actions": [
+          "Submit POST /password/reset with the expired token and a valid new password and a valid TOTP code"
+        ],
+        "expected": [
+          "HTTP 410 Gone",
+          "Response body contains error code 'TOKEN_EXPIRED'",
+          "Password is unchanged"
+        ],
+        "trace": [
+          "R-WEB-106: expired links must be rejected",
+          "R-WEB-106: 410 when token expired"
+        ],
+        "executable": "import pytest\n\ndef test_expired_token_returns_410(\n    <api_client_fixture>, <expired_reset_token_fixture>, <totp_fixture>\n):\n    expired_token = <expired_reset_token_fixture>\n    payload = {\n        \"token\": expired_token,\n        \"new_password\": \"NewP@ssw0rd!2024\",\n        \"totp_code\": <totp_fixture>.now()\n    }\n\n    resp = <api_client_fixture>.post(\"/password/reset\", json=payload)\n\n    assert resp.status_code == 410, f\"Expected 410, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"error\") == \"TOKEN_EXPIRED\", f\"Unexpected error body: {body}\"\n\n    login_resp = <api_client_fixture>.post(\n        \"/api/login\",\n        json={\"password\": \"NewP@ssw0rd!2024\"}\n    )\n    assert login_resp.status_code == 401, \"Password must remain unchanged after expired token\""
+      },
+      {
+        "name": "test_password_failing_policy_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A valid, unexpired reset token exists",
+          "2FA TOTP code is available"
+        ],
+        "actions": [
+          "Submit POST /password/reset with valid token, valid TOTP, but a weak password ('abc') that violates length and complexity policy"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body lists password policy violations",
+          "Password is unchanged"
+        ],
+        "trace": [
+          "R-WEB-106: 422 when password fails policy"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"bad_password,violation_hint\", [\n    (\"abc\", \"too_short\"),\n    (\"alllowercase1!\", \"no_uppercase\"),\n    (\"ALLUPPERCASE1!\", \"no_lowercase\"),\n    (\"NoSpecialChar1\", \"no_special\"),\n])\ndef test_password_failing_policy_returns_422(\n    <api_client_fixture>, <valid_reset_token_fixture>, <totp_fixture>,\n    bad_password, violation_hint\n):\n    payload = {\n        \"token\": <valid_reset_token_fixture>,\n        \"new_password\": bad_password,\n        \"totp_code\": <totp_fixture>.now()\n    }\n\n    resp = <api_client_fixture>.post(\"/password/reset\", json=payload)\n\n    assert resp.status_code == 422, (\n        f\"[{violation_hint}] Expected 422, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"errors\" in body, \"Response must contain policy error details\"\n    assert len(body[\"errors\"]) > 0, \"At least one policy violation must be reported\""
+      },
+      {
+        "name": "test_token_at_exactly_30_minutes_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A reset token was issued exactly 30 minutes ago (at the expiry boundary)",
+          "The token has not previously been used",
+          "2FA TOTP code is available"
+        ],
+        "actions": [
+          "Submit POST /password/reset with the boundary-age token, a policy-compliant new password, and a valid TOTP code"
+        ],
+        "expected": [
+          "HTTP 410 Gone (token at exactly 30 min is expired, boundary is exclusive)",
+          "Response body contains error code 'TOKEN_EXPIRED'"
+        ],
+        "trace": [
+          "R-WEB-106: email link expires after 30 minutes",
+          "R-WEB-106: expired links must be rejected",
+          "R-WEB-106: 410 when token expired"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timedelta, timezone\n\ndef test_token_at_exactly_30_minutes_is_rejected(\n    <api_client_fixture>, <totp_fixture>, <token_factory_fixture>\n):\n    # Token created at exactly T-30min (boundary: expiry is exclusive at 30min)\n    issued_at = datetime.now(timezone.utc) - timedelta(minutes=30)\n    boundary_token = <token_factory_fixture>.create(issued_at=issued_at)\n\n    payload = {\n        \"token\": boundary_token,\n        \"new_password\": \"B0undary!Pass#99\",\n        \"totp_code\": <totp_fixture>.now()\n    }\n\n    resp = <api_client_fixture>.post(\"/password/reset\", json=payload)\n\n    assert resp.status_code == 410, (\n        f\"Token at 30min boundary must be expired (410), got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert body.get(\"error\") == \"TOKEN_EXPIRED\", (\n        f\"Expected TOKEN_EXPIRED error, got: {body}\"\n    )"
+      },
+      {
+        "name": "test_token_at_29min_59sec_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A reset token was issued 29 minutes and 59 seconds ago (one second before boundary)",
+          "2FA TOTP code is available"
+        ],
+        "actions": [
+          "Submit POST /password/reset with the near-boundary token, a policy-compliant new password, and a valid TOTP code"
+        ],
+        "expected": [
+          "HTTP 200 or redirect confirming successful password reset",
+          "All sessions invalidated"
+        ],
+        "trace": [
+          "R-WEB-106: email link expires after 30 minutes \u2014 token just inside validity window must succeed",
+          "R-WEB-106: password updated"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timedelta, timezone\n\ndef test_token_at_29min_59sec_is_accepted(\n    <api_client_fixture>, <totp_fixture>, <token_factory_fixture>, <session_cookie_fixture>\n):\n    issued_at = datetime.now(timezone.utc) - timedelta(seconds=1799)  # 29m 59s ago\n    near_boundary_token = <token_factory_fixture>.create(issued_at=issued_at)\n\n    old_session = <session_cookie_fixture>\n    payload = {\n        \"token\": near_boundary_token,\n        \"new_password\": \"V@lidBoundary!Pass1\",\n        \"totp_code\": <totp_fixture>.now()\n    }\n\n    resp = <api_client_fixture>.post(\"/password/reset\", json=payload)\n\n    assert resp.status_code in (200, 302), (\n        f\"Token at 29m59s must succeed, got {resp.status_code}\"\n    )\n\n    session_resp = <api_client_fixture>.get(\n        \"/api/session\", cookies={\"session\": old_session}\n    )\n    assert session_resp.status_code == 401, \"Old session must be invalidated after reset\""
+      },
+      {
+        "name": "test_invalid_totp_code_blocks_reset",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "A valid, unexpired reset token exists",
+          "Employee provides a syntactically valid but incorrect TOTP code"
+        ],
+        "actions": [
+          "Submit POST /password/reset with valid token, valid new password, but incorrect TOTP code '000000'"
+        ],
+        "expected": [
+          "HTTP 401 or 403 indicating 2FA verification failure",
+          "Response body contains error referencing 2FA or OTP failure",
+          "Password remains unchanged"
+        ],
+        "trace": [
+          "R-WEB-106: action requires two-factor authentication confirmation",
+          "R-WEB-106: additional variant semantics honoured"
+        ],
+        "executable": "import pytest\n\ndef test_invalid_totp_code_blocks_reset(\n    <api_client_fixture>, <valid_reset_token_fixture>\n):\n    payload = {\n        \"token\": <valid_reset_token_fixture>,\n        \"new_password\": \"Val!dP@ssw0rd2024\",\n        \"totp_code\": \"000000\"  # deliberately wrong TOTP\n    }\n\n    resp = <api_client_fixture>.post(\"/password/reset\", json=payload)\n\n    assert resp.status_code in (401, 403), (\n        f\"Invalid TOTP must block reset, got {resp.status_code}\"\n    )\n    body = resp.json()\n    error_text = str(body).lower()\n    assert any(kw in error_text for kw in (\"2fa\", \"otp\", \"totp\", \"mfa\", \"authentication\")), (\n        f\"Response must cite 2FA failure, got: {body}\"\n    )\n\n    login_resp = <api_client_fixture>.post(\n        \"/api/login\",\n        json={\"password\": \"Val!dP@ssw0rd2024\"}\n    )\n    assert login_resp.status_code == 401, \"Password must be unchanged after failed 2FA\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-106",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[5] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 3634,
+    "latency_ms": 48792,
+    "wall_ms": 48792,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-106\",\n  \"reasoning\": \"The requirement covers four key dimensions: (1) valid token + valid password + valid 2FA \u2192 success; (2) expired token \u2192 410 rejection; (3) password policy violation \u2192 422; (4) the 30-minute expiry boundary (token at exactly 30 min). Tests are allocated as: positive=happy-path with 2FA (EP/STC), negative=expired token (NEG), negative=policy violation (DT), boundary=token at expiry edge (BVA). Each test is idempotent by generating fresh tokens via fixtures and tearing down state via API cleanup.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_token_2fa_resets_password_and_invalidates_sessions\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Employee account exists with known credentials\",\n        \"A valid, unexpired reset token has been issued within the last 5 minutes\",\n        \"Employee has an active session cookie stored\",\n        \"2FA is enrolled and TOTP code is obtainable from <totp_fixture>\"\n      ],\n      \"actions\": [\n        \"Navigate to /password/reset?token=<valid_token>\",\n        \"Enter a policy-compliant new password\",\n        \"Enter a valid TOTP code from <totp_fixture>\",\n        \"Submit the form\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or redirect to /login\",\n        \"API GET /api/session returns 401 for previously stored session cookie\",\n        \"Login with new password succeeds (HTTP 200)\",\n        \"Login with old password returns 401\"\n      ],\n      \"trace\": [\n        \"R-WEB-106: password updated\",\n        \"R-WEB-106: all sessions invalidated\",\n        \"R-WEB-106: two-factor authentication confirmation required\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_valid_token_2fa_resets_password_and_invalidates_sessions(\\n    page, <valid_reset_token_fixture>, <totp_fixture>, <api_client_fixture>, <session_cookie_fixture>\\n):\\n    token = <valid_reset_token_fixture>\\n    old_session = <session_cookie_fixture>\\n    new_password = \\\"NewP@ssw0rd!2024\\\"\\n\\n    page.goto(f\\\"/password/reset?token={token}\\\")\\n    page.fill(\\\"[data-testid='new-password']\\\", new_password)\\n    page.fill(\\\"[data-testid='confirm-password']\\\", new_password)\\n    page.fill(\\\"[data-testid='totp-code']\\\", <totp_fixture>.now())\\n    page.click(\\\"[data-testid='submit-reset']\\\")\\n\\n    expect(page).to_have_url(\\\"/login\\\", timeout=5000)\\n\\n    resp = <api_client_fixture>.get(\\\"/api/session\\\", cookies={\\\"session\\\": old_session})\\n    assert resp.status_code == 401, \\\"Old session must be invalidated\\\"\\n\\n    login_resp = <api_client_fixture>.post(\\\"/api/login\\\", json={\\\"password\\\": new_password})\\n    assert login_resp.status_code == 200, \\\"Login with new password must succeed\\\"\\n\\n    old_login = <api_client_fixture>.post(\\\"/api/login\\\", json={\\\"password\\\": \\\"OldP@ssword99!\\\"})\\n    assert old_login.status_code == 401, \\\"Old password must be rejected\\\"\"\n    },\n    {\n      \"name\": \"test_expired_token_returns_410\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A reset token was issued more than 30 minutes ago (expired)\",\n        \"The token has not been used\"\n      ],\n      \"actions\": [\n        \"Submit POST /password/reset with the expired token and a valid new password and a valid TOTP code\"\n      ],\n      \"expected\": [\n        \"HTTP 410 Gone\",\n        \"Response body contains error code 'TOKEN_EXPIRED'\",\n        \"Password is unchanged\"\n      ],\n      \"trace\": [\n        \"R-WEB-106: expired links must be rejected\",\n        \"R-WEB-106: 410 when token expired\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_expired_token_returns_410(\\n    <api_client_fixture>, <expired_reset_token_fixture>, <totp_fixture>\\n):\\n    expired_token = <expired_reset_token_fixture>\\n    payload = {\\n        \\\"token\\\": expired_token,\\n        \\\"new_password\\\": \\\"NewP@ssw0rd!2024\\\",\\n        \\\"totp_code\\\": <totp_fixture>.now()\\n    }\\n\\n    resp = <api_client_fixture>.post(\\\"/password/re"
+  }
+}

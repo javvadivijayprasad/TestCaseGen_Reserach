@@ -1,0 +1,174 @@
+{
+  "req": {
+    "id": "R-HLT-028",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Update patient (boundary)",
+    "statement": "A clinician shall update patient demographics; historical versions must be preserved. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician updates resource"
+    ],
+    "expected_outcomes": [
+      "new version stored",
+      "history preserved"
+    ],
+    "error_pathways": [
+      "409 on version conflict"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-028",
+    "reasoning": "R-HLT-028 mandates three verification axes: (1) happy-path demographic update with history preservation (EP/STC), (2) version-conflict rejection returning 409 (NEG/DT), and (3) boundary timestamps and numeric field edge values (BVA). Each test is self-contained via a fixture that creates and tears down its own Patient resource, ensuring idempotency. Version conflict is forced by reusing a stale versionId. Boundary values target the minimum/maximum allowed birthDate year and the 0/max-length string boundaries for family name to stress numeric and string elements as cited in the requirement.",
+    "tests": [
+      {
+        "name": "test_update_patient_demographics_preserves_history",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician auth token is available via <clinician_token fixture>",
+          "A Patient resource exists on the server (created by <create_patient fixture>)",
+          "Server is in state: resource version 1 stored"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with updated family name and correct versionId in If-Match header",
+          "GET /Patient/{id}/_history to retrieve version list"
+        ],
+        "expected": [
+          "PUT returns HTTP 200 with new versionId incremented",
+          "Response body contains updated family name",
+          "GET history returns at least 2 entries",
+          "First history entry retains original family name"
+        ],
+        "trace": [
+          "R-HLT-028: clinician updates patient demographics",
+          "R-HLT-028: historical versions must be preserved",
+          "R-HLT-028: new version stored"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_update_patient_demographics_preserves_history(clinician_token, create_patient, fhir_base_url):\n    patient_id, v1_version_id = create_patient\n    headers = {\n        \"Authorization\": f\"Bearer {clinician_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        \"If-Match\": f'W/\"{v1_version_id}\"',\n    }\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": patient_id,\n        \"meta\": {\"versionId\": v1_version_id},\n        \"name\": [{\"use\": \"official\", \"family\": \"UpdatedFamily\"}],\n    }\n    put_resp = requests.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=headers,\n    )\n    assert put_resp.status_code == 200, put_resp.text\n    new_vid = put_resp.json()[\"meta\"][\"versionId\"]\n    assert new_vid != v1_version_id\n    assert put_resp.json()[\"name\"][0][\"family\"] == \"UpdatedFamily\"\n\n    hist_resp = requests.get(\n        f\"{fhir_base_url}/Patient/{patient_id}/_history\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert hist_resp.status_code == 200\n    entries = hist_resp.json().get(\"entry\", [])\n    assert len(entries) >= 2\n    families = [e[\"resource\"][\"name\"][0][\"family\"] for e in entries]\n    assert \"UpdatedFamily\" in families\n    assert \"OriginalFamily\" in families\n"
+      },
+      {
+        "name": "test_update_patient_version_conflict_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician auth token is available via <clinician_token fixture>",
+          "A Patient resource exists at version N (created by <create_patient fixture>)",
+          "A successful update has already advanced the resource to version N+1"
+        ],
+        "actions": [
+          "PUT /Patient/{id} using the stale versionId N in If-Match header"
+        ],
+        "expected": [
+          "Server returns HTTP 409 Conflict",
+          "Response body contains OperationOutcome with issue.code = 'conflict'"
+        ],
+        "trace": [
+          "R-HLT-028: error pathway \u2013 409 on version conflict",
+          "R-HLT-028: historical versions must be preserved (conflict must not overwrite)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_update_patient_version_conflict_returns_409(clinician_token, create_patient, fhir_base_url):\n    patient_id, v1_version_id = create_patient\n    headers = lambda vid: {\n        \"Authorization\": f\"Bearer {clinician_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        \"If-Match\": f'W/\"{vid}\"',\n    }\n    payload = lambda name: {\n        \"resourceType\": \"Patient\",\n        \"id\": patient_id,\n        \"name\": [{\"use\": \"official\", \"family\": name}],\n    }\n    # Advance to version N+1\n    adv = requests.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload(\"FirstUpdate\"),\n        headers=headers(v1_version_id),\n    )\n    assert adv.status_code == 200, adv.text\n\n    # Now replay with stale versionId (version N)\n    conflict_resp = requests.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload(\"StaleUpdate\"),\n        headers=headers(v1_version_id),\n    )\n    assert conflict_resp.status_code == 409, conflict_resp.text\n    outcome = conflict_resp.json()\n    issues = outcome.get(\"issue\", [])\n    codes = [i.get(\"code\", \"\") for i in issues]\n    assert \"conflict\" in codes\n"
+      },
+      {
+        "name": "test_update_patient_boundary_birthdate_and_name_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician auth token is available via <clinician_token fixture>",
+          "A Patient resource exists (created by <create_patient fixture>)",
+          "Server accepts FHIR date strings in yyyy-mm-dd format"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with birthDate set to minimum valid year '1900-01-01'",
+          "PUT /Patient/{id} with birthDate set to maximum valid year '2099-12-31'",
+          "PUT /Patient/{id} with family name of exactly 1 character (lower boundary)",
+          "PUT /Patient/{id} with family name of exactly 64 characters (upper boundary per profile)"
+        ],
+        "expected": [
+          "Each PUT returns HTTP 200",
+          "Stored resource reflects the exact boundary value sent",
+          "No 400/422 validation errors are raised for any boundary value"
+        ],
+        "trace": [
+          "R-HLT-028: boundary cases on timestamps and numeric elements must be tested",
+          "R-HLT-028: new version stored for each successful update"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"birth,family\", [\n    (\"1900-01-01\", \"A\"),\n    (\"2099-12-31\", \"B\" * 64),\n])\ndef test_update_patient_boundary_birthdate_and_name_length(\n    birth, family, clinician_token, create_patient, fhir_base_url\n):\n    patient_id, version_id = create_patient\n    headers = {\n        \"Authorization\": f\"Bearer {clinician_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        \"If-Match\": f'W/\"{version_id}\"',\n    }\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": patient_id,\n        \"meta\": {\"versionId\": version_id},\n        \"name\": [{\"use\": \"official\", \"family\": family}],\n        \"birthDate\": birth,\n    }\n    resp = requests.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 200, f\"boundary ({birth}, len={len(family)}) failed: {resp.text}\"\n    body = resp.json()\n    assert body[\"birthDate\"] == birth\n    assert body[\"name\"][0][\"family\"] == family\n"
+      },
+      {
+        "name": "test_update_patient_missing_if_match_header_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician auth token is available via <clinician_token fixture>",
+          "A Patient resource exists (created by <create_patient fixture>)",
+          "Server enforces optimistic locking via If-Match"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with valid payload but without If-Match header"
+        ],
+        "expected": [
+          "Server returns HTTP 400 or 412 (server-policy dependent)",
+          "Response body contains OperationOutcome indicating missing version control header"
+        ],
+        "trace": [
+          "R-HLT-028: error pathway \u2013 version conflict guard must be enforced",
+          "R-HLT-028: clinician updates resource \u2013 precondition: correct version supplied"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_update_patient_missing_if_match_header_rejected(clinician_token, create_patient, fhir_base_url):\n    patient_id, _ = create_patient\n    headers = {\n        \"Authorization\": f\"Bearer {clinician_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        # Intentionally omit If-Match\n    }\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": patient_id,\n        \"name\": [{\"use\": \"official\", \"family\": \"NoVersionUpdate\"}],\n    }\n    resp = requests.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp.status_code in (400, 412), (\n        f\"Expected 400 or 412 without If-Match, got {resp.status_code}: {resp.text}\"\n    )\n    outcome = resp.json()\n    assert outcome.get(\"resourceType\") == \"OperationOutcome\"\n    assert len(outcome.get(\"issue\", [])) > 0\n"
+      },
+      {
+        "name": "test_update_patient_unauthorized_role_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A non-clinician auth token is available via <patient_token fixture>",
+          "A Patient resource exists (created by <create_patient fixture>)"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with a token that does not carry the clinician role"
+        ],
+        "expected": [
+          "Server returns HTTP 403 Forbidden",
+          "Resource version is unchanged after the rejected call"
+        ],
+        "trace": [
+          "R-HLT-028: precondition \u2013 role:clinician required",
+          "R-HLT-028: error pathway \u2013 unauthorized actor must be rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_update_patient_unauthorized_role_rejected(patient_token, clinician_token, create_patient, fhir_base_url):\n    patient_id, v1_version_id = create_patient\n    headers = {\n        \"Authorization\": f\"Bearer {patient_token}\",\n        \"Content-Type\": \"application/fhir+json\",\n        \"If-Match\": f'W/\"{v1_version_id}\"',\n    }\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": patient_id,\n        \"name\": [{\"use\": \"official\", \"family\": \"UnauthorisedChange\"}],\n    }\n    resp = requests.put(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n\n    # Verify version unchanged\n    get_resp = requests.get(\n        f\"{fhir_base_url}/Patient/{patient_id}\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"meta\"][\"versionId\"] == v1_version_id\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-028",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 984,
+    "output_tokens": 3520,
+    "latency_ms": 45183,
+    "wall_ms": 45183,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-028\",\n  \"reasoning\": \"R-HLT-028 mandates three verification axes: (1) happy-path demographic update with history preservation (EP/STC), (2) version-conflict rejection returning 409 (NEG/DT), and (3) boundary timestamps and numeric field edge values (BVA). Each test is self-contained via a fixture that creates and tears down its own Patient resource, ensuring idempotency. Version conflict is forced by reusing a stale versionId. Boundary values target the minimum/maximum allowed birthDate year and the 0/max-length string boundaries for family name to stress numeric and string elements as cited in the requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_update_patient_demographics_preserves_history\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Clinician auth token is available via <clinician_token fixture>\",\n        \"A Patient resource exists on the server (created by <create_patient fixture>)\",\n        \"Server is in state: resource version 1 stored\"\n      ],\n      \"actions\": [\n        \"PUT /Patient/{id} with updated family name and correct versionId in If-Match header\",\n        \"GET /Patient/{id}/_history to retrieve version list\"\n      ],\n      \"expected\": [\n        \"PUT returns HTTP 200 with new versionId incremented\",\n        \"Response body contains updated family name\",\n        \"GET history returns at least 2 entries\",\n        \"First history entry retains original family name\"\n      ],\n      \"trace\": [\n        \"R-HLT-028: clinician updates patient demographics\",\n        \"R-HLT-028: historical versions must be preserved\",\n        \"R-HLT-028: new version stored\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_update_patient_demographics_preserves_history(clinician_token, create_patient, fhir_base_url):\\n    patient_id, v1_version_id = create_patient\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\",\\n        \\\"Content-Type\\\": \\\"application/fhir+json\\\",\\n        \\\"If-Match\\\": f'W/\\\"{v1_version_id}\\\"',\\n    }\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"id\\\": patient_id,\\n        \\\"meta\\\": {\\\"versionId\\\": v1_version_id},\\n        \\\"name\\\": [{\\\"use\\\": \\\"official\\\", \\\"family\\\": \\\"UpdatedFamily\\\"}],\\n    }\\n    put_resp = requests.put(\\n        f\\\"{fhir_base_url}/Patient/{patient_id}\\\",\\n        json=payload,\\n        headers=headers,\\n    )\\n    assert put_resp.status_code == 200, put_resp.text\\n    new_vid = put_resp.json()[\\\"meta\\\"][\\\"versionId\\\"]\\n    assert new_vid != v1_version_id\\n    assert put_resp.json()[\\\"name\\\"][0][\\\"family\\\"] == \\\"UpdatedFamily\\\"\\n\\n    hist_resp = requests.get(\\n        f\\\"{fhir_base_url}/Patient/{patient_id}/_history\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"},\\n    )\\n    assert hist_resp.status_code == 200\\n    entries = hist_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 2\\n    families = [e[\\\"resource\\\"][\\\"name\\\"][0][\\\"family\\\"] for e in entries]\\n    assert \\\"UpdatedFamily\\\" in families\\n    assert \\\"OriginalFamily\\\" in families\\n\"\n    },\n    {\n      \"name\": \"test_update_patient_version_conflict_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician auth token is available via <clinician_token fixture>\",\n        \"A Patient resource exists at version N (created by <create_patient fixture>)\",\n        \"A successful update has already advanced the resource to version N+1\"\n      ],\n      \"actions\": [\n        \"PUT /Patient/{id} using the stale versionId N in If-Match header\"\n      ],\n      \"expected\": [\n        \"Server returns HTTP 409 Conflict\",\n        \"Response body contains OperationOutcome with issue.code = 'conflict'\"\n      ],\n      \"trace\": [\n        \"R-HLT-028: error pathway \u2013 409 on version conflict\",\n        \"R-HLT-028: historical versions must be preserved (conflict must not overwrite)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n"
+  }
+}

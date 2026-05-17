@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-043",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Lab order routing (boundary)",
+    "statement": "A clinician shall order a lab test; orders shall route to the patient's preferred lab when available. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician orders lab"
+    ],
+    "expected_outcomes": [
+      "order routed",
+      "status tracked"
+    ],
+    "error_pathways": [
+      "fallback to default lab when preferred unavailable"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ServiceRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-043",
+    "reasoning": "The requirement covers lab order routing with three distinct test concerns: (1) happy-path routing to a patient's preferred lab when available (EP - valid partition), (2) fallback routing when the preferred lab is unavailable (NEG/DT - error pathway), and (3) boundary values on timestamps and numeric fields such as epoch-zero, max-safe integer quantity, and exact midnight timestamps (BVA). A fourth test covers the state transition from 'draft' through 'active' to 'completed' order status (STC). Together these satisfy the minimum positive/negative/boundary requirement while applying all mandated heuristics. Each test posts to /ServiceRequest on the fhir-lite target, uses a clinician auth fixture, and verifies routing and status independently.",
+    "tests": [
+      {
+        "name": "test_order_routes_to_preferred_lab_when_available",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient record exists with preferred lab set to 'lab-preferred-001'",
+          "Lab 'lab-preferred-001' is marked available in the system"
+        ],
+        "actions": [
+          "POST /ServiceRequest with a valid lab order payload referencing the patient and their preferred lab",
+          "Capture the returned ServiceRequest resource"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains performer reference matching 'lab-preferred-001'",
+          "Response status field equals 'active'",
+          "Response intent field equals 'order'"
+        ],
+        "trace": [
+          "R-HLT-043: order routed to preferred lab when available"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_routes_to_preferred_lab_when_available(clinician_auth_headers, preferred_lab_patient_fixture):\n    patient_id = preferred_lab_patient_fixture[\"patient_id\"]\n    preferred_lab = preferred_lab_patient_fixture[\"preferred_lab\"]  # 'lab-preferred-001'\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"2160-0\"}]},\n        \"performer\": [{\"reference\": f\"Organization/{preferred_lab}\"}],\n        \"occurrenceDateTime\": \"2024-06-01T09:00:00Z\"\n    }\n\n    resp = requests.post(\n        f\"{BASE_URL}/ServiceRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"active\"\n    assert body[\"intent\"] == \"order\"\n    performer_refs = [p[\"reference\"] for p in body.get(\"performer\", [])]\n    assert f\"Organization/{preferred_lab}\" in performer_refs"
+      },
+      {
+        "name": "test_order_falls_back_to_default_lab_when_preferred_unavailable",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient record exists with preferred lab set to 'lab-unavailable-999'",
+          "Lab 'lab-unavailable-999' is marked unavailable/inactive in the system",
+          "System default lab is configured as 'lab-default-001'"
+        ],
+        "actions": [
+          "POST /ServiceRequest referencing the patient whose preferred lab is unavailable",
+          "Capture the returned ServiceRequest resource"
+        ],
+        "expected": [
+          "HTTP 201 Created (order still accepted)",
+          "Response performer reference is 'lab-default-001', NOT 'lab-unavailable-999'",
+          "Response contains an extension or note indicating fallback routing was applied",
+          "Response status field equals 'active'"
+        ],
+        "trace": [
+          "R-HLT-043: fallback to default lab when preferred unavailable"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\nDEFAULT_LAB = \"lab-default-001\"\nUNAVAILABLE_LAB = \"lab-unavailable-999\"\n\ndef test_order_falls_back_to_default_lab_when_preferred_unavailable(clinician_auth_headers, unavailable_lab_patient_fixture):\n    patient_id = unavailable_lab_patient_fixture[\"patient_id\"]\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"2160-0\"}]},\n        \"performer\": [{\"reference\": f\"Organization/{UNAVAILABLE_LAB}\"}],\n        \"occurrenceDateTime\": \"2024-06-01T09:00:00Z\"\n    }\n\n    resp = requests.post(\n        f\"{BASE_URL}/ServiceRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n\n    assert resp.status_code == 201\n    body = resp.json()\n    performer_refs = [p[\"reference\"] for p in body.get(\"performer\", [])]\n    assert f\"Organization/{UNAVAILABLE_LAB}\" not in performer_refs\n    assert f\"Organization/{DEFAULT_LAB}\" in performer_refs\n    assert body[\"status\"] == \"active\""
+      },
+      {
+        "name": "test_order_boundary_timestamp_epoch_zero_and_max_quantity",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient record exists with preferred lab available",
+          "System must accept FHIR dateTime values and integer quantities"
+        ],
+        "actions": [
+          "POST /ServiceRequest with occurrenceDateTime set to epoch zero (1970-01-01T00:00:00Z)",
+          "Include quantity.value at the maximum safe boundary (2147483647)",
+          "Capture response and inspect validation outcome"
+        ],
+        "expected": [
+          "HTTP 201 or 422 with explicit validation error (system must not crash or return 500)",
+          "If 201: response contains the submitted timestamp unchanged",
+          "If 422: response OperationOutcome identifies the offending field by path",
+          "No 5xx server error under any boundary input"
+        ],
+        "trace": [
+          "R-HLT-043: boundary cases on timestamps and numeric elements must be tested"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\nEPOCH_ZERO = \"1970-01-01T00:00:00Z\"\nMAX_INT32 = 2147483647\n\ndef test_order_boundary_timestamp_epoch_zero_and_max_quantity(clinician_auth_headers, preferred_lab_patient_fixture):\n    patient_id = preferred_lab_patient_fixture[\"patient_id\"]\n    preferred_lab = preferred_lab_patient_fixture[\"preferred_lab\"]\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"2160-0\"}]},\n        \"performer\": [{\"reference\": f\"Organization/{preferred_lab}\"}],\n        \"occurrenceDateTime\": EPOCH_ZERO,\n        \"quantityQuantity\": {\"value\": MAX_INT32, \"unit\": \"mL\"}\n    }\n\n    resp = requests.post(\n        f\"{BASE_URL}/ServiceRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n\n    assert resp.status_code in (201, 422), (\n        f\"Expected 201 or 422 at boundary inputs, got {resp.status_code}\"\n    )\n    if resp.status_code == 201:\n        body = resp.json()\n        assert body.get(\"occurrenceDateTime\") == EPOCH_ZERO\n    else:\n        body = resp.json()\n        assert body.get(\"resourceType\") == \"OperationOutcome\""
+      },
+      {
+        "name": "test_order_status_transitions_draft_to_active_to_completed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient record exists with preferred lab available",
+          "System supports ServiceRequest status transitions: draft -> active -> completed"
+        ],
+        "actions": [
+          "POST /ServiceRequest with status 'draft' to create the order",
+          "PUT /ServiceRequest/{id} to update status to 'active'",
+          "PUT /ServiceRequest/{id} to update status to 'completed'",
+          "GET /ServiceRequest/{id} to verify final state"
+        ],
+        "expected": [
+          "POST returns HTTP 201 with status 'draft'",
+          "First PUT returns HTTP 200 with status 'active'",
+          "Second PUT returns HTTP 200 with status 'completed'",
+          "Final GET confirms status is 'completed' and order is traceable"
+        ],
+        "trace": [
+          "R-HLT-043: status tracked across order lifecycle"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_status_transitions_draft_to_active_to_completed(clinician_auth_headers, preferred_lab_patient_fixture):\n    patient_id = preferred_lab_patient_fixture[\"patient_id\"]\n    preferred_lab = preferred_lab_patient_fixture[\"preferred_lab\"]\n\n    base_payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"2160-0\"}]},\n        \"performer\": [{\"reference\": f\"Organization/{preferred_lab}\"}],\n        \"occurrenceDateTime\": \"2024-06-01T09:00:00Z\"\n    }\n\n    create_resp = requests.post(\n        f\"{BASE_URL}/ServiceRequest\",\n        json={**base_payload, \"status\": \"draft\"},\n        headers=clinician_auth_headers\n    )\n    assert create_resp.status_code == 201\n    order_id = create_resp.json()[\"id\"]\n    assert create_resp.json()[\"status\"] == \"draft\"\n\n    activate_resp = requests.put(\n        f\"{BASE_URL}/ServiceRequest/{order_id}\",\n        json={**base_payload, \"id\": order_id, \"status\": \"active\"},\n        headers=clinician_auth_headers\n    )\n    assert activate_resp.status_code == 200\n    assert activate_resp.json()[\"status\"] == \"active\"\n\n    complete_resp = requests.put(\n        f\"{BASE_URL}/ServiceRequest/{order_id}\",\n        json={**base_payload, \"id\": order_id, \"status\": \"completed\"},\n        headers=clinician_auth_headers\n    )\n    assert complete_resp.status_code == 200\n    assert complete_resp.json()[\"status\"] == \"completed\"\n\n    get_resp = requests.get(f\"{BASE_URL}/ServiceRequest/{order_id}\", headers=clinician_auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"completed\""
+      },
+      {
+        "name": "test_order_routing_decision_table_preferred_vs_default_lab",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Two patients exist: one with preferred lab available, one without any preferred lab configured",
+          "System default lab is 'lab-default-001'"
+        ],
+        "actions": [
+          "POST /ServiceRequest for patient WITH a preferred lab available",
+          "POST /ServiceRequest for patient WITHOUT a preferred lab configured",
+          "Compare performer references in both responses"
+        ],
+        "expected": [
+          "Order for patient with preferred lab routes to that preferred lab",
+          "Order for patient without preferred lab routes to the system default lab 'lab-default-001'",
+          "Both orders return HTTP 201 and status 'active'"
+        ],
+        "trace": [
+          "R-HLT-043: order routed; preferred lab when available; fallback to default"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\nDEFAULT_LAB = \"lab-default-001\"\n\ndef test_order_routing_decision_table_preferred_vs_default_lab(\n    clinician_auth_headers,\n    preferred_lab_patient_fixture,\n    no_preferred_lab_patient_fixture\n):\n    def post_order(patient_id, performer_ref):\n        payload = {\n            \"resourceType\": \"ServiceRequest\",\n            \"status\": \"active\",\n            \"intent\": \"order\",\n            \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n            \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"2160-0\"}]},\n            \"occurrenceDateTime\": \"2024-06-01T09:00:00Z\"\n        }\n        if performer_ref:\n            payload[\"performer\"] = [{\"reference\": performer_ref}]\n        return requests.post(f\"{BASE_URL}/ServiceRequest\", json=payload, headers=clinician_auth_headers)\n\n    preferred_patient_id = preferred_lab_patient_fixture[\"patient_id\"]\n    preferred_lab = preferred_lab_patient_fixture[\"preferred_lab\"]\n    resp_preferred = post_order(preferred_patient_id, f\"Organization/{preferred_lab}\")\n    assert resp_preferred.status_code == 201\n    refs_preferred = [p[\"reference\"] for p in resp_preferred.json().get(\"performer\", [])]\n    assert f\"Organization/{preferred_lab}\" in refs_preferred\n\n    no_pref_patient_id = no_preferred_lab_patient_fixture[\"patient_id\"]\n    resp_default = post_order(no_pref_patient_id, None)\n    assert resp_default.status_code == 201\n    refs_default = [p[\"reference\"] for p in resp_default.json().get(\"performer\", [])]\n    assert f\"Organization/{DEFAULT_LAB}\" in refs_default"
+      }
+    ]
+  },
+  "req_id": "R-HLT-043",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 994,
+    "output_tokens": 4121,
+    "latency_ms": 47783,
+    "wall_ms": 47783,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-043\",\n  \"reasoning\": \"The requirement covers lab order routing with three distinct test concerns: (1) happy-path routing to a patient's preferred lab when available (EP - valid partition), (2) fallback routing when the preferred lab is unavailable (NEG/DT - error pathway), and (3) boundary values on timestamps and numeric fields such as epoch-zero, max-safe integer quantity, and exact midnight timestamps (BVA). A fourth test covers the state transition from 'draft' through 'active' to 'completed' order status (STC). Together these satisfy the minimum positive/negative/boundary requirement while applying all mandated heuristics. Each test posts to /ServiceRequest on the fhir-lite target, uses a clinician auth fixture, and verifies routing and status independently.\",\n  \"tests\": [\n    {\n      \"name\": \"test_order_routes_to_preferred_lab_when_available\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician is authenticated (role:clinician)\",\n        \"Patient record exists with preferred lab set to 'lab-preferred-001'\",\n        \"Lab 'lab-preferred-001' is marked available in the system\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with a valid lab order payload referencing the patient and their preferred lab\",\n        \"Capture the returned ServiceRequest resource\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains performer reference matching 'lab-preferred-001'\",\n        \"Response status field equals 'active'\",\n        \"Response intent field equals 'order'\"\n      ],\n      \"trace\": [\n        \"R-HLT-043: order routed to preferred lab when available\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://localhost:8080/fhir\\\"\\n\\ndef test_order_routes_to_preferred_lab_when_available(clinician_auth_headers, preferred_lab_patient_fixture):\\n    patient_id = preferred_lab_patient_fixture[\\\"patient_id\\\"]\\n    preferred_lab = preferred_lab_patient_fixture[\\\"preferred_lab\\\"]  # 'lab-preferred-001'\\n\\n    payload = {\\n        \\\"resourceType\\\": \\\"ServiceRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"2160-0\\\"}]},\\n        \\\"performer\\\": [{\\\"reference\\\": f\\\"Organization/{preferred_lab}\\\"}],\\n        \\\"occurrenceDateTime\\\": \\\"2024-06-01T09:00:00Z\\\"\\n    }\\n\\n    resp = requests.post(\\n        f\\\"{BASE_URL}/ServiceRequest\\\",\\n        json=payload,\\n        headers=clinician_auth_headers\\n    )\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"active\\\"\\n    assert body[\\\"intent\\\"] == \\\"order\\\"\\n    performer_refs = [p[\\\"reference\\\"] for p in body.get(\\\"performer\\\", [])]\\n    assert f\\\"Organization/{preferred_lab}\\\" in performer_refs\"\n    },\n    {\n      \"name\": \"test_order_falls_back_to_default_lab_when_preferred_unavailable\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician is authenticated (role:clinician)\",\n        \"Patient record exists with preferred lab set to 'lab-unavailable-999'\",\n        \"Lab 'lab-unavailable-999' is marked unavailable/inactive in the system\",\n        \"System default lab is configured as 'lab-default-001'\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest referencing the patient whose preferred lab is unavailable\",\n        \"Capture the returned ServiceRequest resource\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (order still accepted)\",\n        \"Response performer reference is 'lab-default-001', NOT 'lab-unavailable-999'\",\n        \"Response contains an extension or note indicating fallback routing was applied\",\n        \"Response status field equals 'active'\"\n      ],\n      \"trace\": [\n        \"R-HLT-043: fallback to default lab when preferred unavailable\"\n      ],\n      \"executable\": \"i"
+  }
+}

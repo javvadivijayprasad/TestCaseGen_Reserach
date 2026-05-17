@@ -1,0 +1,217 @@
+{
+  "req": {
+    "id": "R-HLT-015",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Consent management",
+    "statement": "A patient shall grant or revoke consent for data sharing; revoked consent shall be enforced within 15 minutes.",
+    "actors": [
+      "patient"
+    ],
+    "preconditions": [
+      "role:patient"
+    ],
+    "triggers": [
+      "patient updates consent"
+    ],
+    "expected_outcomes": [
+      "consent stored",
+      "downstream caches invalidated"
+    ],
+    "error_pathways": [
+      "accesses after revoke within SLA denied"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Consent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-015",
+    "reasoning": "R-HLT-015 mandates patient-initiated consent grant/revoke with 15-minute enforcement SLA for cache invalidation. Test coverage must span: (1) successful consent grant and storage (positive, EP), (2) successful consent revoke with downstream denial (positive, STC), (3) invalid payload rejection (negative, NEG), (4) boundary timing at 15-minute threshold (boundary, BVA). Tests are deterministic, use mocked time where needed, and assert both API contract and cache behavior.",
+    "tests": [
+      {
+        "name": "test_patient_grants_consent_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated as patient user",
+          "patient_id = 'P12345'",
+          "no prior consent record for data_type='genomics'"
+        ],
+        "actions": [
+          "POST /Consent with body: {\"patient_id\": \"P12345\", \"data_type\": \"genomics\", \"granted\": true}",
+          "verify HTTP 201 response",
+          "retrieve consent record via GET /Consent/P12345"
+        ],
+        "expected": [
+          "response status = 201",
+          "response.id is UUID",
+          "response.granted = true",
+          "response.created_at is ISO8601 timestamp",
+          "GET retrieval returns same record with granted=true",
+          "X-Cache-Key header present in response"
+        ],
+        "trace": [
+          "R-HLT-015: consent stored",
+          "R-HLT-015: expected outcome - consent stored"
+        ],
+        "executable": "import requests, json, re\nfrom datetime import datetime\n\ndef test_patient_grants_consent_success(base_url, patient_token):\n    headers = {'Authorization': f'Bearer {patient_token}'}\n    payload = {\n        'patient_id': 'P12345',\n        'data_type': 'genomics',\n        'granted': True\n    }\n    resp = requests.post(f'{base_url}/Consent', json=payload, headers=headers)\n    assert resp.status_code == 201\n    data = resp.json()\n    assert 'id' in data\n    assert re.match(r'^[0-9a-f\\-]{36}$', data['id'])\n    assert data['granted'] is True\n    assert 'created_at' in data\n    try:\n        datetime.fromisoformat(data['created_at'].replace('Z', '+00:00'))\n    except ValueError:\n        pytest.fail('created_at not ISO8601')\n    \n    get_resp = requests.get(f'{base_url}/Consent/P12345', headers=headers)\n    assert get_resp.status_code == 200\n    get_data = get_resp.json()\n    assert get_data['granted'] is True\n    assert 'X-Cache-Key' in resp.headers"
+      },
+      {
+        "name": "test_patient_revokes_consent_enforced",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "authenticated as patient user",
+          "patient_id = 'P67890'",
+          "active consent exists: {patient_id: 'P67890', data_type: 'labs', granted: true, created_at: T-1day}",
+          "mock time: current = 2024-01-15T14:00:00Z"
+        ],
+        "actions": [
+          "POST /Consent with body: {\"patient_id\": \"P67890\", \"data_type\": \"labs\", \"granted\": false}",
+          "verify HTTP 200 response",
+          "attempt GET /data/labs/P67890 as downstream service with service token",
+          "verify revocation is enforced (within SLA)"
+        ],
+        "expected": [
+          "revoke response status = 200",
+          "revoke response.granted = false",
+          "revoke response.revoked_at is ISO8601 timestamp",
+          "downstream GET returns 403 Forbidden",
+          "downstream response includes reason: 'consent revoked'",
+          "cache invalidation header present: X-Cache-Invalidate=true"
+        ],
+        "trace": [
+          "R-HLT-015: revoked consent shall be enforced",
+          "R-HLT-015: error pathway - accesses after revoke denied",
+          "R-HLT-015: expected outcome - downstream caches invalidated"
+        ],
+        "executable": "import requests\n\ndef test_patient_revokes_consent_enforced(base_url, patient_token, service_token, mock_time):\n    patient_id = 'P67890'\n    headers_patient = {'Authorization': f'Bearer {patient_token}'}\n    headers_service = {'Authorization': f'Bearer {service_token}'}\n    \n    revoke_payload = {\n        'patient_id': patient_id,\n        'data_type': 'labs',\n        'granted': False\n    }\n    revoke_resp = requests.post(f'{base_url}/Consent', json=revoke_payload, headers=headers_patient)\n    assert revoke_resp.status_code == 200\n    revoke_data = revoke_resp.json()\n    assert revoke_data['granted'] is False\n    assert 'revoked_at' in revoke_data\n    assert 'X-Cache-Invalidate' in revoke_resp.headers\n    \n    access_resp = requests.get(\n        f'{base_url}/data/labs/{patient_id}',\n        headers=headers_service\n    )\n    assert access_resp.status_code == 403\n    assert 'consent revoked' in access_resp.json().get('reason', '').lower()"
+      },
+      {
+        "name": "test_revoke_enforcement_boundary_15min_sla",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "authenticated as patient user",
+          "patient_id = 'P11111'",
+          "active consent exists: {patient_id: 'P11111', data_type: 'imaging', granted: true}",
+          "mock time T0: 2024-01-15T14:00:00Z",
+          "revoke initiated at T0"
+        ],
+        "actions": [
+          "revoke consent at T0",
+          "advance mock time to T0 + 14min 59sec",
+          "attempt GET /data/imaging/P11111 as service",
+          "advance mock time to T0 + 15min 0sec",
+          "attempt GET /data/imaging/P11111 as service again"
+        ],
+        "expected": [
+          "at T0 + 14m59s: access succeeds (status 200) - cache not yet invalidated",
+          "at T0 + 15m0s: access denied (status 403) - cache invalidated at SLA boundary",
+          "no access granted after 15-minute window"
+        ],
+        "trace": [
+          "R-HLT-015: revoked consent shall be enforced within 15 minutes",
+          "R-HLT-015: boundary condition at 15-minute SLA threshold",
+          "R-HLT-015: error pathway enforcement"
+        ],
+        "executable": "import requests\nfrom unittest.mock import patch\nfrom datetime import timedelta\n\ndef test_revoke_enforcement_boundary_15min_sla(base_url, patient_token, service_token, mock_time_context):\n    patient_id = 'P11111'\n    headers_patient = {'Authorization': f'Bearer {patient_token}'}\n    headers_service = {'Authorization': f'Bearer {service_token}'}\n    \n    revoke_payload = {'patient_id': patient_id, 'data_type': 'imaging', 'granted': False}\n    revoke_resp = requests.post(f'{base_url}/Consent', json=revoke_payload, headers=headers_patient)\n    assert revoke_resp.status_code == 200\n    \n    with mock_time_context.advance(timedelta(minutes=14, seconds=59)):\n        early_resp = requests.get(f'{base_url}/data/imaging/{patient_id}', headers=headers_service)\n        assert early_resp.status_code == 200, 'cache should not invalidate before 15min'\n    \n    with mock_time_context.advance(timedelta(minutes=15)):\n        late_resp = requests.get(f'{base_url}/data/imaging/{patient_id}', headers=headers_service)\n        assert late_resp.status_code == 403, 'cache must invalidate at/after 15min SLA'"
+      },
+      {
+        "name": "test_consent_invalid_payload_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated as patient user",
+          "patient_id = 'P22222'"
+        ],
+        "actions": [
+          "POST /Consent with malformed payload (missing 'granted' field)",
+          "verify HTTP 400 response",
+          "verify error message identifies missing field"
+        ],
+        "expected": [
+          "response status = 400",
+          "response.error includes 'granted'",
+          "response.error includes 'required'",
+          "no consent record created in database"
+        ],
+        "trace": [
+          "R-HLT-015: negative case - invalid payload",
+          "R-HLT-015: error pathway - malformed request rejected"
+        ],
+        "executable": "import requests\n\ndef test_consent_invalid_payload_rejected(base_url, patient_token):\n    headers = {'Authorization': f'Bearer {patient_token}'}\n    invalid_payload = {\n        'patient_id': 'P22222',\n        'data_type': 'genomics'\n    }\n    resp = requests.post(f'{base_url}/Consent', json=invalid_payload, headers=headers)\n    assert resp.status_code == 400\n    error_data = resp.json()\n    assert 'error' in error_data\n    error_msg = error_data['error'].lower()\n    assert 'granted' in error_msg or 'required' in error_msg"
+      },
+      {
+        "name": "test_consent_unauthorized_user_denied",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "unauthenticated request (no Bearer token)"
+        ],
+        "actions": [
+          "POST /Consent with valid payload and no auth header"
+        ],
+        "expected": [
+          "response status = 401",
+          "response includes 'authentication required' or 'unauthorized'"
+        ],
+        "trace": [
+          "R-HLT-015: negative case - unauthorized access",
+          "R-HLT-015: authentication enforcement"
+        ],
+        "executable": "import requests\n\ndef test_consent_unauthorized_user_denied(base_url):\n    payload = {\n        'patient_id': 'P33333',\n        'data_type': 'labs',\n        'granted': True\n    }\n    resp = requests.post(f'{base_url}/Consent', json=payload)\n    assert resp.status_code == 401\n    assert 'unauthorized' in resp.json().get('error', '').lower() or 'authentication' in resp.json().get('error', '').lower()"
+      },
+      {
+        "name": "test_consent_idempotent_on_repeated_grant",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated as patient user",
+          "patient_id = 'P44444'",
+          "no prior consent record"
+        ],
+        "actions": [
+          "POST /Consent with grant payload",
+          "POST /Consent again with identical payload",
+          "GET /Consent/P44444 to verify single record"
+        ],
+        "expected": [
+          "first POST status = 201",
+          "second POST status = 200 (idempotent)",
+          "both responses return same consent.id",
+          "GET returns one record (no duplicate)"
+        ],
+        "trace": [
+          "R-HLT-015: idempotency requirement",
+          "R-HLT-015: consent stored deterministically"
+        ],
+        "executable": "import requests\n\ndef test_consent_idempotent_on_repeated_grant(base_url, patient_token):\n    headers = {'Authorization': f'Bearer {patient_token}'}\n    payload = {\n        'patient_id': 'P44444',\n        'data_type': 'vital_signs',\n        'granted': True\n    }\n    resp1 = requests.post(f'{base_url}/Consent', json=payload, headers=headers)\n    assert resp1.status_code == 201\n    id1 = resp1.json()['id']\n    \n    resp2 = requests.post(f'{base_url}/Consent', json=payload, headers=headers)\n    assert resp2.status_code == 200\n    id2 = resp2.json()['id']\n    assert id1 == id2\n    \n    get_resp = requests.get(f'{base_url}/Consent/P44444', headers=headers)\n    records = get_resp.json() if isinstance(get_resp.json(), list) else [get_resp.json()]\n    assert len(records) == 1"
+      }
+    ]
+  },
+  "req_id": "R-HLT-015",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1024,
+    "output_tokens": 3491,
+    "latency_ms": 19985,
+    "wall_ms": 19985,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-015\",\n  \"reasoning\": \"R-HLT-015 mandates patient-initiated consent grant/revoke with 15-minute enforcement SLA for cache invalidation. Test coverage must span: (1) successful consent grant and storage (positive, EP), (2) successful consent revoke with downstream denial (positive, STC), (3) invalid payload rejection (negative, NEG), (4) boundary timing at 15-minute threshold (boundary, BVA). Tests are deterministic, use mocked time where needed, and assert both API contract and cache behavior.\",\n  \"tests\": [\n    {\n      \"name\": \"test_patient_grants_consent_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"authenticated as patient user\",\n        \"patient_id = 'P12345'\",\n        \"no prior consent record for data_type='genomics'\"\n      ],\n      \"actions\": [\n        \"POST /Consent with body: {\\\"patient_id\\\": \\\"P12345\\\", \\\"data_type\\\": \\\"genomics\\\", \\\"granted\\\": true}\",\n        \"verify HTTP 201 response\",\n        \"retrieve consent record via GET /Consent/P12345\"\n      ],\n      \"expected\": [\n        \"response status = 201\",\n        \"response.id is UUID\",\n        \"response.granted = true\",\n        \"response.created_at is ISO8601 timestamp\",\n        \"GET retrieval returns same record with granted=true\",\n        \"X-Cache-Key header present in response\"\n      ],\n      \"trace\": [\n        \"R-HLT-015: consent stored\",\n        \"R-HLT-015: expected outcome - consent stored\"\n      ],\n      \"executable\": \"import requests, json, re\\nfrom datetime import datetime\\n\\ndef test_patient_grants_consent_success(base_url, patient_token):\\n    headers = {'Authorization': f'Bearer {patient_token}'}\\n    payload = {\\n        'patient_id': 'P12345',\\n        'data_type': 'genomics',\\n        'granted': True\\n    }\\n    resp = requests.post(f'{base_url}/Consent', json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    data = resp.json()\\n    assert 'id' in data\\n    assert re.match(r'^[0-9a-f\\\\-]{36}$', data['id'])\\n    assert data['granted'] is True\\n    assert 'created_at' in data\\n    try:\\n        datetime.fromisoformat(data['created_at'].replace('Z', '+00:00'))\\n    except ValueError:\\n        pytest.fail('created_at not ISO8601')\\n    \\n    get_resp = requests.get(f'{base_url}/Consent/P12345', headers=headers)\\n    assert get_resp.status_code == 200\\n    get_data = get_resp.json()\\n    assert get_data['granted'] is True\\n    assert 'X-Cache-Key' in resp.headers\"\n    },\n    {\n      \"name\": \"test_patient_revokes_consent_enforced\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"authenticated as patient user\",\n        \"patient_id = 'P67890'\",\n        \"active consent exists: {patient_id: 'P67890', data_type: 'labs', granted: true, created_at: T-1day}\",\n        \"mock time: current = 2024-01-15T14:00:00Z\"\n      ],\n      \"actions\": [\n        \"POST /Consent with body: {\\\"patient_id\\\": \\\"P67890\\\", \\\"data_type\\\": \\\"labs\\\", \\\"granted\\\": false}\",\n        \"verify HTTP 200 response\",\n        \"attempt GET /data/labs/P67890 as downstream service with service token\",\n        \"verify revocation is enforced (within SLA)\"\n      ],\n      \"expected\": [\n        \"revoke response status = 200\",\n        \"revoke response.granted = false\",\n        \"revoke response.revoked_at is ISO8601 timestamp\",\n        \"downstream GET returns 403 Forbidden\",\n        \"downstream response includes reason: 'consent revoked'\",\n        \"cache invalidation header present: X-Cache-Invalidate=true\"\n      ],\n      \"trace\": [\n        \"R-HLT-015: revoked consent shall be enforced\",\n        \"R-HLT-015: error pathway - accesses after revoke denied\",\n        \"R-HLT-015: expected outcome - downstream caches invalidated\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_patient_revokes_consent_enforced(base_url, patient_token, service_token, mock_time):\\n    patient_id = 'P67890'\\n    headers_patient = {'Authorization': f'Bearer {patient_token}'}\\n    headers_service "
+  }
+}

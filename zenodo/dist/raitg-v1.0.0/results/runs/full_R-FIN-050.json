@@ -1,0 +1,217 @@
+{
+  "req": {
+    "id": "R-FIN-050",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Reconciliation report (boundary variant)",
+    "statement": "The system shall produce a daily reconciliation report comparing internal ledger to correspondent bank; non-zero variance shall open an incident. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "EOD trigger"
+    ],
+    "expected_outcomes": [
+      "report stored",
+      "incidents opened on variance"
+    ],
+    "error_pathways": [
+      "incident severity based on variance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/reconcile"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-050",
+    "reasoning": "R-FIN-050 requires testing: (1) zero-variance happy path where no incident is raised, (2) non-zero variance triggering an incident with appropriate severity, (3) boundary values at exact min/max thresholds where the variance transitions from zero to non-zero. EP covers normal operational partitions, BVA covers exact threshold crossings, STC covers the state change from 'no incident' to 'incident opened', DT covers severity mapping, and NEG covers malformed/unauthorized trigger invocations. Five tests are included to satisfy all mandatory heuristics and the minimum three cases.",
+    "tests": [
+      {
+        "name": "test_reconcile_zero_variance_no_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "Internal ledger balance equals correspondent bank balance for test account set",
+          "EOD cron job is authorized via CRON_API_KEY header"
+        ],
+        "actions": [
+          "Seed ledger and correspondent bank with identical balances via <seed_balanced_ledger_fixture>",
+          "POST /cron/reconcile with valid CRON_API_KEY header",
+          "Poll report store until report status is COMPLETE"
+        ],
+        "expected": [
+          "HTTP 200 returned from /cron/reconcile",
+          "Report stored with status=COMPLETE",
+          "Report variance field equals 0",
+          "No incident record created for the reconciliation run ID"
+        ],
+        "trace": [
+          "R-FIN-050: daily reconciliation report shall be produced",
+          "R-FIN-050: non-zero variance shall open an incident (contrapositive: zero variance must NOT open one)"
+        ],
+        "executable": "import pytest\nimport requests\nfrom tests.fixtures import seed_balanced_ledger_fixture, get_report, get_incidents\nfrom tests.config import BASE_URL, CRON_HEADERS\n\ndef test_reconcile_zero_variance_no_incident(seed_balanced_ledger_fixture):\n    run_id = seed_balanced_ledger_fixture[\"run_id\"]\n\n    resp = requests.post(f\"{BASE_URL}/cron/reconcile\", headers=CRON_HEADERS,\n                         json={\"run_id\": run_id})\n    assert resp.status_code == 200\n\n    report = get_report(run_id, timeout=30)\n    assert report[\"status\"] == \"COMPLETE\"\n    assert report[\"variance\"] == 0\n\n    incidents = get_incidents(run_id)\n    assert len(incidents) == 0, f\"Expected no incidents, got {incidents}\"\n"
+      },
+      {
+        "name": "test_reconcile_nonzero_variance_opens_incident",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "Internal ledger balance is seeded to differ from correspondent bank balance by 500.00",
+          "EOD cron job is authorized via CRON_API_KEY header"
+        ],
+        "actions": [
+          "Seed ledger with a 500.00 surplus versus correspondent bank via <seed_variance_ledger_fixture>",
+          "POST /cron/reconcile with valid CRON_API_KEY header",
+          "Poll report store until report status is COMPLETE",
+          "Retrieve incidents for the run ID"
+        ],
+        "expected": [
+          "HTTP 200 returned from /cron/reconcile",
+          "Report stored with status=COMPLETE",
+          "Report variance field equals 500.00",
+          "Exactly one incident record created for the run ID",
+          "Incident severity maps to expected level per variance amount decision table"
+        ],
+        "trace": [
+          "R-FIN-050: non-zero variance shall open an incident",
+          "R-FIN-050: incident severity based on variance"
+        ],
+        "executable": "import pytest\nimport requests\nfrom tests.fixtures import seed_variance_ledger_fixture, get_report, get_incidents\nfrom tests.config import BASE_URL, CRON_HEADERS, SEVERITY_TABLE\n\nVARIANCE = 500.00\n\ndef test_reconcile_nonzero_variance_opens_incident(seed_variance_ledger_fixture):\n    run_id = seed_variance_ledger_fixture(variance=VARIANCE)[\"run_id\"]\n\n    resp = requests.post(f\"{BASE_URL}/cron/reconcile\", headers=CRON_HEADERS,\n                         json={\"run_id\": run_id})\n    assert resp.status_code == 200\n\n    report = get_report(run_id, timeout=30)\n    assert report[\"status\"] == \"COMPLETE\"\n    assert report[\"variance\"] == pytest.approx(VARIANCE)\n\n    incidents = get_incidents(run_id)\n    assert len(incidents) == 1\n    expected_severity = SEVERITY_TABLE.resolve(VARIANCE)\n    assert incidents[0][\"severity\"] == expected_severity\n"
+      },
+      {
+        "name": "test_reconcile_boundary_minimum_nonzero_variance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "System minimum reportable variance threshold is known (e.g. 0.01)",
+          "Internal ledger balance is seeded to differ from correspondent bank by exactly 0.01",
+          "EOD cron job is authorized via CRON_API_KEY header"
+        ],
+        "actions": [
+          "Seed ledger with exactly 0.01 variance vs correspondent bank via <seed_variance_ledger_fixture>",
+          "POST /cron/reconcile with valid CRON_API_KEY header",
+          "Poll report store until report status is COMPLETE",
+          "Retrieve incidents for the run ID"
+        ],
+        "expected": [
+          "HTTP 200 returned from /cron/reconcile",
+          "Report variance equals exactly 0.01",
+          "Exactly one incident is opened (threshold crossed)",
+          "Incident severity matches the lowest severity band in the decision table"
+        ],
+        "trace": [
+          "R-FIN-050: boundary behaviour at exact min threshold must be tested",
+          "R-FIN-050: non-zero variance shall open an incident"
+        ],
+        "executable": "import pytest\nimport requests\nfrom tests.fixtures import seed_variance_ledger_fixture, get_report, get_incidents\nfrom tests.config import BASE_URL, CRON_HEADERS, SEVERITY_TABLE, MIN_VARIANCE\n\ndef test_reconcile_boundary_minimum_nonzero_variance(seed_variance_ledger_fixture):\n    assert MIN_VARIANCE == 0.01, \"Precondition: min threshold must be 0.01\"\n    run_id = seed_variance_ledger_fixture(variance=MIN_VARIANCE)[\"run_id\"]\n\n    resp = requests.post(f\"{BASE_URL}/cron/reconcile\", headers=CRON_HEADERS,\n                         json={\"run_id\": run_id})\n    assert resp.status_code == 200\n\n    report = get_report(run_id, timeout=30)\n    assert report[\"variance\"] == pytest.approx(MIN_VARIANCE)\n\n    incidents = get_incidents(run_id)\n    assert len(incidents) == 1\n    assert incidents[0][\"severity\"] == SEVERITY_TABLE.resolve(MIN_VARIANCE)\n"
+      },
+      {
+        "name": "test_reconcile_boundary_maximum_variance_highest_severity",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "System maximum variance threshold is known (e.g. 1000000.00)",
+          "Internal ledger balance is seeded to differ from correspondent bank by exactly MAX_VARIANCE",
+          "EOD cron job is authorized via CRON_API_KEY header"
+        ],
+        "actions": [
+          "Seed ledger with exactly MAX_VARIANCE difference vs correspondent bank via <seed_variance_ledger_fixture>",
+          "POST /cron/reconcile with valid CRON_API_KEY header",
+          "Poll report store until report status is COMPLETE",
+          "Retrieve incidents for the run ID"
+        ],
+        "expected": [
+          "HTTP 200 returned from /cron/reconcile",
+          "Report variance equals exactly MAX_VARIANCE",
+          "Exactly one incident is opened",
+          "Incident severity equals CRITICAL (highest severity band)"
+        ],
+        "trace": [
+          "R-FIN-050: boundary behaviour at exact max threshold must be tested",
+          "R-FIN-050: incident severity based on variance"
+        ],
+        "executable": "import pytest\nimport requests\nfrom tests.fixtures import seed_variance_ledger_fixture, get_report, get_incidents\nfrom tests.config import BASE_URL, CRON_HEADERS, SEVERITY_TABLE, MAX_VARIANCE\n\ndef test_reconcile_boundary_maximum_variance_highest_severity(seed_variance_ledger_fixture):\n    run_id = seed_variance_ledger_fixture(variance=MAX_VARIANCE)[\"run_id\"]\n\n    resp = requests.post(f\"{BASE_URL}/cron/reconcile\", headers=CRON_HEADERS,\n                         json={\"run_id\": run_id})\n    assert resp.status_code == 200\n\n    report = get_report(run_id, timeout=30)\n    assert report[\"variance\"] == pytest.approx(MAX_VARIANCE)\n\n    incidents = get_incidents(run_id)\n    assert len(incidents) == 1\n    assert incidents[0][\"severity\"] == \"CRITICAL\"\n    assert incidents[0][\"severity\"] == SEVERITY_TABLE.resolve(MAX_VARIANCE)\n"
+      },
+      {
+        "name": "test_reconcile_unauthorized_trigger_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "No valid CRON_API_KEY is supplied in the request"
+        ],
+        "actions": [
+          "POST /cron/reconcile with a missing or invalid Authorization header",
+          "Inspect HTTP response code and body"
+        ],
+        "expected": [
+          "HTTP 401 or 403 returned",
+          "No report is created in the report store",
+          "No incident is opened"
+        ],
+        "trace": [
+          "R-FIN-050: EOD trigger must be authenticated (system job actor)",
+          "R-FIN-050: report stored only on valid trigger"
+        ],
+        "executable": "import pytest\nimport requests\nfrom tests.fixtures import get_report_by_token, get_incidents_by_token\nfrom tests.config import BASE_URL\nimport uuid\n\ndef test_reconcile_unauthorized_trigger_rejected():\n    bad_headers = {\"Authorization\": \"Bearer INVALID_TOKEN_XYZ\"}\n    fake_run_id = str(uuid.uuid4())\n\n    resp = requests.post(f\"{BASE_URL}/cron/reconcile\", headers=bad_headers,\n                         json={\"run_id\": fake_run_id})\n    assert resp.status_code in (401, 403), (\n        f\"Expected 401/403 for unauthorized trigger, got {resp.status_code}\"\n    )\n\n    report = get_report_by_token(fake_run_id, must_exist=False)\n    assert report is None, \"No report should be stored for unauthorized trigger\"\n\n    incidents = get_incidents_by_token(fake_run_id)\n    assert len(incidents) == 0, \"No incidents should be opened for unauthorized trigger\"\n"
+      },
+      {
+        "name": "test_reconcile_state_transition_open_to_resolved",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "A previous reconciliation run has created an OPEN incident",
+          "Subsequent ledger correction brings variance to zero",
+          "EOD cron job is authorized via CRON_API_KEY header"
+        ],
+        "actions": [
+          "Seed run_1 with non-zero variance; trigger reconcile; verify OPEN incident via <seed_variance_ledger_fixture>",
+          "Correct the ledger to zero variance via <seed_balanced_ledger_fixture> for run_2",
+          "POST /cron/reconcile again with run_2",
+          "Retrieve incident status for run_1 after run_2 completes"
+        ],
+        "expected": [
+          "run_1 incident transitions from OPEN to RESOLVED after zero-variance run",
+          "run_2 report variance equals 0",
+          "No new incident created for run_2"
+        ],
+        "trace": [
+          "R-FIN-050: non-zero variance shall open an incident",
+          "R-FIN-050: system state must transition correctly once variance is resolved"
+        ],
+        "executable": "import pytest\nimport requests\nfrom tests.fixtures import (\n    seed_variance_ledger_fixture, seed_balanced_ledger_fixture,\n    get_report, get_incidents, get_incident_by_id\n)\nfrom tests.config import BASE_URL, CRON_HEADERS\n\ndef test_reconcile_state_transition_open_to_resolved(\n    seed_variance_ledger_fixture, seed_balanced_ledger_fixture\n):\n    run_1 = seed_variance_ledger_fixture(variance=200.00)[\"run_id\"]\n    requests.post(f\"{BASE_URL}/cron/reconcile\", headers=CRON_HEADERS,\n                  json={\"run_id\": run_1})\n    incidents_1 = get_incidents(run_1)\n    assert len(incidents_1) == 1\n    incident_id = incidents_1[0][\"id\"]\n    assert incidents_1[0][\"status\"] == \"OPEN\"\n\n    run_2 = seed_balanced_ledger_fixture[\"run_id\"]\n    resp2 = requests.post(f\"{BASE_URL}/cron/reconcile\", headers=CRON_HEADERS,\n                          json={\"run_id\": run_2})\n    assert resp2.status_code == 200\n\n    report_2 = get_report(run_2, timeout=30)\n    assert report_2[\"variance\"] == 0\n    assert len(get_incidents(run_2)) == 0\n\n    resolved = get_incident_by_id(incident_id)\n    assert resolved[\"status\"] == \"RESOLVED\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-050",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 999,
+    "output_tokens": 3846,
+    "latency_ms": 46614,
+    "wall_ms": 46614,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-050\",\n  \"reasoning\": \"R-FIN-050 requires testing: (1) zero-variance happy path where no incident is raised, (2) non-zero variance triggering an incident with appropriate severity, (3) boundary values at exact min/max thresholds where the variance transitions from zero to non-zero. EP covers normal operational partitions, BVA covers exact threshold crossings, STC covers the state change from 'no incident' to 'incident opened', DT covers severity mapping, and NEG covers malformed/unauthorized trigger invocations. Five tests are included to satisfy all mandatory heuristics and the minimum three cases.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reconcile_zero_variance_no_incident\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Banking API is reachable at BASE_URL\",\n        \"Internal ledger balance equals correspondent bank balance for test account set\",\n        \"EOD cron job is authorized via CRON_API_KEY header\"\n      ],\n      \"actions\": [\n        \"Seed ledger and correspondent bank with identical balances via <seed_balanced_ledger_fixture>\",\n        \"POST /cron/reconcile with valid CRON_API_KEY header\",\n        \"Poll report store until report status is COMPLETE\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned from /cron/reconcile\",\n        \"Report stored with status=COMPLETE\",\n        \"Report variance field equals 0\",\n        \"No incident record created for the reconciliation run ID\"\n      ],\n      \"trace\": [\n        \"R-FIN-050: daily reconciliation report shall be produced\",\n        \"R-FIN-050: non-zero variance shall open an incident (contrapositive: zero variance must NOT open one)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom tests.fixtures import seed_balanced_ledger_fixture, get_report, get_incidents\\nfrom tests.config import BASE_URL, CRON_HEADERS\\n\\ndef test_reconcile_zero_variance_no_incident(seed_balanced_ledger_fixture):\\n    run_id = seed_balanced_ledger_fixture[\\\"run_id\\\"]\\n\\n    resp = requests.post(f\\\"{BASE_URL}/cron/reconcile\\\", headers=CRON_HEADERS,\\n                         json={\\\"run_id\\\": run_id})\\n    assert resp.status_code == 200\\n\\n    report = get_report(run_id, timeout=30)\\n    assert report[\\\"status\\\"] == \\\"COMPLETE\\\"\\n    assert report[\\\"variance\\\"] == 0\\n\\n    incidents = get_incidents(run_id)\\n    assert len(incidents) == 0, f\\\"Expected no incidents, got {incidents}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reconcile_nonzero_variance_opens_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Banking API is reachable at BASE_URL\",\n        \"Internal ledger balance is seeded to differ from correspondent bank balance by 500.00\",\n        \"EOD cron job is authorized via CRON_API_KEY header\"\n      ],\n      \"actions\": [\n        \"Seed ledger with a 500.00 surplus versus correspondent bank via <seed_variance_ledger_fixture>\",\n        \"POST /cron/reconcile with valid CRON_API_KEY header\",\n        \"Poll report store until report status is COMPLETE\",\n        \"Retrieve incidents for the run ID\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned from /cron/reconcile\",\n        \"Report stored with status=COMPLETE\",\n        \"Report variance field equals 500.00\",\n        \"Exactly one incident record created for the run ID\",\n        \"Incident severity maps to expected level per variance amount decision table\"\n      ],\n      \"trace\": [\n        \"R-FIN-050: non-zero variance shall open an incident\",\n        \"R-FIN-050: incident severity based on variance\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom tests.fixtures import seed_variance_ledger_fixture, get_report, get_incidents\\nfrom tests.config import BASE_URL, CRON_HEADERS, SEVERITY_TABLE\\n\\nVARIANCE = 500.00\\n\\ndef test_reconcile_nonzero_variance_opens_incident(seed_variance_ledger_fixture):\\n    run_id = seed_variance_ledger_fixture(variance=VARIANCE)[\\\"run_id\\\"]\\n\\n    resp = requests.post(f\\\"{BASE_U"
+  }
+}

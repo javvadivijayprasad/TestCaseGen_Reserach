@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-FIN-081",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Wire transfer (idempotency variant)",
+    "statement": "A customer shall initiate a wire transfer requiring two-factor authentication; transfers above $100,000 require manual review. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "2fa verified in last 5 min"
+    ],
+    "triggers": [
+      "customer submits wire"
+    ],
+    "expected_outcomes": [
+      "wire queued",
+      "compliance check started"
+    ],
+    "error_pathways": [
+      "401 when 2fa stale",
+      "202 when manual review required"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/wire"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-081",
+    "reasoning": "The requirement has four distinct testable behaviours: (1) happy-path wire under $100k queued immediately, (2) wire at/above $100k triggers manual-review 202, (3) stale 2FA returns 401, and (4) duplicate Idempotency-Key returns the original result. EP covers the normal under-threshold case; BVA pins the $100,000 boundary; NEG covers the stale-2FA auth failure; STC models the idempotency state transition from first-submission to duplicate-submission; DT covers the combined auth+amount decision table for the manual-review path. Tests use a shared fixture for HTTP session setup and a helper for fresh idempotency keys. Each test is self-contained and resets state via unique keys or mocked preconditions.",
+    "tests": [
+      {
+        "name": "test_wire_transfer_under_threshold_queued",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer 2FA verified within last 5 minutes",
+          "Transfer amount is $50,000 (well within $100,000 threshold)",
+          "Valid Idempotency-Key generated"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=50000, valid auth token, and unique Idempotency-Key",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code",
+          "Response body contains status='queued'",
+          "Response body contains a transfer_id",
+          "compliance_check field indicates check has started"
+        ],
+        "trace": [
+          "R-FIN-081: wire queued on valid submission under threshold",
+          "R-FIN-081: compliance check started on queued wire"
+        ],
+        "executable": "def test_wire_transfer_under_threshold_queued(api_session, fresh_idempotency_key, valid_auth_headers):\n    payload = {\n        \"amount\": 50000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"<test_beneficiary_account>\",\n        \"routing_number\": \"<test_routing_number>\"\n    }\n    headers = {**valid_auth_headers, \"Idempotency-Key\": fresh_idempotency_key}\n    resp = api_session.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201)\n    body = resp.json()\n    assert body.get(\"status\") == \"queued\"\n    assert \"transfer_id\" in body\n    assert body.get(\"compliance_check\") in (\"started\", \"pending\")"
+      },
+      {
+        "name": "test_wire_transfer_stale_2fa_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer 2FA was verified MORE than 5 minutes ago (stale token)",
+          "Transfer amount is $10,000",
+          "Valid Idempotency-Key generated"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=10000 and a stale/expired 2FA auth token",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 401 status code",
+          "Response body contains error code indicating stale or expired 2FA",
+          "No transfer_id is present in the response"
+        ],
+        "trace": [
+          "R-FIN-081: 401 when 2FA is stale"
+        ],
+        "executable": "def test_wire_transfer_stale_2fa_returns_401(api_session, fresh_idempotency_key, stale_auth_headers):\n    payload = {\n        \"amount\": 10000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"<test_beneficiary_account>\",\n        \"routing_number\": \"<test_routing_number>\"\n    }\n    headers = {**stale_auth_headers, \"Idempotency-Key\": fresh_idempotency_key}\n    resp = api_session.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 401\n    body = resp.json()\n    assert \"transfer_id\" not in body\n    error = body.get(\"error\", \"\").lower()\n    assert any(kw in error for kw in (\"2fa\", \"authentication\", \"expired\", \"stale\"))"
+      },
+      {
+        "name": "test_wire_transfer_at_100k_threshold_requires_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer 2FA verified within last 5 minutes",
+          "Transfer amount is exactly $100,000 (boundary value)",
+          "Valid Idempotency-Key generated"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=100000, valid auth token, and unique Idempotency-Key",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 202 status code indicating manual review required",
+          "Response body contains status indicating pending manual review",
+          "Response body contains a transfer_id"
+        ],
+        "trace": [
+          "R-FIN-081: transfers above $100,000 require manual review",
+          "R-FIN-081: 202 when manual review required",
+          "BVA: exact boundary value $100,000 tested"
+        ],
+        "executable": "def test_wire_transfer_at_100k_threshold_requires_manual_review(api_session, fresh_idempotency_key, valid_auth_headers):\n    payload = {\n        \"amount\": 100000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"<test_beneficiary_account>\",\n        \"routing_number\": \"<test_routing_number>\"\n    }\n    headers = {**valid_auth_headers, \"Idempotency-Key\": fresh_idempotency_key}\n    resp = api_session.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert \"transfer_id\" in body\n    status_val = body.get(\"status\", \"\").lower()\n    assert any(kw in status_val for kw in (\"manual_review\", \"pending_review\", \"review\"))"
+      },
+      {
+        "name": "test_wire_transfer_idempotency_duplicate_returns_original",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer 2FA verified within last 5 minutes",
+          "Transfer amount is $20,000",
+          "A fixed Idempotency-Key is used for both submissions",
+          "First submission has already been accepted by the system"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=20000, valid auth token, and a fixed Idempotency-Key (first submission)",
+          "Record the transfer_id and status from the first response",
+          "POST /transfers/wire again with identical payload and the SAME Idempotency-Key (duplicate submission)",
+          "Compare the second response against the first"
+        ],
+        "expected": [
+          "Both submissions return the same HTTP status code",
+          "Both responses contain the same transfer_id",
+          "Both responses contain the same status value",
+          "No new transfer is created on the duplicate submission"
+        ],
+        "trace": [
+          "R-FIN-081: duplicate submission with same Idempotency-Key must return the original result",
+          "STC: state transition from initial-submission to duplicate-submission"
+        ],
+        "executable": "def test_wire_transfer_idempotency_duplicate_returns_original(api_session, fixed_idempotency_key, valid_auth_headers):\n    payload = {\n        \"amount\": 20000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"<test_beneficiary_account>\",\n        \"routing_number\": \"<test_routing_number>\"\n    }\n    headers = {**valid_auth_headers, \"Idempotency-Key\": fixed_idempotency_key}\n    resp1 = api_session.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp1.status_code in (200, 201, 202)\n    body1 = resp1.json()\n    assert \"transfer_id\" in body1\n    resp2 = api_session.post(\"/transfers/wire\", json=payload, headers=headers)\n    body2 = resp2.json()\n    assert resp2.status_code == resp1.status_code\n    assert body2.get(\"transfer_id\") == body1.get(\"transfer_id\")\n    assert body2.get(\"status\") == body1.get(\"status\")"
+      },
+      {
+        "name": "test_wire_transfer_above_threshold_with_valid_2fa_requires_review",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer 2FA verified within last 5 minutes (valid auth)",
+          "Transfer amount is $150,000 (above $100,000 threshold)",
+          "Valid Idempotency-Key generated"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=150000, valid auth token, and unique Idempotency-Key",
+          "Capture HTTP status code, transfer_id, and compliance fields"
+        ],
+        "expected": [
+          "HTTP 202 status code",
+          "Response body contains transfer_id",
+          "Response body status indicates manual review pending",
+          "Compliance check is started"
+        ],
+        "trace": [
+          "R-FIN-081: transfers above $100,000 require manual review",
+          "R-FIN-081: 202 when manual review required",
+          "DT: decision rule - valid 2FA AND amount > $100k => 202 + manual review + compliance check"
+        ],
+        "executable": "def test_wire_transfer_above_threshold_with_valid_2fa_requires_review(api_session, fresh_idempotency_key, valid_auth_headers):\n    payload = {\n        \"amount\": 150000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"<test_beneficiary_account>\",\n        \"routing_number\": \"<test_routing_number>\"\n    }\n    headers = {**valid_auth_headers, \"Idempotency-Key\": fresh_idempotency_key}\n    resp = api_session.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert \"transfer_id\" in body\n    status_val = body.get(\"status\", \"\").lower()\n    assert any(kw in status_val for kw in (\"manual_review\", \"pending_review\", \"review\"))\n    assert body.get(\"compliance_check\") in (\"started\", \"pending\")"
+      }
+    ]
+  },
+  "req_id": "R-FIN-081",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1029,
+    "output_tokens": 2930,
+    "latency_ms": 30327,
+    "wall_ms": 30327,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-081\",\n  \"reasoning\": \"The requirement has four distinct testable behaviours: (1) happy-path wire under $100k queued immediately, (2) wire at/above $100k triggers manual-review 202, (3) stale 2FA returns 401, and (4) duplicate Idempotency-Key returns the original result. EP covers the normal under-threshold case; BVA pins the $100,000 boundary; NEG covers the stale-2FA auth failure; STC models the idempotency state transition from first-submission to duplicate-submission; DT covers the combined auth+amount decision table for the manual-review path. Tests use a shared fixture for HTTP session setup and a helper for fresh idempotency keys. Each test is self-contained and resets state via unique keys or mocked preconditions.\",\n  \"tests\": [\n    {\n      \"name\": \"test_wire_transfer_under_threshold_queued\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer 2FA verified within last 5 minutes\",\n        \"Transfer amount is $50,000 (well within $100,000 threshold)\",\n        \"Valid Idempotency-Key generated\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=50000, valid auth token, and unique Idempotency-Key\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 status code\",\n        \"Response body contains status='queued'\",\n        \"Response body contains a transfer_id\",\n        \"compliance_check field indicates check has started\"\n      ],\n      \"trace\": [\n        \"R-FIN-081: wire queued on valid submission under threshold\",\n        \"R-FIN-081: compliance check started on queued wire\"\n      ],\n      \"executable\": \"def test_wire_transfer_under_threshold_queued(api_session, fresh_idempotency_key, valid_auth_headers):\\n    payload = {\\n        \\\"amount\\\": 50000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"beneficiary_account\\\": \\\"<test_beneficiary_account>\\\",\\n        \\\"routing_number\\\": \\\"<test_routing_number>\\\"\\n    }\\n    headers = {**valid_auth_headers, \\\"Idempotency-Key\\\": fresh_idempotency_key}\\n    resp = api_session.post(\\\"/transfers/wire\\\", json=payload, headers=headers)\\n    assert resp.status_code in (200, 201)\\n    body = resp.json()\\n    assert body.get(\\\"status\\\") == \\\"queued\\\"\\n    assert \\\"transfer_id\\\" in body\\n    assert body.get(\\\"compliance_check\\\") in (\\\"started\\\", \\\"pending\\\")\"\n    },\n    {\n      \"name\": \"test_wire_transfer_stale_2fa_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer 2FA was verified MORE than 5 minutes ago (stale token)\",\n        \"Transfer amount is $10,000\",\n        \"Valid Idempotency-Key generated\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=10000 and a stale/expired 2FA auth token\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 401 status code\",\n        \"Response body contains error code indicating stale or expired 2FA\",\n        \"No transfer_id is present in the response\"\n      ],\n      \"trace\": [\n        \"R-FIN-081: 401 when 2FA is stale\"\n      ],\n      \"executable\": \"def test_wire_transfer_stale_2fa_returns_401(api_session, fresh_idempotency_key, stale_auth_headers):\\n    payload = {\\n        \\\"amount\\\": 10000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"beneficiary_account\\\": \\\"<test_beneficiary_account>\\\",\\n        \\\"routing_number\\\": \\\"<test_routing_number>\\\"\\n    }\\n    headers = {**stale_auth_headers, \\\"Idempotency-Key\\\": fresh_idempotency_key}\\n    resp = api_session.post(\\\"/transfers/wire\\\", json=payload, headers=headers)\\n    assert resp.status_code == 401\\n    body = resp.json()\\n    assert \\\"transfer_id\\\" not in body\\n    error = body.get(\\\"error\\\", \\\"\\\").lower()\\n    assert any(kw in error for kw in (\\\"2fa\\\", \\\"authentication\\\", \\\"expired\\\", \\\"stale\\\"))\"\n    },\n    {\n      \"name\": \"test_wire_transfer_at_100k_threshold_requires_manual_review\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"prec"
+  }
+}

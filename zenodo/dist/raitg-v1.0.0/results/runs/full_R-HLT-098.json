@@ -1,0 +1,143 @@
+{
+  "req": {
+    "id": "R-HLT-098",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Patient portal login (audit)",
+    "statement": "A patient shall log in using SSO; failed attempts shall be rate-limited and notify the patient. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "valid SSO assertion"
+    ],
+    "triggers": [
+      "patient logs in"
+    ],
+    "expected_outcomes": [
+      "session established"
+    ],
+    "error_pathways": [
+      "429 when too many attempts"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/portal/login"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-098",
+    "reasoning": "The requirement covers three testable scenarios: (1) successful SSO login establishing a session and emitting an AuditEvent \u2014 positive path via EP; (2) repeated failed login attempts triggering HTTP 429 rate-limiting with patient notification \u2014 negative path via NEG/DT; (3) the exact boundary attempt count (N-1 vs N) that transitions from allowed to rate-limited \u2014 boundary path via BVA/STC. Each test is self-contained using fixtures that reset rate-limit state and SSO stubs, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_successful_sso_login_establishes_session_and_emits_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Valid SSO assertion is available",
+          "Patient account exists in fhir-lite",
+          "Rate-limit counter is reset for the test patient",
+          "AuditEvent sink is observable (API or log)"
+        ],
+        "actions": [
+          "POST /portal/login with a valid SSO assertion payload",
+          "Capture HTTP response status and body",
+          "Query AuditEvent endpoint for the patient's login event"
+        ],
+        "expected": [
+          "HTTP 200 with session token in response body",
+          "Set-Cookie or Authorization header present",
+          "AuditEvent record exists with action=login, outcome=success, patient reference correct"
+        ],
+        "trace": [
+          "R-HLT-098: session established on valid SSO",
+          "R-HLT-098: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_successful_sso_login_establishes_session_and_emits_audit_event(\n    api_client,           # <fixture>: pre-configured httpx/requests session\n    valid_sso_assertion,  # <fixture>: returns signed SSO payload dict\n    reset_rate_limit,     # <fixture>: resets rate-limit for test patient\n    audit_event_query,    # <helper_fn>: queries FHIR AuditEvent API\n    test_patient_id,      # <fixture>: stable patient ID for this test run\n):\n    payload = valid_sso_assertion(patient_id=test_patient_id)\n\n    response = api_client.post(\"/portal/login\", json=payload)\n\n    assert response.status_code == 200, f\"Expected 200, got {response.status_code}\"\n    body = response.json()\n    assert \"session_token\" in body, \"No session_token in response\"\n    assert len(body[\"session_token\"]) > 0\n\n    events = audit_event_query(\n        patient_id=test_patient_id,\n        action=\"login\",\n        outcome=\"success\",\n    )\n    assert len(events) >= 1, \"AuditEvent not emitted for successful login\"\n    evt = events[-1]\n    assert evt[\"action\"] == \"login\"\n    assert evt[\"outcome\"] == \"success\"\n    assert test_patient_id in evt[\"patient_ref\"]"
+      },
+      {
+        "name": "test_repeated_failed_login_returns_429_and_notifies_patient",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient account exists in fhir-lite",
+          "Rate-limit counter is reset for the test patient",
+          "An invalid SSO assertion is constructable",
+          "Notification sink is observable (email stub or API)"
+        ],
+        "actions": [
+          "POST /portal/login with invalid SSO assertion N times (exceeding rate-limit threshold)",
+          "Capture each HTTP response status",
+          "Check notification stub for patient alert",
+          "Query AuditEvent for each failed attempt"
+        ],
+        "expected": [
+          "First (threshold) attempts return 401 Unauthorized",
+          "Attempt exceeding threshold returns 429 Too Many Requests",
+          "429 response body contains rate-limit error message",
+          "Patient notification fired (email/push) referencing failed login",
+          "AuditEvent emitted for every attempt including the rate-limited one"
+        ],
+        "trace": [
+          "R-HLT-098: failed attempts shall be rate-limited",
+          "R-HLT-098: notify the patient on rate-limit",
+          "R-HLT-098: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\n\nRATE_LIMIT_THRESHOLD = 5  # <config_const>: matches fhir-lite setting\n\ndef test_repeated_failed_login_returns_429_and_notifies_patient(\n    api_client,\n    invalid_sso_assertion,  # <fixture>: returns unsigned/bad SSO payload\n    reset_rate_limit,\n    audit_event_query,\n    notification_stub,      # <fixture>: captures outbound notifications\n    test_patient_id,\n):\n    payload = invalid_sso_assertion(patient_id=test_patient_id)\n\n    for attempt in range(1, RATE_LIMIT_THRESHOLD + 1):\n        resp = api_client.post(\"/portal/login\", json=payload)\n        assert resp.status_code == 401, (\n            f\"Attempt {attempt}: expected 401, got {resp.status_code}\"\n        )\n\n    over_limit = api_client.post(\"/portal/login\", json=payload)\n    assert over_limit.status_code == 429, (\n        f\"Expected 429 on attempt {RATE_LIMIT_THRESHOLD + 1}, \"\n        f\"got {over_limit.status_code}\"\n    )\n    assert \"rate\" in over_limit.text.lower(), \"No rate-limit message in 429 body\"\n\n    notices = notification_stub.get_notifications(patient_id=test_patient_id)\n    assert any(\"login\" in n[\"message\"].lower() for n in notices), (\n        \"Patient was not notified of excessive failed attempts\"\n    )\n\n    events = audit_event_query(patient_id=test_patient_id, action=\"login\")\n    assert len(events) >= RATE_LIMIT_THRESHOLD + 1, (\n        \"AuditEvent count less than number of attempts\"\n    )"
+      },
+      {
+        "name": "test_login_attempt_at_rate_limit_boundary_transitions_to_blocked",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient account exists in fhir-lite",
+          "Rate-limit counter is pre-seeded to threshold minus one (N-1)",
+          "An invalid SSO assertion is constructable",
+          "AuditEvent sink is observable"
+        ],
+        "actions": [
+          "Pre-seed rate-limit counter to N-1 via test-support API",
+          "POST /portal/login with invalid assertion (attempt N \u2014 last allowed)",
+          "Assert 401 returned (not yet blocked)",
+          "POST /portal/login with invalid assertion (attempt N+1 \u2014 first blocked)",
+          "Assert 429 returned",
+          "Verify AuditEvent emitted for both attempts"
+        ],
+        "expected": [
+          "Attempt exactly at threshold (N) returns 401, not 429",
+          "Attempt one beyond threshold (N+1) returns 429",
+          "State transition from ALLOWED to BLOCKED occurs precisely at N+1",
+          "AuditEvent records exist for both boundary attempts"
+        ],
+        "trace": [
+          "R-HLT-098: rate-limit boundary \u2014 BVA on attempt count",
+          "R-HLT-098: state transition ALLOWED->BLOCKED \u2014 STC",
+          "R-HLT-098: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\n\nRATE_LIMIT_THRESHOLD = 5  # <config_const>\n\ndef test_login_attempt_at_rate_limit_boundary_transitions_to_blocked(\n    api_client,\n    invalid_sso_assertion,\n    reset_rate_limit,\n    seed_rate_limit_counter,  # <helper_fn>: sets counter via admin/test API\n    audit_event_query,\n    test_patient_id,\n):\n    seed_rate_limit_counter(\n        patient_id=test_patient_id,\n        count=RATE_LIMIT_THRESHOLD - 1,\n    )\n\n    payload = invalid_sso_assertion(patient_id=test_patient_id)\n\n    # Attempt N: boundary \u2014 must still return 401, not 429\n    resp_at_limit = api_client.post(\"/portal/login\", json=payload)\n    assert resp_at_limit.status_code == 401, (\n        f\"Attempt N={RATE_LIMIT_THRESHOLD}: expected 401 (not yet blocked), \"\n        f\"got {resp_at_limit.status_code}\"\n    )\n\n    # Attempt N+1: one beyond boundary \u2014 must return 429\n    resp_over_limit = api_client.post(\"/portal/login\", json=payload)\n    assert resp_over_limit.status_code == 429, (\n        f\"Attempt N+1={RATE_LIMIT_THRESHOLD + 1}: expected 429, \"\n        f\"got {resp_over_limit.status_code}\"\n    )\n\n    events = audit_event_query(patient_id=test_patient_id, action=\"login\")\n    assert len(events) >= 2, \"Expected AuditEvents for both boundary attempts\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-098",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 994,
+    "output_tokens": 2503,
+    "latency_ms": 32762,
+    "wall_ms": 32762,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-098\",\n  \"reasoning\": \"The requirement covers three testable scenarios: (1) successful SSO login establishing a session and emitting an AuditEvent \u2014 positive path via EP; (2) repeated failed login attempts triggering HTTP 429 rate-limiting with patient notification \u2014 negative path via NEG/DT; (3) the exact boundary attempt count (N-1 vs N) that transitions from allowed to rate-limited \u2014 boundary path via BVA/STC. Each test is self-contained using fixtures that reset rate-limit state and SSO stubs, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_successful_sso_login_establishes_session_and_emits_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Valid SSO assertion is available\",\n        \"Patient account exists in fhir-lite\",\n        \"Rate-limit counter is reset for the test patient\",\n        \"AuditEvent sink is observable (API or log)\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with a valid SSO assertion payload\",\n        \"Capture HTTP response status and body\",\n        \"Query AuditEvent endpoint for the patient's login event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with session token in response body\",\n        \"Set-Cookie or Authorization header present\",\n        \"AuditEvent record exists with action=login, outcome=success, patient reference correct\"\n      ],\n      \"trace\": [\n        \"R-HLT-098: session established on valid SSO\",\n        \"R-HLT-098: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_successful_sso_login_establishes_session_and_emits_audit_event(\\n    api_client,           # <fixture>: pre-configured httpx/requests session\\n    valid_sso_assertion,  # <fixture>: returns signed SSO payload dict\\n    reset_rate_limit,     # <fixture>: resets rate-limit for test patient\\n    audit_event_query,    # <helper_fn>: queries FHIR AuditEvent API\\n    test_patient_id,      # <fixture>: stable patient ID for this test run\\n):\\n    payload = valid_sso_assertion(patient_id=test_patient_id)\\n\\n    response = api_client.post(\\\"/portal/login\\\", json=payload)\\n\\n    assert response.status_code == 200, f\\\"Expected 200, got {response.status_code}\\\"\\n    body = response.json()\\n    assert \\\"session_token\\\" in body, \\\"No session_token in response\\\"\\n    assert len(body[\\\"session_token\\\"]) > 0\\n\\n    events = audit_event_query(\\n        patient_id=test_patient_id,\\n        action=\\\"login\\\",\\n        outcome=\\\"success\\\",\\n    )\\n    assert len(events) >= 1, \\\"AuditEvent not emitted for successful login\\\"\\n    evt = events[-1]\\n    assert evt[\\\"action\\\"] == \\\"login\\\"\\n    assert evt[\\\"outcome\\\"] == \\\"success\\\"\\n    assert test_patient_id in evt[\\\"patient_ref\\\"]\"\n    },\n    {\n      \"name\": \"test_repeated_failed_login_returns_429_and_notifies_patient\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient account exists in fhir-lite\",\n        \"Rate-limit counter is reset for the test patient\",\n        \"An invalid SSO assertion is constructable\",\n        \"Notification sink is observable (email stub or API)\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with invalid SSO assertion N times (exceeding rate-limit threshold)\",\n        \"Capture each HTTP response status\",\n        \"Check notification stub for patient alert\",\n        \"Query AuditEvent for each failed attempt\"\n      ],\n      \"expected\": [\n        \"First (threshold) attempts return 401 Unauthorized\",\n        \"Attempt exceeding threshold returns 429 Too Many Requests\",\n        \"429 response body contains rate-limit error message\",\n        \"Patient notification fired (email/push) referencing failed login\",\n        \"AuditEvent emitted for every attempt including the rate-limited one\"\n      ],\n      \"trace\": [\n        \"R-HLT-098: failed attempts shall be rate-limited\",\n        \"R-HLT-098: notify the patient on rate-limit\",\n        \"R-HLT-098: AuditEvent emitted for every oper"
+  }
+}

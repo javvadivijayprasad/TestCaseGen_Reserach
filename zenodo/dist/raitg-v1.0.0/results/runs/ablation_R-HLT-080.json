@@ -1,0 +1,161 @@
+{
+  "req": {
+    "id": "R-HLT-080",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create observation (audit)",
+    "statement": "A clinician shall create an Observation tied to a patient with LOINC-coded code element; Observations without code shall be rejected. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician records observation"
+    ],
+    "expected_outcomes": [
+      "observation stored"
+    ],
+    "error_pathways": [
+      "422 when code missing"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-080",
+    "reasoning": "R-HLT-080 mandates three distinct verification concerns: (1) a well-formed Observation with a LOINC-coded code element is accepted and persisted (positive / EP), (2) an Observation lacking a code element is rejected with HTTP 422 (negative / NEG), and (3) an AuditEvent is emitted for every operation end-to-end (boundary / STC \u2014 the state transition from 'operation performed' to 'audit record exists'). A fourth Decision Table case covers the code-present vs code-absent decision axis explicitly. Each test authenticates as a clinician role, targets /Observation, and validates both the primary resource response and the AuditEvent side-effect to satisfy the audit requirement.",
+    "tests": [
+      {
+        "name": "test_create_observation_with_loinc_code_returns_201",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician role credentials are available via <fixture:auth_headers>",
+          "A patient resource exists with id provided by <fixture:patient_id>",
+          "FHIR-lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Build a minimal FHIR Observation payload with resourceType, status, subject, and a LOINC-coded code element",
+          "POST the payload to /Observation with clinician auth headers",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'resourceType': 'Observation'",
+          "Response body contains the submitted LOINC code (8867-4)",
+          "Response body contains an 'id' field (server-assigned)"
+        ],
+        "trace": [
+          "R-HLT-080: clinician creates Observation tied to patient with LOINC-coded code",
+          "R-HLT-080: observation stored"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_observation_with_loinc_code_returns_201(auth_headers, patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [\n                {\n                    \"system\": \"http://loinc.org\",\n                    \"code\": \"8867-4\",\n                    \"display\": \"Heart rate\"\n                }\n            ]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=auth_headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    assert body.get(\"id\"), \"Server must assign an id\"\n    codes = [c[\"code\"] for c in body[\"code\"][\"coding\"]]\n    assert \"8867-4\" in codes\n"
+      },
+      {
+        "name": "test_create_observation_without_code_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician role credentials are available via <fixture:auth_headers>",
+          "A patient resource exists with id provided by <fixture:patient_id>",
+          "FHIR-lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Build a FHIR Observation payload that omits the 'code' element entirely",
+          "POST the payload to /Observation with clinician auth headers",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body indicates validation failure related to missing 'code'"
+        ],
+        "trace": [
+          "R-HLT-080: Observations without code shall be rejected",
+          "R-HLT-080: error pathway 422 when code missing"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_observation_without_code_returns_422(auth_headers, patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"valueQuantity\": {\"value\": 98, \"unit\": \"bpm\"}\n        # 'code' element deliberately omitted\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=auth_headers)\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    # FHIR OperationOutcome or app error must reference the missing field\n    text = str(body).lower()\n    assert \"code\" in text or \"missing\" in text or \"required\" in text, (\n        f\"Response should reference missing 'code': {body}\"\n    )\n"
+      },
+      {
+        "name": "test_audit_event_emitted_for_observation_creation",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician role credentials are available via <fixture:auth_headers>",
+          "A patient resource exists with id provided by <fixture:patient_id>",
+          "FHIR-lite service is reachable at BASE_URL",
+          "AuditEvent endpoint /AuditEvent is queryable"
+        ],
+        "actions": [
+          "Record a timestamp immediately before the operation",
+          "POST a valid LOINC-coded Observation to /Observation",
+          "Assert HTTP 201 to confirm the resource state transition",
+          "Query /AuditEvent filtering by the newly created Observation id",
+          "Assert that exactly one AuditEvent exists referencing the Observation"
+        ],
+        "expected": [
+          "HTTP 201 for Observation creation",
+          "At least one AuditEvent returned for the created Observation id",
+          "AuditEvent action type corresponds to a create/write operation",
+          "AuditEvent agent role indicates clinician"
+        ],
+        "trace": [
+          "R-HLT-080: AuditEvent must be emitted for every operation",
+          "R-HLT-080: tested end-to-end"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_audit_event_emitted_for_observation_creation(auth_headers, patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"29463-7\", \"display\": \"Body weight\"}]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"valueQuantity\": {\"value\": 70, \"unit\": \"kg\"}\n    }\n    obs_resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=auth_headers)\n    assert obs_resp.status_code == 201, f\"Observation creation failed: {obs_resp.text}\"\n    obs_id = obs_resp.json()[\"id\"]\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Observation/{obs_id}\"},\n        headers=auth_headers\n    )\n    assert audit_resp.status_code == 200, f\"AuditEvent query failed: {audit_resp.text}\"\n    bundle = audit_resp.json()\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) >= 1, f\"Expected AuditEvent for Observation/{obs_id}, got none\"\n    actions = [e[\"resource\"].get(\"action\") for e in entries if \"resource\" in e]\n    assert any(a in (\"C\", \"U\", \"E\") for a in actions), f\"Unexpected audit action types: {actions}\"\n"
+      },
+      {
+        "name": "test_observation_code_present_vs_absent_decision_table",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician role credentials are available via <fixture:auth_headers>",
+          "A patient resource exists with id provided by <fixture:patient_id>",
+          "FHIR-lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Define a decision table: row A: code present + valid LOINC -> expect 201; row B: code present + empty coding list -> expect 422; row C: code element null -> expect 422",
+          "Execute each row as a parameterised POST to /Observation",
+          "Assert the expected HTTP status for each condition combination"
+        ],
+        "expected": [
+          "Row A (valid LOINC code): HTTP 201",
+          "Row B (empty coding list): HTTP 422",
+          "Row C (null code element): HTTP 422"
+        ],
+        "trace": [
+          "R-HLT-080: LOINC-coded code element required",
+          "R-HLT-080: Observations without code shall be rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"label,code_field,expected_status\", [\n    (\n        \"valid_loinc\",\n        {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"55284-4\", \"display\": \"BP\"}]},\n        201\n    ),\n    (\n        \"empty_coding_list\",\n        {\"coding\": []},\n        422\n    ),\n    (\n        \"null_code\",\n        None,\n        422\n    ),\n])\ndef test_observation_code_present_vs_absent_decision_table(\n    label, code_field, expected_status, auth_headers, patient_id, base_url\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    if code_field is not None:\n        payload[\"code\"] = code_field\n    # null code: omit key entirely to test missing-field path\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=auth_headers)\n    assert resp.status_code == expected_status, (\n        f\"[{label}] Expected {expected_status}, got {resp.status_code}: {resp.text}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-080",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1005,
+    "output_tokens": 2931,
+    "latency_ms": 37310,
+    "wall_ms": 37310,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-080\",\n  \"reasoning\": \"R-HLT-080 mandates three distinct verification concerns: (1) a well-formed Observation with a LOINC-coded code element is accepted and persisted (positive / EP), (2) an Observation lacking a code element is rejected with HTTP 422 (negative / NEG), and (3) an AuditEvent is emitted for every operation end-to-end (boundary / STC \u2014 the state transition from 'operation performed' to 'audit record exists'). A fourth Decision Table case covers the code-present vs code-absent decision axis explicitly. Each test authenticates as a clinician role, targets /Observation, and validates both the primary resource response and the AuditEvent side-effect to satisfy the audit requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_observation_with_loinc_code_returns_201\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician role credentials are available via <fixture:auth_headers>\",\n        \"A patient resource exists with id provided by <fixture:patient_id>\",\n        \"FHIR-lite service is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"Build a minimal FHIR Observation payload with resourceType, status, subject, and a LOINC-coded code element\",\n        \"POST the payload to /Observation with clinician auth headers\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains 'resourceType': 'Observation'\",\n        \"Response body contains the submitted LOINC code (8867-4)\",\n        \"Response body contains an 'id' field (server-assigned)\"\n      ],\n      \"trace\": [\n        \"R-HLT-080: clinician creates Observation tied to patient with LOINC-coded code\",\n        \"R-HLT-080: observation stored\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_observation_with_loinc_code_returns_201(auth_headers, patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\n            \\\"coding\\\": [\\n                {\\n                    \\\"system\\\": \\\"http://loinc.org\\\",\\n                    \\\"code\\\": \\\"8867-4\\\",\\n                    \\\"display\\\": \\\"Heart rate\\\"\\n                }\\n            ]\\n        },\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_url}/Observation\\\", json=payload, headers=auth_headers)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Observation\\\"\\n    assert body.get(\\\"id\\\"), \\\"Server must assign an id\\\"\\n    codes = [c[\\\"code\\\"] for c in body[\\\"code\\\"][\\\"coding\\\"]]\\n    assert \\\"8867-4\\\" in codes\\n\"\n    },\n    {\n      \"name\": \"test_create_observation_without_code_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician role credentials are available via <fixture:auth_headers>\",\n        \"A patient resource exists with id provided by <fixture:patient_id>\",\n        \"FHIR-lite service is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"Build a FHIR Observation payload that omits the 'code' element entirely\",\n        \"POST the payload to /Observation with clinician auth headers\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body indicates validation failure related to missing 'code'\"\n      ],\n      \"trace\": [\n        \"R-HLT-080: Observations without code shall be rejected\",\n        \"R-HLT-080: error pathway 422 when code missing\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_observation_without_code_returns_422(auth_headers, patient_id, base_url):\\n    payload = {\\n  "
+  }
+}

@@ -1,0 +1,222 @@
+{
+  "req": {
+    "id": "R-WEB-061",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Submit leave request \u2014 variant 5",
+    "statement": "A full-time employee shall be able to submit a leave request for between 1 and 30 business days; requests spanning more than 30 days require hr-admin approval. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated",
+      "employment_type:full_time"
+    ],
+    "triggers": [
+      "employee submits form"
+    ],
+    "expected_outcomes": [
+      "request created",
+      "manager notified",
+      "notification email sent",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "400 when start_date > end_date",
+      "409 when overlapping existing leave",
+      "422 when request exceeds 30 days without hr-admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-061",
+    "reasoning": "The requirement defines a leave-request submission flow with: (1) a valid range of 1-30 business days for self-approval, (2) >30 days requiring hr-admin approval, (3) 2FA confirmation mandatory, and (4) three explicit error pathways (400, 409, 422). Test selection covers: EP for a nominal in-range request; BVA for the exact 30-day upper boundary; NEG/NEG for start>end (400) and overlapping leave (409); DT for the >30 days without hr-admin (422) decision-table rule \u2014 this test is negative kind paired with DT heuristic because the DT condition combination (employee + days>30 + no hr-admin) yields an error outcome; STC for the state transition from draft to pending after form submission. The violation in test[5] was that a negative kind was paired with STC heuristic \u2014 STC is reserved for state-transition coverage which is a structural/positive technique. The fix reassigns test[5] (the 422 scenario) from heuristic=STC to heuristic=DT, which correctly models the decision-table condition combination driving the error pathway.",
+    "tests": [
+      {
+        "name": "test_submit_leave_request_valid_mid_range",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "2FA is enrolled and OTP is available",
+          "No overlapping leave exists for the chosen date range",
+          "Chosen date range spans 10 business days (well within 1-30 partition)"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date covering 10 business days",
+          "Submit the form",
+          "Complete 2FA OTP prompt"
+        ],
+        "expected": [
+          "HTTP 201 / success page shown",
+          "Leave request record created in DB",
+          "Manager receives in-app notification",
+          "Notification email dispatched to employee"
+        ],
+        "trace": [
+          "R-WEB-061: positive path, 1-30 day partition",
+          "R-WEB-061: 2FA confirmation required",
+          "R-WEB-061: manager notified; email sent"
+        ],
+        "executable": "def test_submit_leave_request_valid_mid_range(page, auth_full_time_employee, otp_provider, api_client):\n    start, end = business_day_range(days=10)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n    otp = otp_provider.current_otp(auth_full_time_employee[\"totp_secret\"])\n    page.fill(\"[data-testid='otp-input']\", otp)\n    page.click(\"[data-testid='otp-confirm-btn']\")\n    assert page.locator(\"[data-testid='success-banner']\").is_visible()\n    leave = api_client.get_latest_leave(auth_full_time_employee[\"id\"])\n    assert leave[\"status\"] == \"pending\"\n    assert leave[\"start_date\"] == start\n    notifications = api_client.get_manager_notifications(auth_full_time_employee[\"manager_id\"])\n    assert any(n[\"leave_id\"] == leave[\"id\"] for n in notifications)\n    emails = get_sent_emails(auth_full_time_employee[\"email\"])\n    assert len(emails) >= 1"
+      },
+      {
+        "name": "test_submit_leave_request_exactly_30_days_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "2FA is enrolled and OTP is available",
+          "No overlapping leave exists for the chosen date range",
+          "Chosen date range spans exactly 30 business days (upper boundary)"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date covering exactly 30 business days",
+          "Submit the form",
+          "Complete 2FA OTP prompt"
+        ],
+        "expected": [
+          "HTTP 201 / success page shown (no hr-admin approval required at boundary)",
+          "Leave request status is 'pending' not 'pending_hr_admin'",
+          "Manager notified; email sent"
+        ],
+        "trace": [
+          "R-WEB-061: upper boundary BVA \u2014 30 days is last self-approval value",
+          "R-WEB-061: >30 days triggers 422 / hr-admin path; =30 must not"
+        ],
+        "executable": "def test_submit_leave_request_exactly_30_days_boundary(page, auth_full_time_employee, otp_provider, api_client):\n    start, end = business_day_range(days=30)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n    otp = otp_provider.current_otp(auth_full_time_employee[\"totp_secret\"])\n    page.fill(\"[data-testid='otp-input']\", otp)\n    page.click(\"[data-testid='otp-confirm-btn']\")\n    assert page.locator(\"[data-testid='success-banner']\").is_visible()\n    leave = api_client.get_latest_leave(auth_full_time_employee[\"id\"])\n    assert leave[\"status\"] == \"pending\"\n    assert leave[\"business_days\"] == 30"
+      },
+      {
+        "name": "test_submit_leave_request_start_after_end_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "2FA is enrolled"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with a date after end_date",
+          "Submit the form"
+        ],
+        "expected": [
+          "Form or API returns HTTP 400",
+          "Error message indicates start_date must not exceed end_date",
+          "No leave record created"
+        ],
+        "trace": [
+          "R-WEB-061 error pathway: 400 when start_date > end_date"
+        ],
+        "executable": "def test_submit_leave_request_start_after_end_returns_400(page, auth_full_time_employee, api_client):\n    start = date_offset(days=10)\n    end = date_offset(days=5)\n    count_before = api_client.leave_count(auth_full_time_employee[\"id\"])\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n    error = page.locator(\"[data-testid='form-error']\")\n    assert error.is_visible()\n    assert \"start date\" in error.inner_text().lower()\n    assert api_client.leave_count(auth_full_time_employee[\"id\"]) == count_before"
+      },
+      {
+        "name": "test_submit_leave_request_overlapping_existing_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "2FA is enrolled",
+          "An approved leave already exists overlapping the target date range"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date overlapping the existing leave",
+          "Submit the form",
+          "Complete 2FA OTP prompt"
+        ],
+        "expected": [
+          "HTTP 409 returned",
+          "UI displays overlap conflict message",
+          "No new leave record created"
+        ],
+        "trace": [
+          "R-WEB-061 error pathway: 409 when overlapping existing leave"
+        ],
+        "executable": "def test_submit_leave_request_overlapping_existing_returns_409(page, auth_full_time_employee, otp_provider, api_client):\n    existing_start, existing_end = business_day_range(days=5)\n    seed_approved_leave(auth_full_time_employee[\"id\"], existing_start, existing_end)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", existing_start)\n    page.fill(\"[data-testid='end-date']\", existing_end)\n    page.click(\"[data-testid='submit-btn']\")\n    otp = otp_provider.current_otp(auth_full_time_employee[\"totp_secret\"])\n    page.fill(\"[data-testid='otp-input']\", otp)\n    page.click(\"[data-testid='otp-confirm-btn']\")\n    error = page.locator(\"[data-testid='conflict-error']\")\n    assert error.is_visible()\n    assert \"overlap\" in error.inner_text().lower()\n    assert api_client.leave_count(auth_full_time_employee[\"id\"]) == 1"
+      },
+      {
+        "name": "test_submit_leave_request_exceeds_30_days_without_hr_admin_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as a full-time employee (not hr-admin)",
+          "2FA is enrolled",
+          "No overlapping leave exists",
+          "Chosen date range spans 31 business days"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date covering 31 business days",
+          "Submit the form",
+          "Complete 2FA OTP prompt"
+        ],
+        "expected": [
+          "HTTP 422 returned",
+          "UI displays message requiring hr-admin approval",
+          "Leave request not created in pending state"
+        ],
+        "trace": [
+          "R-WEB-061 error pathway: 422 when request exceeds 30 days without hr-admin",
+          "R-WEB-061: DT rule \u2014 actor=employee, days>30, no hr-admin => 422"
+        ],
+        "executable": "def test_submit_leave_request_exceeds_30_days_without_hr_admin_returns_422(page, auth_full_time_employee, otp_provider, api_client):\n    start, end = business_day_range(days=31)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n    otp = otp_provider.current_otp(auth_full_time_employee[\"totp_secret\"])\n    page.fill(\"[data-testid='otp-input']\", otp)\n    page.click(\"[data-testid='otp-confirm-btn']\")\n    error = page.locator(\"[data-testid='hr-admin-required-error']\")\n    assert error.is_visible()\n    assert \"hr-admin\" in error.inner_text().lower()\n    leave = api_client.get_latest_leave(auth_full_time_employee[\"id\"])\n    assert leave is None or leave[\"status\"] != \"pending\""
+      },
+      {
+        "name": "test_submit_leave_request_state_transition_draft_to_pending",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "2FA is enrolled and OTP is available",
+          "No overlapping leave exists",
+          "Chosen date range spans 5 business days"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Verify leave form is in initial draft state",
+          "Fill start_date and end_date covering 5 business days",
+          "Submit the form",
+          "Complete 2FA OTP prompt",
+          "Retrieve the created leave record via API"
+        ],
+        "expected": [
+          "Leave record transitions from no state (draft UI) to status='pending' after successful submission",
+          "State 'pending' is reflected immediately in the API response",
+          "No intermediate error state is observed"
+        ],
+        "trace": [
+          "R-WEB-061: STC \u2014 state transition: draft form -> submitted -> pending",
+          "R-WEB-061: request created outcome; additional variant semantics honoured"
+        ],
+        "executable": "def test_submit_leave_request_state_transition_draft_to_pending(page, auth_full_time_employee, otp_provider, api_client):\n    start, end = business_day_range(days=5)\n    page.goto(\"/leave-requests/new\")\n    assert page.locator(\"[data-testid='leave-form']\").is_visible()\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n    otp = otp_provider.current_otp(auth_full_time_employee[\"totp_secret\"])\n    page.fill(\"[data-testid='otp-input']\", otp)\n    page.click(\"[data-testid='otp-confirm-btn']\")\n    assert page.locator(\"[data-testid='success-banner']\").is_visible()\n    leave = api_client.get_latest_leave(auth_full_time_employee[\"id\"])\n    assert leave is not None\n    assert leave[\"status\"] == \"pending\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-061",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1055,
+    "output_tokens": 3658,
+    "latency_ms": 42613,
+    "wall_ms": 42613,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-061\",\n  \"reasoning\": \"The requirement defines a leave-request submission flow with: (1) a valid range of 1-30 business days for self-approval, (2) >30 days requiring hr-admin approval, (3) 2FA confirmation mandatory, and (4) three explicit error pathways (400, 409, 422). Test selection covers: EP for a nominal in-range request; BVA for the exact 30-day upper boundary; NEG for start>end (400), overlapping leave (409), and >30 days without hr-admin (422); DT for the 2FA gate; STC for the state transition from 'draft' to 'pending' after form submission.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_leave_request_valid_mid_range\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"2FA is enrolled and OTP is available\",\n        \"No overlapping leave exists for the chosen date range\",\n        \"Chosen date range spans 10 business days (well within 1-30 partition)\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date and end_date covering 10 business days\",\n        \"Submit the form\",\n        \"Complete 2FA OTP prompt\"\n      ],\n      \"expected\": [\n        \"HTTP 201 / success page shown\",\n        \"Leave request record created in DB\",\n        \"Manager receives in-app notification\",\n        \"Notification email dispatched to employee\"\n      ],\n      \"trace\": [\n        \"R-WEB-061: positive path, 1-30 day partition\",\n        \"R-WEB-061: 2FA confirmation required\",\n        \"R-WEB-061: manager notified; email sent\"\n      ],\n      \"executable\": \"def test_submit_leave_request_valid_mid_range(page, auth_full_time_employee, otp_provider, api_client):\\n    start, end = <helper_fn>.business_day_range(days=10)\\n    page.goto(\\\"/leave-requests/new\\\")\\n    page.fill(\\\"[data-testid='start-date']\\\", start)\\n    page.fill(\\\"[data-testid='end-date']\\\", end)\\n    page.click(\\\"[data-testid='submit-btn']\\\")\\n    otp = otp_provider.current_otp(auth_full_time_employee[\\\"totp_secret\\\"])\\n    page.fill(\\\"[data-testid='otp-input']\\\", otp)\\n    page.click(\\\"[data-testid='otp-confirm-btn']\\\")\\n    assert page.locator(\\\"[data-testid='success-banner']\\\").is_visible()\\n    leave = api_client.get_latest_leave(auth_full_time_employee[\\\"id\\\"])\\n    assert leave[\\\"status\\\"] == \\\"pending\\\"\\n    assert leave[\\\"start_date\\\"] == start\\n    notifications = api_client.get_manager_notifications(auth_full_time_employee[\\\"manager_id\\\"])\\n    assert any(n[\\\"leave_id\\\"] == leave[\\\"id\\\"] for n in notifications)\\n    emails = <helper_fn>.get_sent_emails(auth_full_time_employee[\\\"email\\\"])\\n    assert len(emails) >= 1\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_exactly_30_days_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"2FA is enrolled and OTP is available\",\n        \"No overlapping leave exists for the chosen date range\",\n        \"Chosen date range spans exactly 30 business days (upper boundary)\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date and end_date covering exactly 30 business days\",\n        \"Submit the form\",\n        \"Complete 2FA OTP prompt\"\n      ],\n      \"expected\": [\n        \"HTTP 201 / success page shown (no hr-admin approval required at boundary)\",\n        \"Leave request status is 'pending' not 'pending_hr_admin'\",\n        \"Manager notified; email sent\"\n      ],\n      \"trace\": [\n        \"R-WEB-061: upper boundary BVA \u2014 30 days is last self-approval value\",\n        \"R-WEB-061: >30 days triggers 422 / hr-admin path; =30 must not\"\n      ],\n      \"executable\": \"def test_submit_leave_request_exactly_30_days_boundary(page, auth_full_time_employee, otp_provider, api_client):\\n    start, end = <helper_fn>.business_day_range(days=30)\\n    page.goto(\\\"/leave-requests/new\\\")\\n    page.fill(\\\"[data-testid='start-date']\\\", start)\\n    page.fill(\\\"[da"
+  }
+}

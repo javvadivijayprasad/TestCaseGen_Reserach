@@ -1,0 +1,149 @@
+{
+  "req": {
+    "id": "R-FIN-011",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Beneficiary management",
+    "statement": "A customer shall add a beneficiary which enters a 24-hour cooling-off period before it can receive transfers.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds beneficiary"
+    ],
+    "expected_outcomes": [
+      "beneficiary saved in pending state"
+    ],
+    "error_pathways": [
+      "409 if duplicate account"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/beneficiaries"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-011",
+    "reasoning": "R-FIN-011 mandates that adding a beneficiary produces a pending state with a 24-hour cooling-off period. Four tests are designed: (1) EP positive \u2013 a valid, unique beneficiary is accepted with 201 and status=pending; (2) NEG negative \u2013 a duplicate account number triggers a 409 conflict; (3) BVA boundary \u2013 the beneficiary status exactly at the 24-hour mark transitions from pending to active, verifying the boundary of the cooling-off window; (4) STC negative \u2013 an attempt to use a pending beneficiary as a transfer destination before cooling-off expires is rejected, confirming the state machine blocks premature use. The violation fix: test[3] had kind=negative and heuristic=STC, which is valid per schema rules since STC can be used with negative kind to represent a state-transition that must NOT occur; however the rule-checker flagged STC as only valid for non-negative kinds. To comply, the heuristic for test[3] is changed to NEG while retaining the state-transition rationale in the trace, preserving full coverage of the cooling-off enforcement behaviour.",
+    "tests": [
+      {
+        "name": "test_add_valid_beneficiary_enters_pending_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Beneficiary account number does not already exist for this customer"
+        ],
+        "actions": [
+          "POST /beneficiaries with a valid, unique account payload",
+          "Inspect HTTP response status and JSON body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status=pending",
+          "Response body contains a non-null beneficiary_id",
+          "Response body contains cooling_off_expires_at timestamp ~24 h in the future"
+        ],
+        "trace": [
+          "R-FIN-011: beneficiary saved in pending state",
+          "R-FIN-011: 24-hour cooling-off period begins on add"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_add_valid_beneficiary_enters_pending_state(auth_client, unique_account_number):\n    payload = {\n        \"account_number\": unique_account_number,\n        \"account_name\": \"Alice Example\",\n        \"bank_code\": \"TESTBANK\"\n    }\n    resp = auth_client.post(\"/beneficiaries\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\", f\"Expected pending, got {body.get('status')}\"\n    assert body.get(\"beneficiary_id\") is not None\n    expires_at = datetime.fromisoformat(body[\"cooling_off_expires_at\"])\n    now_utc = datetime.now(timezone.utc)\n    expected_expiry = now_utc + timedelta(hours=24)\n    delta = abs((expires_at - expected_expiry).total_seconds())\n    assert delta < 60, f\"cooling_off_expires_at drift too large: {delta}s\"\n"
+      },
+      {
+        "name": "test_add_duplicate_beneficiary_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A beneficiary with the same account number already exists for this customer (seeded via fixture)"
+        ],
+        "actions": [
+          "POST /beneficiaries with an account_number that is already registered for the customer",
+          "Inspect HTTP response status and JSON body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains an error code indicating duplicate account"
+        ],
+        "trace": [
+          "R-FIN-011: error pathway \u2013 409 if duplicate account"
+        ],
+        "executable": "import pytest\n\ndef test_add_duplicate_beneficiary_returns_409(auth_client, existing_beneficiary_account):\n    payload = {\n        \"account_number\": existing_beneficiary_account,\n        \"account_name\": \"Duplicate User\",\n        \"bank_code\": \"TESTBANK\"\n    }\n    resp = auth_client.post(\"/beneficiaries\", json=payload)\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"error\" in body or \"code\" in body, \"Response must contain error detail\"\n    error_text = str(body.get(\"error\", body.get(\"code\", \"\"))).lower()\n    assert \"duplicate\" in error_text or \"already\" in error_text or \"conflict\" in error_text, \\\n        f\"Unexpected error message: {error_text}\"\n"
+      },
+      {
+        "name": "test_beneficiary_status_at_exactly_24h_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A beneficiary was created exactly 24 hours ago (clock-controlled via fixture or test-clock API)",
+          "System test-clock is available to advance time"
+        ],
+        "actions": [
+          "Advance system test-clock to T+24h using <advance_clock_fixture>",
+          "GET /beneficiaries/{beneficiary_id} to retrieve current status"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body contains status=active (cooling-off expired)",
+          "Beneficiary is no longer in pending state at the 24-hour boundary"
+        ],
+        "trace": [
+          "R-FIN-011: 24-hour cooling-off period \u2013 boundary at exactly 24 h",
+          "BVA: at T=24h the state transitions from pending to active"
+        ],
+        "executable": "import pytest\n\ndef test_beneficiary_status_at_exactly_24h_boundary(\n    auth_client, beneficiary_created_24h_ago, advance_clock\n):\n    beneficiary_id = beneficiary_created_24h_ago[\"beneficiary_id\"]\n    cooling_off_expires_at = beneficiary_created_24h_ago[\"cooling_off_expires_at\"]\n    advance_clock(to_iso=cooling_off_expires_at)\n    resp = auth_client.get(f\"/beneficiaries/{beneficiary_id}\")\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"active\", \\\n        f\"Expected active at 24h boundary, got {body.get('status')}\"\n"
+      },
+      {
+        "name": "test_pending_beneficiary_cannot_receive_transfer",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A beneficiary exists with status=pending (cooling-off not yet expired)",
+          "Customer account has sufficient funds for a transfer"
+        ],
+        "actions": [
+          "POST /transfers targeting the pending beneficiary_id before the 24-hour cooling-off expires",
+          "Inspect HTTP response status and JSON body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity or 403 Forbidden",
+          "Response body contains an error indicating the beneficiary is in a cooling-off period",
+          "No transfer record is created"
+        ],
+        "trace": [
+          "R-FIN-011: 24-hour cooling-off period before beneficiary can receive transfers",
+          "NEG/STC: state=pending must block the transfer trigger; transfer is only valid from state=active"
+        ],
+        "executable": "import pytest\n\nALLOWED_BLOCK_STATUSES = {403, 422, 400}\n\ndef test_pending_beneficiary_cannot_receive_transfer(\n    auth_client, pending_beneficiary\n):\n    beneficiary_id = pending_beneficiary[\"beneficiary_id\"]\n    transfer_payload = {\n        \"beneficiary_id\": beneficiary_id,\n        \"amount\": \"10.00\",\n        \"currency\": \"USD\",\n        \"reference\": \"cooling-off-transfer-test\"\n    }\n    resp = auth_client.post(\"/transfers\", json=transfer_payload)\n    assert resp.status_code in ALLOWED_BLOCK_STATUSES, \\\n        f\"Expected transfer to be blocked, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_text = str(body.get(\"error\", body.get(\"message\", \"\"))).lower()\n    assert any(kw in error_text for kw in [\"cooling\", \"pending\", \"not active\", \"restricted\"]), \\\n        f\"Expected cooling-off error, got: {error_text}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-011",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 975,
+    "output_tokens": 2266,
+    "latency_ms": 26234,
+    "wall_ms": 26234,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-011\",\n  \"reasoning\": \"R-FIN-011 mandates that adding a beneficiary produces a pending state with a 24-hour cooling-off period. Four tests are designed: (1) EP positive \u2013 a valid, unique beneficiary is accepted with 201 and status=pending; (2) NEG negative \u2013 a duplicate account number triggers a 409 conflict; (3) BVA boundary \u2013 the beneficiary status exactly at the 24-hour mark transitions from pending to active, verifying the boundary of the cooling-off window; (4) STC state-transition \u2013 an attempt to use a pending beneficiary as a transfer destination before cooling-off expires is rejected, confirming the state machine blocks premature use.\",\n  \"tests\": [\n    {\n      \"name\": \"test_add_valid_beneficiary_enters_pending_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"Beneficiary account number does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with a valid, unique account payload\",\n        \"Inspect HTTP response status and JSON body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status=pending\",\n        \"Response body contains a non-null beneficiary_id\",\n        \"Response body contains cooling_off_expires_at timestamp ~24 h in the future\"\n      ],\n      \"trace\": [\n        \"R-FIN-011: beneficiary saved in pending state\",\n        \"R-FIN-011: 24-hour cooling-off period begins on add\"\n      ],\n      \"executable\": \"import pytest\\nimport re\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_add_valid_beneficiary_enters_pending_state(auth_client, unique_account_number):\\n    payload = {\\n        \\\"account_number\\\": unique_account_number,\\n        \\\"account_name\\\": \\\"Alice Example\\\",\\n        \\\"bank_code\\\": \\\"TESTBANK\\\"\\n    }\\n    resp = auth_client.post(\\\"/beneficiaries\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\", f\\\"Expected pending, got {body.get('status')}\\\"\\n    assert body.get(\\\"beneficiary_id\\\") is not None\\n    expires_at = datetime.fromisoformat(body[\\\"cooling_off_expires_at\\\"])\\n    now_utc = datetime.now(timezone.utc)\\n    expected_expiry = now_utc + timedelta(hours=24)\\n    delta = abs((expires_at - expected_expiry).total_seconds())\\n    assert delta < 60, f\\\"cooling_off_expires_at drift too large: {delta}s\\\"\\n\"\n    },\n    {\n      \"name\": \"test_add_duplicate_beneficiary_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"A beneficiary with the same account number already exists for this customer (seeded via fixture)\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with an account_number that is already registered for the customer\",\n        \"Inspect HTTP response status and JSON body\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response body contains an error code indicating duplicate account\"\n      ],\n      \"trace\": [\n        \"R-FIN-011: error pathway \u2013 409 if duplicate account\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_add_duplicate_beneficiary_returns_409(auth_client, existing_beneficiary_account):\\n    payload = {\\n        \\\"account_number\\\": existing_beneficiary_account,\\n        \\\"account_name\\\": \\\"Duplicate User\\\",\\n        \\\"bank_code\\\": \\\"TESTBANK\\\"\\n    }\\n    resp = auth_client.post(\\\"/beneficiaries\\\", json=payload)\\n    assert resp.status_code == 409, f\\\"Expected 409, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"code\\\" in body, \\\"Response must contain error detail\\\"\\n    error_text = str(body.get(\\\"error\\\", body.get(\\\"code\\\", \\\"\\\"))).lower()\\n    assert \\\"duplicate\\\" in error_text or \\\"already\\\" in error_text or \\\"conflict\\\" in error_text, \\"
+  }
+}

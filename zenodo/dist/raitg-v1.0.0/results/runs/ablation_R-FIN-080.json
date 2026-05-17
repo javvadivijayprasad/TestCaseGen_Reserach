@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-FIN-080",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Recurring transfer (idempotency variant)",
+    "statement": "A premium-tier customer shall be able to schedule a recurring transfer up to $10,000 per occurrence; non-premium accounts capped at $2,500. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "tier in {standard,premium}"
+    ],
+    "triggers": [
+      "customer schedules transfer"
+    ],
+    "expected_outcomes": [
+      "schedule persisted",
+      "next run calculated"
+    ],
+    "error_pathways": [
+      "422 when per-occurrence limit exceeded",
+      "422 when frequency unsupported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/recurring"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-080",
+    "reasoning": "The requirement defines two equivalence partitions for tier-based limits (standard/premium), a hard boundary at $2,500 for standard and $10,000 for premium, an idempotency contract for duplicate submissions, and two explicit 422 error paths (limit exceeded, unsupported frequency). Tests are designed to cover: (1) EP \u2013 valid premium schedule within limit; (2) NEG \u2013 standard account exceeds $2,500 cap; (3) BVA \u2013 standard account at exactly $2,500 (upper boundary, valid); (4) DT \u2013 idempotency: duplicate key returns original result; (5) NEG \u2013 unsupported frequency yields 422. All tests are self-contained via fixtures and use a unique Idempotency-Key per run via uuid4.",
+    "tests": [
+      {
+        "name": "test_premium_recurring_transfer_within_limit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated as premium-tier",
+          "Source account has sufficient balance",
+          "WEEKLY frequency is supported"
+        ],
+        "actions": [
+          "POST /transfers/recurring with amount=9000, frequency=WEEKLY, idempotency_key=<uuid>"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains schedule_id",
+          "Response body contains next_run timestamp",
+          "Persisted schedule reflects amount=9000 and frequency=WEEKLY"
+        ],
+        "trace": [
+          "R-FIN-080: premium tier cap $10,000; $9,000 is within partition [0, 10000]",
+          "R-FIN-080: schedule persisted; next run calculated"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <helper_fn> import api_client, assert_schedule_persisted\n\ndef test_premium_recurring_transfer_within_limit(<premium_customer_token>, <api_base_url>):\n    client = api_client(<api_base_url>, token=<premium_customer_token>)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"amount\": 9000,\n        \"currency\": \"USD\",\n        \"frequency\": \"WEEKLY\",\n        \"source_account_id\": <premium_source_account>,\n        \"destination_account_id\": <destination_account>\n    }\n    headers = {\"Idempotency-Key\": idempotency_key}\n    resp = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"schedule_id\" in body\n    assert \"next_run\" in body\n    assert body[\"amount\"] == 9000\n    assert body[\"frequency\"] == \"WEEKLY\"\n    assert_schedule_persisted(client, body[\"schedule_id\"], expected_amount=9000)"
+      },
+      {
+        "name": "test_standard_recurring_transfer_exceeds_cap_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated as standard-tier",
+          "Source account has sufficient balance"
+        ],
+        "actions": [
+          "POST /transfers/recurring with amount=2501, frequency=WEEKLY"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code indicating per-occurrence limit exceeded",
+          "No schedule is persisted"
+        ],
+        "trace": [
+          "R-FIN-080: non-premium cap $2,500; $2,501 exceeds limit",
+          "R-FIN-080: 422 when per-occurrence limit exceeded"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <helper_fn> import api_client, schedule_exists\n\ndef test_standard_recurring_transfer_exceeds_cap_returns_422(<standard_customer_token>, <api_base_url>):\n    client = api_client(<api_base_url>, token=<standard_customer_token>)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"amount\": 2501,\n        \"currency\": \"USD\",\n        \"frequency\": \"WEEKLY\",\n        \"source_account_id\": <standard_source_account>,\n        \"destination_account_id\": <destination_account>\n    }\n    headers = {\"Idempotency-Key\": idempotency_key}\n    resp = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n    error_text = str(body).lower()\n    assert \"limit\" in error_text or \"exceed\" in error_text or \"cap\" in error_text\n    assert not schedule_exists(client, idempotency_key)"
+      },
+      {
+        "name": "test_standard_recurring_transfer_at_exact_cap_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated as standard-tier",
+          "Source account has sufficient balance",
+          "MONTHLY frequency is supported"
+        ],
+        "actions": [
+          "POST /transfers/recurring with amount=2500 (exact boundary), frequency=MONTHLY"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Schedule created with amount=2500",
+          "next_run field present in response"
+        ],
+        "trace": [
+          "R-FIN-080: non-premium cap $2,500; $2,500 is at upper boundary (inclusive)",
+          "BVA: test on-point at maximum allowed value for standard tier"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <helper_fn> import api_client\n\ndef test_standard_recurring_transfer_at_exact_cap_boundary(<standard_customer_token>, <api_base_url>):\n    client = api_client(<api_base_url>, token=<standard_customer_token>)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"amount\": 2500,\n        \"currency\": \"USD\",\n        \"frequency\": \"MONTHLY\",\n        \"source_account_id\": <standard_source_account>,\n        \"destination_account_id\": <destination_account>\n    }\n    headers = {\"Idempotency-Key\": idempotency_key}\n    resp = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"amount\"] == 2500\n    assert \"next_run\" in body\n    assert \"schedule_id\" in body"
+      },
+      {
+        "name": "test_idempotent_duplicate_submission_returns_original_result",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated as premium-tier",
+          "First POST with Idempotency-Key has already succeeded and returned 201"
+        ],
+        "actions": [
+          "POST /transfers/recurring with amount=5000, frequency=WEEKLY, same Idempotency-Key (first submission)",
+          "POST /transfers/recurring with identical payload and same Idempotency-Key (duplicate submission)"
+        ],
+        "expected": [
+          "First call returns HTTP 201 with schedule_id and next_run",
+          "Second call returns HTTP 200 or 201 with identical schedule_id",
+          "Exactly one schedule record exists (no duplicate created)"
+        ],
+        "trace": [
+          "R-FIN-080: operation must be idempotent; duplicate Idempotency-Key returns original result",
+          "DT: decision row: same key + same payload => replay cached response"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <helper_fn> import api_client, count_schedules_for_key\n\ndef test_idempotent_duplicate_submission_returns_original_result(<premium_customer_token>, <api_base_url>):\n    client = api_client(<api_base_url>, token=<premium_customer_token>)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"amount\": 5000,\n        \"currency\": \"USD\",\n        \"frequency\": \"WEEKLY\",\n        \"source_account_id\": <premium_source_account>,\n        \"destination_account_id\": <destination_account>\n    }\n    headers = {\"Idempotency-Key\": idempotency_key}\n    first = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert first.status_code == 201\n    first_body = first.json()\n    second = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert second.status_code in (200, 201)\n    second_body = second.json()\n    assert second_body[\"schedule_id\"] == first_body[\"schedule_id\"]\n    assert second_body[\"next_run\"] == first_body[\"next_run\"]\n    assert count_schedules_for_key(client, idempotency_key) == 1"
+      },
+      {
+        "name": "test_unsupported_frequency_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated as premium-tier",
+          "HOURLY is not a supported frequency value"
+        ],
+        "actions": [
+          "POST /transfers/recurring with amount=1000, frequency=HOURLY"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body references unsupported frequency",
+          "No schedule is persisted"
+        ],
+        "trace": [
+          "R-FIN-080: 422 when frequency unsupported",
+          "NEG: invalid frequency value outside allowed set"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <helper_fn> import api_client, schedule_exists\n\ndef test_unsupported_frequency_returns_422(<premium_customer_token>, <api_base_url>):\n    client = api_client(<api_base_url>, token=<premium_customer_token>)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"amount\": 1000,\n        \"currency\": \"USD\",\n        \"frequency\": \"HOURLY\",\n        \"source_account_id\": <premium_source_account>,\n        \"destination_account_id\": <destination_account>\n    }\n    headers = {\"Idempotency-Key\": idempotency_key}\n    resp = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    error_text = str(body).lower()\n    assert \"frequency\" in error_text or \"unsupported\" in error_text or \"invalid\" in error_text\n    assert not schedule_exists(client, idempotency_key)"
+      },
+      {
+        "name": "test_premium_boundary_at_max_cap_10000",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated as premium-tier",
+          "Source account has sufficient balance",
+          "WEEKLY frequency is supported"
+        ],
+        "actions": [
+          "POST /transfers/recurring with amount=10000 (exact premium cap), frequency=WEEKLY"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Schedule persisted with amount=10000",
+          "next_run is a future timestamp"
+        ],
+        "trace": [
+          "R-FIN-080: premium tier cap $10,000; $10,000 is on-point upper boundary",
+          "BVA: on-point at maximum allowed value for premium tier"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom datetime import datetime, timezone\nfrom <helper_fn> import api_client\n\ndef test_premium_boundary_at_max_cap_10000(<premium_customer_token>, <api_base_url>):\n    client = api_client(<api_base_url>, token=<premium_customer_token>)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"amount\": 10000,\n        \"currency\": \"USD\",\n        \"frequency\": \"WEEKLY\",\n        \"source_account_id\": <premium_source_account>,\n        \"destination_account_id\": <destination_account>\n    }\n    headers = {\"Idempotency-Key\": idempotency_key}\n    resp = client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"amount\"] == 10000\n    assert \"schedule_id\" in body\n    next_run = datetime.fromisoformat(body[\"next_run\"].replace(\"Z\", \"+00:00\"))\n    assert next_run > datetime.now(timezone.utc)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-080",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1038,
+    "output_tokens": 3503,
+    "latency_ms": 39944,
+    "wall_ms": 39944,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-080\",\n  \"reasoning\": \"The requirement defines two equivalence partitions for tier-based limits (standard/premium), a hard boundary at $2,500 for standard and $10,000 for premium, an idempotency contract for duplicate submissions, and two explicit 422 error paths (limit exceeded, unsupported frequency). Tests are designed to cover: (1) EP \u2013 valid premium schedule within limit; (2) NEG \u2013 standard account exceeds $2,500 cap; (3) BVA \u2013 standard account at exactly $2,500 (upper boundary, valid); (4) DT \u2013 idempotency: duplicate key returns original result; (5) NEG \u2013 unsupported frequency yields 422. All tests are self-contained via fixtures and use a unique Idempotency-Key per run via uuid4.\",\n  \"tests\": [\n    {\n      \"name\": \"test_premium_recurring_transfer_within_limit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated as premium-tier\",\n        \"Source account has sufficient balance\",\n        \"WEEKLY frequency is supported\"\n      ],\n      \"actions\": [\n        \"POST /transfers/recurring with amount=9000, frequency=WEEKLY, idempotency_key=<uuid>\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains schedule_id\",\n        \"Response body contains next_run timestamp\",\n        \"Persisted schedule reflects amount=9000 and frequency=WEEKLY\"\n      ],\n      \"trace\": [\n        \"R-FIN-080: premium tier cap $10,000; $9,000 is within partition [0, 10000]\",\n        \"R-FIN-080: schedule persisted; next run calculated\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\nfrom <helper_fn> import api_client, assert_schedule_persisted\\n\\ndef test_premium_recurring_transfer_within_limit(<premium_customer_token>, <api_base_url>):\\n    client = api_client(<api_base_url>, token=<premium_customer_token>)\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"amount\\\": 9000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"frequency\\\": \\\"WEEKLY\\\",\\n        \\\"source_account_id\\\": <premium_source_account>,\\n        \\\"destination_account_id\\\": <destination_account>\\n    }\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n    resp = client.post(\\\"/transfers/recurring\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"schedule_id\\\" in body\\n    assert \\\"next_run\\\" in body\\n    assert body[\\\"amount\\\"] == 9000\\n    assert body[\\\"frequency\\\"] == \\\"WEEKLY\\\"\\n    assert_schedule_persisted(client, body[\\\"schedule_id\\\"], expected_amount=9000)\"\n    },\n    {\n      \"name\": \"test_standard_recurring_transfer_exceeds_cap_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated as standard-tier\",\n        \"Source account has sufficient balance\"\n      ],\n      \"actions\": [\n        \"POST /transfers/recurring with amount=2501, frequency=WEEKLY\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains error code indicating per-occurrence limit exceeded\",\n        \"No schedule is persisted\"\n      ],\n      \"trace\": [\n        \"R-FIN-080: non-premium cap $2,500; $2,501 exceeds limit\",\n        \"R-FIN-080: 422 when per-occurrence limit exceeded\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\nfrom <helper_fn> import api_client, schedule_exists\\n\\ndef test_standard_recurring_transfer_exceeds_cap_returns_422(<standard_customer_token>, <api_base_url>):\\n    client = api_client(<api_base_url>, token=<standard_customer_token>)\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"amount\\\": 2501,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"frequency\\\": \\\"WEEKLY\\\",\\n        \\\"source_account_id\\\": <standard_source_account>,\\n        \\\"destination_account_id\\\": <destination_account>\\n    }\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n    resp = client.post(\\\"/transfers/recurring\\\", json=payload, headers=headers)\\n    assert resp.status_code == 4"
+  }
+}

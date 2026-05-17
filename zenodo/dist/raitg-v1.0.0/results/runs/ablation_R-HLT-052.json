@@ -1,0 +1,161 @@
+{
+  "req": {
+    "id": "R-HLT-052",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient (negative)",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-052",
+    "reasoning": "The requirement mandates that a clinician can read only patients assigned to them, with 403 returned for unassigned patients and an audit log written on success. Four tests are designed: (1) EP-positive: assigned clinician reads their patient -> 200 + audit; (2) NEG-negative: unassigned clinician reads another patient -> 403; (3) BVA-boundary: clinician reads a patient whose assignment was just removed (edge of assignment boundary) -> 403; (4) STC-boundary: clinician token in an expired/invalid state attempts read -> 401, covering a state transition from valid to expired auth state.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_can_read_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician user 'clinician_a' exists with role=clinician",
+          "Patient 'patient_001' is assigned to 'clinician_a'",
+          "Valid JWT bearer token is available for 'clinician_a'",
+          "Audit log service is reachable"
+        ],
+        "actions": [
+          "Obtain bearer token for clinician_a via <get_auth_token> fixture",
+          "Send GET /Patient/patient_001 with Authorization header",
+          "Capture response status and body",
+          "Query audit log for the read event"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body contains resourceType='Patient' and id='patient_001'",
+          "Audit log contains an entry for clinician_a reading patient_001"
+        ],
+        "trace": [
+          "R-HLT-052: clinician reads assigned patient -> resource returned",
+          "R-HLT-052: expected outcome -> access audit written"
+        ],
+        "executable": "import pytest\n\ndef test_assigned_clinician_can_read_patient(api_client, get_auth_token, audit_log_client):\n    token = get_auth_token(user=\"clinician_a\", role=\"clinician\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    patient_id = \"patient_001\"\n\n    response = api_client.get(f\"/Patient/{patient_id}\", headers=headers)\n\n    assert response.status_code == 200\n    body = response.json()\n    assert body.get(\"resourceType\") == \"Patient\"\n    assert body.get(\"id\") == patient_id\n\n    audit_entries = audit_log_client.get_entries(\n        actor=\"clinician_a\", resource_id=patient_id, action=\"read\"\n    )\n    assert len(audit_entries) >= 1, \"Audit entry not written for successful read\"\n"
+      },
+      {
+        "name": "test_unassigned_clinician_cannot_read_patient",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician user 'clinician_b' exists with role=clinician",
+          "Patient 'patient_002' is NOT assigned to 'clinician_b'",
+          "Valid JWT bearer token is available for 'clinician_b'"
+        ],
+        "actions": [
+          "Obtain bearer token for clinician_b via <get_auth_token> fixture",
+          "Send GET /Patient/patient_002 with Authorization header",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an OperationOutcome or error indicating access denied",
+          "No patient data is returned in the response body"
+        ],
+        "trace": [
+          "R-HLT-052: error pathway -> 403 when clinician not assigned",
+          "R-HLT-052: permission denial negative path"
+        ],
+        "executable": "import pytest\n\ndef test_unassigned_clinician_cannot_read_patient(api_client, get_auth_token):\n    token = get_auth_token(user=\"clinician_b\", role=\"clinician\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    patient_id = \"patient_002\"\n\n    response = api_client.get(f\"/Patient/{patient_id}\", headers=headers)\n\n    assert response.status_code == 403\n    body = response.json()\n    assert \"resourceType\" not in body or body.get(\"resourceType\") == \"OperationOutcome\", (\n        \"Patient data must not be exposed on 403\"\n    )\n    if body.get(\"resourceType\") == \"OperationOutcome\":\n        issues = body.get(\"issue\", [])\n        assert any(i.get(\"severity\") in (\"error\", \"fatal\") for i in issues)\n"
+      },
+      {
+        "name": "test_clinician_denied_after_assignment_removed",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician 'clinician_c' was previously assigned to patient 'patient_003'",
+          "Assignment for clinician_c -> patient_003 has just been revoked",
+          "Valid JWT bearer token is available for 'clinician_c'"
+        ],
+        "actions": [
+          "Revoke assignment of clinician_c from patient_003 via <revoke_assignment> helper",
+          "Obtain fresh bearer token for clinician_c via <get_auth_token> fixture",
+          "Send GET /Patient/patient_003 with Authorization header immediately after revocation",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Access is denied at the exact boundary of assignment removal",
+          "No patient resource data is present in the response"
+        ],
+        "trace": [
+          "R-HLT-052: boundary of clinician assignment -> just-revoked access must be denied",
+          "R-HLT-052: error pathway -> 403 when clinician not assigned"
+        ],
+        "executable": "import pytest\n\ndef test_clinician_denied_after_assignment_removed(\n    api_client, get_auth_token, revoke_assignment\n):\n    patient_id = \"patient_003\"\n    clinician = \"clinician_c\"\n\n    revoke_assignment(clinician=clinician, patient_id=patient_id)\n\n    token = get_auth_token(user=clinician, role=\"clinician\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    response = api_client.get(f\"/Patient/{patient_id}\", headers=headers)\n\n    assert response.status_code == 403, (\n        f\"Expected 403 after assignment revocation, got {response.status_code}\"\n    )\n    body = response.json()\n    assert body.get(\"resourceType\") != \"Patient\", \"Patient data must not be returned\"\n"
+      },
+      {
+        "name": "test_expired_token_cannot_read_patient",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician 'clinician_d' is assigned to patient 'patient_004'",
+          "An expired JWT token for clinician_d is available (token state: expired)"
+        ],
+        "actions": [
+          "Obtain an expired bearer token for clinician_d via <get_expired_token> helper",
+          "Send GET /Patient/patient_004 with the expired Authorization header",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response indicates token is expired or invalid",
+          "No patient resource data is present in the response"
+        ],
+        "trace": [
+          "R-HLT-052: state transition from valid-auth to expired-auth must block access",
+          "R-HLT-052: conflicting state transitions must be tested"
+        ],
+        "executable": "import pytest\n\ndef test_expired_token_cannot_read_patient(api_client, get_expired_token):\n    patient_id = \"patient_004\"\n    expired_token = get_expired_token(user=\"clinician_d\", role=\"clinician\")\n    headers = {\"Authorization\": f\"Bearer {expired_token}\"}\n\n    response = api_client.get(f\"/Patient/{patient_id}\", headers=headers)\n\n    assert response.status_code == 401, (\n        f\"Expected 401 for expired token, got {response.status_code}\"\n    )\n    body = response.json()\n    assert body.get(\"resourceType\") != \"Patient\", \"Patient data must not be returned\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-052",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 2257,
+    "latency_ms": 23994,
+    "wall_ms": 23994,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-052\",\n  \"reasoning\": \"The requirement mandates that a clinician can read only patients assigned to them, with 403 returned for unassigned patients and an audit log written on success. Four tests are designed: (1) EP-positive: assigned clinician reads their patient -> 200 + audit; (2) NEG-negative: unassigned clinician reads another patient -> 403; (3) BVA-boundary: clinician reads a patient whose assignment was just removed (edge of assignment boundary) -> 403; (4) STC-boundary: clinician token in an expired/invalid state attempts read -> 401, covering a state transition from valid to expired auth state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_can_read_patient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician user 'clinician_a' exists with role=clinician\",\n        \"Patient 'patient_001' is assigned to 'clinician_a'\",\n        \"Valid JWT bearer token is available for 'clinician_a'\",\n        \"Audit log service is reachable\"\n      ],\n      \"actions\": [\n        \"Obtain bearer token for clinician_a via <get_auth_token> fixture\",\n        \"Send GET /Patient/patient_001 with Authorization header\",\n        \"Capture response status and body\",\n        \"Query audit log for the read event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body contains resourceType='Patient' and id='patient_001'\",\n        \"Audit log contains an entry for clinician_a reading patient_001\"\n      ],\n      \"trace\": [\n        \"R-HLT-052: clinician reads assigned patient -> resource returned\",\n        \"R-HLT-052: expected outcome -> access audit written\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_assigned_clinician_can_read_patient(api_client, get_auth_token, audit_log_client):\\n    token = get_auth_token(user=\\\"clinician_a\\\", role=\\\"clinician\\\")\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    patient_id = \\\"patient_001\\\"\\n\\n    response = api_client.get(f\\\"/Patient/{patient_id}\\\", headers=headers)\\n\\n    assert response.status_code == 200\\n    body = response.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Patient\\\"\\n    assert body.get(\\\"id\\\") == patient_id\\n\\n    audit_entries = audit_log_client.get_entries(\\n        actor=\\\"clinician_a\\\", resource_id=patient_id, action=\\\"read\\\"\\n    )\\n    assert len(audit_entries) >= 1, \\\"Audit entry not written for successful read\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_cannot_read_patient\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician user 'clinician_b' exists with role=clinician\",\n        \"Patient 'patient_002' is NOT assigned to 'clinician_b'\",\n        \"Valid JWT bearer token is available for 'clinician_b'\"\n      ],\n      \"actions\": [\n        \"Obtain bearer token for clinician_b via <get_auth_token> fixture\",\n        \"Send GET /Patient/patient_002 with Authorization header\",\n        \"Capture response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an OperationOutcome or error indicating access denied\",\n        \"No patient data is returned in the response body\"\n      ],\n      \"trace\": [\n        \"R-HLT-052: error pathway -> 403 when clinician not assigned\",\n        \"R-HLT-052: permission denial negative path\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_unassigned_clinician_cannot_read_patient(api_client, get_auth_token):\\n    token = get_auth_token(user=\\\"clinician_b\\\", role=\\\"clinician\\\")\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    patient_id = \\\"patient_002\\\"\\n\\n    response = api_client.get(f\\\"/Patient/{patient_id}\\\", headers=headers)\\n\\n    assert response.status_code == 403\\n    body = response.json()\\n    assert \\\"resourceType\\\" not in body or body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\", (\\n        \\\"Patient data must not be exposed on 403\\\"\\n    )\\n    if body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\"
+  }
+}

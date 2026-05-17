@@ -1,0 +1,177 @@
+{
+  "req": {
+    "id": "R-FIN-098",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration (idempotency variant)",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-098",
+    "reasoning": "R-FIN-098 has four testable behaviours: (1) a valid biller registration is accepted and placed in 'hold' state, (2) a duplicate Idempotency-Key returns the original response without creating a new record, (3) a duplicate biller (same biller details, different key) returns 409, and (4) boundary behaviour at exactly the 24-hour hold threshold. Tests are designed to be self-contained via fixtures that create and teardown their own data, and idempotent by using unique keys per run (uuid4). Heuristics chosen: EP for the happy path, STC for the idempotency replay, NEG for the 409 duplicate biller, BVA for the 24-hour hold boundary, and DT for the combined decision (auth + key + duplicate) matrix.",
+    "tests": [
+      {
+        "name": "test_register_biller_returns_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid bearer token available via <auth_token> fixture)",
+          "Biller with generated account number does not pre-exist",
+          "Banking API is reachable"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key (uuid4)",
+          "POST /billers with valid biller payload and Idempotency-Key header",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'status': 'hold'",
+          "Response body contains 'biller_id' field",
+          "Response body contains 'hold_until' timestamp approximately 24 hours from now"
+        ],
+        "trace": [
+          "R-FIN-098: biller placed in hold state after registration",
+          "R-FIN-098: withdrawals to new billers shall be deferred"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_register_biller_returns_hold_state(auth_token, api_client, cleanup_biller):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"account_number\": <generate_account_number>(),\n        \"bank_code\": \"001\",\n        \"nickname\": \"Test Biller EP\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {auth_token}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n\n    resp = api_client.post(\"/billers\", json=payload, headers=headers)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"hold\"\n    assert \"biller_id\" in body\n    assert \"hold_until\" in body\n\n    hold_until = datetime.fromisoformat(body[\"hold_until\"])\n    now = datetime.now(timezone.utc)\n    delta = hold_until - now\n    assert timedelta(hours=23, minutes=55) <= delta <= timedelta(hours=24, minutes=5)\n\n    cleanup_biller(body[\"biller_id\"])"
+      },
+      {
+        "name": "test_idempotent_duplicate_key_returns_original_response",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated",
+          "First POST with a unique Idempotency-Key has already succeeded (201)",
+          "Original biller_id and status are stored"
+        ],
+        "actions": [
+          "Reuse the same Idempotency-Key from the first POST",
+          "POST /billers again with identical payload and same Idempotency-Key",
+          "Capture second HTTP response"
+        ],
+        "expected": [
+          "HTTP 201 Created (same as original)",
+          "Response body is identical to the original response (same biller_id, same status 'hold')",
+          "No duplicate biller record created"
+        ],
+        "trace": [
+          "R-FIN-098: duplicate submission with same Idempotency-Key must return the original result"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_idempotent_duplicate_key_returns_original_response(auth_token, api_client, cleanup_biller):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"account_number\": <generate_account_number>(),\n        \"bank_code\": \"002\",\n        \"nickname\": \"Test Biller STC\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {auth_token}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n\n    resp1 = api_client.post(\"/billers\", json=payload, headers=headers)\n    assert resp1.status_code == 201\n    body1 = resp1.json()\n\n    resp2 = api_client.post(\"/billers\", json=payload, headers=headers)\n    assert resp2.status_code == 201\n    body2 = resp2.json()\n\n    assert body1[\"biller_id\"] == body2[\"biller_id\"]\n    assert body1[\"status\"] == body2[\"status\"] == \"hold\"\n    assert body1[\"hold_until\"] == body2[\"hold_until\"]\n\n    cleanup_biller(body1[\"biller_id\"])"
+      },
+      {
+        "name": "test_duplicate_biller_different_key_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated",
+          "A biller with the target account_number and bank_code is already registered"
+        ],
+        "actions": [
+          "POST /billers with a new unique Idempotency-Key but the same account_number and bank_code as the existing biller",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains an error code indicating duplicate biller",
+          "No second biller record is created"
+        ],
+        "trace": [
+          "R-FIN-098: 409 if duplicate biller"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_duplicate_biller_different_key_returns_409(auth_token, api_client, existing_biller, cleanup_biller):\n    # existing_biller fixture pre-creates a biller and yields its details\n    account_number = existing_biller[\"account_number\"]\n    bank_code = existing_biller[\"bank_code\"]\n    biller_id = existing_biller[\"biller_id\"]\n\n    new_key = str(uuid.uuid4())\n    payload = {\n        \"account_number\": account_number,\n        \"bank_code\": bank_code,\n        \"nickname\": \"Duplicate Attempt NEG\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {auth_token}\",\n        \"Idempotency-Key\": new_key\n    }\n\n    resp = api_client.post(\"/billers\", json=payload, headers=headers)\n\n    assert resp.status_code == 409\n    body = resp.json()\n    assert \"error\" in body\n    assert body[\"error\"][\"code\"] == \"DUPLICATE_BILLER\"\n\n    cleanup_biller(biller_id)"
+      },
+      {
+        "name": "test_biller_not_withdrawable_before_24h_hold_expires",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated",
+          "A biller has just been registered (status: hold)",
+          "hold_until is exactly 24 hours from registration time"
+        ],
+        "actions": [
+          "Register a new biller via POST /billers",
+          "Immediately attempt a withdrawal via POST /withdrawals targeting the new biller",
+          "Capture withdrawal HTTP response"
+        ],
+        "expected": [
+          "Biller registration returns HTTP 201 with status 'hold'",
+          "Immediate withdrawal attempt returns HTTP 422 or 403 indicating biller is in hold",
+          "No funds are debited"
+        ],
+        "trace": [
+          "R-FIN-098: withdrawals to new billers shall be deferred",
+          "R-FIN-098: 24-hour hold boundary"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_biller_not_withdrawable_before_24h_hold_expires(auth_token, api_client, cleanup_biller):\n    idempotency_key = str(uuid.uuid4())\n    biller_payload = {\n        \"account_number\": <generate_account_number>(),\n        \"bank_code\": \"003\",\n        \"nickname\": \"BVA Hold Test\"\n    }\n    biller_headers = {\n        \"Authorization\": f\"Bearer {auth_token}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n\n    reg_resp = api_client.post(\"/billers\", json=biller_payload, headers=biller_headers)\n    assert reg_resp.status_code == 201\n    body = reg_resp.json()\n    assert body[\"status\"] == \"hold\"\n    biller_id = body[\"biller_id\"]\n\n    withdrawal_payload = {\n        \"biller_id\": biller_id,\n        \"amount\": \"100.00\",\n        \"currency\": \"USD\"\n    }\n    wd_headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    wd_resp = api_client.post(\"/withdrawals\", json=withdrawal_payload, headers=wd_headers)\n\n    assert wd_resp.status_code in (422, 403)\n    wd_body = wd_resp.json()\n    assert wd_body[\"error\"][\"code\"] in (\"BILLER_IN_HOLD\", \"BILLER_NOT_ACTIVE\")\n\n    cleanup_biller(biller_id)"
+      },
+      {
+        "name": "test_unauthenticated_request_rejected_and_authenticated_succeeds",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "No valid bearer token for the unauthenticated attempt",
+          "Valid bearer token available for the authenticated attempt"
+        ],
+        "actions": [
+          "POST /billers with no Authorization header; record response (row 1 of decision table)",
+          "POST /billers with invalid token; record response (row 2)",
+          "POST /billers with valid token and unique Idempotency-Key; record response (row 3)"
+        ],
+        "expected": [
+          "Row 1: HTTP 401 Unauthorized",
+          "Row 2: HTTP 401 Unauthorized",
+          "Row 3: HTTP 201 with status 'hold'"
+        ],
+        "trace": [
+          "R-FIN-098: precondition - authenticated",
+          "R-FIN-098: biller placed in hold on success"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_unauthenticated_request_rejected_and_authenticated_succeeds(auth_token, api_client, cleanup_biller):\n    account_number = <generate_account_number>()\n    payload = {\n        \"account_number\": account_number,\n        \"bank_code\": \"004\",\n        \"nickname\": \"DT Auth Test\"\n    }\n\n    # Row 1: no auth header\n    resp_no_auth = api_client.post(\"/billers\", json=payload)\n    assert resp_no_auth.status_code == 401\n\n    # Row 2: invalid token\n    bad_headers = {\"Authorization\": \"Bearer invalid.token.value\"}\n    resp_bad_token = api_client.post(\"/billers\", json=payload, headers=bad_headers)\n    assert resp_bad_token.status_code == 401\n\n    # Row 3: valid auth + unique idempotency key\n    idempotency_key = str(uuid.uuid4())\n    good_headers = {\n        \"Authorization\": f\"Bearer {auth_token}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp_ok = api_client.post(\"/billers\", json=payload, headers=good_headers)\n    assert resp_ok.status_code == 201\n    body = resp_ok.json()\n    assert body[\"status\"] == \"hold\"\n\n    cleanup_biller(body[\"biller_id\"])"
+      }
+    ]
+  },
+  "req_id": "R-FIN-098",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1011,
+    "output_tokens": 3380,
+    "latency_ms": 40899,
+    "wall_ms": 40899,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-098\",\n  \"reasoning\": \"R-FIN-098 has four testable behaviours: (1) a valid biller registration is accepted and placed in 'hold' state, (2) a duplicate Idempotency-Key returns the original response without creating a new record, (3) a duplicate biller (same biller details, different key) returns 409, and (4) boundary behaviour at exactly the 24-hour hold threshold. Tests are designed to be self-contained via fixtures that create and teardown their own data, and idempotent by using unique keys per run (uuid4). Heuristics chosen: EP for the happy path, STC for the idempotency replay, NEG for the 409 duplicate biller, BVA for the 24-hour hold boundary, and DT for the combined decision (auth + key + duplicate) matrix.\",\n  \"tests\": [\n    {\n      \"name\": \"test_register_biller_returns_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid bearer token available via <auth_token> fixture)\",\n        \"Biller with generated account number does not pre-exist\",\n        \"Banking API is reachable\"\n      ],\n      \"actions\": [\n        \"Generate a unique Idempotency-Key (uuid4)\",\n        \"POST /billers with valid biller payload and Idempotency-Key header\",\n        \"Capture HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains 'status': 'hold'\",\n        \"Response body contains 'biller_id' field\",\n        \"Response body contains 'hold_until' timestamp approximately 24 hours from now\"\n      ],\n      \"trace\": [\n        \"R-FIN-098: biller placed in hold state after registration\",\n        \"R-FIN-098: withdrawals to new billers shall be deferred\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_register_biller_returns_hold_state(auth_token, api_client, cleanup_biller):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"account_number\\\": <generate_account_number>(),\\n        \\\"bank_code\\\": \\\"001\\\",\\n        \\\"nickname\\\": \\\"Test Biller EP\\\"\\n    }\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {auth_token}\\\",\\n        \\\"Idempotency-Key\\\": idempotency_key\\n    }\\n\\n    resp = api_client.post(\\\"/billers\\\", json=payload, headers=headers)\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"hold\\\"\\n    assert \\\"biller_id\\\" in body\\n    assert \\\"hold_until\\\" in body\\n\\n    hold_until = datetime.fromisoformat(body[\\\"hold_until\\\"])\\n    now = datetime.now(timezone.utc)\\n    delta = hold_until - now\\n    assert timedelta(hours=23, minutes=55) <= delta <= timedelta(hours=24, minutes=5)\\n\\n    cleanup_biller(body[\\\"biller_id\\\"])\"\n    },\n    {\n      \"name\": \"test_idempotent_duplicate_key_returns_original_response\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"First POST with a unique Idempotency-Key has already succeeded (201)\",\n        \"Original biller_id and status are stored\"\n      ],\n      \"actions\": [\n        \"Reuse the same Idempotency-Key from the first POST\",\n        \"POST /billers again with identical payload and same Idempotency-Key\",\n        \"Capture second HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (same as original)\",\n        \"Response body is identical to the original response (same biller_id, same status 'hold')\",\n        \"No duplicate biller record created\"\n      ],\n      \"trace\": [\n        \"R-FIN-098: duplicate submission with same Idempotency-Key must return the original result\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_idempotent_duplicate_key_returns_original_response(auth_token, api_client, cleanup_biller):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"account_number\\\": <generate_account_number>(),\\n        \\\"bank_code\\\": \\\"002\\\",\\n        \\\"nickname\\\": \\\"Test Biller STC\\\"\\n    }\\n    headers = {"
+  }
+}

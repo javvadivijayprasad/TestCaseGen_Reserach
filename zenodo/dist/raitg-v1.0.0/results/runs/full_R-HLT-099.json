@@ -1,0 +1,164 @@
+{
+  "req": {
+    "id": "R-HLT-099",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Appointment scheduling (audit)",
+    "statement": "A patient shall schedule an appointment at least 24 hours in advance during provider's available slots. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient books slot"
+    ],
+    "expected_outcomes": [
+      "appointment created",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "422 when slot unavailable or in past"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/appointments"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-099",
+    "reasoning": "The requirement mandates: (1) appointments must be \u226524 h in the future, (2) the slot must be in the provider's available set, (3) an AuditEvent must be emitted for every operation, and (4) the API must return 422 for unavailable or past slots. Four tests are designed: EP-positive covers a clearly valid future booking; BVA-boundary tests the exact 24 h + 1 min edge; NEG covers a slot fewer than 24 h away; DT covers an unavailable slot to exercise the decision-table branch where time rule passes but slot availability fails. Each test is self-contained via fixtures that create and clean up their own state, making them idempotent.",
+    "tests": [
+      {
+        "name": "test_schedule_appointment_valid_future_slot",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated (valid JWT in session)",
+          "Provider has an available slot at now+48 h",
+          "AuditEvent collection starts empty for this patient"
+        ],
+        "actions": [
+          "POST /appointments with slot_time = now + 48 hours and a known available provider slot id",
+          "Assert HTTP 201 response",
+          "Assert response body contains appointment id and status='booked'",
+          "GET /AuditEvent?entity=<appointment_id> and assert one CREATE event exists"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Appointment resource with status='booked'",
+          "Provider notification recorded in response or notification queue",
+          "AuditEvent with action='C' linked to the new appointment"
+        ],
+        "trace": [
+          "R-HLT-099: patient books slot -> appointment created",
+          "R-HLT-099: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_valid_future_slot(auth_client, available_slot, audit_query):\n    slot_time = datetime.now(timezone.utc) + timedelta(hours=48)\n    payload = {\n        \"provider_id\": available_slot[\"provider_id\"],\n        \"slot_id\": available_slot[\"slot_id\"],\n        \"slot_time\": slot_time.isoformat(),\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n    assert resp.status_code == 201\n\n    body = resp.json()\n    assert body[\"status\"] == \"booked\"\n    appt_id = body[\"id\"]\n    assert appt_id\n\n    events = audit_query(entity=appt_id)\n    assert len(events) >= 1\n    assert any(e[\"action\"] == \"C\" for e in events)\n\n    # idempotency cleanup\n    auth_client.delete(f\"/appointments/{appt_id}\")\n"
+      },
+      {
+        "name": "test_schedule_appointment_less_than_24h_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated",
+          "Provider slot exists but its time is now + 23 hours 59 minutes"
+        ],
+        "actions": [
+          "POST /appointments with slot_time = now + 23 h 59 min",
+          "Assert HTTP 422 response",
+          "Assert error detail indicates advance-booking violation",
+          "GET /AuditEvent for this patient and verify a FAILED audit entry is emitted"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Error body contains 'advance_booking_violation' or equivalent code",
+          "No appointment resource created",
+          "AuditEvent with outcome indicating failure is emitted"
+        ],
+        "trace": [
+          "R-HLT-099: Error pathways: 422 when slot unavailable or in past",
+          "R-HLT-099: AuditEvent must be emitted for every operation (including failures)"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_less_than_24h_returns_422(auth_client, any_provider_slot, audit_query):\n    slot_time = datetime.now(timezone.utc) + timedelta(hours=23, minutes=59)\n    payload = {\n        \"provider_id\": any_provider_slot[\"provider_id\"],\n        \"slot_id\": any_provider_slot[\"slot_id\"],\n        \"slot_time\": slot_time.isoformat(),\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n    assert resp.status_code == 422\n\n    body = resp.json()\n    detail = str(body)\n    assert \"advance_booking\" in detail.lower() or \"24\" in detail\n\n    patient_id = auth_client.current_patient_id()\n    events = audit_query(agent=patient_id, action=\"C\")\n    failed = [e for e in events if e.get(\"outcome\") not in (\"0\", \"success\", None)]\n    assert len(failed) >= 1\n"
+      },
+      {
+        "name": "test_schedule_appointment_exactly_24h_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated",
+          "Provider has an available slot at exactly now + 24 hours + 1 minute (on-boundary valid side)"
+        ],
+        "actions": [
+          "POST /appointments with slot_time = now + 24 h + 1 min (minimum valid advance)",
+          "Assert HTTP 201",
+          "POST /appointments with slot_time = now + 24 h - 1 min (one minute below boundary)",
+          "Assert HTTP 422"
+        ],
+        "expected": [
+          "First request: HTTP 201, appointment created",
+          "Second request: HTTP 422, advance_booking violation",
+          "AuditEvent emitted for both requests"
+        ],
+        "trace": [
+          "R-HLT-099: at least 24 hours in advance (BVA lower boundary)",
+          "R-HLT-099: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_exactly_24h_boundary(auth_client, available_slot, any_provider_slot, audit_query):\n    # ON boundary: 24 h + 1 min -> must succeed\n    valid_time = datetime.now(timezone.utc) + timedelta(hours=24, minutes=1)\n    resp_ok = auth_client.post(\"/appointments\", json={\n        \"provider_id\": available_slot[\"provider_id\"],\n        \"slot_id\": available_slot[\"slot_id\"],\n        \"slot_time\": valid_time.isoformat(),\n    })\n    assert resp_ok.status_code == 201\n    appt_id = resp_ok.json()[\"id\"]\n\n    events_ok = audit_query(entity=appt_id)\n    assert any(e[\"action\"] == \"C\" for e in events_ok)\n\n    # OFF boundary: 24 h - 1 min -> must fail\n    invalid_time = datetime.now(timezone.utc) + timedelta(hours=23, minutes=59)\n    resp_fail = auth_client.post(\"/appointments\", json={\n        \"provider_id\": any_provider_slot[\"provider_id\"],\n        \"slot_id\": any_provider_slot[\"slot_id\"],\n        \"slot_time\": invalid_time.isoformat(),\n    })\n    assert resp_fail.status_code == 422\n\n    # cleanup\n    auth_client.delete(f\"/appointments/{appt_id}\")\n"
+      },
+      {
+        "name": "test_schedule_appointment_unavailable_slot_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is authenticated",
+          "Target slot is already booked by another patient (slot unavailable)",
+          "Slot time satisfies the 24 h advance rule"
+        ],
+        "actions": [
+          "Ensure slot is marked unavailable via <seed_booked_slot> fixture",
+          "POST /appointments with that slot_id and a valid future time (now + 48 h)",
+          "Assert HTTP 422",
+          "Assert error body references slot unavailability",
+          "Assert AuditEvent emitted with failure outcome"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Error detail references slot conflict or unavailability",
+          "No duplicate appointment resource created",
+          "AuditEvent with failure outcome linked to the attempt"
+        ],
+        "trace": [
+          "R-HLT-099: Error pathways: 422 when slot unavailable",
+          "R-HLT-099: Decision-table branch: time valid=TRUE, slot available=FALSE -> 422",
+          "R-HLT-099: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_unavailable_slot_returns_422(auth_client, booked_slot, audit_query):\n    # booked_slot fixture seeds a slot already occupied by another patient\n    future_time = datetime.now(timezone.utc) + timedelta(hours=48)\n    payload = {\n        \"provider_id\": booked_slot[\"provider_id\"],\n        \"slot_id\": booked_slot[\"slot_id\"],\n        \"slot_time\": future_time.isoformat(),\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n    assert resp.status_code == 422\n\n    body = resp.json()\n    detail = str(body).lower()\n    assert \"unavailable\" in detail or \"conflict\" in detail or \"slot\" in detail\n\n    patient_id = auth_client.current_patient_id()\n    events = audit_query(agent=patient_id)\n    failed = [e for e in events if e.get(\"outcome\") not in (\"0\", \"success\", None)]\n    assert len(failed) >= 1\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-099",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 2736,
+    "latency_ms": 36980,
+    "wall_ms": 36980,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-099\",\n  \"reasoning\": \"The requirement mandates: (1) appointments must be \u226524 h in the future, (2) the slot must be in the provider's available set, (3) an AuditEvent must be emitted for every operation, and (4) the API must return 422 for unavailable or past slots. Four tests are designed: EP-positive covers a clearly valid future booking; BVA-boundary tests the exact 24 h + 1 min edge; NEG covers a slot fewer than 24 h away; DT covers an unavailable slot to exercise the decision-table branch where time rule passes but slot availability fails. Each test is self-contained via fixtures that create and clean up their own state, making them idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_schedule_appointment_valid_future_slot\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated (valid JWT in session)\",\n        \"Provider has an available slot at now+48 h\",\n        \"AuditEvent collection starts empty for this patient\"\n      ],\n      \"actions\": [\n        \"POST /appointments with slot_time = now + 48 hours and a known available provider slot id\",\n        \"Assert HTTP 201 response\",\n        \"Assert response body contains appointment id and status='booked'\",\n        \"GET /AuditEvent?entity=<appointment_id> and assert one CREATE event exists\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Appointment resource with status='booked'\",\n        \"Provider notification recorded in response or notification queue\",\n        \"AuditEvent with action='C' linked to the new appointment\"\n      ],\n      \"trace\": [\n        \"R-HLT-099: patient books slot -> appointment created\",\n        \"R-HLT-099: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_schedule_appointment_valid_future_slot(auth_client, available_slot, audit_query):\\n    slot_time = datetime.now(timezone.utc) + timedelta(hours=48)\\n    payload = {\\n        \\\"provider_id\\\": available_slot[\\\"provider_id\\\"],\\n        \\\"slot_id\\\": available_slot[\\\"slot_id\\\"],\\n        \\\"slot_time\\\": slot_time.isoformat(),\\n    }\\n\\n    resp = auth_client.post(\\\"/appointments\\\", json=payload)\\n    assert resp.status_code == 201\\n\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"booked\\\"\\n    appt_id = body[\\\"id\\\"]\\n    assert appt_id\\n\\n    events = audit_query(entity=appt_id)\\n    assert len(events) >= 1\\n    assert any(e[\\\"action\\\"] == \\\"C\\\" for e in events)\\n\\n    # idempotency cleanup\\n    auth_client.delete(f\\\"/appointments/{appt_id}\\\")\\n\"\n    },\n    {\n      \"name\": \"test_schedule_appointment_less_than_24h_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated\",\n        \"Provider slot exists but its time is now + 23 hours 59 minutes\"\n      ],\n      \"actions\": [\n        \"POST /appointments with slot_time = now + 23 h 59 min\",\n        \"Assert HTTP 422 response\",\n        \"Assert error detail indicates advance-booking violation\",\n        \"GET /AuditEvent for this patient and verify a FAILED audit entry is emitted\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Error body contains 'advance_booking_violation' or equivalent code\",\n        \"No appointment resource created\",\n        \"AuditEvent with outcome indicating failure is emitted\"\n      ],\n      \"trace\": [\n        \"R-HLT-099: Error pathways: 422 when slot unavailable or in past\",\n        \"R-HLT-099: AuditEvent must be emitted for every operation (including failures)\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_schedule_appointment_less_than_24h_returns_422(auth_client, any_provider_slot, audit_query):\\n    slot_time = datetime.now(timezone.utc) + timedelta(hours=23, minutes=59)\\n    payload = {\\n        \\\"provider_id\\\": any_provider_slot[\\\"provider_id\\\"],\\n        \\\"slo"
+  }
+}

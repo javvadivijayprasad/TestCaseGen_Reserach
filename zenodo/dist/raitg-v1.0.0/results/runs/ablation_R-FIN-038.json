@@ -1,0 +1,206 @@
+{
+  "req": {
+    "id": "R-FIN-038",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Fraud alert response (boundary variant)",
+    "statement": "A customer shall confirm or deny a suspected-fraud alert within 24 hours; unacknowledged alerts shall auto-freeze the account. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "alert active"
+    ],
+    "triggers": [
+      "customer responds"
+    ],
+    "expected_outcomes": [
+      "alert closed",
+      "card reissued if fraud"
+    ],
+    "error_pathways": [
+      "410 when alert expired"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/alerts/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-038",
+    "reasoning": "R-FIN-038 governs fraud-alert lifecycle on /alerts/{id}. Key decision axes are: (1) customer response type (confirm fraud / deny fraud), (2) timing relative to the 24-hour window (well within, at exactly 24 h, past 24 h), and (3) account state transitions triggered by each path. EP partitions valid responses vs. expired alerts. BVA targets exactly T=0 min (alert just opened), T=23h59m59s (last valid second), and T=24h00m00s (first expired second). STC traces ACTIVE\u2192CLOSED and ACTIVE\u2192FROZEN. DT covers the confirm/deny decision matrix. NEG covers the 410 error on an already-expired alert.",
+    "tests": [
+      {
+        "name": "test_deny_fraud_alert_within_window_closes_alert",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A fraud alert exists with status=ACTIVE and age < 24 hours",
+          "Customer is authenticated with a valid bearer token",
+          "No prior acknowledgement has been made on this alert"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"DENY\"}",
+          "Assert HTTP 200",
+          "Assert response body alert.status == CLOSED",
+          "Assert response body alert.resolution == DENIED",
+          "Assert card reissue is NOT triggered"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "alert.status == CLOSED",
+          "alert.resolution == DENIED",
+          "No card reissue event emitted"
+        ],
+        "trace": [
+          "R-FIN-038: customer confirms or denies within 24 h -> alert closed",
+          "R-FIN-038: card reissued only when fraud confirmed"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_deny_fraud_alert_within_window_closes_alert(\n    active_alert_fixture,\n    auth_headers,\n    banking_api_base_url,\n):\n    alert_id = active_alert_fixture[\"id\"]\n    url = f\"{banking_api_base_url}/alerts/{alert_id}\"\n\n    resp = requests.patch(url, json={\"response\": \"DENY\"}, headers=auth_headers)\n\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"alert\"][\"status\"] == \"CLOSED\"\n    assert body[\"alert\"][\"resolution\"] == \"DENIED\"\n    assert body[\"alert\"].get(\"card_reissued\", False) is False\n"
+      },
+      {
+        "name": "test_confirm_fraud_alert_triggers_card_reissue",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "A fraud alert exists with status=ACTIVE and age < 24 hours",
+          "Customer is authenticated with a valid bearer token"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"CONFIRM\"}",
+          "Assert HTTP 200",
+          "Assert alert.status == CLOSED",
+          "Assert alert.resolution == CONFIRMED",
+          "Assert card_reissued == true in response"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "alert.status == CLOSED",
+          "alert.resolution == CONFIRMED",
+          "card_reissued == true"
+        ],
+        "trace": [
+          "R-FIN-038: alert closed after customer response",
+          "R-FIN-038: card reissued if fraud confirmed"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_confirm_fraud_alert_triggers_card_reissue(\n    active_alert_fixture,\n    auth_headers,\n    banking_api_base_url,\n):\n    alert_id = active_alert_fixture[\"id\"]\n    url = f\"{banking_api_base_url}/alerts/{alert_id}\"\n\n    resp = requests.patch(url, json={\"response\": \"CONFIRM\"}, headers=auth_headers)\n\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"alert\"][\"status\"] == \"CLOSED\"\n    assert body[\"alert\"][\"resolution\"] == \"CONFIRMED\"\n    assert body[\"alert\"][\"card_reissued\"] is True\n"
+      },
+      {
+        "name": "test_unacknowledged_alert_auto_freezes_account_at_24h",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A fraud alert exists that was created exactly 24 hours ago (age == 86400 s)",
+          "Customer has NOT responded to the alert",
+          "System auto-freeze job has executed for this alert"
+        ],
+        "actions": [
+          "GET /alerts/{id} to read current alert state",
+          "Assert alert.status == FROZEN or account.status == FROZEN",
+          "PATCH /alerts/{id} with body {\"response\": \"DENY\"}",
+          "Assert HTTP 410 (alert expired / frozen state blocks response)"
+        ],
+        "expected": [
+          "Alert or account enters FROZEN state at T=24h boundary",
+          "HTTP 410 Gone on any subsequent acknowledgement attempt"
+        ],
+        "trace": [
+          "R-FIN-038: unacknowledged alerts shall auto-freeze the account",
+          "R-FIN-038: boundary behaviour at exact max threshold (24 h) must be tested",
+          "R-FIN-038: 410 when alert expired"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unacknowledged_alert_auto_freezes_account_at_24h(\n    expired_alert_fixture,\n    auth_headers,\n    banking_api_base_url,\n):\n    # expired_alert_fixture provides an alert aged exactly 24 h with no response\n    alert_id = expired_alert_fixture[\"id\"]\n    base = banking_api_base_url\n\n    get_resp = requests.get(\n        f\"{base}/alerts/{alert_id}\", headers=auth_headers\n    )\n    assert get_resp.status_code in (200, 410)\n    if get_resp.status_code == 200:\n        body = get_resp.json()\n        status = body.get(\"alert\", {}).get(\"status\") or \\\n                 body.get(\"account\", {}).get(\"status\")\n        assert status == \"FROZEN\", f\"Expected FROZEN, got {status}\"\n\n    patch_resp = requests.patch(\n        f\"{base}/alerts/{alert_id}\",\n        json={\"response\": \"DENY\"},\n        headers=auth_headers,\n    )\n    assert patch_resp.status_code == 410, (\n        f\"Expected 410 Gone, got {patch_resp.status_code}: {patch_resp.text}\"\n    )\n"
+      },
+      {
+        "name": "test_respond_to_expired_alert_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A fraud alert exists with age > 24 hours and status=EXPIRED",
+          "Customer is authenticated with a valid bearer token"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"DENY\"}",
+          "Assert HTTP 410",
+          "Assert error body contains a meaningful reason code"
+        ],
+        "expected": [
+          "HTTP 410 Gone",
+          "Response body contains error.code == ALERT_EXPIRED or equivalent"
+        ],
+        "trace": [
+          "R-FIN-038: 410 when alert expired (error pathway)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_respond_to_expired_alert_returns_410(\n    expired_alert_fixture,\n    auth_headers,\n    banking_api_base_url,\n):\n    alert_id = expired_alert_fixture[\"id\"]\n    url = f\"{banking_api_base_url}/alerts/{alert_id}\"\n\n    resp = requests.patch(url, json={\"response\": \"DENY\"}, headers=auth_headers)\n\n    assert resp.status_code == 410, (\n        f\"Expected 410 Gone for expired alert, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    error_code = body.get(\"error\", {}).get(\"code\", \"\")\n    assert \"EXPIRED\" in error_code.upper() or \"GONE\" in error_code.upper(), (\n        f\"Unexpected error code: {error_code}\"\n    )\n"
+      },
+      {
+        "name": "test_alert_state_transition_active_to_closed_on_valid_response",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A fraud alert exists with status=ACTIVE",
+          "Customer is authenticated"
+        ],
+        "actions": [
+          "GET /alerts/{id} -> assert status == ACTIVE",
+          "PATCH /alerts/{id} with body {\"response\": \"DENY\"}",
+          "GET /alerts/{id} -> assert status == CLOSED"
+        ],
+        "expected": [
+          "State transition: ACTIVE -> CLOSED",
+          "Intermediate ACTIVE state confirmed before PATCH",
+          "Final CLOSED state confirmed after PATCH"
+        ],
+        "trace": [
+          "R-FIN-038: alert closed after customer response (state lifecycle)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_alert_state_transition_active_to_closed_on_valid_response(\n    active_alert_fixture,\n    auth_headers,\n    banking_api_base_url,\n):\n    alert_id = active_alert_fixture[\"id\"]\n    base = banking_api_base_url\n    headers = auth_headers\n\n    pre = requests.get(f\"{base}/alerts/{alert_id}\", headers=headers)\n    assert pre.status_code == 200\n    assert pre.json()[\"alert\"][\"status\"] == \"ACTIVE\"\n\n    patch = requests.patch(\n        f\"{base}/alerts/{alert_id}\",\n        json={\"response\": \"DENY\"},\n        headers=headers,\n    )\n    assert patch.status_code == 200, f\"PATCH failed: {patch.text}\"\n\n    post = requests.get(f\"{base}/alerts/{alert_id}\", headers=headers)\n    assert post.status_code == 200\n    assert post.json()[\"alert\"][\"status\"] == \"CLOSED\"\n"
+      },
+      {
+        "name": "test_response_one_second_before_expiry_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A fraud alert exists with age == 86399 seconds (T=24h minus 1 second)",
+          "Customer is authenticated with a valid bearer token"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"DENY\"}",
+          "Assert HTTP 200",
+          "Assert alert.status == CLOSED"
+        ],
+        "expected": [
+          "HTTP 200 OK \u2014 response accepted at T minus 1 second boundary",
+          "alert.status == CLOSED"
+        ],
+        "trace": [
+          "R-FIN-038: boundary behaviour at exact min/max thresholds must be tested",
+          "R-FIN-038: 24-hour window upper boundary \u2014 one second before expiry must still be valid"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_response_one_second_before_expiry_is_accepted(\n    near_expiry_alert_fixture,\n    auth_headers,\n    banking_api_base_url,\n):\n    # near_expiry_alert_fixture: alert aged 86399 s (24 h - 1 s)\n    alert_id = near_expiry_alert_fixture[\"id\"]\n    url = f\"{banking_api_base_url}/alerts/{alert_id}\"\n\n    resp = requests.patch(url, json={\"response\": \"DENY\"}, headers=auth_headers)\n\n    assert resp.status_code == 200, (\n        f\"Expected 200 at T-1s boundary, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body[\"alert\"][\"status\"] == \"CLOSED\", (\n        f\"Expected CLOSED, got {body['alert']['status']}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-038",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 3396,
+    "latency_ms": 34949,
+    "wall_ms": 34949,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-038\",\n  \"reasoning\": \"R-FIN-038 governs fraud-alert lifecycle on /alerts/{id}. Key decision axes are: (1) customer response type (confirm fraud / deny fraud), (2) timing relative to the 24-hour window (well within, at exactly 24 h, past 24 h), and (3) account state transitions triggered by each path. EP partitions valid responses vs. expired alerts. BVA targets exactly T=0 min (alert just opened), T=23h59m59s (last valid second), and T=24h00m00s (first expired second). STC traces ACTIVE\u2192CLOSED and ACTIVE\u2192FROZEN. DT covers the confirm/deny decision matrix. NEG covers the 410 error on an already-expired alert.\",\n  \"tests\": [\n    {\n      \"name\": \"test_deny_fraud_alert_within_window_closes_alert\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A fraud alert exists with status=ACTIVE and age < 24 hours\",\n        \"Customer is authenticated with a valid bearer token\",\n        \"No prior acknowledgement has been made on this alert\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"DENY\\\"}\",\n        \"Assert HTTP 200\",\n        \"Assert response body alert.status == CLOSED\",\n        \"Assert response body alert.resolution == DENIED\",\n        \"Assert card reissue is NOT triggered\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"alert.status == CLOSED\",\n        \"alert.resolution == DENIED\",\n        \"No card reissue event emitted\"\n      ],\n      \"trace\": [\n        \"R-FIN-038: customer confirms or denies within 24 h -> alert closed\",\n        \"R-FIN-038: card reissued only when fraud confirmed\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_deny_fraud_alert_within_window_closes_alert(\\n    active_alert_fixture,\\n    auth_headers,\\n    banking_api_base_url,\\n):\\n    alert_id = active_alert_fixture[\\\"id\\\"]\\n    url = f\\\"{banking_api_base_url}/alerts/{alert_id}\\\"\\n\\n    resp = requests.patch(url, json={\\\"response\\\": \\\"DENY\\\"}, headers=auth_headers)\\n\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body[\\\"alert\\\"][\\\"status\\\"] == \\\"CLOSED\\\"\\n    assert body[\\\"alert\\\"][\\\"resolution\\\"] == \\\"DENIED\\\"\\n    assert body[\\\"alert\\\"].get(\\\"card_reissued\\\", False) is False\\n\"\n    },\n    {\n      \"name\": \"test_confirm_fraud_alert_triggers_card_reissue\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"A fraud alert exists with status=ACTIVE and age < 24 hours\",\n        \"Customer is authenticated with a valid bearer token\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"CONFIRM\\\"}\",\n        \"Assert HTTP 200\",\n        \"Assert alert.status == CLOSED\",\n        \"Assert alert.resolution == CONFIRMED\",\n        \"Assert card_reissued == true in response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"alert.status == CLOSED\",\n        \"alert.resolution == CONFIRMED\",\n        \"card_reissued == true\"\n      ],\n      \"trace\": [\n        \"R-FIN-038: alert closed after customer response\",\n        \"R-FIN-038: card reissued if fraud confirmed\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_confirm_fraud_alert_triggers_card_reissue(\\n    active_alert_fixture,\\n    auth_headers,\\n    banking_api_base_url,\\n):\\n    alert_id = active_alert_fixture[\\\"id\\\"]\\n    url = f\\\"{banking_api_base_url}/alerts/{alert_id}\\\"\\n\\n    resp = requests.patch(url, json={\\\"response\\\": \\\"CONFIRM\\\"}, headers=auth_headers)\\n\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body[\\\"alert\\\"][\\\"status\\\"] == \\\"CLOSED\\\"\\n    assert body[\\\"alert\\\"][\\\"resolution\\\"] == \\\"CONFIRMED\\\"\\n    assert body[\\\"alert\\\"][\\\"card_reissued\\\"] is True\\n\"\n    },\n    {\n      \"name\": \"test_unacknowledged_alert_auto_freezes_account_at_24h\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"A "
+  }
+}

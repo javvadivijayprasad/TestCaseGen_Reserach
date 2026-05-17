@@ -1,0 +1,190 @@
+{
+  "req": {
+    "id": "R-FIN-058",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Account statement generation (negative variant)",
+    "statement": "A customer shall request monthly statements as PDF; statements older than 7 years shall be fetched from cold storage. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer requests statement"
+    ],
+    "expected_outcomes": [
+      "PDF delivered",
+      "retrieval logged"
+    ],
+    "error_pathways": [
+      "404 if no activity in period",
+      "503 if cold storage unavailable"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/statements/{month}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-058",
+    "reasoning": "The requirement covers PDF statement delivery, cold-storage retrieval for records older than 7 years, retrieval logging, and several error paths (404 for inactive periods, 503 for cold-storage failures, 401 for unauthorised callers). Test design uses: EP for the happy-path (valid authenticated owner gets a recent statement); NEG for the unauthorised-caller case (different account owner); BVA for the 7-year boundary (statement exactly 84 months ago triggers cold-storage path); DT for combined error conditions (no activity + valid auth \u2192 404); STC for the cold-storage unavailability state (service degraded \u2192 503). Each test is self-contained via pytest fixtures and stubs, deterministic through mocked dependencies, and idempotent because no persistent state is mutated.",
+    "tests": [
+      {
+        "name": "test_get_recent_statement_returns_pdf_and_logs_retrieval",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer token belongs to account owner",
+          "Statement for target month exists in hot storage",
+          "Month is within the last 7 years"
+        ],
+        "actions": [
+          "Authenticate as the account owner",
+          "GET /statements/{month} with a valid recent month (e.g. 2024-06)",
+          "Capture response headers and body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type header equals application/pdf",
+          "Response body is non-empty binary PDF data",
+          "Audit log contains a retrieval entry for the requested month"
+        ],
+        "trace": [
+          "R-FIN-058: customer requests monthly statement",
+          "R-FIN-058: PDF delivered",
+          "R-FIN-058: retrieval logged"
+        ],
+        "executable": "def test_get_recent_statement_returns_pdf_and_logs_retrieval(\n    auth_token_owner, api_client, audit_log_spy, statement_month_recent\n):\n    resp = api_client.get(\n        f\"/statements/{statement_month_recent}\",\n        headers={\"Authorization\": f\"Bearer {auth_token_owner}\"},\n    )\n    assert resp.status_code == 200\n    assert resp.headers[\"Content-Type\"] == \"application/pdf\"\n    assert len(resp.content) > 0\n    assert resp.content[:4] == b\"%PDF\"\n    log_entry = audit_log_spy.last_entry()\n    assert log_entry[\"action\"] == \"statement_retrieved\"\n    assert log_entry[\"month\"] == statement_month_recent"
+      },
+      {
+        "name": "test_get_statement_as_non_owner_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Token belongs to a different account holder (not the resource owner)",
+          "Target account has a statement for the requested month"
+        ],
+        "actions": [
+          "Authenticate as a different customer (non-owner)",
+          "GET /statements/{month} for the target account owner's month"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response body contains error code UNAUTHORIZED or similar",
+          "No PDF content returned",
+          "No retrieval audit log entry created for this request"
+        ],
+        "trace": [
+          "R-FIN-058: precondition account.owner == caller",
+          "R-FIN-058: error pathway \u2013 unauthorised"
+        ],
+        "executable": "def test_get_statement_as_non_owner_returns_401(\n    auth_token_non_owner, api_client, audit_log_spy, statement_month_recent\n):\n    resp = api_client.get(\n        f\"/statements/{statement_month_recent}\",\n        headers={\"Authorization\": f\"Bearer {auth_token_non_owner}\"},\n    )\n    assert resp.status_code == 401\n    body = resp.json()\n    assert body.get(\"error\") in (\"UNAUTHORIZED\", \"Unauthorized\", \"unauthorized\")\n    assert \"Content-Type\" not in resp.headers or resp.headers.get(\n        \"Content-Type\"\n    ) != \"application/pdf\"\n    assert audit_log_spy.count_entries(action=\"statement_retrieved\") == 0"
+      },
+      {
+        "name": "test_get_statement_exactly_seven_years_ago_uses_cold_storage",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated token belongs to account owner",
+          "Statement for the month exactly 84 months (7 years) prior to today exists in cold storage",
+          "Cold storage service is available"
+        ],
+        "actions": [
+          "Compute month that is exactly 84 months before the current month",
+          "Authenticate as the account owner",
+          "GET /statements/{month} with that boundary month",
+          "Inspect cold-storage access log"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type header equals application/pdf",
+          "Response body begins with PDF magic bytes",
+          "Cold-storage access log records one read for the boundary month",
+          "Audit retrieval log entry created"
+        ],
+        "trace": [
+          "R-FIN-058: statements older than 7 years shall be fetched from cold storage",
+          "R-FIN-058: PDF delivered",
+          "R-FIN-058: retrieval logged"
+        ],
+        "executable": "from datetime import date\nfrom dateutil.relativedelta import relativedelta\n\ndef test_get_statement_exactly_seven_years_ago_uses_cold_storage(\n    auth_token_owner, api_client, cold_storage_spy, audit_log_spy\n):\n    boundary_month = (date.today() - relativedelta(months=84)).strftime(\"%Y-%m\")\n    resp = api_client.get(\n        f\"/statements/{boundary_month}\",\n        headers={\"Authorization\": f\"Bearer {auth_token_owner}\"},\n    )\n    assert resp.status_code == 200\n    assert resp.headers[\"Content-Type\"] == \"application/pdf\"\n    assert resp.content[:4] == b\"%PDF\"\n    assert cold_storage_spy.read_count(month=boundary_month) == 1\n    log_entry = audit_log_spy.last_entry()\n    assert log_entry[\"action\"] == \"statement_retrieved\"\n    assert log_entry[\"month\"] == boundary_month"
+      },
+      {
+        "name": "test_get_statement_for_inactive_month_returns_404",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated token belongs to account owner",
+          "Account has no transaction activity in the requested month",
+          "No statement was generated for that month"
+        ],
+        "actions": [
+          "Authenticate as the account owner",
+          "GET /statements/{month} for a month with no account activity"
+        ],
+        "expected": [
+          "HTTP 404 Not Found",
+          "Response body contains error code NO_ACTIVITY or NOT_FOUND",
+          "No PDF content returned"
+        ],
+        "trace": [
+          "R-FIN-058: error pathway \u2013 404 if no activity in period"
+        ],
+        "executable": "def test_get_statement_for_inactive_month_returns_404(\n    auth_token_owner, api_client, inactive_month\n):\n    resp = api_client.get(\n        f\"/statements/{inactive_month}\",\n        headers={\"Authorization\": f\"Bearer {auth_token_owner}\"},\n    )\n    assert resp.status_code == 404\n    body = resp.json()\n    assert body.get(\"error\") in (\"NO_ACTIVITY\", \"NOT_FOUND\", \"Not Found\")\n    assert resp.headers.get(\"Content-Type\") != \"application/pdf\""
+      },
+      {
+        "name": "test_get_old_statement_when_cold_storage_unavailable_returns_503",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated token belongs to account owner",
+          "Requested month is older than 7 years (cold storage required)",
+          "Cold storage service is in a degraded / unavailable state (simulated via stub)"
+        ],
+        "actions": [
+          "Configure cold-storage stub to return a service-unavailable error",
+          "Compute a month older than 84 months",
+          "Authenticate as the account owner",
+          "GET /statements/{month} for that old month"
+        ],
+        "expected": [
+          "HTTP 503 Service Unavailable",
+          "Response body indicates cold storage unavailability",
+          "No PDF content returned",
+          "Retry-After header may be present"
+        ],
+        "trace": [
+          "R-FIN-058: error pathway \u2013 503 if cold storage unavailable",
+          "R-FIN-058: statements older than 7 years shall be fetched from cold storage"
+        ],
+        "executable": "from datetime import date\nfrom dateutil.relativedelta import relativedelta\n\ndef test_get_old_statement_when_cold_storage_unavailable_returns_503(\n    auth_token_owner, api_client, cold_storage_stub\n):\n    cold_storage_stub.set_unavailable(True)\n    old_month = (date.today() - relativedelta(months=90)).strftime(\"%Y-%m\")\n    try:\n        resp = api_client.get(\n            f\"/statements/{old_month}\",\n            headers={\"Authorization\": f\"Bearer {auth_token_owner}\"},\n        )\n        assert resp.status_code == 503\n        body = resp.json()\n        assert body.get(\"error\") in (\n            \"COLD_STORAGE_UNAVAILABLE\", \"Service Unavailable\", \"503\"\n        )\n        assert resp.headers.get(\"Content-Type\") != \"application/pdf\"\n    finally:\n        cold_storage_stub.set_unavailable(False)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-058",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 2628,
+    "latency_ms": 30807,
+    "wall_ms": 30807,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-058\",\n  \"reasoning\": \"The requirement covers PDF statement delivery, cold-storage retrieval for records older than 7 years, retrieval logging, and several error paths (404 for inactive periods, 503 for cold-storage failures, 401 for unauthorised callers). Test design uses: EP for the happy-path (valid authenticated owner gets a recent statement); NEG for the unauthorised-caller case (different account owner); BVA for the 7-year boundary (statement exactly 84 months ago triggers cold-storage path); DT for combined error conditions (no activity + valid auth \u2192 404); STC for the cold-storage unavailability state (service degraded \u2192 503). Each test is self-contained via pytest fixtures and stubs, deterministic through mocked dependencies, and idempotent because no persistent state is mutated.\",\n  \"tests\": [\n    {\n      \"name\": \"test_get_recent_statement_returns_pdf_and_logs_retrieval\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer token belongs to account owner\",\n        \"Statement for target month exists in hot storage\",\n        \"Month is within the last 7 years\"\n      ],\n      \"actions\": [\n        \"Authenticate as the account owner\",\n        \"GET /statements/{month} with a valid recent month (e.g. 2024-06)\",\n        \"Capture response headers and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Content-Type header equals application/pdf\",\n        \"Response body is non-empty binary PDF data\",\n        \"Audit log contains a retrieval entry for the requested month\"\n      ],\n      \"trace\": [\n        \"R-FIN-058: customer requests monthly statement\",\n        \"R-FIN-058: PDF delivered\",\n        \"R-FIN-058: retrieval logged\"\n      ],\n      \"executable\": \"def test_get_recent_statement_returns_pdf_and_logs_retrieval(\\n    auth_token_owner, api_client, audit_log_spy, statement_month_recent\\n):\\n    resp = api_client.get(\\n        f\\\"/statements/{statement_month_recent}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {auth_token_owner}\\\"},\\n    )\\n    assert resp.status_code == 200\\n    assert resp.headers[\\\"Content-Type\\\"] == \\\"application/pdf\\\"\\n    assert len(resp.content) > 0\\n    assert resp.content[:4] == b\\\"%PDF\\\"\\n    log_entry = audit_log_spy.last_entry()\\n    assert log_entry[\\\"action\\\"] == \\\"statement_retrieved\\\"\\n    assert log_entry[\\\"month\\\"] == statement_month_recent\"\n    },\n    {\n      \"name\": \"test_get_statement_as_non_owner_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Token belongs to a different account holder (not the resource owner)\",\n        \"Target account has a statement for the requested month\"\n      ],\n      \"actions\": [\n        \"Authenticate as a different customer (non-owner)\",\n        \"GET /statements/{month} for the target account owner's month\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized\",\n        \"Response body contains error code UNAUTHORIZED or similar\",\n        \"No PDF content returned\",\n        \"No retrieval audit log entry created for this request\"\n      ],\n      \"trace\": [\n        \"R-FIN-058: precondition account.owner == caller\",\n        \"R-FIN-058: error pathway \u2013 unauthorised\"\n      ],\n      \"executable\": \"def test_get_statement_as_non_owner_returns_401(\\n    auth_token_non_owner, api_client, audit_log_spy, statement_month_recent\\n):\\n    resp = api_client.get(\\n        f\\\"/statements/{statement_month_recent}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {auth_token_non_owner}\\\"},\\n    )\\n    assert resp.status_code == 401\\n    body = resp.json()\\n    assert body.get(\\\"error\\\") in (\\\"UNAUTHORIZED\\\", \\\"Unauthorized\\\", \\\"unauthorized\\\")\\n    assert \\\"Content-Type\\\" not in resp.headers or resp.headers.get(\\n        \\\"Content-Type\\\"\\n    ) != \\\"application/pdf\\\"\\n    assert audit_log_spy.count_entries(action=\\\"statement_retrieved\\\") == 0\"\n    },\n    {\n      \"name\": \"test_get_statement_exactly_seven_years_ago_uses_col"
+  }
+}

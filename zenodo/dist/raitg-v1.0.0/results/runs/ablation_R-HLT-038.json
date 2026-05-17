@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-HLT-038",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients (boundary)",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-038",
+    "reasoning": "R-HLT-038 requires patient search by name/MRN/DOB with care-team scoping, access logging, and correct error handling for malformed queries. I selected: (1) EP positive \u2013 valid name search returns only care-team patients; (2) NEG \u2013 malformed DOB yields 400; (3) BVA \u2013 DOB at exact midnight boundary (00:00:00) is handled correctly; (4) DT \u2013 clinician with no assigned patients returns empty bundle (not 403/500); (5) EP \u2013 MRN search returns correct scoped result. Together these cover the main equivalence classes, boundary timestamps, negative path, and a decision-table scenario for the empty-result branch.",
+    "tests": [
+      {
+        "name": "test_search_by_name_returns_scoped_patients",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <fixture:clinician_auth_headers>",
+          "At least one patient named 'Smith' is assigned to the clinician in <fixture:seeded_patients>",
+          "No patient named 'Smith' belongs to a different clinician"
+        ],
+        "actions": [
+          "GET /Patient?search with query param name=Smith and clinician auth header"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Response body is a FHIR Bundle with resourceType='Bundle'",
+          "All entries have family name containing 'Smith'",
+          "Access log entry created for this search (verified via <helper_fn:get_audit_log>)"
+        ],
+        "trace": [
+          "R-HLT-038: search by name",
+          "R-HLT-038: only patients in care returned",
+          "R-HLT-038: access logged"
+        ],
+        "executable": "def test_search_by_name_returns_scoped_patients(clinician_auth_headers, seeded_patients, api_client, get_audit_log):\n    resp = api_client.get(\"/Patient?search\", params={\"name\": \"Smith\"}, headers=clinician_auth_headers)\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) > 0, \"Expected at least one Smith patient\"\n    for e in entries:\n        names = e[\"resource\"][\"name\"]\n        family_names = [n.get(\"family\", \"\") for n in names]\n        assert any(\"Smith\" in fn for fn in family_names), f\"Unexpected patient: {family_names}\"\n    clinician_id = clinician_auth_headers[\"X-Clinician-Id\"]\n    logs = get_audit_log(clinician_id, action=\"search\", resource=\"Patient\")\n    assert len(logs) >= 1, \"Access log entry not found\"\n"
+      },
+      {
+        "name": "test_malformed_dob_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token available via <fixture:clinician_auth_headers>"
+        ],
+        "actions": [
+          "GET /Patient?search with query param birthdate=not-a-date (invalid format)"
+        ],
+        "expected": [
+          "HTTP 400",
+          "Response body contains an OperationOutcome resource",
+          "OperationOutcome issue severity is 'error'",
+          "OperationOutcome diagnostics mention 'birthdate' or 'invalid'"
+        ],
+        "trace": [
+          "R-HLT-038: error pathway \u2013 400 when query malformed"
+        ],
+        "executable": "def test_malformed_dob_returns_400(clinician_auth_headers, api_client):\n    resp = api_client.get(\"/Patient?search\", params={\"birthdate\": \"not-a-date\"}, headers=clinician_auth_headers)\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\", \"Expected OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert len(issues) > 0, \"OperationOutcome must contain at least one issue\"\n    severities = [i.get(\"severity\") for i in issues]\n    assert \"error\" in severities, f\"Expected error severity, got {severities}\"\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues).lower()\n    assert \"birthdate\" in diagnostics or \"invalid\" in diagnostics\n"
+      },
+      {
+        "name": "test_dob_midnight_boundary_timestamp",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <fixture:clinician_auth_headers>",
+          "Patient with DOB '1990-06-15' (midnight, no time component) assigned to clinician exists in <fixture:seeded_patients>"
+        ],
+        "actions": [
+          "GET /Patient?search with birthdate=1990-06-15 (date-only, boundary of datetime precision)",
+          "GET /Patient?search with birthdate=1990-06-15T00:00:00 (explicit midnight timestamp)"
+        ],
+        "expected": [
+          "Both requests return HTTP 200",
+          "Both bundles contain the patient born on 1990-06-15",
+          "No 400 or 500 error on midnight timestamp format"
+        ],
+        "trace": [
+          "R-HLT-038: boundary cases on timestamps must be tested",
+          "R-HLT-038: DOB search"
+        ],
+        "executable": "def test_dob_midnight_boundary_timestamp(clinician_auth_headers, seeded_patients, api_client):\n    target_dob = \"1990-06-15\"\n    for dob_param in [target_dob, f\"{target_dob}T00:00:00\"]:\n        resp = api_client.get(\"/Patient?search\", params={\"birthdate\": dob_param}, headers=clinician_auth_headers)\n        assert resp.status_code == 200, f\"Unexpected status for param '{dob_param}': {resp.status_code}\"\n        bundle = resp.json()\n        assert bundle[\"resourceType\"] == \"Bundle\"\n        dobs = [e[\"resource\"].get(\"birthDate\", \"\") for e in bundle.get(\"entry\", [])]\n        assert any(d.startswith(target_dob) for d in dobs), (\n            f\"Patient with DOB {target_dob} not found for param '{dob_param}'. Got: {dobs}\"\n        )\n"
+      },
+      {
+        "name": "test_clinician_with_no_patients_returns_empty_bundle",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician token for a clinician with zero assigned patients via <fixture:empty_panel_clinician_auth_headers>"
+        ],
+        "actions": [
+          "GET /Patient?search with name=Smith using the empty-panel clinician credentials"
+        ],
+        "expected": [
+          "HTTP 200 (not 403 or 404)",
+          "Response is a FHIR Bundle with total=0 or empty entry array",
+          "No patients from other clinicians are leaked"
+        ],
+        "trace": [
+          "R-HLT-038: only patients in care returned",
+          "R-HLT-038: decision \u2013 clinician has no care-team patients"
+        ],
+        "executable": "def test_clinician_with_no_patients_returns_empty_bundle(empty_panel_clinician_auth_headers, api_client):\n    resp = api_client.get(\"/Patient?search\", params={\"name\": \"Smith\"}, headers=empty_panel_clinician_auth_headers)\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    total = bundle.get(\"total\", len(bundle.get(\"entry\", [])))\n    assert total == 0, f\"Expected 0 results for empty-panel clinician, got {total}\"\n"
+      },
+      {
+        "name": "test_search_by_mrn_returns_scoped_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <fixture:clinician_auth_headers>",
+          "Patient with MRN '00042987' is assigned to the clinician in <fixture:seeded_patients>",
+          "MRN '00042987' belongs exclusively to one patient record"
+        ],
+        "actions": [
+          "GET /Patient?search with query param identifier=00042987 and clinician auth header"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Bundle contains exactly one entry",
+          "Returned patient's identifier value equals '00042987'",
+          "Patient is within the clinician's care team (not a foreign patient)"
+        ],
+        "trace": [
+          "R-HLT-038: search by MRN",
+          "R-HLT-038: only patients in care returned",
+          "R-HLT-038: boundary cases on numeric elements (MRN leading zeros preserved)"
+        ],
+        "executable": "def test_search_by_mrn_returns_scoped_patient(clinician_auth_headers, seeded_patients, api_client):\n    target_mrn = \"00042987\"\n    resp = api_client.get(\"/Patient?search\", params={\"identifier\": target_mrn}, headers=clinician_auth_headers)\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 1, f\"Expected exactly 1 result, got {len(entries)}\"\n    identifiers = entries[0][\"resource\"].get(\"identifier\", [])\n    values = [i.get(\"value\", \"\") for i in identifiers]\n    assert target_mrn in values, f\"MRN {target_mrn} not found in {values}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-038",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 995,
+    "output_tokens": 2717,
+    "latency_ms": 30568,
+    "wall_ms": 30568,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-038\",\n  \"reasoning\": \"R-HLT-038 requires patient search by name/MRN/DOB with care-team scoping, access logging, and correct error handling for malformed queries. I selected: (1) EP positive \u2013 valid name search returns only care-team patients; (2) NEG \u2013 malformed DOB yields 400; (3) BVA \u2013 DOB at exact midnight boundary (00:00:00) is handled correctly; (4) DT \u2013 clinician with no assigned patients returns empty bundle (not 403/500); (5) EP \u2013 MRN search returns correct scoped result. Together these cover the main equivalence classes, boundary timestamps, negative path, and a decision-table scenario for the empty-result branch.\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_by_name_returns_scoped_patients\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <fixture:clinician_auth_headers>\",\n        \"At least one patient named 'Smith' is assigned to the clinician in <fixture:seeded_patients>\",\n        \"No patient named 'Smith' belongs to a different clinician\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param name=Smith and clinician auth header\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Response body is a FHIR Bundle with resourceType='Bundle'\",\n        \"All entries have family name containing 'Smith'\",\n        \"Access log entry created for this search (verified via <helper_fn:get_audit_log>)\"\n      ],\n      \"trace\": [\n        \"R-HLT-038: search by name\",\n        \"R-HLT-038: only patients in care returned\",\n        \"R-HLT-038: access logged\"\n      ],\n      \"executable\": \"def test_search_by_name_returns_scoped_patients(clinician_auth_headers, seeded_patients, api_client, get_audit_log):\\n    resp = api_client.get(\\\"/Patient?search\\\", params={\\\"name\\\": \\\"Smith\\\"}, headers=clinician_auth_headers)\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n    entries = bundle.get(\\\"entry\\\", [])\\n    assert len(entries) > 0, \\\"Expected at least one Smith patient\\\"\\n    for e in entries:\\n        names = e[\\\"resource\\\"][\\\"name\\\"]\\n        family_names = [n.get(\\\"family\\\", \\\"\\\") for n in names]\\n        assert any(\\\"Smith\\\" in fn for fn in family_names), f\\\"Unexpected patient: {family_names}\\\"\\n    clinician_id = clinician_auth_headers[\\\"X-Clinician-Id\\\"]\\n    logs = get_audit_log(clinician_id, action=\\\"search\\\", resource=\\\"Patient\\\")\\n    assert len(logs) >= 1, \\\"Access log entry not found\\\"\\n\"\n    },\n    {\n      \"name\": \"test_malformed_dob_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <fixture:clinician_auth_headers>\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param birthdate=not-a-date (invalid format)\"\n      ],\n      \"expected\": [\n        \"HTTP 400\",\n        \"Response body contains an OperationOutcome resource\",\n        \"OperationOutcome issue severity is 'error'\",\n        \"OperationOutcome diagnostics mention 'birthdate' or 'invalid'\"\n      ],\n      \"trace\": [\n        \"R-HLT-038: error pathway \u2013 400 when query malformed\"\n      ],\n      \"executable\": \"def test_malformed_dob_returns_400(clinician_auth_headers, api_client):\\n    resp = api_client.get(\\\"/Patient?search\\\", params={\\\"birthdate\\\": \\\"not-a-date\\\"}, headers=clinician_auth_headers)\\n    assert resp.status_code == 400\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\", \\\"Expected OperationOutcome\\\"\\n    issues = body.get(\\\"issue\\\", [])\\n    assert len(issues) > 0, \\\"OperationOutcome must contain at least one issue\\\"\\n    severities = [i.get(\\\"severity\\\") for i in issues]\\n    assert \\\"error\\\" in severities, f\\\"Expected error severity, got {severities}\\\"\\n    diagnostics = \\\" \\\".join(i.get(\\\"diagnostics\\\", \\\"\\\") for i in issues).lower()\\n    assert \\\"birthdate\\\" in diagnostics or \\\"invalid\\\" in diagnostics\\n\"\n    }"
+  }
+}

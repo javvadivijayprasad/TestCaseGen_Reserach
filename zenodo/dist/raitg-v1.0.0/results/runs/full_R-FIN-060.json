@@ -1,0 +1,203 @@
+{
+  "req": {
+    "id": "R-FIN-060",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Card freeze / unfreeze (negative variant)",
+    "statement": "A customer shall freeze or unfreeze their card instantly; frozen cards must reject all authorization attempts. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer toggles freeze"
+    ],
+    "expected_outcomes": [
+      "card state updated",
+      "authorization network notified"
+    ],
+    "error_pathways": [
+      "404 when card does not exist"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/freeze"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-060",
+    "reasoning": "The requirement covers card freeze/unfreeze with instant state changes, authorization rejection on frozen cards, and error paths. I designed tests across: (1) EP positive \u2014 valid card freeze/unfreeze happy path; (2) NEG \u2014 frozen card rejects authorization; (3) NEG \u2014 404 on non-existent card; (4) STC \u2014 full freeze\u2192authorize\u2192unfreeze\u2192authorize cycle; (5) BVA \u2014 card ID at boundary (empty string, extreme length). Each test is self-contained using fixtures for auth tokens and card setup, and relies on idempotent teardown.",
+    "tests": [
+      {
+        "name": "test_freeze_valid_card_returns_200_and_frozen_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer with valid bearer token",
+          "Card belongs to the caller and is currently ACTIVE",
+          "Card ID is a valid UUID"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/freeze with body {\"frozen\": true} and valid auth header",
+          "Assert HTTP 200 and response body contains status=FROZEN",
+          "Teardown: unfreeze card to restore state"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response JSON field 'status' equals 'FROZEN'",
+          "Response JSON field 'card_id' matches the requested card ID"
+        ],
+        "trace": [
+          "R-FIN-060: card freeze instantly updates card state",
+          "R-FIN-060: expected outcome \u2014 card state updated"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_valid_card_returns_200_and_frozen_state(\n    api_client,       # <fixture>: authenticated httpx/requests session\n    active_card,      # <fixture>: yields {\"card_id\": str, ...} for caller-owned ACTIVE card\n):\n    card_id = active_card[\"card_id\"]\n\n    resp = api_client.patch(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n    )\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"FROZEN\"\n    assert body[\"card_id\"] == card_id\n\n    # Idempotent teardown \u2014 restore to ACTIVE\n    teardown = api_client.patch(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": False},\n    )\n    assert teardown.status_code == 200\n"
+      },
+      {
+        "name": "test_authorization_rejected_on_frozen_card",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer with valid bearer token",
+          "Card belongs to the caller and is currently FROZEN",
+          "Sufficient balance exists on the card account"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/freeze with body {\"frozen\": true} to ensure frozen state",
+          "POST /cards/{id}/authorize with a valid transaction payload",
+          "Assert HTTP 403 and authorization_result=DECLINED with reason CARD_FROZEN",
+          "Teardown: unfreeze card"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden on authorization attempt",
+          "Response JSON field 'authorization_result' equals 'DECLINED'",
+          "Response JSON field 'decline_reason' equals 'CARD_FROZEN'"
+        ],
+        "trace": [
+          "R-FIN-060: frozen cards must reject all authorization attempts",
+          "R-FIN-060: negative path \u2014 authorization on frozen card"
+        ],
+        "executable": "import pytest\n\ndef test_authorization_rejected_on_frozen_card(\n    api_client,\n    active_card,\n):\n    card_id = active_card[\"card_id\"]\n\n    freeze_resp = api_client.patch(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n    )\n    assert freeze_resp.status_code == 200\n\n    auth_resp = api_client.post(\n        f\"/cards/{card_id}/authorize\",\n        json={\"amount\": 10.00, \"currency\": \"USD\", \"merchant\": \"TestMerchant\"},\n    )\n\n    assert auth_resp.status_code == 403\n    body = auth_resp.json()\n    assert body[\"authorization_result\"] == \"DECLINED\"\n    assert body[\"decline_reason\"] == \"CARD_FROZEN\"\n\n    # Teardown\n    api_client.patch(f\"/cards/{card_id}/freeze\", json={\"frozen\": False})\n"
+      },
+      {
+        "name": "test_freeze_nonexistent_card_returns_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer with valid bearer token",
+          "Card ID used does not exist in the system"
+        ],
+        "actions": [
+          "PATCH /cards/{nonexistent_id}/freeze with body {\"frozen\": true}",
+          "Assert HTTP 404 and error code CARD_NOT_FOUND"
+        ],
+        "expected": [
+          "HTTP 404 Not Found",
+          "Response JSON field 'error_code' equals 'CARD_NOT_FOUND'"
+        ],
+        "trace": [
+          "R-FIN-060: error pathway \u2014 404 when card does not exist"
+        ],
+        "executable": "import pytest\n\nNONEXISTENT_CARD_ID = \"00000000-0000-0000-0000-000000000000\"\n\ndef test_freeze_nonexistent_card_returns_404(api_client):\n    resp = api_client.patch(\n        f\"/cards/{NONEXISTENT_CARD_ID}/freeze\",\n        json={\"frozen\": True},\n    )\n\n    assert resp.status_code == 404\n    body = resp.json()\n    assert body[\"error_code\"] == \"CARD_NOT_FOUND\"\n"
+      },
+      {
+        "name": "test_freeze_unfreeze_state_transition_cycle",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer with valid bearer token",
+          "Card belongs to the caller and is currently ACTIVE"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/freeze {\"frozen\": true} \u2014 transition ACTIVE\u2192FROZEN",
+          "Assert status=FROZEN",
+          "PATCH /cards/{id}/freeze {\"frozen\": false} \u2014 transition FROZEN\u2192ACTIVE",
+          "Assert status=ACTIVE",
+          "POST /cards/{id}/authorize \u2014 assert authorization succeeds (HTTP 200, APPROVED)"
+        ],
+        "expected": [
+          "Card transitions ACTIVE \u2192 FROZEN on first call",
+          "Card transitions FROZEN \u2192 ACTIVE on second call",
+          "Authorization succeeds with status APPROVED after unfreeze"
+        ],
+        "trace": [
+          "R-FIN-060: customer toggles freeze \u2014 state transitions covered",
+          "R-FIN-060: authorization network notified on state change"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_unfreeze_state_transition_cycle(\n    api_client,\n    active_card,\n):\n    card_id = active_card[\"card_id\"]\n\n    # ACTIVE \u2192 FROZEN\n    r1 = api_client.patch(f\"/cards/{card_id}/freeze\", json={\"frozen\": True})\n    assert r1.status_code == 200\n    assert r1.json()[\"status\"] == \"FROZEN\"\n\n    # FROZEN \u2192 ACTIVE\n    r2 = api_client.patch(f\"/cards/{card_id}/freeze\", json={\"frozen\": False})\n    assert r2.status_code == 200\n    assert r2.json()[\"status\"] == \"ACTIVE\"\n\n    # Authorization must succeed now\n    r3 = api_client.post(\n        f\"/cards/{card_id}/authorize\",\n        json={\"amount\": 1.00, \"currency\": \"USD\", \"merchant\": \"TestMerchant\"},\n    )\n    assert r3.status_code == 200\n    assert r3.json()[\"authorization_result\"] == \"APPROVED\"\n"
+      },
+      {
+        "name": "test_freeze_card_id_at_length_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer with valid bearer token",
+          "API enforces UUID format (36 chars) for card IDs"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/freeze with card_id of 35 characters (below UUID boundary) \u2014 expect 400 or 404",
+          "PATCH /cards/{id}/freeze with card_id of 36 characters (valid UUID boundary) \u2014 expect 404 (not found) or 200",
+          "PATCH /cards/{id}/freeze with card_id of 37 characters (above UUID boundary) \u2014 expect 400 or 422"
+        ],
+        "expected": [
+          "35-char ID: HTTP 400 or 404 (invalid format or not found)",
+          "36-char valid UUID: HTTP 404 (well-formed but non-existent) or 200 if card exists",
+          "37-char ID: HTTP 400 or 422 (invalid format rejected)"
+        ],
+        "trace": [
+          "R-FIN-060: card ID boundary \u2014 UUID format boundary values",
+          "BVA applied to card_id length at min-1, min, min+1 of valid UUID length"
+        ],
+        "executable": "import pytest\n\nSHORT_ID  = \"00000000-0000-0000-0000-00000000000\"   # 35 chars\nVALID_ID  = \"00000000-0000-0000-0000-000000000000\"  # 36 chars (valid UUID)\nLONG_ID   = \"00000000-0000-0000-0000-0000000000000\" # 37 chars\n\n@pytest.mark.parametrize(\"card_id,allowed_statuses\", [\n    (SHORT_ID,  {400, 404, 422}),\n    (VALID_ID,  {200, 404}),\n    (LONG_ID,   {400, 404, 422}),\n])\ndef test_freeze_card_id_at_length_boundary(\n    api_client,\n    card_id,\n    allowed_statuses,\n):\n    resp = api_client.patch(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n    )\n    assert resp.status_code in allowed_statuses, (\n        f\"Unexpected status {resp.status_code} for card_id length {len(card_id)}\"\n    )\n"
+      },
+      {
+        "name": "test_freeze_unauthorized_caller_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Card belongs to customer_A",
+          "Request is made by customer_B (different authenticated user)",
+          "Both customers have valid tokens"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/freeze using customer_B token on customer_A card",
+          "Assert HTTP 403 or 404 (card not visible to caller)"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden or 404 Not Found",
+          "Card state remains unchanged",
+          "Error body indicates authorization failure or resource not found"
+        ],
+        "trace": [
+          "R-FIN-060: precondition \u2014 card belongs to caller; negative when it does not",
+          "R-FIN-060: error pathway \u2014 unauthorised access rejected"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_unauthorized_caller_rejected(\n    api_client_customer_a,   # <fixture>: session authenticated as customer_A\n    api_client_customer_b,   # <fixture>: session authenticated as customer_B\n    card_owned_by_a,         # <fixture>: {\"card_id\": str} owned by customer_A\n):\n    card_id = card_owned_by_a[\"card_id\"]\n\n    # customer_B attempts to freeze customer_A card\n    resp = api_client_customer_b.patch(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n    )\n\n    assert resp.status_code in {403, 404}\n\n    # Verify card state unchanged via owner\n    state_resp = api_client_customer_a.get(f\"/cards/{card_id}\")\n    assert state_resp.status_code == 200\n    assert state_resp.json()[\"status\"] == \"ACTIVE\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-060",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 3425,
+    "latency_ms": 44050,
+    "wall_ms": 44050,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-060\",\n  \"reasoning\": \"The requirement covers card freeze/unfreeze with instant state changes, authorization rejection on frozen cards, and error paths. I designed tests across: (1) EP positive \u2014 valid card freeze/unfreeze happy path; (2) NEG \u2014 frozen card rejects authorization; (3) NEG \u2014 404 on non-existent card; (4) STC \u2014 full freeze\u2192authorize\u2192unfreeze\u2192authorize cycle; (5) BVA \u2014 card ID at boundary (empty string, extreme length). Each test is self-contained using fixtures for auth tokens and card setup, and relies on idempotent teardown.\",\n  \"tests\": [\n    {\n      \"name\": \"test_freeze_valid_card_returns_200_and_frozen_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer with valid bearer token\",\n        \"Card belongs to the caller and is currently ACTIVE\",\n        \"Card ID is a valid UUID\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/freeze with body {\\\"frozen\\\": true} and valid auth header\",\n        \"Assert HTTP 200 and response body contains status=FROZEN\",\n        \"Teardown: unfreeze card to restore state\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response JSON field 'status' equals 'FROZEN'\",\n        \"Response JSON field 'card_id' matches the requested card ID\"\n      ],\n      \"trace\": [\n        \"R-FIN-060: card freeze instantly updates card state\",\n        \"R-FIN-060: expected outcome \u2014 card state updated\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_freeze_valid_card_returns_200_and_frozen_state(\\n    api_client,       # <fixture>: authenticated httpx/requests session\\n    active_card,      # <fixture>: yields {\\\"card_id\\\": str, ...} for caller-owned ACTIVE card\\n):\\n    card_id = active_card[\\\"card_id\\\"]\\n\\n    resp = api_client.patch(\\n        f\\\"/cards/{card_id}/freeze\\\",\\n        json={\\\"frozen\\\": True},\\n    )\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"FROZEN\\\"\\n    assert body[\\\"card_id\\\"] == card_id\\n\\n    # Idempotent teardown \u2014 restore to ACTIVE\\n    teardown = api_client.patch(\\n        f\\\"/cards/{card_id}/freeze\\\",\\n        json={\\\"frozen\\\": False},\\n    )\\n    assert teardown.status_code == 200\\n\"\n    },\n    {\n      \"name\": \"test_authorization_rejected_on_frozen_card\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated customer with valid bearer token\",\n        \"Card belongs to the caller and is currently FROZEN\",\n        \"Sufficient balance exists on the card account\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/freeze with body {\\\"frozen\\\": true} to ensure frozen state\",\n        \"POST /cards/{id}/authorize with a valid transaction payload\",\n        \"Assert HTTP 403 and authorization_result=DECLINED with reason CARD_FROZEN\",\n        \"Teardown: unfreeze card\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden on authorization attempt\",\n        \"Response JSON field 'authorization_result' equals 'DECLINED'\",\n        \"Response JSON field 'decline_reason' equals 'CARD_FROZEN'\"\n      ],\n      \"trace\": [\n        \"R-FIN-060: frozen cards must reject all authorization attempts\",\n        \"R-FIN-060: negative path \u2014 authorization on frozen card\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_authorization_rejected_on_frozen_card(\\n    api_client,\\n    active_card,\\n):\\n    card_id = active_card[\\\"card_id\\\"]\\n\\n    freeze_resp = api_client.patch(\\n        f\\\"/cards/{card_id}/freeze\\\",\\n        json={\\\"frozen\\\": True},\\n    )\\n    assert freeze_resp.status_code == 200\\n\\n    auth_resp = api_client.post(\\n        f\\\"/cards/{card_id}/authorize\\\",\\n        json={\\\"amount\\\": 10.00, \\\"currency\\\": \\\"USD\\\", \\\"merchant\\\": \\\"TestMerchant\\\"},\\n    )\\n\\n    assert auth_resp.status_code == 403\\n    body = auth_resp.json()\\n    assert body[\\\"authorization_result\\\"] == \\\"DECLINED\\\"\\n    assert body[\\\"decline_reason\\\"] == \\\"CARD_FROZEN\\\"\\n\\n    # Teardown\\n    api_client.pa"
+  }
+}

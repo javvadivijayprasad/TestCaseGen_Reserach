@@ -1,0 +1,178 @@
+{
+  "req": {
+    "id": "R-HLT-058",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Create medication request (negative)",
+    "statement": "A prescribing clinician shall issue a MedicationRequest; requests for controlled substances shall require schedule verification. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "prescriber"
+    ],
+    "preconditions": [
+      "role:prescriber"
+    ],
+    "triggers": [
+      "clinician prescribes"
+    ],
+    "expected_outcomes": [
+      "request stored",
+      "pharmacy notified"
+    ],
+    "error_pathways": [
+      "403 without schedule verification for CII"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/MedicationRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-058",
+    "reasoning": "R-HLT-058 governs MedicationRequest creation with three critical axes: (1) happy-path prescriber success, (2) controlled-substance schedule-verification enforcement, and (3) boundary conditions around mandatory field presence. EP covers valid vs invalid prescriber payloads; NEG covers the CII 403 path and missing mandatory elements; BVA covers the exact boundary of a single missing required field; DT covers the combined decision of role \u00d7 schedule-verification flag; STC covers the draft\u2192active state transition conflict. Five tests are produced to satisfy the minimum three and provide fuller coverage of the stated error pathways.",
+    "tests": [
+      {
+        "name": "test_create_medication_request_valid_prescriber_non_controlled",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated with role=prescriber",
+          "Token has schedule-verification=false (non-controlled substance)",
+          "FHIR server is reachable at BASE_URL"
+        ],
+        "actions": [
+          "POST /MedicationRequest with valid FHIR R4 payload for a non-controlled drug",
+          "Include all mandatory elements: resourceType, status, intent, medicationCodeableConcept, subject, requester"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains id field",
+          "Response status equals 'active'",
+          "X-Pharmacy-Notified header or async event confirmed"
+        ],
+        "trace": [
+          "R-HLT-058 \u2013 positive path: prescriber creates non-controlled MedicationRequest",
+          "R-HLT-058 \u2013 expected outcome: request stored; pharmacy notified"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_medication_request_valid_prescriber_non_controlled(\n    prescriber_token, base_url, non_controlled_rx_payload\n):\n    headers = {\n        \"Authorization\": f\"Bearer {prescriber_token}\",\n        \"Content-Type\": \"application/fhir+json\"\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=non_controlled_rx_payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    assert body.get(\"status\") == \"active\"\n    assert body.get(\"resourceType\") == \"MedicationRequest\"\n    assert \"X-Pharmacy-Notified\" in resp.headers or body.get(\"_pharmacyNotified\") is True"
+      },
+      {
+        "name": "test_create_cii_medication_request_without_schedule_verification_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated with role=prescriber",
+          "Token does NOT contain schedule-verification claim",
+          "Payload references a Schedule II controlled substance (e.g. oxycodone)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with a CII drug payload and no schedule-verification header/claim",
+          "Observe response status and error body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "OperationOutcome in response body",
+          "diagnostics message references schedule verification"
+        ],
+        "trace": [
+          "R-HLT-058 \u2013 error pathway: 403 without schedule verification for CII",
+          "R-HLT-058 \u2013 controlled substances shall require schedule verification"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_cii_medication_request_without_schedule_verification_returns_403(\n    prescriber_token_no_schedule, base_url, cii_rx_payload\n):\n    headers = {\n        \"Authorization\": f\"Bearer {prescriber_token_no_schedule}\",\n        \"Content-Type\": \"application/fhir+json\"\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=cii_rx_payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\n        \"schedule\" in (i.get(\"diagnostics\") or \"\").lower()\n        for i in issues\n    ), \"Expected schedule-verification error in OperationOutcome\""
+      },
+      {
+        "name": "test_create_medication_request_missing_single_mandatory_field_returns_422",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated with role=prescriber",
+          "All mandatory FHIR MedicationRequest fields are present EXCEPT exactly one (subject)",
+          "Payload is otherwise valid"
+        ],
+        "actions": [
+          "Build valid non-controlled MedicationRequest payload",
+          "Remove the 'subject' field (boundary: one field below the minimum required set)",
+          "POST to /MedicationRequest"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "OperationOutcome referencing the missing 'subject' element"
+        ],
+        "trace": [
+          "R-HLT-058 \u2013 negative path: missing mandatory elements",
+          "BVA: boundary between a complete and incomplete required-field set (n vs n-1 mandatory fields)"
+        ],
+        "executable": "import pytest\nimport requests\nimport copy\n\ndef test_create_medication_request_missing_single_mandatory_field_returns_422(\n    prescriber_token, base_url, non_controlled_rx_payload\n):\n    payload = copy.deepcopy(non_controlled_rx_payload)\n    payload.pop(\"subject\", None)\n    headers = {\n        \"Authorization\": f\"Bearer {prescriber_token}\",\n        \"Content-Type\": \"application/fhir+json\"\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\n        \"subject\" in (i.get(\"diagnostics\") or \"\").lower() or\n        \"subject\" in str(i.get(\"location\", \"\")).lower()\n        for i in issues\n    ), \"Expected 'subject' referenced in OperationOutcome issue\""
+      },
+      {
+        "name": "test_create_medication_request_non_prescriber_role_returns_403",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated with role=nurse (NOT prescriber)",
+          "Payload is a fully valid non-controlled MedicationRequest"
+        ],
+        "actions": [
+          "POST /MedicationRequest with a valid payload using a nurse-role token",
+          "Observe response"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "OperationOutcome with issue.code = 'forbidden' or 'security'"
+        ],
+        "trace": [
+          "R-HLT-058 \u2013 precondition: role:prescriber required",
+          "DT: decision row where role\u2260prescriber \u00d7 any payload \u2192 403"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_medication_request_non_prescriber_role_returns_403(\n    nurse_token, base_url, non_controlled_rx_payload\n):\n    headers = {\n        \"Authorization\": f\"Bearer {nurse_token}\",\n        \"Content-Type\": \"application/fhir+json\"\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=non_controlled_rx_payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\n        i.get(\"code\") in (\"forbidden\", \"security\", \"login\")\n        for i in issues\n    ), \"Expected forbidden/security code in OperationOutcome\""
+      },
+      {
+        "name": "test_create_medication_request_on_cancelled_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated with role=prescriber",
+          "Referenced encounter is in status=cancelled (terminal state)",
+          "Payload is otherwise fully valid"
+        ],
+        "actions": [
+          "Create or reference a cancelled Encounter resource",
+          "POST /MedicationRequest referencing the cancelled encounter",
+          "Observe response for conflicting state transition"
+        ],
+        "expected": [
+          "HTTP 409 Conflict or 422 Unprocessable Entity",
+          "OperationOutcome diagnostics reference invalid state or cancelled encounter"
+        ],
+        "trace": [
+          "R-HLT-058 \u2013 negative path: conflicting state transitions",
+          "STC: transition from cancelled encounter state to active MedicationRequest is invalid"
+        ],
+        "executable": "import pytest\nimport requests\nimport copy\n\ndef test_create_medication_request_on_cancelled_encounter_returns_409(\n    prescriber_token, base_url, non_controlled_rx_payload, cancelled_encounter_id\n):\n    payload = copy.deepcopy(non_controlled_rx_payload)\n    payload[\"encounter\"] = {\n        \"reference\": f\"Encounter/{cancelled_encounter_id}\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {prescriber_token}\",\n        \"Content-Type\": \"application/fhir+json\"\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code in (409, 422)\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\n        any(kw in (i.get(\"diagnostics\") or \"\").lower()\n            for kw in (\"cancel\", \"state\", \"conflict\", \"invalid\"))\n        for i in issues\n    ), \"Expected state-conflict error in OperationOutcome\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-058",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 2882,
+    "latency_ms": 33243,
+    "wall_ms": 33243,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-058\",\n  \"reasoning\": \"R-HLT-058 governs MedicationRequest creation with three critical axes: (1) happy-path prescriber success, (2) controlled-substance schedule-verification enforcement, and (3) boundary conditions around mandatory field presence. EP covers valid vs invalid prescriber payloads; NEG covers the CII 403 path and missing mandatory elements; BVA covers the exact boundary of a single missing required field; DT covers the combined decision of role \u00d7 schedule-verification flag; STC covers the draft\u2192active state transition conflict. Five tests are produced to satisfy the minimum three and provide fuller coverage of the stated error pathways.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_medication_request_valid_prescriber_non_controlled\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated with role=prescriber\",\n        \"Token has schedule-verification=false (non-controlled substance)\",\n        \"FHIR server is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with valid FHIR R4 payload for a non-controlled drug\",\n        \"Include all mandatory elements: resourceType, status, intent, medicationCodeableConcept, subject, requester\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains id field\",\n        \"Response status equals 'active'\",\n        \"X-Pharmacy-Notified header or async event confirmed\"\n      ],\n      \"trace\": [\n        \"R-HLT-058 \u2013 positive path: prescriber creates non-controlled MedicationRequest\",\n        \"R-HLT-058 \u2013 expected outcome: request stored; pharmacy notified\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_medication_request_valid_prescriber_non_controlled(\\n    prescriber_token, base_url, non_controlled_rx_payload\\n):\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {prescriber_token}\\\",\\n        \\\"Content-Type\\\": \\\"application/fhir+json\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/MedicationRequest\\\",\\n        json=non_controlled_rx_payload,\\n        headers=headers,\\n        timeout=10\\n    )\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"id\\\" in body\\n    assert body.get(\\\"status\\\") == \\\"active\\\"\\n    assert body.get(\\\"resourceType\\\") == \\\"MedicationRequest\\\"\\n    assert \\\"X-Pharmacy-Notified\\\" in resp.headers or body.get(\\\"_pharmacyNotified\\\") is True\"\n    },\n    {\n      \"name\": \"test_create_cii_medication_request_without_schedule_verification_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller is authenticated with role=prescriber\",\n        \"Token does NOT contain schedule-verification claim\",\n        \"Payload references a Schedule II controlled substance (e.g. oxycodone)\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with a CII drug payload and no schedule-verification header/claim\",\n        \"Observe response status and error body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"OperationOutcome in response body\",\n        \"diagnostics message references schedule verification\"\n      ],\n      \"trace\": [\n        \"R-HLT-058 \u2013 error pathway: 403 without schedule verification for CII\",\n        \"R-HLT-058 \u2013 controlled substances shall require schedule verification\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_cii_medication_request_without_schedule_verification_returns_403(\\n    prescriber_token_no_schedule, base_url, cii_rx_payload\\n):\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {prescriber_token_no_schedule}\\\",\\n        \\\"Content-Type\\\": \\\"application/fhir+json\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/MedicationRequest\\\",\\n        json=cii_rx_payload,\\n        headers=headers,\\n        timeout=10\\n    )\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") =="
+  }
+}

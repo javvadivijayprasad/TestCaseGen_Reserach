@@ -1,0 +1,205 @@
+{
+  "req": {
+    "id": "R-FIN-092",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Account-level transaction limits (idempotency variant)",
+    "statement": "A customer shall configure daily per-channel limits within regulatory caps; changes take effect after a 2-hour cool-down. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer submits limits"
+    ],
+    "expected_outcomes": [
+      "pending limit stored",
+      "effective after cool-down"
+    ],
+    "error_pathways": [
+      "422 when over regulatory cap"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/limits"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-092",
+    "reasoning": "The requirement has four testable concerns: (1) a valid limit submission within regulatory caps returns 202/pending status, (2) a duplicate submission with the same Idempotency-Key returns the original response without side-effects, (3) a limit at exactly the regulatory cap boundary is accepted, (4) a limit one unit above the cap is rejected with 422. State transitions cover: unauthenticated \u2192 authenticated \u2192 limit-pending \u2192 limit-active (after cool-down). Tests are scoped to the API layer and use a shared auth fixture plus a deterministic idempotency-key generator.",
+    "tests": [
+      {
+        "name": "test_set_valid_daily_limit_within_cap_returns_pending",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Account ID exists and belongs to the authenticated customer",
+          "Requested limit is within the regulatory cap (e.g., 5000 < CAP)"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key",
+          "POST /accounts/{id}/limits with channel='online', daily_limit=5000",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status='pending'",
+          "Response body contains effective_after timestamp ~2 hours in the future"
+        ],
+        "trace": [
+          "R-FIN-092: pending limit stored on valid submission",
+          "R-FIN-092: changes take effect after 2-hour cool-down"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import datetime, timezone, timedelta\n\ndef test_set_valid_daily_limit_within_cap_returns_pending(\n    auth_client,       # <fixture>: authenticated httpx.Client with base_url\n    account_id,        # <fixture>: valid account ID for the test customer\n    regulatory_cap,    # <fixture>: int, e.g. 10_000\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"channel\": \"online\", \"daily_limit\": regulatory_cap - 1}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp = auth_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    effective_after = datetime.fromisoformat(body[\"effective_after\"])\n    now = datetime.now(timezone.utc)\n    assert effective_after >= now + timedelta(hours=1, minutes=55)\n    assert effective_after <= now + timedelta(hours=2, minutes=5)\n"
+      },
+      {
+        "name": "test_duplicate_idempotency_key_returns_original_response",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Account ID exists and belongs to the authenticated customer",
+          "A prior successful limit submission was made with a known Idempotency-Key"
+        ],
+        "actions": [
+          "Submit POST /accounts/{id}/limits with a fixed Idempotency-Key (first call)",
+          "Record the full response body and headers from the first call",
+          "Re-submit the identical POST request with the same Idempotency-Key (second call)",
+          "Compare both responses"
+        ],
+        "expected": [
+          "Both calls return HTTP 202",
+          "Second response body is identical to first response body",
+          "No duplicate limit record is created (idempotent state)"
+        ],
+        "trace": [
+          "R-FIN-092: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_duplicate_idempotency_key_returns_original_response(\n    auth_client,\n    account_id,\n    regulatory_cap,\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"channel\": \"mobile\", \"daily_limit\": regulatory_cap - 500}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp1 = auth_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp1.status_code == 202\n    body1 = resp1.json()\n\n    resp2 = auth_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n    assert resp2.status_code == 202\n    body2 = resp2.json()\n\n    assert body1[\"limit_id\"] == body2[\"limit_id\"]\n    assert body1[\"status\"] == body2[\"status\"]\n    assert body1[\"effective_after\"] == body2[\"effective_after\"]\n"
+      },
+      {
+        "name": "test_limit_at_exact_regulatory_cap_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Account ID exists and belongs to the authenticated customer",
+          "Regulatory cap value is known (e.g., 10000)"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key",
+          "POST /accounts/{id}/limits with daily_limit equal to exactly the regulatory cap",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status='pending'",
+          "No 422 error is returned (cap boundary is inclusive)"
+        ],
+        "trace": [
+          "R-FIN-092: customer shall configure limits within regulatory caps (boundary inclusive)",
+          "R-FIN-092: 422 only when over regulatory cap"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_limit_at_exact_regulatory_cap_is_accepted(\n    auth_client,\n    account_id,\n    regulatory_cap,\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"channel\": \"online\", \"daily_limit\": regulatory_cap}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp = auth_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert resp.status_code == 202, (\n        f\"Expected 202 at cap boundary, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n"
+      },
+      {
+        "name": "test_limit_one_unit_above_regulatory_cap_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Account ID exists and belongs to the authenticated customer",
+          "Regulatory cap value is known (e.g., 10000)"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key",
+          "POST /accounts/{id}/limits with daily_limit = regulatory_cap + 1",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code indicating regulatory cap violation",
+          "No pending limit is stored"
+        ],
+        "trace": [
+          "R-FIN-092: 422 when over regulatory cap",
+          "R-FIN-092: BVA upper boundary exclusive"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_limit_one_unit_above_regulatory_cap_returns_422(\n    auth_client,\n    account_id,\n    regulatory_cap,\n):\n    idempotency_key = str(uuid.uuid4())\n    over_cap = regulatory_cap + 1\n    payload = {\"channel\": \"online\", \"daily_limit\": over_cap}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp = auth_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n    error_text = str(body.get(\"error\", body.get(\"detail\", \"\"))).lower()\n    assert any(kw in error_text for kw in [\"cap\", \"limit\", \"exceed\", \"regulatory\"])\n"
+      },
+      {
+        "name": "test_unauthenticated_request_returns_401",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "No valid JWT is present (unauthenticated client)",
+          "Account ID is structurally valid"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits without Authorization header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "No limit is stored",
+          "Response body contains authentication error message"
+        ],
+        "trace": [
+          "R-FIN-092: precondition is authenticated",
+          "DT: unauthenticated row \u2192 reject without processing"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_unauthenticated_request_returns_401(\n    anon_client,    # <fixture>: httpx.Client with base_url, NO auth headers\n    account_id,\n    regulatory_cap,\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"channel\": \"online\", \"daily_limit\": regulatory_cap - 1}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp = anon_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert resp.status_code == 401\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n"
+      },
+      {
+        "name": "test_pending_limit_not_active_before_cooldown_elapses",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Account ID exists",
+          "A limit submission has just been accepted (status=pending)"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits to create a pending limit",
+          "Immediately GET /accounts/{id}/limits to read current active limit",
+          "Assert that the newly submitted limit is NOT yet active"
+        ],
+        "expected": [
+          "POST returns 202 with status='pending'",
+          "GET shows old active limit unchanged (cool-down not yet elapsed)",
+          "New limit is listed as pending, not active"
+        ],
+        "trace": [
+          "R-FIN-092: changes take effect after 2-hour cool-down",
+          "STC: pending state must not transition to active before cool-down"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pending_limit_not_active_before_cooldown_elapses(\n    auth_client,\n    account_id,\n    regulatory_cap,\n    get_active_limit,   # <helper_fn>(client, account_id) -> dict\n):\n    baseline = get_active_limit(auth_client, account_id)\n\n    idempotency_key = str(uuid.uuid4())\n    new_limit_value = (baseline.get(\"daily_limit\", 1000) + 100)\n    if new_limit_value > regulatory_cap:\n        pytest.skip(\"Cannot form a distinct new limit within cap\")\n\n    payload = {\"channel\": \"online\", \"daily_limit\": new_limit_value}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    post_resp = auth_client.post(\n        f\"/accounts/{account_id}/limits\",\n        json=payload,\n        headers=headers,\n    )\n    assert post_resp.status_code == 202\n    assert post_resp.json()[\"status\"] == \"pending\"\n\n    current_active = get_active_limit(auth_client, account_id)\n    assert current_active.get(\"daily_limit\") == baseline.get(\"daily_limit\"), (\n        \"Active limit changed before cool-down elapsed\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-092",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1018,
+    "output_tokens": 3439,
+    "latency_ms": 36030,
+    "wall_ms": 36030,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-092\",\n  \"reasoning\": \"The requirement has four testable concerns: (1) a valid limit submission within regulatory caps returns 202/pending status, (2) a duplicate submission with the same Idempotency-Key returns the original response without side-effects, (3) a limit at exactly the regulatory cap boundary is accepted, (4) a limit one unit above the cap is rejected with 422. State transitions cover: unauthenticated \u2192 authenticated \u2192 limit-pending \u2192 limit-active (after cool-down). Tests are scoped to the API layer and use a shared auth fixture plus a deterministic idempotency-key generator.\",\n  \"tests\": [\n    {\n      \"name\": \"test_set_valid_daily_limit_within_cap_returns_pending\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"Account ID exists and belongs to the authenticated customer\",\n        \"Requested limit is within the regulatory cap (e.g., 5000 < CAP)\"\n      ],\n      \"actions\": [\n        \"Generate a unique Idempotency-Key\",\n        \"POST /accounts/{id}/limits with channel='online', daily_limit=5000\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains status='pending'\",\n        \"Response body contains effective_after timestamp ~2 hours in the future\"\n      ],\n      \"trace\": [\n        \"R-FIN-092: pending limit stored on valid submission\",\n        \"R-FIN-092: changes take effect after 2-hour cool-down\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_set_valid_daily_limit_within_cap_returns_pending(\\n    auth_client,       # <fixture>: authenticated httpx.Client with base_url\\n    account_id,        # <fixture>: valid account ID for the test customer\\n    regulatory_cap,    # <fixture>: int, e.g. 10_000\\n):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\\"channel\\\": \\\"online\\\", \\\"daily_limit\\\": regulatory_cap - 1}\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n\\n    resp = auth_client.post(\\n        f\\\"/accounts/{account_id}/limits\\\",\\n        json=payload,\\n        headers=headers,\\n    )\\n\\n    assert resp.status_code == 202\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    effective_after = datetime.fromisoformat(body[\\\"effective_after\\\"])\\n    now = datetime.now(timezone.utc)\\n    assert effective_after >= now + timedelta(hours=1, minutes=55)\\n    assert effective_after <= now + timedelta(hours=2, minutes=5)\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_idempotency_key_returns_original_response\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"Account ID exists and belongs to the authenticated customer\",\n        \"A prior successful limit submission was made with a known Idempotency-Key\"\n      ],\n      \"actions\": [\n        \"Submit POST /accounts/{id}/limits with a fixed Idempotency-Key (first call)\",\n        \"Record the full response body and headers from the first call\",\n        \"Re-submit the identical POST request with the same Idempotency-Key (second call)\",\n        \"Compare both responses\"\n      ],\n      \"expected\": [\n        \"Both calls return HTTP 202\",\n        \"Second response body is identical to first response body\",\n        \"No duplicate limit record is created (idempotent state)\"\n      ],\n      \"trace\": [\n        \"R-FIN-092: duplicate submission with same Idempotency-Key must return original result\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_duplicate_idempotency_key_returns_original_response(\\n    auth_client,\\n    account_id,\\n    regulatory_cap,\\n):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\\"channel\\\": \\\"mobile\\\", \\\"daily_limit\\\": regulatory_cap - 500}\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n\\n    resp1 = auth_client.post(\\n    "
+  }
+}

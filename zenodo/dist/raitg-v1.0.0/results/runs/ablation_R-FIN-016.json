@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-FIN-016",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-016",
+    "reasoning": "R-FIN-016 mandates daily interest accrual using tier rates and monthly crediting on the last business day via /cron/interest. Tests cover: (1) EP positive \u2013 a standard mid-tier balance account receives correct interest credit and ledger entry on a normal last-business-day trigger; (2) NEG negative \u2013 triggering the job on a non-last-business-day must not credit interest, exercising the error/guard path; (3) BVA boundary \u2013 an account balance sitting exactly on a tier boundary (e.g. $10,000.00) to validate rate selection at the edge; (4) DT decision-table \u2013 a zero-balance account where no interest should accrue and no ledger entry should be written; (5) STC state-transition \u2013 verifying the account moves from ACCRUING state to INTEREST_CREDITED state after the month-end job fires, and returns to ACCRUING for the next cycle.",
+    "tests": [
+      {
+        "name": "test_interest_credited_on_last_business_day_standard_balance",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A savings account exists with a balance in the mid-tier range (e.g. $5,000.00)",
+          "Daily accrual records exist for every calendar day of the current month",
+          "Today is the last business day of the month",
+          "The banking-api service is reachable"
+        ],
+        "actions": [
+          "Seed account via <seed_account_fixture> with balance=5000.00 and 30 daily accrual rows",
+          "POST /cron/interest with a date header matching the last business day",
+          "Fetch the account ledger via GET /accounts/{account_id}/ledger"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200",
+          "Response body contains account_id with status=CREDITED",
+          "Ledger contains exactly one INTEREST_CREDIT entry for the month",
+          "Credited amount equals sum of daily accruals rounded to 2 decimal places"
+        ],
+        "trace": [
+          "R-FIN-016: interest credited monthly on the last business day",
+          "R-FIN-016: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport requests\nfrom decimal import Decimal\n\nBASE_URL = \"<BASE_URL>\"\n\n@pytest.fixture\ndef standard_account(seed_account_fixture):\n    return seed_account_fixture(balance=5000.00, accrual_days=30, tier=\"mid\")\n\ndef test_interest_credited_on_last_business_day_standard_balance(\n    standard_account, last_business_day_date\n):\n    account_id = standard_account[\"account_id\"]\n    expected_interest = standard_account[\"expected_interest\"]\n\n    resp = requests.post(\n        f\"{BASE_URL}/cron/interest\",\n        json={\"run_date\": last_business_day_date},\n        headers={\"X-Idempotency-Key\": f\"test-ep-{account_id}\"}\n    )\n    assert resp.status_code == 200\n\n    body = resp.json()\n    result = next(r for r in body[\"results\"] if r[\"account_id\"] == account_id)\n    assert result[\"status\"] == \"CREDITED\"\n\n    ledger_resp = requests.get(f\"{BASE_URL}/accounts/{account_id}/ledger\")\n    entries = [e for e in ledger_resp.json()[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"]\n    assert len(entries) == 1\n    assert Decimal(str(entries[0][\"amount\"])) == Decimal(str(expected_interest))"
+      },
+      {
+        "name": "test_interest_not_credited_on_non_last_business_day",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A savings account exists with a balance of $5,000.00",
+          "Daily accrual records exist for the partial month",
+          "Today is NOT the last business day of the month (e.g. mid-month date)",
+          "The banking-api service is reachable"
+        ],
+        "actions": [
+          "Seed account via <seed_account_fixture> with balance=5000.00",
+          "POST /cron/interest with a date header set to a mid-month date",
+          "Fetch the account ledger via GET /accounts/{account_id}/ledger"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200 (job ran) or HTTP 422/409 (guard rejection)",
+          "Response body status for account is NOT CREDITED (e.g. SKIPPED or absent)",
+          "No INTEREST_CREDIT ledger entry is created for the account",
+          "No reconciliation variance is reported for this account"
+        ],
+        "trace": [
+          "R-FIN-016: credit interest monthly on the last business day (guard: no credit on other days)",
+          "R-FIN-016: error pathway \u2013 reconciliation variance reported if credited incorrectly"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"<BASE_URL>\"\n\n@pytest.fixture\ndef mid_month_account(seed_account_fixture):\n    return seed_account_fixture(balance=5000.00, accrual_days=15, tier=\"mid\")\n\ndef test_interest_not_credited_on_non_last_business_day(\n    mid_month_account, mid_month_date\n):\n    account_id = mid_month_account[\"account_id\"]\n\n    resp = requests.post(\n        f\"{BASE_URL}/cron/interest\",\n        json={\"run_date\": mid_month_date},\n        headers={\"X-Idempotency-Key\": f\"test-neg-{account_id}\"}\n    )\n    assert resp.status_code in (200, 409, 422)\n\n    if resp.status_code == 200:\n        body = resp.json()\n        results = body.get(\"results\", [])\n        credited = [r for r in results if r.get(\"account_id\") == account_id\n                    and r.get(\"status\") == \"CREDITED\"]\n        assert len(credited) == 0, \"Interest must not be credited mid-month\"\n\n    ledger_resp = requests.get(f\"{BASE_URL}/accounts/{account_id}/ledger\")\n    entries = [e for e in ledger_resp.json()[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"]\n    assert len(entries) == 0, \"No INTEREST_CREDIT ledger entry expected mid-month\""
+      },
+      {
+        "name": "test_interest_accrual_at_tier_boundary_balance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Two savings accounts exist: one at exactly $10,000.00 (tier boundary) and one at $9,999.99 (just below)",
+          "Daily accrual records exist for the full month for both accounts",
+          "Today is the last business day of the month",
+          "The tier rate changes at $10,000.00"
+        ],
+        "actions": [
+          "Seed two accounts via <seed_account_fixture>: balance=10000.00 and balance=9999.99",
+          "POST /cron/interest with last-business-day date for both accounts",
+          "Fetch credited amounts from ledger for both accounts"
+        ],
+        "expected": [
+          "Account at $10,000.00 is credited using the UPPER tier rate",
+          "Account at $9,999.99 is credited using the LOWER tier rate",
+          "Both credits are present as INTEREST_CREDIT ledger entries",
+          "The $10,000.00 account credit amount is strictly greater than the $9,999.99 account credit (proportionally)"
+        ],
+        "trace": [
+          "R-FIN-016: accrue interest using the tier rate",
+          "R-FIN-016: tier boundary at $10,000.00 separates rate bands"
+        ],
+        "executable": "import pytest\nimport requests\nfrom decimal import Decimal\n\nBASE_URL = \"<BASE_URL>\"\nTIER_BOUNDARY = Decimal(\"10000.00\")\n\n@pytest.fixture\ndef boundary_accounts(seed_account_fixture):\n    acc_at = seed_account_fixture(balance=10000.00, accrual_days=30, tier=\"upper\")\n    acc_below = seed_account_fixture(balance=9999.99, accrual_days=30, tier=\"lower\")\n    return acc_at, acc_below\n\ndef test_interest_accrual_at_tier_boundary_balance(\n    boundary_accounts, last_business_day_date\n):\n    acc_at, acc_below = boundary_accounts\n\n    for acc in (acc_at, acc_below):\n        resp = requests.post(\n            f\"{BASE_URL}/cron/interest\",\n            json={\"run_date\": last_business_day_date},\n            headers={\"X-Idempotency-Key\": f\"test-bva-{acc['account_id']}\"}\n        )\n        assert resp.status_code == 200\n\n    def get_credit(account_id):\n        r = requests.get(f\"{BASE_URL}/accounts/{account_id}/ledger\")\n        entries = [e for e in r.json()[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"]\n        assert len(entries) == 1\n        return Decimal(str(entries[0][\"amount\"]))\n\n    credit_at = get_credit(acc_at[\"account_id\"])\n    credit_below = get_credit(acc_below[\"account_id\"])\n\n    rate_at = credit_at / TIER_BOUNDARY\n    rate_below = credit_below / Decimal(\"9999.99\")\n    assert rate_at > rate_below, \"Upper tier rate must exceed lower tier rate at boundary\""
+      },
+      {
+        "name": "test_no_interest_credited_for_zero_balance_account",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A savings account exists with a balance of exactly $0.00",
+          "No positive daily accrual records exist for the month",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed account via <seed_account_fixture> with balance=0.00 and accrual_days=30",
+          "POST /cron/interest with last-business-day date",
+          "Fetch ledger for the zero-balance account"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200",
+          "Account status in response is SKIPPED or ZERO_BALANCE",
+          "No INTEREST_CREDIT ledger entry is created",
+          "No reconciliation variance is raised for this account"
+        ],
+        "trace": [
+          "R-FIN-016: tier rate applied \u2013 zero balance maps to zero interest (DT: balance=0 row)",
+          "R-FIN-016: ledger entry per account \u2013 no entry when credit amount is zero"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"<BASE_URL>\"\n\n@pytest.fixture\ndef zero_balance_account(seed_account_fixture):\n    return seed_account_fixture(balance=0.00, accrual_days=30, tier=\"lower\")\n\ndef test_no_interest_credited_for_zero_balance_account(\n    zero_balance_account, last_business_day_date\n):\n    account_id = zero_balance_account[\"account_id\"]\n\n    resp = requests.post(\n        f\"{BASE_URL}/cron/interest\",\n        json={\"run_date\": last_business_day_date},\n        headers={\"X-Idempotency-Key\": f\"test-dt-zero-{account_id}\"}\n    )\n    assert resp.status_code == 200\n\n    body = resp.json()\n    results = body.get(\"results\", [])\n    result = next((r for r in results if r[\"account_id\"] == account_id), None)\n    if result:\n        assert result[\"status\"] in (\"SKIPPED\", \"ZERO_BALANCE\", \"NO_CREDIT\")\n\n    ledger_resp = requests.get(f\"{BASE_URL}/accounts/{account_id}/ledger\")\n    entries = [e for e in ledger_resp.json()[\"entries\"] if e[\"type\"] == \"INTEREST_CREDIT\"]\n    assert len(entries) == 0, \"Zero-balance account must not receive an interest credit\""
+      },
+      {
+        "name": "test_account_state_transitions_through_accrual_and_credit_cycle",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A savings account exists in ACTIVE state with balance $2,500.00",
+          "The account has no prior accrual records for the current month",
+          "The banking-api exposes account state via GET /accounts/{id}/state"
+        ],
+        "actions": [
+          "Seed account via <seed_account_fixture> with balance=2500.00",
+          "POST /cron/daily-accrual for each day of the month to drive state to ACCRUING",
+          "Assert account state is ACCRUING after first accrual",
+          "POST /cron/interest on the last business day to trigger credit",
+          "Assert account state transitions to INTEREST_CREDITED",
+          "POST /cron/daily-accrual for the first day of the next month",
+          "Assert account state returns to ACCRUING"
+        ],
+        "expected": [
+          "After daily accrual: account state is ACCRUING",
+          "After month-end interest job: account state is INTEREST_CREDITED",
+          "After next month first accrual: account state is ACCRUING (cycle resets)",
+          "Each state transition is recorded with a timestamp in the audit log"
+        ],
+        "trace": [
+          "R-FIN-016: accrue interest daily (ACTIVE -> ACCRUING transition)",
+          "R-FIN-016: credit interest monthly on last business day (ACCRUING -> INTEREST_CREDITED)",
+          "R-FIN-016: system job trigger drives cycle reset"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"<BASE_URL>\"\n\n@pytest.fixture\ndef cycle_account(seed_account_fixture):\n    return seed_account_fixture(balance=2500.00, accrual_days=0, tier=\"lower\")\n\ndef get_state(account_id):\n    r = requests.get(f\"{BASE_URL}/accounts/{account_id}/state\")\n    assert r.status_code == 200\n    return r.json()[\"state\"]\n\ndef test_account_state_transitions_through_accrual_and_credit_cycle(\n    cycle_account, last_business_day_date, next_month_first_day_date\n):\n    account_id = cycle_account[\"account_id\"]\n\n    accrual_resp = requests.post(\n        f\"{BASE_URL}/cron/daily-accrual\",\n        json={\"account_id\": account_id, \"date\": \"<first_day_of_month>\"},\n        headers={\"X-Idempotency-Key\": f\"test-stc-accrual-{account_id}\"}\n    )\n    assert accrual_resp.status_code == 200\n    assert get_state(account_id) == \"ACCRUING\"\n\n    credit_resp = requests.post(\n        f\"{BASE_URL}/cron/interest\",\n        json={\"run_date\": last_business_day_date},\n        headers={\"X-Idempotency-Key\": f\"test-stc-credit-{account_id}\"}\n    )\n    assert credit_resp.status_code == 200\n    assert get_state(account_id) == \"INTEREST_CREDITED\"\n\n    next_resp = requests.post(\n        f\"{BASE_URL}/cron/daily-accrual\",\n        json={\"account_id\": account_id, \"date\": next_month_first_day_date},\n        headers={\"X-Idempotency-Key\": f\"test-stc-next-{account_id}\"}\n    )\n    assert next_resp.status_code == 200\n    assert get_state(account_id) == \"ACCRUING\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-016",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 976,
+    "output_tokens": 4388,
+    "latency_ms": 45790,
+    "wall_ms": 45790,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-016\",\n  \"reasoning\": \"R-FIN-016 mandates daily interest accrual using tier rates and monthly crediting on the last business day via /cron/interest. Tests cover: (1) EP positive \u2013 a standard mid-tier balance account receives correct interest credit and ledger entry on a normal last-business-day trigger; (2) NEG negative \u2013 triggering the job on a non-last-business-day must not credit interest, exercising the error/guard path; (3) BVA boundary \u2013 an account balance sitting exactly on a tier boundary (e.g. $10,000.00) to validate rate selection at the edge; (4) DT decision-table \u2013 a zero-balance account where no interest should accrue and no ledger entry should be written; (5) STC state-transition \u2013 verifying the account moves from ACCRUING state to INTEREST_CREDITED state after the month-end job fires, and returns to ACCRUING for the next cycle.\",\n  \"tests\": [\n    {\n      \"name\": \"test_interest_credited_on_last_business_day_standard_balance\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A savings account exists with a balance in the mid-tier range (e.g. $5,000.00)\",\n        \"Daily accrual records exist for every calendar day of the current month\",\n        \"Today is the last business day of the month\",\n        \"The banking-api service is reachable\"\n      ],\n      \"actions\": [\n        \"Seed account via <seed_account_fixture> with balance=5000.00 and 30 daily accrual rows\",\n        \"POST /cron/interest with a date header matching the last business day\",\n        \"Fetch the account ledger via GET /accounts/{account_id}/ledger\"\n      ],\n      \"expected\": [\n        \"POST /cron/interest returns HTTP 200\",\n        \"Response body contains account_id with status=CREDITED\",\n        \"Ledger contains exactly one INTEREST_CREDIT entry for the month\",\n        \"Credited amount equals sum of daily accruals rounded to 2 decimal places\"\n      ],\n      \"trace\": [\n        \"R-FIN-016: interest credited monthly on the last business day\",\n        \"R-FIN-016: ledger entry per account\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom decimal import Decimal\\n\\nBASE_URL = \\\"<BASE_URL>\\\"\\n\\n@pytest.fixture\\ndef standard_account(seed_account_fixture):\\n    return seed_account_fixture(balance=5000.00, accrual_days=30, tier=\\\"mid\\\")\\n\\ndef test_interest_credited_on_last_business_day_standard_balance(\\n    standard_account, last_business_day_date\\n):\\n    account_id = standard_account[\\\"account_id\\\"]\\n    expected_interest = standard_account[\\\"expected_interest\\\"]\\n\\n    resp = requests.post(\\n        f\\\"{BASE_URL}/cron/interest\\\",\\n        json={\\\"run_date\\\": last_business_day_date},\\n        headers={\\\"X-Idempotency-Key\\\": f\\\"test-ep-{account_id}\\\"}\\n    )\\n    assert resp.status_code == 200\\n\\n    body = resp.json()\\n    result = next(r for r in body[\\\"results\\\"] if r[\\\"account_id\\\"] == account_id)\\n    assert result[\\\"status\\\"] == \\\"CREDITED\\\"\\n\\n    ledger_resp = requests.get(f\\\"{BASE_URL}/accounts/{account_id}/ledger\\\")\\n    entries = [e for e in ledger_resp.json()[\\\"entries\\\"] if e[\\\"type\\\"] == \\\"INTEREST_CREDIT\\\"]\\n    assert len(entries) == 1\\n    assert Decimal(str(entries[0][\\\"amount\\\"])) == Decimal(str(expected_interest))\"\n    },\n    {\n      \"name\": \"test_interest_not_credited_on_non_last_business_day\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A savings account exists with a balance of $5,000.00\",\n        \"Daily accrual records exist for the partial month\",\n        \"Today is NOT the last business day of the month (e.g. mid-month date)\",\n        \"The banking-api service is reachable\"\n      ],\n      \"actions\": [\n        \"Seed account via <seed_account_fixture> with balance=5000.00\",\n        \"POST /cron/interest with a date header set to a mid-month date\",\n        \"Fetch the account ledger via GET /accounts/{account_id}/ledger\"\n      ],\n      \"expected\": [\n        \"POST /cron/interest returns HTTP 200 (job ran) or HTT"
+  }
+}

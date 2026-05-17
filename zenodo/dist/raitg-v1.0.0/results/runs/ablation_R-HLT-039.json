@@ -1,0 +1,236 @@
+{
+  "req": {
+    "id": "R-HLT-039",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Audit log access (boundary)",
+    "statement": "A privacy-officer shall access audit logs scoped to their organisation; cross-organisation access shall be forbidden. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "privacy-officer"
+    ],
+    "preconditions": [
+      "role:privacy-officer"
+    ],
+    "triggers": [
+      "officer queries logs"
+    ],
+    "expected_outcomes": [
+      "records returned within org"
+    ],
+    "error_pathways": [
+      "403 when crossing org boundary"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AuditEvent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-039",
+    "reasoning": "R-HLT-039 requires three distinct partitions: (1) a privacy-officer querying their own org \u2014 valid, should return 200 with scoped records; (2) a privacy-officer querying a foreign org \u2014 invalid, must return 403; (3) boundary values on the timestamp/_count query parameters \u2014 e.g. _count=0 (lower bound), _count=1 (first valid), and an epoch-edge timestamp. EP covers the happy-path org-scoped query; NEG covers cross-org access; BVA covers numeric and timestamp boundaries. A DT case is added to cover the decision matrix of (auth role) x (org match) combinations. State-transition is less applicable here but is noted where token state (valid vs expired) transitions are exercised.",
+    "tests": [
+      {
+        "name": "test_privacy_officer_reads_own_org_audit_events",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User has role:privacy-officer for org-A",
+          "At least one AuditEvent record exists scoped to org-A",
+          "Valid JWT bearer token for privacy-officer is available"
+        ],
+        "actions": [
+          "Obtain bearer token for privacy-officer of org-A via <get_token_fixture>",
+          "GET /AuditEvent?organization=org-A with Authorization header",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body is a FHIR Bundle",
+          "Every entry.resource.agent[].who.reference contains 'org-A'",
+          "total >= 1"
+        ],
+        "trace": [
+          "R-HLT-039: records returned within org",
+          "EP: valid input partition \u2014 officer queries own org"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/fhir\"\n\ndef test_privacy_officer_reads_own_org_audit_events(get_token, org_audit_seed):\n    token = get_token(role=\"privacy-officer\", org=\"org-A\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-A\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    assert bundle.get(\"total\", 0) >= 1\n    for entry in bundle.get(\"entry\", []):\n        resource = entry[\"resource\"]\n        agents = resource.get(\"agent\", [])\n        refs = [a.get(\"who\", {}).get(\"reference\", \"\") for a in agents]\n        assert any(\"org-A\" in r for r in refs), f\"Cross-org record leaked: {refs}\"\n"
+      },
+      {
+        "name": "test_privacy_officer_forbidden_from_cross_org_audit_events",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User has role:privacy-officer for org-A only",
+          "AuditEvent records exist scoped to org-B",
+          "Valid JWT bearer token for privacy-officer of org-A is available"
+        ],
+        "actions": [
+          "Obtain bearer token for privacy-officer of org-A via <get_token_fixture>",
+          "GET /AuditEvent?organization=org-B with Authorization header",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains OperationOutcome with issue.severity='error'",
+          "No AuditEvent resources from org-B are returned"
+        ],
+        "trace": [
+          "R-HLT-039: cross-organisation access shall be forbidden",
+          "R-HLT-039: error pathway \u2014 403 when crossing org boundary",
+          "NEG: invalid input partition \u2014 officer queries foreign org"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/fhir\"\n\ndef test_privacy_officer_forbidden_from_cross_org_audit_events(get_token):\n    token = get_token(role=\"privacy-officer\", org=\"org-A\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-B\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"severity\") == \"error\" for i in issues)\n"
+      },
+      {
+        "name": "test_audit_event_boundary_count_zero_returns_empty_bundle",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User has role:privacy-officer for org-A",
+          "AuditEvent records exist for org-A",
+          "Valid JWT bearer token for privacy-officer of org-A is available"
+        ],
+        "actions": [
+          "Obtain bearer token for privacy-officer of org-A via <get_token_fixture>",
+          "GET /AuditEvent?organization=org-A&_count=0 with Authorization header",
+          "Capture HTTP status, total, and entry count"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Bundle.total reflects actual record count (server-side knowledge)",
+          "Bundle.entry is absent or empty \u2014 zero resources returned in page",
+          "No 4xx or 5xx error"
+        ],
+        "trace": [
+          "R-HLT-039: boundary cases on numeric elements must be tested",
+          "BVA: lower boundary of _count parameter \u2014 0 yields empty page"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/fhir\"\n\ndef test_audit_event_boundary_count_zero_returns_empty_bundle(get_token, org_audit_seed):\n    token = get_token(role=\"privacy-officer\", org=\"org-A\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-A\", \"_count\": \"0\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 0, f\"Expected 0 entries with _count=0, got {len(entries)}\"\n"
+      },
+      {
+        "name": "test_audit_event_boundary_count_one_returns_single_record",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User has role:privacy-officer for org-A",
+          "At least two AuditEvent records exist for org-A",
+          "Valid JWT bearer token for privacy-officer of org-A is available"
+        ],
+        "actions": [
+          "Obtain bearer token for privacy-officer of org-A via <get_token_fixture>",
+          "GET /AuditEvent?organization=org-A&_count=1 with Authorization header",
+          "Capture HTTP status and entry count"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Exactly 1 entry present in Bundle",
+          "The single entry is scoped to org-A"
+        ],
+        "trace": [
+          "R-HLT-039: boundary cases on numeric elements must be tested",
+          "BVA: first-valid boundary of _count \u2014 1 yields exactly one record"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/fhir\"\n\ndef test_audit_event_boundary_count_one_returns_single_record(get_token, org_audit_seed):\n    token = get_token(role=\"privacy-officer\", org=\"org-A\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-A\", \"_count\": \"1\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 1, f\"Expected exactly 1 entry, got {len(entries)}\"\n    resource = entries[0][\"resource\"]\n    agents = resource.get(\"agent\", [])\n    refs = [a.get(\"who\", {}).get(\"reference\", \"\") for a in agents]\n    assert any(\"org-A\" in r for r in refs)\n"
+      },
+      {
+        "name": "test_audit_event_boundary_timestamp_epoch_start",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User has role:privacy-officer for org-A",
+          "AuditEvent records exist for org-A with recorded dates after 1970-01-01T00:00:00Z",
+          "Valid JWT bearer token for privacy-officer of org-A is available"
+        ],
+        "actions": [
+          "Obtain bearer token for privacy-officer of org-A via <get_token_fixture>",
+          "GET /AuditEvent?organization=org-A&date=ge1970-01-01T00:00:00Z with Authorization header",
+          "Capture HTTP status and total"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Bundle returned without error",
+          "All entries have recorded >= 1970-01-01T00:00:00Z",
+          "total >= 0 (no server crash on epoch boundary)"
+        ],
+        "trace": [
+          "R-HLT-039: boundary cases on timestamps must be tested",
+          "BVA: minimum timestamp boundary \u2014 Unix epoch lower bound"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import timezone, datetime\n\nBASE_URL = \"http://fhir-lite/fhir\"\nEPOCH = \"1970-01-01T00:00:00Z\"\n\ndef test_audit_event_boundary_timestamp_epoch_start(get_token):\n    token = get_token(role=\"privacy-officer\", org=\"org-A\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-A\", \"date\": f\"ge{EPOCH}\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    assert \"total\" in bundle\n    assert bundle[\"total\"] >= 0\n"
+      },
+      {
+        "name": "test_decision_table_non_privacy_officer_role_forbidden",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User has role:clinician for org-A (not privacy-officer)",
+          "AuditEvent records exist for org-A",
+          "Valid JWT bearer token for clinician is available"
+        ],
+        "actions": [
+          "Obtain bearer token for clinician of org-A via <get_token_fixture>",
+          "GET /AuditEvent?organization=org-A with Authorization header",
+          "Capture HTTP status"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "OperationOutcome returned indicating insufficient privileges",
+          "No AuditEvent resources exposed to clinician role"
+        ],
+        "trace": [
+          "R-HLT-039: privacy-officer is the sole authorised actor",
+          "DT: decision cell \u2014 wrong role + correct org => 403"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/fhir\"\n\ndef test_decision_table_non_privacy_officer_role_forbidden(get_token):\n    token = get_token(role=\"clinician\", org=\"org-A\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-A\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    severities = [i.get(\"severity\") for i in issues]\n    assert \"error\" in severities or \"fatal\" in severities\n"
+      },
+      {
+        "name": "test_state_transition_expired_token_returns_401",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "An expired JWT bearer token for privacy-officer of org-A is available",
+          "AuditEvent records exist for org-A"
+        ],
+        "actions": [
+          "Use an expired token obtained via <expired_token_fixture>",
+          "GET /AuditEvent?organization=org-A with expired Authorization header",
+          "Capture HTTP status"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response indicates token expiry (WWW-Authenticate header or OperationOutcome)",
+          "No AuditEvent data returned"
+        ],
+        "trace": [
+          "R-HLT-039: precondition is role:privacy-officer with valid session",
+          "STC: token state transition from valid -> expired -> rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/fhir\"\n\ndef test_state_transition_expired_token_returns_401(expired_token):\n    headers = {\"Authorization\": f\"Bearer {expired_token}\"}\n    resp = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"organization\": \"org-A\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 401\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    assert \"entry\" not in body, \"AuditEvent data must not be present with expired token\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-039",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[6] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 994,
+    "output_tokens": 3999,
+    "latency_ms": 39245,
+    "wall_ms": 39245,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-039\",\n  \"reasoning\": \"R-HLT-039 requires three distinct partitions: (1) a privacy-officer querying their own org \u2014 valid, should return 200 with scoped records; (2) a privacy-officer querying a foreign org \u2014 invalid, must return 403; (3) boundary values on the timestamp/_count query parameters \u2014 e.g. _count=0 (lower bound), _count=1 (first valid), and an epoch-edge timestamp. EP covers the happy-path org-scoped query; NEG covers cross-org access; BVA covers numeric and timestamp boundaries. A DT case is added to cover the decision matrix of (auth role) x (org match) combinations. State-transition is less applicable here but is noted where token state (valid vs expired) transitions are exercised.\",\n  \"tests\": [\n    {\n      \"name\": \"test_privacy_officer_reads_own_org_audit_events\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User has role:privacy-officer for org-A\",\n        \"At least one AuditEvent record exists scoped to org-A\",\n        \"Valid JWT bearer token for privacy-officer is available\"\n      ],\n      \"actions\": [\n        \"Obtain bearer token for privacy-officer of org-A via <get_token_fixture>\",\n        \"GET /AuditEvent?organization=org-A with Authorization header\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body is a FHIR Bundle\",\n        \"Every entry.resource.agent[].who.reference contains 'org-A'\",\n        \"total >= 1\"\n      ],\n      \"trace\": [\n        \"R-HLT-039: records returned within org\",\n        \"EP: valid input partition \u2014 officer queries own org\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite/fhir\\\"\\n\\ndef test_privacy_officer_reads_own_org_audit_events(get_token, org_audit_seed):\\n    token = get_token(role=\\\"privacy-officer\\\", org=\\\"org-A\\\")\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    resp = requests.get(\\n        f\\\"{BASE_URL}/AuditEvent\\\",\\n        params={\\\"organization\\\": \\\"org-A\\\"},\\n        headers=headers,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n    assert bundle.get(\\\"total\\\", 0) >= 1\\n    for entry in bundle.get(\\\"entry\\\", []):\\n        resource = entry[\\\"resource\\\"]\\n        agents = resource.get(\\\"agent\\\", [])\\n        refs = [a.get(\\\"who\\\", {}).get(\\\"reference\\\", \\\"\\\") for a in agents]\\n        assert any(\\\"org-A\\\" in r for r in refs), f\\\"Cross-org record leaked: {refs}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_privacy_officer_forbidden_from_cross_org_audit_events\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User has role:privacy-officer for org-A only\",\n        \"AuditEvent records exist scoped to org-B\",\n        \"Valid JWT bearer token for privacy-officer of org-A is available\"\n      ],\n      \"actions\": [\n        \"Obtain bearer token for privacy-officer of org-A via <get_token_fixture>\",\n        \"GET /AuditEvent?organization=org-B with Authorization header\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome with issue.severity='error'\",\n        \"No AuditEvent resources from org-B are returned\"\n      ],\n      \"trace\": [\n        \"R-HLT-039: cross-organisation access shall be forbidden\",\n        \"R-HLT-039: error pathway \u2014 403 when crossing org boundary\",\n        \"NEG: invalid input partition \u2014 officer queries foreign org\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite/fhir\\\"\\n\\ndef test_privacy_officer_forbidden_from_cross_org_audit_events(get_token):\\n    token = get_token(role=\\\"privacy-officer\\\", org=\\\"org-A\\\")\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    resp = requests.get(\\n        f\\\"{BASE_URL}/AuditEvent\\\",\\n        params={\\\"organization\\\": \\\"org-B\\\"},\\n        headers=h"
+  }
+}

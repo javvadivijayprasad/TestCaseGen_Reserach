@@ -1,0 +1,137 @@
+{
+  "req": {
+    "id": "R-HLT-083",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Create medication request (audit)",
+    "statement": "A prescribing clinician shall issue a MedicationRequest; requests for controlled substances shall require schedule verification. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "prescriber"
+    ],
+    "preconditions": [
+      "role:prescriber"
+    ],
+    "triggers": [
+      "clinician prescribes"
+    ],
+    "expected_outcomes": [
+      "request stored",
+      "pharmacy notified"
+    ],
+    "error_pathways": [
+      "403 without schedule verification for CII"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/MedicationRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-083",
+    "reasoning": "The requirement mandates: (1) a prescriber can create a MedicationRequest and an AuditEvent is emitted (positive/EP), (2) a CII controlled substance without schedule verification is rejected with 403 (negative/NEG+DT), (3) a boundary case at exactly the Schedule II threshold tests the transition from non-controlled to controlled-substance workflow (boundary/BVA+STC). Each test is self-contained via fixtures that create and clean up their own data, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_create_non_controlled_medication_request_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated prescriber token available via <prescriber_token> fixture",
+          "FHIR-lite service is reachable at BASE_URL",
+          "Target medication is non-controlled (Schedule V or unscheduled)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with valid non-controlled medication payload",
+          "Assert HTTP 201 and resource ID in response",
+          "GET /AuditEvent?entity=<resource_id> to retrieve emitted audit record"
+        ],
+        "expected": [
+          "HTTP 201 with MedicationRequest resource containing an id",
+          "AuditEvent entry exists referencing the created MedicationRequest id",
+          "AuditEvent.action equals 'C' (create)",
+          "Pharmacy notification flag set in response or side-channel"
+        ],
+        "trace": [
+          "R-HLT-083: request stored",
+          "R-HLT-083: AuditEvent emitted for every operation",
+          "R-HLT-083: pharmacy notified"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_non_controlled_medication_request_emits_audit(\n    prescriber_token, base_url, cleanup_resource\n):\n    headers = {\"Authorization\": f\"Bearer {prescriber_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"1049502\", \"display\": \"Amoxicillin 500mg\"}]\n        },\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-1\"}\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\",\n                         json=payload, headers=headers)\n    assert resp.status_code == 201\n    resource_id = resp.json()[\"id\"]\n    cleanup_resource(f\"{base_url}/MedicationRequest/{resource_id}\", headers)\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"MedicationRequest/{resource_id}\"},\n        headers=headers\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1\n    actions = [e[\"resource\"][\"action\"] for e in entries]\n    assert \"C\" in actions\n"
+      },
+      {
+        "name": "test_create_cii_medication_request_without_schedule_verification_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated prescriber token available via <prescriber_token> fixture",
+          "Token does NOT carry schedule-verification claim for CII substances",
+          "Target medication is Schedule II (e.g., oxycodone)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with a Schedule II controlled substance payload",
+          "Omit or exclude the schedule-verification header/claim",
+          "Assert HTTP 403 is returned"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains error code indicating missing schedule verification",
+          "No MedicationRequest resource persisted",
+          "AuditEvent emitted recording the failed/denied attempt"
+        ],
+        "trace": [
+          "R-HLT-083: 403 without schedule verification for CII",
+          "R-HLT-083: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_cii_medication_request_without_schedule_verification_returns_403(\n    prescriber_token_no_schedule, base_url\n):\n    headers = {\"Authorization\": f\"Bearer {prescriber_token_no_schedule}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"7804\", \"display\": \"Oxycodone 5mg\"}],\n            \"extension\": [{\n                \"url\": \"http://fhir-lite.local/dea-schedule\",\n                \"valueCode\": \"CII\"\n            }]\n        },\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-1\"}\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\",\n                         json=payload, headers=headers)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"schedule\" in str(body).lower() or \"verification\" in str(body).lower()\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"outcome\": \"8\", \"action\": \"C\"},\n        headers={\"Authorization\": f\"Bearer {prescriber_token_no_schedule}\"}\n    )\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json().get(\"entry\", [])) >= 1\n"
+      },
+      {
+        "name": "test_create_cii_medication_request_with_schedule_verification_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated prescriber token available via <prescriber_token_with_schedule> fixture",
+          "Token carries valid schedule-verification claim for CII",
+          "Target medication is exactly Schedule II (boundary between non-restricted and CII path)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with Schedule II payload and valid schedule-verification claim",
+          "Assert HTTP 201 is returned (boundary: just inside the verified threshold)",
+          "GET /AuditEvent for the new resource to confirm audit trail"
+        ],
+        "expected": [
+          "HTTP 201 with MedicationRequest resource id",
+          "AuditEvent with action 'C' and outcome '0' (success) references the resource",
+          "Response or downstream signal confirms pharmacy notification"
+        ],
+        "trace": [
+          "R-HLT-083: schedule verification required for CII \u2014 passing this boundary case confirms the exact threshold",
+          "R-HLT-083: request stored",
+          "R-HLT-083: AuditEvent emitted for every operation",
+          "R-HLT-083: pharmacy notified"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_cii_medication_request_with_schedule_verification_succeeds(\n    prescriber_token_with_schedule, base_url, cleanup_resource\n):\n    headers = {\"Authorization\": f\"Bearer {prescriber_token_with_schedule}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\",\n                        \"code\": \"7804\", \"display\": \"Oxycodone 5mg\"}],\n            \"extension\": [{\n                \"url\": \"http://fhir-lite.local/dea-schedule\",\n                \"valueCode\": \"CII\"\n            }]\n        },\n        \"requester\": {\"reference\": \"Practitioner/test-prescriber-1\"}\n    }\n    resp = requests.post(f\"{base_url}/MedicationRequest\",\n                         json=payload, headers=headers)\n    assert resp.status_code == 201\n    resource_id = resp.json()[\"id\"]\n    cleanup_resource(f\"{base_url}/MedicationRequest/{resource_id}\", headers)\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"MedicationRequest/{resource_id}\", \"outcome\": \"0\"},\n        headers=headers\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert any(e[\"resource\"][\"action\"] == \"C\" for e in entries)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-083",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 2614,
+    "latency_ms": 27033,
+    "wall_ms": 27033,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-083\",\n  \"reasoning\": \"The requirement mandates: (1) a prescriber can create a MedicationRequest and an AuditEvent is emitted (positive/EP), (2) a CII controlled substance without schedule verification is rejected with 403 (negative/NEG+DT), (3) a boundary case at exactly the Schedule II threshold tests the transition from non-controlled to controlled-substance workflow (boundary/BVA+STC). Each test is self-contained via fixtures that create and clean up their own data, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_non_controlled_medication_request_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated prescriber token available via <prescriber_token> fixture\",\n        \"FHIR-lite service is reachable at BASE_URL\",\n        \"Target medication is non-controlled (Schedule V or unscheduled)\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with valid non-controlled medication payload\",\n        \"Assert HTTP 201 and resource ID in response\",\n        \"GET /AuditEvent?entity=<resource_id> to retrieve emitted audit record\"\n      ],\n      \"expected\": [\n        \"HTTP 201 with MedicationRequest resource containing an id\",\n        \"AuditEvent entry exists referencing the created MedicationRequest id\",\n        \"AuditEvent.action equals 'C' (create)\",\n        \"Pharmacy notification flag set in response or side-channel\"\n      ],\n      \"trace\": [\n        \"R-HLT-083: request stored\",\n        \"R-HLT-083: AuditEvent emitted for every operation\",\n        \"R-HLT-083: pharmacy notified\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_non_controlled_medication_request_emits_audit(\\n    prescriber_token, base_url, cleanup_resource\\n):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {prescriber_token}\\\",\\n               \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    payload = {\\n        \\\"resourceType\\\": \\\"MedicationRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/test-patient-1\\\"},\\n        \\\"medicationCodeableConcept\\\": {\\n            \\\"coding\\\": [{\\\"system\\\": \\\"http://www.nlm.nih.gov/research/umls/rxnorm\\\",\\n                        \\\"code\\\": \\\"1049502\\\", \\\"display\\\": \\\"Amoxicillin 500mg\\\"}]\\n        },\\n        \\\"requester\\\": {\\\"reference\\\": \\\"Practitioner/test-prescriber-1\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_url}/MedicationRequest\\\",\\n                         json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    resource_id = resp.json()[\\\"id\\\"]\\n    cleanup_resource(f\\\"{base_url}/MedicationRequest/{resource_id}\\\", headers)\\n\\n    audit_resp = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"MedicationRequest/{resource_id}\\\"},\\n        headers=headers\\n    )\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1\\n    actions = [e[\\\"resource\\\"][\\\"action\\\"] for e in entries]\\n    assert \\\"C\\\" in actions\\n\"\n    },\n    {\n      \"name\": \"test_create_cii_medication_request_without_schedule_verification_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated prescriber token available via <prescriber_token> fixture\",\n        \"Token does NOT carry schedule-verification claim for CII substances\",\n        \"Target medication is Schedule II (e.g., oxycodone)\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with a Schedule II controlled substance payload\",\n        \"Omit or exclude the schedule-verification header/claim\",\n        \"Assert HTTP 403 is returned\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains error code indicating missing schedule verification\",\n        \"No MedicationRequest resource persisted\",\n        \"AuditEvent emitted recording the failed/denied attempt\"\n      ],\n      \"tra"
+  }
+}

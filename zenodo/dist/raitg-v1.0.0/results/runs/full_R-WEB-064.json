@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-WEB-064",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Approve leave request \u2014 variant 3",
+    "statement": "A manager shall approve or reject leave requests assigned to them within 5 business days; unactioned requests auto-escalate to hr-admin. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager",
+      "request assigned to manager"
+    ],
+    "triggers": [
+      "manager clicks approve"
+    ],
+    "expected_outcomes": [
+      "request state=approved",
+      "employee notified",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if manager not the assignee",
+      "409 if already actioned"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/{id}/approve"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-064",
+    "reasoning": "The requirement covers: (1) a happy-path approval by the assigned manager, (2) rejection of the action when the acting user is not the assignee (403), (3) rejection when the request is already actioned (409), (4) auto-escalation boundary at exactly 5 business days, and (5) webhook emission on approval. Tests are designed using EP for the happy path, NEG for the 403/409 error paths, BVA for the 5-business-day escalation boundary, and STC for state transitions (pending\u2192approved, pending\u2192escalated). Each test is self-contained via fixtures that create and clean up their own leave request.",
+    "tests": [
+      {
+        "name": "test_manager_approves_assigned_request_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role:manager",
+          "A leave request exists in state=pending and is assigned to this manager",
+          "Webhook receiver endpoint is reachable and recorded"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with manager's auth token",
+          "Capture HTTP response status and body",
+          "Query GET /leave-requests/{id} to read persisted state",
+          "Query GET /audit-log?entity_id={id} to verify audit entry",
+          "Query webhook capture endpoint for emitted events"
+        ],
+        "expected": [
+          "HTTP 200 returned from approve endpoint",
+          "Response body contains state=approved",
+          "GET /leave-requests/{id} returns state=approved",
+          "Employee notification record exists (notifications API or email stub)",
+          "Audit log contains one entry with action=approve and actor=manager",
+          "Webhook capture shows event type=leave_request.approved for the request id"
+        ],
+        "trace": [
+          "R-WEB-064: manager approves assigned request",
+          "R-WEB-064: employee notified",
+          "R-WEB-064: audit entry created",
+          "R-WEB-064: webhook event emitted"
+        ],
+        "executable": "import pytest\n\ndef test_manager_approves_assigned_request_succeeds(\n    manager_session,          # <fixture>: returns authed requests.Session for manager\n    pending_leave_request,    # <fixture>: creates pending request assigned to manager, yields id\n    webhook_capture,          # <fixture>: starts mock receiver, yields helper\n    api_base_url,             # <fixture>: base URL string\n):\n    req_id = pending_leave_request\n    url = f\"{api_base_url}/leave-requests/{req_id}/approve\"\n\n    resp = manager_session.post(url)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"state\"] == \"approved\"\n\n    detail = manager_session.get(f\"{api_base_url}/leave-requests/{req_id}\").json()\n    assert detail[\"state\"] == \"approved\"\n\n    notifications = manager_session.get(\n        f\"{api_base_url}/notifications\", params={\"entity_id\": req_id}\n    ).json()\n    assert any(n[\"recipient_role\"] == \"employee\" for n in notifications)\n\n    audit = manager_session.get(\n        f\"{api_base_url}/audit-log\", params={\"entity_id\": req_id}\n    ).json()\n    assert any(e[\"action\"] == \"approve\" for e in audit)\n\n    events = webhook_capture.received_events()\n    assert any(\n        e[\"event_type\"] == \"leave_request.approved\" and e[\"payload\"][\"id\"] == req_id\n        for e in events\n    )"
+      },
+      {
+        "name": "test_non_assignee_manager_approve_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for manager_b (role:manager)",
+          "A leave request exists in state=pending and is assigned to manager_a (different manager)",
+          "manager_b is NOT the assignee of the request"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with manager_b's auth token"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden returned",
+          "Response body contains error code indicating not-assignee",
+          "Leave request state remains pending (unchanged)",
+          "No audit entry created for this attempt",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-064: error pathway \u2014 403 if manager not the assignee"
+        ],
+        "executable": "import pytest\n\ndef test_non_assignee_manager_approve_returns_403(\n    manager_b_session,                # <fixture>: authed session for manager_b\n    pending_request_for_manager_a,    # <fixture>: pending request assigned to manager_a, yields id\n    webhook_capture,\n    api_base_url,\n):\n    req_id = pending_request_for_manager_a\n    url = f\"{api_base_url}/leave-requests/{req_id}/approve\"\n\n    resp = manager_b_session.post(url)\n    assert resp.status_code == 403\n    err = resp.json()\n    assert \"not_assignee\" in err.get(\"error_code\", \"\").lower() or \\\n           \"forbidden\" in err.get(\"message\", \"\").lower()\n\n    detail = manager_b_session.get(\n        f\"{api_base_url}/leave-requests/{req_id}\"\n    ).json()\n    assert detail[\"state\"] == \"pending\"\n\n    events = webhook_capture.received_events()\n    assert not any(\n        e[\"payload\"].get(\"id\") == req_id for e in events\n    )"
+      },
+      {
+        "name": "test_approve_already_actioned_request_returns_409",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated session exists for a user with role:manager",
+          "A leave request exists in state=approved (already actioned) and is assigned to this manager"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with manager's auth token (second approval attempt)"
+        ],
+        "expected": [
+          "HTTP 409 Conflict returned",
+          "Response body contains error indicating request already actioned",
+          "Leave request state remains approved (no mutation)",
+          "No duplicate audit entry created",
+          "No duplicate webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-064: error pathway \u2014 409 if already actioned",
+          "R-WEB-064: state must not regress or duplicate"
+        ],
+        "executable": "import pytest\n\ndef test_approve_already_actioned_request_returns_409(\n    manager_session,\n    approved_leave_request,    # <fixture>: creates request in state=approved, yields id\n    webhook_capture,\n    api_base_url,\n):\n    req_id = approved_leave_request\n    url = f\"{api_base_url}/leave-requests/{req_id}/approve\"\n\n    resp = manager_session.post(url)\n    assert resp.status_code == 409\n    err = resp.json()\n    assert \"already\" in err.get(\"message\", \"\").lower() or \\\n           err.get(\"error_code\", \"\") in (\"already_actioned\", \"conflict\")\n\n    detail = manager_session.get(\n        f\"{api_base_url}/leave-requests/{req_id}\"\n    ).json()\n    assert detail[\"state\"] == \"approved\"\n\n    audit = manager_session.get(\n        f\"{api_base_url}/audit-log\", params={\"entity_id\": req_id}\n    ).json()\n    approve_entries = [e for e in audit if e[\"action\"] == \"approve\"]\n    assert len(approve_entries) == 1   # exactly one, no duplicate\n\n    events = webhook_capture.received_events()\n    approve_events = [\n        e for e in events\n        if e[\"event_type\"] == \"leave_request.approved\"\n        and e[\"payload\"].get(\"id\") == req_id\n    ]\n    assert len(approve_events) == 1"
+      },
+      {
+        "name": "test_unactioned_request_escalates_at_exactly_5_business_days",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A leave request exists in state=pending assigned to manager",
+          "System clock or created_at timestamp is manipulated so the request age is exactly 5 business days",
+          "Auto-escalation job/cron is triggerable via test API or time-travel fixture"
+        ],
+        "actions": [
+          "Advance simulated time to exactly T+5 business days from request creation",
+          "Trigger auto-escalation check (POST /internal/escalate-overdue or advance scheduler)",
+          "Query GET /leave-requests/{id} to read state",
+          "Query GET /audit-log?entity_id={id}",
+          "Verify assignee changed to hr-admin role"
+        ],
+        "expected": [
+          "Leave request state transitions to escalated (or assignee changes to hr-admin)",
+          "Audit log contains entry with action=escalate at the 5-business-day mark",
+          "Original manager is no longer the assignee",
+          "HR-admin receives notification of escalated request",
+          "Webhook event type=leave_request.escalated is emitted"
+        ],
+        "trace": [
+          "R-WEB-064: unactioned requests auto-escalate to hr-admin",
+          "R-WEB-064: within 5 business days \u2014 boundary at exactly day 5"
+        ],
+        "executable": "import pytest\n\ndef test_unactioned_request_escalates_at_exactly_5_business_days(\n    admin_session,              # <fixture>: internal/admin authed session\n    pending_leave_request,      # <fixture>: pending request assigned to manager, yields id\n    time_travel,                # <fixture>: context-manager to advance system/app clock\n    webhook_capture,\n    api_base_url,\n):\n    req_id = pending_leave_request\n\n    with time_travel(business_days=5):\n        escalate_resp = admin_session.post(\n            f\"{api_base_url}/internal/escalate-overdue\"\n        )\n    assert escalate_resp.status_code in (200, 204)\n\n    detail = admin_session.get(\n        f\"{api_base_url}/leave-requests/{req_id}\"\n    ).json()\n    assert detail[\"state\"] in (\"escalated\", \"pending\")  # state or assignee signals escalation\n    assert detail.get(\"assignee_role\") == \"hr-admin\" or \\\n           detail.get(\"state\") == \"escalated\"\n\n    audit = admin_session.get(\n        f\"{api_base_url}/audit-log\", params={\"entity_id\": req_id}\n    ).json()\n    assert any(e[\"action\"] == \"escalate\" for e in audit)\n\n    events = webhook_capture.received_events()\n    assert any(\n        e[\"event_type\"] == \"leave_request.escalated\"\n        and e[\"payload\"].get(\"id\") == req_id\n        for e in events\n    )"
+      },
+      {
+        "name": "test_approval_transitions_state_from_pending_to_approved",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Leave request is confirmed in state=pending before action",
+          "Manager session is authenticated and is the assignee"
+        ],
+        "actions": [
+          "Verify initial state=pending via GET /leave-requests/{id}",
+          "POST /leave-requests/{id}/approve",
+          "Verify resulting state=approved via GET /leave-requests/{id}"
+        ],
+        "expected": [
+          "State machine: pending \u2192 approved (valid transition)",
+          "No intermediate state observed",
+          "HTTP 200 on approve",
+          "Subsequent GET reflects approved deterministically"
+        ],
+        "trace": [
+          "R-WEB-064: request state=approved after manager approval",
+          "R-WEB-064: state transition coverage pending\u2192approved"
+        ],
+        "executable": "import pytest\n\ndef test_approval_transitions_state_from_pending_to_approved(\n    manager_session,\n    pending_leave_request,\n    api_base_url,\n):\n    req_id = pending_leave_request\n    base = api_base_url\n\n    pre = manager_session.get(f\"{base}/leave-requests/{req_id}\").json()\n    assert pre[\"state\"] == \"pending\", f\"Expected pending, got {pre['state']}\"\n\n    approve_resp = manager_session.post(\n        f\"{base}/leave-requests/{req_id}/approve\"\n    )\n    assert approve_resp.status_code == 200\n\n    post = manager_session.get(f\"{base}/leave-requests/{req_id}\").json()\n    assert post[\"state\"] == \"approved\", f\"Expected approved, got {post['state']}\"\n    assert post[\"state\"] != pre[\"state\"], \"State must have changed\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-064",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1032,
+    "output_tokens": 3541,
+    "latency_ms": 46930,
+    "wall_ms": 46930,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-064\",\n  \"reasoning\": \"The requirement covers: (1) a happy-path approval by the assigned manager, (2) rejection of the action when the acting user is not the assignee (403), (3) rejection when the request is already actioned (409), (4) auto-escalation boundary at exactly 5 business days, and (5) webhook emission on approval. Tests are designed using EP for the happy path, NEG for the 403/409 error paths, BVA for the 5-business-day escalation boundary, and STC for state transitions (pending\u2192approved, pending\u2192escalated). Each test is self-contained via fixtures that create and clean up their own leave request.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_approves_assigned_request_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:manager\",\n        \"A leave request exists in state=pending and is assigned to this manager\",\n        \"Webhook receiver endpoint is reachable and recorded\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with manager's auth token\",\n        \"Capture HTTP response status and body\",\n        \"Query GET /leave-requests/{id} to read persisted state\",\n        \"Query GET /audit-log?entity_id={id} to verify audit entry\",\n        \"Query webhook capture endpoint for emitted events\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned from approve endpoint\",\n        \"Response body contains state=approved\",\n        \"GET /leave-requests/{id} returns state=approved\",\n        \"Employee notification record exists (notifications API or email stub)\",\n        \"Audit log contains one entry with action=approve and actor=manager\",\n        \"Webhook capture shows event type=leave_request.approved for the request id\"\n      ],\n      \"trace\": [\n        \"R-WEB-064: manager approves assigned request\",\n        \"R-WEB-064: employee notified\",\n        \"R-WEB-064: audit entry created\",\n        \"R-WEB-064: webhook event emitted\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_manager_approves_assigned_request_succeeds(\\n    manager_session,          # <fixture>: returns authed requests.Session for manager\\n    pending_leave_request,    # <fixture>: creates pending request assigned to manager, yields id\\n    webhook_capture,          # <fixture>: starts mock receiver, yields helper\\n    api_base_url,             # <fixture>: base URL string\\n):\\n    req_id = pending_leave_request\\n    url = f\\\"{api_base_url}/leave-requests/{req_id}/approve\\\"\\n\\n    resp = manager_session.post(url)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"state\\\"] == \\\"approved\\\"\\n\\n    detail = manager_session.get(f\\\"{api_base_url}/leave-requests/{req_id}\\\").json()\\n    assert detail[\\\"state\\\"] == \\\"approved\\\"\\n\\n    notifications = manager_session.get(\\n        f\\\"{api_base_url}/notifications\\\", params={\\\"entity_id\\\": req_id}\\n    ).json()\\n    assert any(n[\\\"recipient_role\\\"] == \\\"employee\\\" for n in notifications)\\n\\n    audit = manager_session.get(\\n        f\\\"{api_base_url}/audit-log\\\", params={\\\"entity_id\\\": req_id}\\n    ).json()\\n    assert any(e[\\\"action\\\"] == \\\"approve\\\" for e in audit)\\n\\n    events = webhook_capture.received_events()\\n    assert any(\\n        e[\\\"event_type\\\"] == \\\"leave_request.approved\\\" and e[\\\"payload\\\"][\\\"id\\\"] == req_id\\n        for e in events\\n    )\"\n    },\n    {\n      \"name\": \"test_non_assignee_manager_approve_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for manager_b (role:manager)\",\n        \"A leave request exists in state=pending and is assigned to manager_a (different manager)\",\n        \"manager_b is NOT the assignee of the request\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with manager_b's auth token\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden returned\",\n        \"Response body contains error code indicat"
+  }
+}

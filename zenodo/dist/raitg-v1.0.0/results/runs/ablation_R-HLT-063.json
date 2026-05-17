@@ -1,0 +1,200 @@
+{
+  "req": {
+    "id": "R-HLT-063",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients (negative)",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-063",
+    "reasoning": "R-HLT-063 mandates that a clinician can search patients by name, MRN, or DOB with results filtered to their care panel, access logged, and malformed queries rejected with HTTP 400. Test design covers: (1) EP positive \u2013 valid name search returns only in-care patients with access log entry; (2) NEG \u2013 non-clinician role (patient role token) is denied access (403); (3) NEG \u2013 missing mandatory query parameter returns 400; (4) BVA \u2013 DOB at exact boundary (patient DOB equals search date) returns correct single match; (5) DT \u2013 conflicting state: search for a patient discharged from care returns empty bundle, not forbidden. Each test is self-contained via fixtures providing auth tokens and a deterministic patient dataset.",
+    "tests": [
+      {
+        "name": "test_clinician_name_search_returns_only_care_panel_patients",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician token issued for clinician_id=C001",
+          "Patient P001 (name=John Doe) is in C001 care panel",
+          "Patient P002 (name=John Doe) is NOT in C001 care panel",
+          "FHIR-lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?search with header Authorization: Bearer <clinician_token> and query param name=John Doe",
+          "Capture HTTP status and response JSON body",
+          "Capture access log entry via audit endpoint"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Bundle.total == 1",
+          "Returned entry contains only patient P001",
+          "Access log contains a SearchPatient event for clinician C001"
+        ],
+        "trace": [
+          "R-HLT-063: filtered bundle returned",
+          "R-HLT-063: access logged",
+          "R-HLT-063: clinician can search by name"
+        ],
+        "executable": "def test_clinician_name_search_returns_only_care_panel_patients(clinician_token, base_url, audit_client):\n    resp = <http_get>(\n        f\"{base_url}/Patient?search\",\n        params={\"name\": \"John Doe\"},\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    assert bundle[\"total\"] == 1\n    entry_ids = [e[\"resource\"][\"id\"] for e in bundle.get(\"entry\", [])]\n    assert \"P001\" in entry_ids\n    assert \"P002\" not in entry_ids\n    log = audit_client.latest_event(clinician_id=\"C001\", action=\"SearchPatient\")\n    assert log is not None"
+      },
+      {
+        "name": "test_non_clinician_role_is_denied_patient_search",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Token issued for role=patient (user_id=PT999)",
+          "FHIR-lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?search with header Authorization: Bearer <patient_role_token> and query param name=Jane"
+        ],
+        "expected": [
+          "HTTP 403",
+          "Response body contains OperationOutcome with issue.code == forbidden"
+        ],
+        "trace": [
+          "R-HLT-063: only clinician role may search",
+          "R-HLT-063: permission denial error pathway"
+        ],
+        "executable": "def test_non_clinician_role_is_denied_patient_search(patient_role_token, base_url):\n    resp = <http_get>(\n        f\"{base_url}/Patient?search\",\n        params={\"name\": \"Jane\"},\n        headers={\"Authorization\": f\"Bearer {patient_role_token}\"},\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    codes = [i[\"code\"] for i in body.get(\"issue\", [])]\n    assert \"forbidden\" in codes"
+      },
+      {
+        "name": "test_search_with_no_query_param_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician token issued for clinician_id=C001",
+          "FHIR-lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?search with valid clinician token but NO query parameters (name, mrn, dob all absent)"
+        ],
+        "expected": [
+          "HTTP 400",
+          "Response body contains OperationOutcome with issue.code == required"
+        ],
+        "trace": [
+          "R-HLT-063: 400 when query malformed",
+          "R-HLT-063: missing mandatory elements error pathway"
+        ],
+        "executable": "def test_search_with_no_query_param_returns_400(clinician_token, base_url):\n    resp = <http_get>(\n        f\"{base_url}/Patient?search\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    codes = [i[\"code\"] for i in body.get(\"issue\", [])]\n    assert \"required\" in codes"
+      },
+      {
+        "name": "test_dob_exact_boundary_match_returns_single_patient",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician token issued for clinician_id=C001",
+          "Patient P010 in C001 care panel with DOB exactly 2000-01-01",
+          "No other patient in C001 care panel shares DOB 2000-01-01",
+          "FHIR-lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?search with query param dob=2000-01-01 and valid clinician token"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Bundle.total == 1",
+          "Returned entry contains patient P010 with birthDate == 2000-01-01"
+        ],
+        "trace": [
+          "R-HLT-063: clinician can search by DOB",
+          "R-HLT-063: filtered bundle returned",
+          "BVA: DOB equals boundary value of search date"
+        ],
+        "executable": "def test_dob_exact_boundary_match_returns_single_patient(clinician_token, base_url):\n    resp = <http_get>(\n        f\"{base_url}/Patient?search\",\n        params={\"dob\": \"2000-01-01\"},\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"total\"] == 1\n    patient = bundle[\"entry\"][0][\"resource\"]\n    assert patient[\"id\"] == \"P010\"\n    assert patient[\"birthDate\"] == \"2000-01-01\""
+      },
+      {
+        "name": "test_search_for_discharged_patient_returns_empty_bundle",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician token issued for clinician_id=C001",
+          "Patient P020 was previously in C001 care panel but has been discharged (state=discharged)",
+          "FHIR-lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?search with query param mrn=MRN020 and valid clinician token"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Bundle.total == 0",
+          "No entry for patient P020 in the bundle"
+        ],
+        "trace": [
+          "R-HLT-063: only patients in their care shall be returned",
+          "R-HLT-063: conflicting state transition error pathway",
+          "STC: care-panel state transitions from active to discharged"
+        ],
+        "executable": "def test_search_for_discharged_patient_returns_empty_bundle(clinician_token, base_url):\n    resp = <http_get>(\n        f\"{base_url}/Patient?search\",\n        params={\"mrn\": \"MRN020\"},\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"total\"] == 0\n    entry_ids = [e[\"resource\"][\"id\"] for e in bundle.get(\"entry\", [])]\n    assert \"P020\" not in entry_ids"
+      },
+      {
+        "name": "test_malformed_dob_format_returns_400",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician token issued for clinician_id=C001",
+          "FHIR-lite service is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?search with query param dob=99-99-9999 (invalid date format) and valid clinician token"
+        ],
+        "expected": [
+          "HTTP 400",
+          "Response OperationOutcome issue.code == invalid or value",
+          "No patient data leaked in response body"
+        ],
+        "trace": [
+          "R-HLT-063: 400 when query malformed",
+          "DT: decision rule \u2013 valid role + invalid param value -> 400"
+        ],
+        "executable": "def test_malformed_dob_format_returns_400(clinician_token, base_url):\n    resp = <http_get>(\n        f\"{base_url}/Patient?search\",\n        params={\"dob\": \"99-99-9999\"},\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    codes = [i[\"code\"] for i in body.get(\"issue\", [])]\n    assert any(c in codes for c in (\"invalid\", \"value\"))\n    assert \"entry\" not in body"
+      }
+    ]
+  },
+  "req_id": "R-HLT-063",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 2835,
+    "latency_ms": 36767,
+    "wall_ms": 36767,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-063\",\n  \"reasoning\": \"R-HLT-063 mandates that a clinician can search patients by name, MRN, or DOB with results filtered to their care panel, access logged, and malformed queries rejected with HTTP 400. Test design covers: (1) EP positive \u2013 valid name search returns only in-care patients with access log entry; (2) NEG \u2013 non-clinician role (patient role token) is denied access (403); (3) NEG \u2013 missing mandatory query parameter returns 400; (4) BVA \u2013 DOB at exact boundary (patient DOB equals search date) returns correct single match; (5) DT \u2013 conflicting state: search for a patient discharged from care returns empty bundle, not forbidden. Each test is self-contained via fixtures providing auth tokens and a deterministic patient dataset.\",\n  \"tests\": [\n    {\n      \"name\": \"test_clinician_name_search_returns_only_care_panel_patients\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician token issued for clinician_id=C001\",\n        \"Patient P001 (name=John Doe) is in C001 care panel\",\n        \"Patient P002 (name=John Doe) is NOT in C001 care panel\",\n        \"FHIR-lite service is running and reachable\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with header Authorization: Bearer <clinician_token> and query param name=John Doe\",\n        \"Capture HTTP status and response JSON body\",\n        \"Capture access log entry via audit endpoint\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Bundle.total == 1\",\n        \"Returned entry contains only patient P001\",\n        \"Access log contains a SearchPatient event for clinician C001\"\n      ],\n      \"trace\": [\n        \"R-HLT-063: filtered bundle returned\",\n        \"R-HLT-063: access logged\",\n        \"R-HLT-063: clinician can search by name\"\n      ],\n      \"executable\": \"def test_clinician_name_search_returns_only_care_panel_patients(clinician_token, base_url, audit_client):\\n    resp = <http_get>(\\n        f\\\"{base_url}/Patient?search\\\",\\n        params={\\\"name\\\": \\\"John Doe\\\"},\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"},\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n    assert bundle[\\\"total\\\"] == 1\\n    entry_ids = [e[\\\"resource\\\"][\\\"id\\\"] for e in bundle.get(\\\"entry\\\", [])]\\n    assert \\\"P001\\\" in entry_ids\\n    assert \\\"P002\\\" not in entry_ids\\n    log = audit_client.latest_event(clinician_id=\\\"C001\\\", action=\\\"SearchPatient\\\")\\n    assert log is not None\"\n    },\n    {\n      \"name\": \"test_non_clinician_role_is_denied_patient_search\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Token issued for role=patient (user_id=PT999)\",\n        \"FHIR-lite service is running and reachable\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with header Authorization: Bearer <patient_role_token> and query param name=Jane\"\n      ],\n      \"expected\": [\n        \"HTTP 403\",\n        \"Response body contains OperationOutcome with issue.code == forbidden\"\n      ],\n      \"trace\": [\n        \"R-HLT-063: only clinician role may search\",\n        \"R-HLT-063: permission denial error pathway\"\n      ],\n      \"executable\": \"def test_non_clinician_role_is_denied_patient_search(patient_role_token, base_url):\\n    resp = <http_get>(\\n        f\\\"{base_url}/Patient?search\\\",\\n        params={\\\"name\\\": \\\"Jane\\\"},\\n        headers={\\\"Authorization\\\": f\\\"Bearer {patient_role_token}\\\"},\\n    )\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"OperationOutcome\\\"\\n    codes = [i[\\\"code\\\"] for i in body.get(\\\"issue\\\", [])]\\n    assert \\\"forbidden\\\" in codes\"\n    },\n    {\n      \"name\": \"test_search_with_no_query_param_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician token issued for clinician_id=C001\",\n        \"FHIR-lite service is running and reachable\"\n      ],\n      \"actions\": [\n "
+  }
+}

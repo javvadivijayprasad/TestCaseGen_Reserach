@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-046",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Break-glass access (boundary)",
+    "statement": "A clinician shall invoke break-glass access for an emergent patient; break-glass use shall be audited and trigger a post-event review. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician asserts emergency"
+    ],
+    "expected_outcomes": [
+      "access granted",
+      "audit event emitted"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/BreakGlass"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-046",
+    "reasoning": "Break-glass access has three critical dimensions: (1) happy-path grant + audit emission for a valid clinician asserting emergency, (2) rejection when the caller lacks clinician role (NEG/DT), (3) boundary conditions on the timestamp and numeric fields (BVA). A fourth test covers the state transition from 'access granted' to 'review task created', verifying the post-event review workflow is triggered. Together these cover EP (valid partition), NEG (invalid role partition), BVA (epoch boundary and max-length reason string), and STC (granted -> review-pending state machine arc).",
+    "tests": [
+      {
+        "name": "test_break_glass_valid_clinician_grants_access_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated token belongs to a user with role:clinician",
+          "Patient identified by PATIENT_ID exists in the system",
+          "No prior active break-glass session for this clinician/patient pair"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician JWT, patient_id, reason, and current ISO-8601 timestamp",
+          "Capture HTTP response status and body",
+          "Query audit log for the emitted break-glass event"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains access_granted: true",
+          "Response body contains a non-empty session_id",
+          "Audit log contains exactly one event with event_type='break_glass' for this session_id"
+        ],
+        "trace": [
+          "R-HLT-046: clinician invokes break-glass -> access granted",
+          "R-HLT-046: break-glass use shall be audited"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import datetime, timezone\n\ndef test_break_glass_valid_clinician_grants_access_and_emits_audit(\n    api_client,          # <fixture>: requests.Session with base_url\n    clinician_token,     # <fixture>: valid JWT for role:clinician\n    existing_patient_id  # <fixture>: str patient ID pre-seeded\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"reason\": \"Cardiac arrest \u2013 immediate access required\",\n        \"timestamp\": datetime.now(timezone.utc).isoformat(),\n        \"request_id\": str(uuid.uuid4())\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n\n    resp = api_client.post(\"/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code in (200, 201), f\"Unexpected status: {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"access_granted\") is True\n    session_id = body.get(\"session_id\")\n    assert session_id, \"session_id must be present\"\n\n    audit_events = get_audit_events(api_client, clinician_token, session_id)  # <helper_fn>\n    bg_events = [e for e in audit_events if e.get(\"event_type\") == \"break_glass\"]\n    assert len(bg_events) == 1, f\"Expected 1 audit event, got {len(bg_events)}\"\n"
+      },
+      {
+        "name": "test_break_glass_non_clinician_role_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated token belongs to a user with role:patient (not clinician)",
+          "Patient identified by PATIENT_ID exists in the system"
+        ],
+        "actions": [
+          "POST /BreakGlass with a patient-role JWT and a valid payload",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden response",
+          "Response body contains an error code indicating insufficient privileges",
+          "No audit event of type break_glass is emitted for this request"
+        ],
+        "trace": [
+          "R-HLT-046: precondition role:clinician \u2013 absence of role must be rejected",
+          "R-HLT-046: error pathway \u2013 unauthorized invocation must not create access"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import datetime, timezone\n\ndef test_break_glass_non_clinician_role_returns_403(\n    api_client,\n    patient_token,       # <fixture>: valid JWT for role:patient\n    existing_patient_id\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"reason\": \"Attempting unauthorized break-glass\",\n        \"timestamp\": datetime.now(timezone.utc).isoformat(),\n        \"request_id\": str(uuid.uuid4())\n    }\n    headers = {\"Authorization\": f\"Bearer {patient_token}\"}\n\n    resp = api_client.post(\"/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body, \"Error descriptor missing from response\"\n    denied_request_id = payload[\"request_id\"]\n    audit_events = get_audit_events_by_request(\n        api_client, denied_request_id  # <helper_fn>\n    )\n    bg_events = [e for e in audit_events if e.get(\"event_type\") == \"break_glass\"]\n    assert len(bg_events) == 0, \"No break-glass audit event should exist for rejected request\"\n"
+      },
+      {
+        "name": "test_break_glass_unix_epoch_timestamp_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated token belongs to a user with role:clinician",
+          "Patient identified by PATIENT_ID exists in the system",
+          "API accepts ISO-8601 timestamps; Unix epoch (1970-01-01T00:00:00Z) is the minimum valid boundary"
+        ],
+        "actions": [
+          "POST /BreakGlass with clinician JWT and timestamp set exactly to Unix epoch (1970-01-01T00:00:00Z)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 or 400 response indicating timestamp is out of acceptable range",
+          "Response body contains a field-level validation error referencing 'timestamp'",
+          "No session_id is issued"
+        ],
+        "trace": [
+          "R-HLT-046: boundary cases on timestamps must be tested",
+          "R-HLT-046: epoch timestamp is below minimum plausible clinical event time"
+        ],
+        "executable": "import pytest\nimport uuid\n\nEPOCH_TIMESTAMP = \"1970-01-01T00:00:00Z\"\n\ndef test_break_glass_unix_epoch_timestamp_boundary(\n    api_client,\n    clinician_token,\n    existing_patient_id\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"reason\": \"Boundary timestamp test\",\n        \"timestamp\": EPOCH_TIMESTAMP,\n        \"request_id\": str(uuid.uuid4())\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n\n    resp = api_client.post(\"/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400/422 for epoch timestamp, got {resp.status_code}\"\n    )\n    body = resp.json()\n    errors = body.get(\"errors\") or body.get(\"detail\") or []\n    error_str = str(errors).lower()\n    assert \"timestamp\" in error_str, (\n        f\"Validation error must reference 'timestamp', got: {error_str}\"\n    )\n    assert body.get(\"session_id\") is None, \"No session_id should be issued for invalid request\"\n"
+      },
+      {
+        "name": "test_break_glass_access_granted_triggers_post_event_review_task",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated token belongs to a user with role:clinician",
+          "Patient identified by PATIENT_ID exists in the system",
+          "System is in state: no active break-glass session for this pair",
+          "Post-event review workflow is enabled"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician JWT to transition state to access_granted",
+          "Poll or query the review-task endpoint for a task linked to the returned session_id",
+          "Verify task state is pending_review"
+        ],
+        "expected": [
+          "HTTP 200 or 201 on break-glass POST",
+          "A review task exists with status pending_review linked to the session_id",
+          "Review task references the correct clinician and patient identifiers"
+        ],
+        "trace": [
+          "R-HLT-046: break-glass use shall trigger a post-event review",
+          "R-HLT-046: error pathway \u2013 review task created (state: access_granted -> review_pending)"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import datetime, timezone\nfrom time import sleep\n\ndef test_break_glass_access_granted_triggers_post_event_review_task(\n    api_client,\n    clinician_token,\n    existing_patient_id\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"reason\": \"Respiratory failure \u2013 STC review task test\",\n        \"timestamp\": datetime.now(timezone.utc).isoformat(),\n        \"request_id\": str(uuid.uuid4())\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n\n    resp = api_client.post(\"/BreakGlass\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201)\n    session_id = resp.json().get(\"session_id\")\n    assert session_id\n\n    review_task = poll_for_review_task(  # <helper_fn>\n        api_client, clinician_token, session_id, retries=5, delay=1\n    )\n    assert review_task is not None, \"Review task must be created after break-glass access\"\n    assert review_task.get(\"status\") == \"pending_review\"\n    assert review_task.get(\"session_id\") == session_id\n    assert review_task.get(\"patient_id\") == existing_patient_id\n"
+      },
+      {
+        "name": "test_break_glass_max_length_reason_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated token belongs to a user with role:clinician",
+          "Patient identified by PATIENT_ID exists in the system",
+          "API specifies maximum reason string length (assumed 500 characters per schema)"
+        ],
+        "actions": [
+          "POST /BreakGlass with reason string of exactly 501 characters (one beyond boundary)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 400 or 422 response indicating reason exceeds maximum length",
+          "Response body contains a field-level validation error referencing 'reason'",
+          "No session_id is issued"
+        ],
+        "trace": [
+          "R-HLT-046: boundary cases on numeric elements must be tested",
+          "R-HLT-046: reason field length is a numeric boundary attribute of the request schema"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import datetime, timezone\n\nMAX_REASON_LENGTH = 500\n\ndef test_break_glass_max_length_reason_boundary(\n    api_client,\n    clinician_token,\n    existing_patient_id\n):\n    oversized_reason = \"A\" * (MAX_REASON_LENGTH + 1)  # one beyond boundary\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"reason\": oversized_reason,\n        \"timestamp\": datetime.now(timezone.utc).isoformat(),\n        \"request_id\": str(uuid.uuid4())\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n\n    resp = api_client.post(\"/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400/422 for oversized reason, got {resp.status_code}\"\n    )\n    body = resp.json()\n    errors = body.get(\"errors\") or body.get(\"detail\") or []\n    error_str = str(errors).lower()\n    assert \"reason\" in error_str, (\n        f\"Validation error must reference 'reason', got: {error_str}\"\n    )\n    assert body.get(\"session_id\") is None, \"No session_id should be issued\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-046",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 3520,
+    "latency_ms": 38382,
+    "wall_ms": 38382,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-046\",\n  \"reasoning\": \"Break-glass access has three critical dimensions: (1) happy-path grant + audit emission for a valid clinician asserting emergency, (2) rejection when the caller lacks clinician role (NEG/DT), (3) boundary conditions on the timestamp and numeric fields (BVA). A fourth test covers the state transition from 'access granted' to 'review task created', verifying the post-event review workflow is triggered. Together these cover EP (valid partition), NEG (invalid role partition), BVA (epoch boundary and max-length reason string), and STC (granted -> review-pending state machine arc).\",\n  \"tests\": [\n    {\n      \"name\": \"test_break_glass_valid_clinician_grants_access_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated token belongs to a user with role:clinician\",\n        \"Patient identified by PATIENT_ID exists in the system\",\n        \"No prior active break-glass session for this clinician/patient pair\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with valid clinician JWT, patient_id, reason, and current ISO-8601 timestamp\",\n        \"Capture HTTP response status and body\",\n        \"Query audit log for the emitted break-glass event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body contains access_granted: true\",\n        \"Response body contains a non-empty session_id\",\n        \"Audit log contains exactly one event with event_type='break_glass' for this session_id\"\n      ],\n      \"trace\": [\n        \"R-HLT-046: clinician invokes break-glass -> access granted\",\n        \"R-HLT-046: break-glass use shall be audited\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom datetime import datetime, timezone\\n\\ndef test_break_glass_valid_clinician_grants_access_and_emits_audit(\\n    api_client,          # <fixture>: requests.Session with base_url\\n    clinician_token,     # <fixture>: valid JWT for role:clinician\\n    existing_patient_id  # <fixture>: str patient ID pre-seeded\\n):\\n    payload = {\\n        \\\"patient_id\\\": existing_patient_id,\\n        \\\"reason\\\": \\\"Cardiac arrest \u2013 immediate access required\\\",\\n        \\\"timestamp\\\": datetime.now(timezone.utc).isoformat(),\\n        \\\"request_id\\\": str(uuid.uuid4())\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n\\n    resp = api_client.post(\\\"/BreakGlass\\\", json=payload, headers=headers)\\n\\n    assert resp.status_code in (200, 201), f\\\"Unexpected status: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"access_granted\\\") is True\\n    session_id = body.get(\\\"session_id\\\")\\n    assert session_id, \\\"session_id must be present\\\"\\n\\n    audit_events = get_audit_events(api_client, clinician_token, session_id)  # <helper_fn>\\n    bg_events = [e for e in audit_events if e.get(\\\"event_type\\\") == \\\"break_glass\\\"]\\n    assert len(bg_events) == 1, f\\\"Expected 1 audit event, got {len(bg_events)}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_break_glass_non_clinician_role_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated token belongs to a user with role:patient (not clinician)\",\n        \"Patient identified by PATIENT_ID exists in the system\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with a patient-role JWT and a valid payload\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden response\",\n        \"Response body contains an error code indicating insufficient privileges\",\n        \"No audit event of type break_glass is emitted for this request\"\n      ],\n      \"trace\": [\n        \"R-HLT-046: precondition role:clinician \u2013 absence of role must be rejected\",\n        \"R-HLT-046: error pathway \u2013 unauthorized invocation must not create access\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom datetime import datetime, timezone\\n\\ndef test_break_glass_non_clinician_role"
+  }
+}

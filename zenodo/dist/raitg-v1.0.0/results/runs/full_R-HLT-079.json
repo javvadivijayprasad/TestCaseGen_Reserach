@@ -1,0 +1,158 @@
+{
+  "req": {
+    "id": "R-HLT-079",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Delete patient (soft) (audit)",
+    "statement": "A system-admin shall soft-delete a patient resource; deletion shall not remove history. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin deletes patient"
+    ],
+    "expected_outcomes": [
+      "resource marked deleted",
+      "retrievable via _history"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-079",
+    "reasoning": "The requirement mandates: (1) admin can soft-delete a Patient resource, (2) history is preserved post-deletion, (3) an AuditEvent is emitted, and (4) non-admins receive 403. Four tests are designed: EP positive (admin deletes patient, verifying 200/204, _history retention, and AuditEvent), NEG negative (non-admin role gets 403), STC boundary (delete an already-deleted patient to test idempotency and state-machine edge), and BVA boundary (patient with exactly one history version before delete, ensuring _history count is precisely 1 prior and 2 after). Each test is self-contained via fixtures that create and clean up resources.",
+    "tests": [
+      {
+        "name": "test_admin_soft_delete_patient_emits_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role: admin",
+          "A Patient resource exists with a known ID",
+          "AuditEvent endpoint is queryable by entity reference"
+        ],
+        "actions": [
+          "POST /Patient to create a test patient, capture patient_id",
+          "DELETE /Patient/{patient_id} with admin credentials",
+          "GET /Patient/{patient_id} to confirm resource is marked deleted",
+          "GET /Patient/{patient_id}/_history to verify history is retained",
+          "GET /AuditEvent?entity=Patient/{patient_id} to verify audit record"
+        ],
+        "expected": [
+          "DELETE returns 200 or 204",
+          "GET /Patient/{patient_id} returns 410 Gone with a meta.tag of 'deleted'",
+          "_history returns at least one entry",
+          "AuditEvent exists with action='D' and outcome='0'"
+        ],
+        "trace": [
+          "R-HLT-079: admin soft-delete",
+          "R-HLT-079: history preserved",
+          "R-HLT-079: AuditEvent emitted"
+        ],
+        "executable": "import pytest\n\ndef test_admin_soft_delete_patient_emits_audit_event(admin_client, create_patient, base_url):\n    patient_id = create_patient(admin_client)\n\n    delete_resp = admin_client.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert delete_resp.status_code in (200, 204), f\"Expected 200/204, got {delete_resp.status_code}\"\n\n    get_resp = admin_client.get(f\"{base_url}/Patient/{patient_id}\")\n    assert get_resp.status_code == 410, f\"Expected 410 Gone, got {get_resp.status_code}\"\n\n    hist_resp = admin_client.get(f\"{base_url}/Patient/{patient_id}/_history\")\n    assert hist_resp.status_code == 200\n    bundle = hist_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"History must contain at least one entry\"\n\n    audit_resp = admin_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\"}\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"At least one AuditEvent must exist\"\n    actions = [e[\"resource\"].get(\"action\") for e in entries]\n    assert \"D\" in actions, \"AuditEvent with action='D' not found\"\n    outcomes = [e[\"resource\"].get(\"outcome\") for e in entries if e[\"resource\"].get(\"action\") == \"D\"]\n    assert \"0\" in outcomes, \"AuditEvent for delete must have outcome='0' (success)\"\n"
+      },
+      {
+        "name": "test_non_admin_delete_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role: practitioner (not admin)",
+          "A Patient resource exists with a known ID"
+        ],
+        "actions": [
+          "POST /Patient to create a test patient using admin_client, capture patient_id",
+          "Attempt DELETE /Patient/{patient_id} with non-admin (practitioner) credentials"
+        ],
+        "expected": [
+          "DELETE returns 403 Forbidden",
+          "Patient resource remains accessible (not deleted)",
+          "No deletion AuditEvent with outcome='0' is created for this attempt"
+        ],
+        "trace": [
+          "R-HLT-079: error pathway - 403 when not admin"
+        ],
+        "executable": "import pytest\n\ndef test_non_admin_delete_patient_returns_403(admin_client, practitioner_client, create_patient, base_url):\n    patient_id = create_patient(admin_client)\n\n    delete_resp = practitioner_client.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert delete_resp.status_code == 403, f\"Expected 403, got {delete_resp.status_code}\"\n\n    get_resp = admin_client.get(f\"{base_url}/Patient/{patient_id}\")\n    assert get_resp.status_code == 200, \"Patient must still exist after unauthorized delete attempt\"\n\n    audit_resp = admin_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\", \"action\": \"D\", \"outcome\": \"0\"}\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) == 0, \"No successful delete AuditEvent should exist after forbidden attempt\"\n"
+      },
+      {
+        "name": "test_delete_already_deleted_patient_is_idempotent",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role: admin",
+          "A Patient resource exists and has already been soft-deleted once"
+        ],
+        "actions": [
+          "POST /Patient to create a patient, capture patient_id",
+          "DELETE /Patient/{patient_id} (first deletion)",
+          "Verify first deletion returns 200 or 204",
+          "DELETE /Patient/{patient_id} again (second deletion - already deleted state)"
+        ],
+        "expected": [
+          "Second DELETE returns 200, 204, or 410 (idempotent, not a 500)",
+          "GET /Patient/{patient_id}/_history still returns all history versions",
+          "AuditEvent count for this patient is at least 2 (one per delete attempt)"
+        ],
+        "trace": [
+          "R-HLT-079: deletion shall not remove history",
+          "R-HLT-079: state transition - active -> deleted -> deleted (idempotent)"
+        ],
+        "executable": "import pytest\n\ndef test_delete_already_deleted_patient_is_idempotent(admin_client, create_patient, base_url):\n    patient_id = create_patient(admin_client)\n\n    first_delete = admin_client.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert first_delete.status_code in (200, 204), f\"First delete failed: {first_delete.status_code}\"\n\n    second_delete = admin_client.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert second_delete.status_code in (200, 204, 410), (\n        f\"Second delete must not cause server error; got {second_delete.status_code}\"\n    )\n\n    hist_resp = admin_client.get(f\"{base_url}/Patient/{patient_id}/_history\")\n    assert hist_resp.status_code == 200\n    bundle = hist_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"History must be retained after repeated deletes\"\n\n    audit_resp = admin_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\", \"action\": \"D\"}\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 2, \"Both delete operations must each produce an AuditEvent\"\n"
+      },
+      {
+        "name": "test_history_version_count_increments_exactly_one_on_delete",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role: admin",
+          "A freshly created Patient resource exists with exactly one history version (versionId=1)"
+        ],
+        "actions": [
+          "POST /Patient to create patient; confirm _history total == 1 before delete",
+          "DELETE /Patient/{patient_id} with admin credentials",
+          "GET /Patient/{patient_id}/_history after deletion"
+        ],
+        "expected": [
+          "Pre-delete _history total is exactly 1",
+          "DELETE returns 200 or 204",
+          "Post-delete _history total is exactly 2 (original + tombstone)",
+          "The latest history entry has resource.meta.tag containing 'deleted' or entry has no resource element per FHIR spec"
+        ],
+        "trace": [
+          "R-HLT-079: deletion shall not remove history",
+          "R-HLT-079: BVA on minimum history count boundary (1 version before, 2 after)"
+        ],
+        "executable": "import pytest\n\ndef test_history_version_count_increments_exactly_one_on_delete(admin_client, create_patient, base_url):\n    patient_id = create_patient(admin_client)\n\n    pre_hist = admin_client.get(f\"{base_url}/Patient/{patient_id}/_history\")\n    assert pre_hist.status_code == 200\n    pre_total = pre_hist.json().get(\"total\", 0)\n    assert pre_total == 1, f\"Expected exactly 1 history entry before delete, got {pre_total}\"\n\n    delete_resp = admin_client.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert delete_resp.status_code in (200, 204), f\"Delete failed with {delete_resp.status_code}\"\n\n    post_hist = admin_client.get(f\"{base_url}/Patient/{patient_id}/_history\")\n    assert post_hist.status_code == 200\n    post_total = post_hist.json().get(\"total\", 0)\n    assert post_total == 2, f\"Expected exactly 2 history entries after delete, got {post_total}\"\n\n    entries = post_hist.json().get(\"entry\", [])\n    latest = entries[0] if entries else {}\n    request_method = latest.get(\"request\", {}).get(\"method\", \"\")\n    assert request_method == \"DELETE\" or \"deleted\" in str(latest), (\n        \"Latest history entry must reflect the delete operation\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-079",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 2930,
+    "latency_ms": 32049,
+    "wall_ms": 32049,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-079\",\n  \"reasoning\": \"The requirement mandates: (1) admin can soft-delete a Patient resource, (2) history is preserved post-deletion, (3) an AuditEvent is emitted, and (4) non-admins receive 403. Four tests are designed: EP positive (admin deletes patient, verifying 200/204, _history retention, and AuditEvent), NEG negative (non-admin role gets 403), STC boundary (delete an already-deleted patient to test idempotency and state-machine edge), and BVA boundary (patient with exactly one history version before delete, ensuring _history count is precisely 1 prior and 2 after). Each test is self-contained via fixtures that create and clean up resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_soft_delete_patient_emits_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role: admin\",\n        \"A Patient resource exists with a known ID\",\n        \"AuditEvent endpoint is queryable by entity reference\"\n      ],\n      \"actions\": [\n        \"POST /Patient to create a test patient, capture patient_id\",\n        \"DELETE /Patient/{patient_id} with admin credentials\",\n        \"GET /Patient/{patient_id} to confirm resource is marked deleted\",\n        \"GET /Patient/{patient_id}/_history to verify history is retained\",\n        \"GET /AuditEvent?entity=Patient/{patient_id} to verify audit record\"\n      ],\n      \"expected\": [\n        \"DELETE returns 200 or 204\",\n        \"GET /Patient/{patient_id} returns 410 Gone with a meta.tag of 'deleted'\",\n        \"_history returns at least one entry\",\n        \"AuditEvent exists with action='D' and outcome='0'\"\n      ],\n      \"trace\": [\n        \"R-HLT-079: admin soft-delete\",\n        \"R-HLT-079: history preserved\",\n        \"R-HLT-079: AuditEvent emitted\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_admin_soft_delete_patient_emits_audit_event(admin_client, create_patient, base_url):\\n    patient_id = create_patient(admin_client)\\n\\n    delete_resp = admin_client.delete(f\\\"{base_url}/Patient/{patient_id}\\\")\\n    assert delete_resp.status_code in (200, 204), f\\\"Expected 200/204, got {delete_resp.status_code}\\\"\\n\\n    get_resp = admin_client.get(f\\\"{base_url}/Patient/{patient_id}\\\")\\n    assert get_resp.status_code == 410, f\\\"Expected 410 Gone, got {get_resp.status_code}\\\"\\n\\n    hist_resp = admin_client.get(f\\\"{base_url}/Patient/{patient_id}/_history\\\")\\n    assert hist_resp.status_code == 200\\n    bundle = hist_resp.json()\\n    assert bundle.get(\\\"total\\\", 0) >= 1, \\\"History must contain at least one entry\\\"\\n\\n    audit_resp = admin_client.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Patient/{patient_id}\\\"}\\n    )\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"At least one AuditEvent must exist\\\"\\n    actions = [e[\\\"resource\\\"].get(\\\"action\\\") for e in entries]\\n    assert \\\"D\\\" in actions, \\\"AuditEvent with action='D' not found\\\"\\n    outcomes = [e[\\\"resource\\\"].get(\\\"outcome\\\") for e in entries if e[\\\"resource\\\"].get(\\\"action\\\") == \\\"D\\\"]\\n    assert \\\"0\\\" in outcomes, \\\"AuditEvent for delete must have outcome='0' (success)\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_delete_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role: practitioner (not admin)\",\n        \"A Patient resource exists with a known ID\"\n      ],\n      \"actions\": [\n        \"POST /Patient to create a test patient using admin_client, capture patient_id\",\n        \"Attempt DELETE /Patient/{patient_id} with non-admin (practitioner) credentials\"\n      ],\n      \"expected\": [\n        \"DELETE returns 403 Forbidden\",\n        \"Patient resource remains accessible (not deleted)\",\n        \"No deletion AuditEvent with outcome='0' is created for this attempt\"\n      ],\n      \"trace\": [\n        \"R-HLT-079: error pathway - 403 when not admin\"\n      ],\n      \"executable\": \"im"
+  }
+}

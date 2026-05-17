@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-HLT-030",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create observation (boundary)",
+    "statement": "A clinician shall create an Observation tied to a patient with LOINC-coded code element; Observations without code shall be rejected. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician records observation"
+    ],
+    "expected_outcomes": [
+      "observation stored"
+    ],
+    "error_pathways": [
+      "422 when code missing"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-030",
+    "reasoning": "The requirement mandates (1) successful creation of a LOINC-coded Observation tied to an existing patient, (2) rejection (HTTP 422) when the code element is absent, and (3) boundary behaviour on timestamps and numeric values. EP covers the valid/invalid code partition; NEG covers the missing-code error path; BVA covers extreme numeric values (0, max decimal) and ISO-8601 timestamp precision edges. DT is applied to capture the interaction between code-present/absent and value-present/absent. STC is applied to trace the Observation lifecycle from draft to final status. Each test POSTs to /Observation, cleans up via DELETE if a resource was created, and relies on shared fixtures for auth headers and a pre-existing patient ID.",
+    "tests": [
+      {
+        "name": "test_create_observation_valid_loinc_code",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role:clinician (Bearer token in <auth_headers> fixture)",
+          "A patient resource exists; its id is provided by <patient_id> fixture",
+          "LOINC code 8867-4 (heart rate) is a valid code in the system"
+        ],
+        "actions": [
+          "POST /Observation with resourceType, status='final', subject referencing patient, LOINC-coded code element, and a numeric valueQuantity"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType == 'Observation'",
+          "Response body id is non-empty string",
+          "Response body code.coding[0].system == 'http://loinc.org'",
+          "Response body code.coding[0].code == '8867-4'"
+        ],
+        "trace": [
+          "R-HLT-030: observation stored when code present",
+          "R-HLT-030: LOINC-coded code element required"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_observation_valid_loinc_code(auth_headers, patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"8867-4\",\n                \"display\": \"Heart rate\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"valueQuantity\": {\n            \"value\": 72,\n            \"unit\": \"beats/min\",\n            \"system\": \"http://unitsofmeasure.org\",\n            \"code\": \"/min\"\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=payload,\n        headers=auth_headers\n    )\n    obs_id = resp.json().get(\"id\")\n    try:\n        assert resp.status_code == 201\n        body = resp.json()\n        assert body[\"resourceType\"] == \"Observation\"\n        assert obs_id\n        assert body[\"code\"][\"coding\"][0][\"system\"] == \"http://loinc.org\"\n        assert body[\"code\"][\"coding\"][0][\"code\"] == \"8867-4\"\n    finally:\n        if obs_id:\n            requests.delete(f\"{base_url}/Observation/{obs_id}\", headers=auth_headers)\n"
+      },
+      {
+        "name": "test_create_observation_missing_code_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:clinician (Bearer token in <auth_headers> fixture)",
+          "A patient resource exists; its id is provided by <patient_id> fixture"
+        ],
+        "actions": [
+          "POST /Observation with resourceType and subject but WITHOUT a code element"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body indicates validation failure related to missing code"
+        ],
+        "trace": [
+          "R-HLT-030: error pathway \u2014 422 when code missing"
+        ],
+        "executable": "import requests\n\ndef test_create_observation_missing_code_returns_422(auth_headers, patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"valueQuantity\": {\n            \"value\": 72,\n            \"unit\": \"beats/min\",\n            \"system\": \"http://unitsofmeasure.org\",\n            \"code\": \"/min\"\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 422\n    body = resp.json()\n    raw = str(body).lower()\n    assert \"code\" in raw or \"required\" in raw or \"missing\" in raw\n"
+      },
+      {
+        "name": "test_create_observation_boundary_numeric_zero_and_timestamp_precision",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:clinician (Bearer token in <auth_headers> fixture)",
+          "A patient resource exists; its id is provided by <patient_id> fixture",
+          "LOINC code 2339-0 (glucose) is a valid code"
+        ],
+        "actions": [
+          "POST /Observation with numeric valueQuantity of exactly 0 (lower boundary)",
+          "Use effectiveDateTime with full ISO-8601 precision including milliseconds and UTC offset"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body valueQuantity.value == 0",
+          "Response body effectiveDateTime is preserved and non-null"
+        ],
+        "trace": [
+          "R-HLT-030: boundary cases on numeric elements \u2014 value of 0",
+          "R-HLT-030: boundary cases on timestamps \u2014 millisecond precision"
+        ],
+        "executable": "import requests\n\ndef test_create_observation_boundary_numeric_zero_and_timestamp_precision(\n    auth_headers, patient_id, base_url\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"2339-0\",\n                \"display\": \"Glucose\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"effectiveDateTime\": \"2024-01-01T00:00:00.000+00:00\",\n        \"valueQuantity\": {\n            \"value\": 0,\n            \"unit\": \"mg/dL\",\n            \"system\": \"http://unitsofmeasure.org\",\n            \"code\": \"mg/dL\"\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=payload,\n        headers=auth_headers\n    )\n    obs_id = resp.json().get(\"id\")\n    try:\n        assert resp.status_code == 201\n        body = resp.json()\n        assert body[\"valueQuantity\"][\"value\"] == 0\n        assert body.get(\"effectiveDateTime\") is not None\n    finally:\n        if obs_id:\n            requests.delete(f\"{base_url}/Observation/{obs_id}\", headers=auth_headers)\n"
+      },
+      {
+        "name": "test_create_observation_code_present_value_absent_decision",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller has role:clinician (Bearer token in <auth_headers> fixture)",
+          "A patient resource exists; its id is provided by <patient_id> fixture",
+          "LOINC code 55284-4 (blood pressure panel) supports value-less observations"
+        ],
+        "actions": [
+          "POST /Observation with code element present but no valueQuantity (code present / value absent decision column)"
+        ],
+        "expected": [
+          "HTTP 201 Created \u2014 code alone satisfies the code requirement",
+          "Response body contains no valueQuantity or valueQuantity is null"
+        ],
+        "trace": [
+          "R-HLT-030: decision table \u2014 code present, value absent \u2192 accepted",
+          "R-HLT-030: LOINC-coded code element required; value is optional"
+        ],
+        "executable": "import requests\n\ndef test_create_observation_code_present_value_absent_decision(\n    auth_headers, patient_id, base_url\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"55284-4\",\n                \"display\": \"Blood pressure panel\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=payload,\n        headers=auth_headers\n    )\n    obs_id = resp.json().get(\"id\")\n    try:\n        assert resp.status_code == 201\n        body = resp.json()\n        assert body[\"resourceType\"] == \"Observation\"\n        assert \"valueQuantity\" not in body or body.get(\"valueQuantity\") is None\n    finally:\n        if obs_id:\n            requests.delete(f\"{base_url}/Observation/{obs_id}\", headers=auth_headers)\n"
+      },
+      {
+        "name": "test_observation_status_lifecycle_registered_to_final",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:clinician (Bearer token in <auth_headers> fixture)",
+          "A patient resource exists; its id is provided by <patient_id> fixture",
+          "LOINC code 8310-5 (body temperature) is valid",
+          "Target system supports Observation status transitions: registered \u2192 preliminary \u2192 final"
+        ],
+        "actions": [
+          "POST /Observation with status='registered' and valid LOINC code",
+          "PUT /Observation/{id} updating status to 'preliminary'",
+          "PUT /Observation/{id} updating status to 'final'"
+        ],
+        "expected": [
+          "POST returns HTTP 201 with status 'registered'",
+          "First PUT returns HTTP 200 with status 'preliminary'",
+          "Second PUT returns HTTP 200 with status 'final'"
+        ],
+        "trace": [
+          "R-HLT-030: observation stored \u2014 verifies full lifecycle to final state",
+          "R-HLT-030: state transition coverage registered\u2192preliminary\u2192final"
+        ],
+        "executable": "import requests\n\ndef test_observation_status_lifecycle_registered_to_final(\n    auth_headers, patient_id, base_url\n):\n    base_payload = {\n        \"resourceType\": \"Observation\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"8310-5\",\n                \"display\": \"Body temperature\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"valueQuantity\": {\"value\": 37.0, \"unit\": \"Cel\",\n                         \"system\": \"http://unitsofmeasure.org\", \"code\": \"Cel\"}\n    }\n    r1 = requests.post(f\"{base_url}/Observation\",\n                       json={**base_payload, \"status\": \"registered\"},\n                       headers=auth_headers)\n    assert r1.status_code == 201\n    obs_id = r1.json()[\"id\"]\n    assert r1.json()[\"status\"] == \"registered\"\n    try:\n        r2 = requests.put(f\"{base_url}/Observation/{obs_id}\",\n                          json={**base_payload, \"id\": obs_id, \"status\": \"preliminary\"},\n                          headers=auth_headers)\n        assert r2.status_code == 200\n        assert r2.json()[\"status\"] == \"preliminary\"\n        r3 = requests.put(f\"{base_url}/Observation/{obs_id}\",\n                          json={**base_payload, \"id\": obs_id, \"status\": \"final\"},\n                          headers=auth_headers)\n        assert r3.status_code == 200\n        assert r3.json()[\"status\"] == \"final\"\n    finally:\n        requests.delete(f\"{base_url}/Observation/{obs_id}\", headers=auth_headers)\n"
+      },
+      {
+        "name": "test_create_observation_boundary_large_numeric_value",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:clinician (Bearer token in <auth_headers> fixture)",
+          "A patient resource exists; its id is provided by <patient_id> fixture",
+          "LOINC code 2339-0 (glucose) is valid"
+        ],
+        "actions": [
+          "POST /Observation with valueQuantity.value set to 9999999.99 (upper practical boundary for a decimal numeric field)"
+        ],
+        "expected": [
+          "HTTP 201 Created \u2014 large-but-valid decimal accepted",
+          "Response body valueQuantity.value equals 9999999.99"
+        ],
+        "trace": [
+          "R-HLT-030: boundary cases on numeric elements \u2014 upper bound decimal"
+        ],
+        "executable": "import requests\n\ndef test_create_observation_boundary_large_numeric_value(\n    auth_headers, patient_id, base_url\n):\n    large_value = 9999999.99\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"2339-0\",\n                \"display\": \"Glucose\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"effectiveDateTime\": \"2024-12-31T23:59:59.999+00:00\",\n        \"valueQuantity\": {\n            \"value\": large_value,\n            \"unit\": \"mg/dL\",\n            \"system\": \"http://unitsofmeasure.org\",\n            \"code\": \"mg/dL\"\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=payload,\n        headers=auth_headers\n    )\n    obs_id = resp.json().get(\"id\")\n    try:\n        assert resp.status_code == 201\n        body = resp.json()\n        assert abs(body[\"valueQuantity\"][\"value\"] - large_value) < 0.01\n    finally:\n        if obs_id:\n            requests.delete(f\"{base_url}/Observation/{obs_id}\", headers=auth_headers)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-030",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 997,
+    "output_tokens": 4187,
+    "latency_ms": 47988,
+    "wall_ms": 47988,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-030\",\n  \"reasoning\": \"The requirement mandates (1) successful creation of a LOINC-coded Observation tied to an existing patient, (2) rejection (HTTP 422) when the code element is absent, and (3) boundary behaviour on timestamps and numeric values. EP covers the valid/invalid code partition; NEG covers the missing-code error path; BVA covers extreme numeric values (0, max decimal) and ISO-8601 timestamp precision edges. DT is applied to capture the interaction between code-present/absent and value-present/absent. STC is applied to trace the Observation lifecycle from draft to final status. Each test POSTs to /Observation, cleans up via DELETE if a resource was created, and relies on shared fixtures for auth headers and a pre-existing patient ID.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_observation_valid_loinc_code\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role:clinician (Bearer token in <auth_headers> fixture)\",\n        \"A patient resource exists; its id is provided by <patient_id> fixture\",\n        \"LOINC code 8867-4 (heart rate) is a valid code in the system\"\n      ],\n      \"actions\": [\n        \"POST /Observation with resourceType, status='final', subject referencing patient, LOINC-coded code element, and a numeric valueQuantity\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType == 'Observation'\",\n        \"Response body id is non-empty string\",\n        \"Response body code.coding[0].system == 'http://loinc.org'\",\n        \"Response body code.coding[0].code == '8867-4'\"\n      ],\n      \"trace\": [\n        \"R-HLT-030: observation stored when code present\",\n        \"R-HLT-030: LOINC-coded code element required\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_observation_valid_loinc_code(auth_headers, patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\n            \\\"coding\\\": [{\\n                \\\"system\\\": \\\"http://loinc.org\\\",\\n                \\\"code\\\": \\\"8867-4\\\",\\n                \\\"display\\\": \\\"Heart rate\\\"\\n            }]\\n        },\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"valueQuantity\\\": {\\n            \\\"value\\\": 72,\\n            \\\"unit\\\": \\\"beats/min\\\",\\n            \\\"system\\\": \\\"http://unitsofmeasure.org\\\",\\n            \\\"code\\\": \\\"/min\\\"\\n        }\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Observation\\\",\\n        json=payload,\\n        headers=auth_headers\\n    )\\n    obs_id = resp.json().get(\\\"id\\\")\\n    try:\\n        assert resp.status_code == 201\\n        body = resp.json()\\n        assert body[\\\"resourceType\\\"] == \\\"Observation\\\"\\n        assert obs_id\\n        assert body[\\\"code\\\"][\\\"coding\\\"][0][\\\"system\\\"] == \\\"http://loinc.org\\\"\\n        assert body[\\\"code\\\"][\\\"coding\\\"][0][\\\"code\\\"] == \\\"8867-4\\\"\\n    finally:\\n        if obs_id:\\n            requests.delete(f\\\"{base_url}/Observation/{obs_id}\\\", headers=auth_headers)\\n\"\n    },\n    {\n      \"name\": \"test_create_observation_missing_code_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:clinician (Bearer token in <auth_headers> fixture)\",\n        \"A patient resource exists; its id is provided by <patient_id> fixture\"\n      ],\n      \"actions\": [\n        \"POST /Observation with resourceType and subject but WITHOUT a code element\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body indicates validation failure related to missing code\"\n      ],\n      \"trace\": [\n        \"R-HLT-030: error pathway \u2014 422 when code missing\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_create_observation_missing_code_returns_422(auth_headers, patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n    "
+  }
+}

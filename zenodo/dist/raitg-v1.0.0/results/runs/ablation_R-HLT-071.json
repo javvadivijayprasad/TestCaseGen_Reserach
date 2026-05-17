@@ -1,0 +1,214 @@
+{
+  "req": {
+    "id": "R-HLT-071",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Break-glass access (negative)",
+    "statement": "A clinician shall invoke break-glass access for an emergent patient; break-glass use shall be audited and trigger a post-event review. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician asserts emergency"
+    ],
+    "expected_outcomes": [
+      "access granted",
+      "audit event emitted"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/BreakGlass"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-071",
+    "reasoning": "The break-glass endpoint has three primary test axes: (1) a valid clinician invoking emergency access for an existing patient (positive/EP), (2) negative paths covering missing mandatory fields, wrong role, and conflicting state transitions (NEG/DT), and (3) boundary conditions such as a reason field at exactly the minimum and maximum allowed length (BVA). State transition coverage is exercised by attempting a second break-glass invocation when one is already active for the same patient (STC). Decision table covers the cross-product of role x patient-exists x reason-present. Each test is self-contained via fixture teardown and uses idempotent patient/session identifiers.",
+    "tests": [
+      {
+        "name": "test_break_glass_valid_clinician_grants_access_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "Patient record with known patient_id exists and is in normal state",
+          "No active break-glass session exists for this patient"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician token, patient_id, and non-empty emergency_reason",
+          "Capture HTTP response status and body",
+          "Query audit log endpoint for the emitted event"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains access_token for the patient record",
+          "Response body contains break_glass_id",
+          "Audit log contains one event with action=BREAK_GLASS_ACCESS and actor matching clinician id",
+          "Audit event timestamp is within 5 seconds of request time"
+        ],
+        "trace": [
+          "R-HLT-071: clinician invokes break-glass for emergent patient",
+          "R-HLT-071: break-glass use shall be audited"
+        ],
+        "executable": "def test_break_glass_valid_clinician_grants_access_and_emits_audit(\n    clinician_session, existing_patient_id, audit_log_client, cleanup_break_glass\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"emergency_reason\": \"Patient unresponsive in ED\"\n    }\n    resp = clinician_session.post(\"/BreakGlass\", json=payload)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"access_token\" in body\n    assert \"break_glass_id\" in body\n    cleanup_break_glass(body[\"break_glass_id\"])\n\n    events = audit_log_client.fetch(\n        action=\"BREAK_GLASS_ACCESS\",\n        resource_id=existing_patient_id\n    )\n    assert len(events) >= 1\n    evt = events[-1]\n    assert evt[\"actor_id\"] == clinician_session.user_id\n    assert <within_seconds>(evt[\"timestamp\"], seconds=5)\n"
+      },
+      {
+        "name": "test_break_glass_missing_emergency_reason_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "Patient record with known patient_id exists"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician token and patient_id but omit emergency_reason field entirely",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Response body error code equals MISSING_REQUIRED_FIELD",
+          "Response body identifies emergency_reason as the missing field",
+          "No audit event is emitted for this request"
+        ],
+        "trace": [
+          "R-HLT-071: missing mandatory elements must be tested (negative path)"
+        ],
+        "executable": "def test_break_glass_missing_emergency_reason_returns_400(\n    clinician_session, existing_patient_id, audit_log_client\n):\n    payload = {\"patient_id\": existing_patient_id}\n    resp = clinician_session.post(\"/BreakGlass\", json=payload)\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body.get(\"error_code\") == \"MISSING_REQUIRED_FIELD\"\n    assert \"emergency_reason\" in body.get(\"fields\", [])\n\n    events = audit_log_client.fetch(\n        action=\"BREAK_GLASS_ACCESS\",\n        resource_id=existing_patient_id,\n        since=<now_minus_seconds>(10)\n    )\n    assert len(events) == 0\n"
+      },
+      {
+        "name": "test_break_glass_non_clinician_role_returns_403",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated session exists for a user with role=billing_admin (not clinician)",
+          "Patient record with known patient_id exists"
+        ],
+        "actions": [
+          "POST /BreakGlass with billing_admin token, patient_id, and valid emergency_reason",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body error code equals PERMISSION_DENIED",
+          "No break_glass_id is returned",
+          "No audit event emitted for BREAK_GLASS_ACCESS"
+        ],
+        "trace": [
+          "R-HLT-071: permission denial must be tested (negative path)",
+          "R-HLT-071: actors restricted to clinician role"
+        ],
+        "executable": "def test_break_glass_non_clinician_role_returns_403(\n    billing_admin_session, existing_patient_id, audit_log_client\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"emergency_reason\": \"Unauthorized role attempt\"\n    }\n    resp = billing_admin_session.post(\"/BreakGlass\", json=payload)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"error_code\") == \"PERMISSION_DENIED\"\n    assert \"break_glass_id\" not in body\n\n    events = audit_log_client.fetch(\n        action=\"BREAK_GLASS_ACCESS\",\n        resource_id=existing_patient_id,\n        since=<now_minus_seconds>(10)\n    )\n    assert len(events) == 0\n"
+      },
+      {
+        "name": "test_break_glass_duplicate_active_session_returns_409",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "Patient record with known patient_id exists",
+          "An active break-glass session already exists for this patient (state=ACTIVE)"
+        ],
+        "actions": [
+          "POST /BreakGlass a first time to establish ACTIVE state; record break_glass_id",
+          "POST /BreakGlass a second time with the same patient_id while first session is ACTIVE",
+          "Capture HTTP response status and body for the second request"
+        ],
+        "expected": [
+          "First POST returns HTTP 201",
+          "Second POST returns HTTP 409 Conflict",
+          "Response body error code equals CONFLICTING_STATE_TRANSITION",
+          "Only one audit event exists for BREAK_GLASS_ACCESS for this patient in this window"
+        ],
+        "trace": [
+          "R-HLT-071: conflicting state transitions must be tested (negative path)",
+          "R-HLT-071: state transition coverage NORMAL -> ACTIVE -> ACTIVE (invalid)"
+        ],
+        "executable": "def test_break_glass_duplicate_active_session_returns_409(\n    clinician_session, existing_patient_id, audit_log_client, cleanup_break_glass\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"emergency_reason\": \"First emergency invocation\"\n    }\n    first = clinician_session.post(\"/BreakGlass\", json=payload)\n    assert first.status_code == 201\n    bg_id = first.json()[\"break_glass_id\"]\n    cleanup_break_glass(bg_id)\n\n    second = clinician_session.post(\"/BreakGlass\", json=payload)\n    assert second.status_code == 409\n    body = second.json()\n    assert body.get(\"error_code\") == \"CONFLICTING_STATE_TRANSITION\"\n\n    events = audit_log_client.fetch(\n        action=\"BREAK_GLASS_ACCESS\",\n        resource_id=existing_patient_id,\n        since=<now_minus_seconds>(30)\n    )\n    assert len(events) == 1\n"
+      },
+      {
+        "name": "test_break_glass_emergency_reason_at_minimum_length_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "Patient record with known patient_id exists",
+          "No active break-glass session for this patient",
+          "API documentation states emergency_reason minimum length is 10 characters"
+        ],
+        "actions": [
+          "POST /BreakGlass with emergency_reason of exactly 10 characters (minimum valid length)",
+          "Capture HTTP response status and body",
+          "POST /BreakGlass with emergency_reason of exactly 9 characters (one below minimum)",
+          "Capture HTTP response status and body for second request"
+        ],
+        "expected": [
+          "10-character reason: HTTP 201 Created with break_glass_id present",
+          "9-character reason: HTTP 400 Bad Request with error_code VALIDATION_ERROR",
+          "Audit event emitted only for the successful 10-character request"
+        ],
+        "trace": [
+          "R-HLT-071: mandatory element validation \u2014 emergency_reason minimum length boundary",
+          "R-HLT-071: missing/invalid mandatory elements must be tested"
+        ],
+        "executable": "def test_break_glass_emergency_reason_at_minimum_length_boundary(\n    clinician_session, existing_patient_id, audit_log_client, cleanup_break_glass\n):\n    MIN_LEN = 10\n    reason_valid = \"A\" * MIN_LEN\n    reason_short = \"A\" * (MIN_LEN - 1)\n\n    resp_valid = clinician_session.post(\"/BreakGlass\", json={\n        \"patient_id\": existing_patient_id,\n        \"emergency_reason\": reason_valid\n    })\n    assert resp_valid.status_code == 201\n    bg_id = resp_valid.json().get(\"break_glass_id\")\n    assert bg_id is not None\n    cleanup_break_glass(bg_id)\n    <close_break_glass_session>(clinician_session, bg_id)\n\n    resp_short = clinician_session.post(\"/BreakGlass\", json={\n        \"patient_id\": existing_patient_id,\n        \"emergency_reason\": reason_short\n    })\n    assert resp_short.status_code == 400\n    assert resp_short.json().get(\"error_code\") == \"VALIDATION_ERROR\"\n\n    events = audit_log_client.fetch(\n        action=\"BREAK_GLASS_ACCESS\",\n        resource_id=existing_patient_id,\n        since=<now_minus_seconds>(30)\n    )\n    assert len(events) == 1\n"
+      },
+      {
+        "name": "test_break_glass_post_event_review_task_created",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "Patient record with known patient_id exists",
+          "No active break-glass session for this patient",
+          "Review task service is reachable"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician token, patient_id, and emergency_reason",
+          "Extract break_glass_id from response",
+          "Query review task service for tasks linked to break_glass_id"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "At least one review task exists with status=PENDING linked to break_glass_id",
+          "Review task contains clinician actor_id and patient_id",
+          "Review task type equals POST_BREAK_GLASS_REVIEW"
+        ],
+        "trace": [
+          "R-HLT-071: break-glass use shall trigger a post-event review",
+          "R-HLT-071: error pathways \u2014 review task created"
+        ],
+        "executable": "def test_break_glass_post_event_review_task_created(\n    clinician_session, existing_patient_id, review_task_client, cleanup_break_glass\n):\n    payload = {\n        \"patient_id\": existing_patient_id,\n        \"emergency_reason\": \"Cardiac arrest, immediate access needed\"\n    }\n    resp = clinician_session.post(\"/BreakGlass\", json=payload)\n    assert resp.status_code == 201\n    bg_id = resp.json()[\"break_glass_id\"]\n    cleanup_break_glass(bg_id)\n\n    tasks = review_task_client.fetch_by_break_glass_id(bg_id)\n    assert len(tasks) >= 1\n    task = tasks[0]\n    assert task[\"status\"] == \"PENDING\"\n    assert task[\"task_type\"] == \"POST_BREAK_GLASS_REVIEW\"\n    assert task[\"actor_id\"] == clinician_session.user_id\n    assert task[\"patient_id\"] == existing_patient_id\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-071",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 3639,
+    "latency_ms": 44428,
+    "wall_ms": 44428,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-071\",\n  \"reasoning\": \"The break-glass endpoint has three primary test axes: (1) a valid clinician invoking emergency access for an existing patient (positive/EP), (2) negative paths covering missing mandatory fields, wrong role, and conflicting state transitions (NEG/DT), and (3) boundary conditions such as a reason field at exactly the minimum and maximum allowed length (BVA). State transition coverage is exercised by attempting a second break-glass invocation when one is already active for the same patient (STC). Decision table covers the cross-product of role x patient-exists x reason-present. Each test is self-contained via fixture teardown and uses idempotent patient/session identifiers.\",\n  \"tests\": [\n    {\n      \"name\": \"test_break_glass_valid_clinician_grants_access_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role=clinician\",\n        \"Patient record with known patient_id exists and is in normal state\",\n        \"No active break-glass session exists for this patient\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with valid clinician token, patient_id, and non-empty emergency_reason\",\n        \"Capture HTTP response status and body\",\n        \"Query audit log endpoint for the emitted event\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains access_token for the patient record\",\n        \"Response body contains break_glass_id\",\n        \"Audit log contains one event with action=BREAK_GLASS_ACCESS and actor matching clinician id\",\n        \"Audit event timestamp is within 5 seconds of request time\"\n      ],\n      \"trace\": [\n        \"R-HLT-071: clinician invokes break-glass for emergent patient\",\n        \"R-HLT-071: break-glass use shall be audited\"\n      ],\n      \"executable\": \"def test_break_glass_valid_clinician_grants_access_and_emits_audit(\\n    clinician_session, existing_patient_id, audit_log_client, cleanup_break_glass\\n):\\n    payload = {\\n        \\\"patient_id\\\": existing_patient_id,\\n        \\\"emergency_reason\\\": \\\"Patient unresponsive in ED\\\"\\n    }\\n    resp = clinician_session.post(\\\"/BreakGlass\\\", json=payload)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"access_token\\\" in body\\n    assert \\\"break_glass_id\\\" in body\\n    cleanup_break_glass(body[\\\"break_glass_id\\\"])\\n\\n    events = audit_log_client.fetch(\\n        action=\\\"BREAK_GLASS_ACCESS\\\",\\n        resource_id=existing_patient_id\\n    )\\n    assert len(events) >= 1\\n    evt = events[-1]\\n    assert evt[\\\"actor_id\\\"] == clinician_session.user_id\\n    assert <within_seconds>(evt[\\\"timestamp\\\"], seconds=5)\\n\"\n    },\n    {\n      \"name\": \"test_break_glass_missing_emergency_reason_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role=clinician\",\n        \"Patient record with known patient_id exists\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with valid clinician token and patient_id but omit emergency_reason field entirely\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 400 Bad Request\",\n        \"Response body error code equals MISSING_REQUIRED_FIELD\",\n        \"Response body identifies emergency_reason as the missing field\",\n        \"No audit event is emitted for this request\"\n      ],\n      \"trace\": [\n        \"R-HLT-071: missing mandatory elements must be tested (negative path)\"\n      ],\n      \"executable\": \"def test_break_glass_missing_emergency_reason_returns_400(\\n    clinician_session, existing_patient_id, audit_log_client\\n):\\n    payload = {\\\"patient_id\\\": existing_patient_id}\\n    resp = clinician_session.post(\\\"/BreakGlass\\\", json=payload)\\n    assert resp.status_code == 400\\n    body = resp.json()\\n    assert body.get(\\\"error_code\\\") == \\\"MISSING_REQUIRED_FIELD\\\"\\n    assert \\\"emergency_reason\\\" i"
+  }
+}

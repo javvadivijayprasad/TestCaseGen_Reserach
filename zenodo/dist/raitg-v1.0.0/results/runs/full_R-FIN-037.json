@@ -1,0 +1,220 @@
+{
+  "req": {
+    "id": "R-FIN-037",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Overdraft protection (boundary variant)",
+    "statement": "An overdraft shall trigger a draw from the linked savings account up to the linked account's available balance; otherwise the transaction shall be declined. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "overdraft linked"
+    ],
+    "triggers": [
+      "debit exceeds checking balance"
+    ],
+    "expected_outcomes": [
+      "linked savings debited",
+      "fee assessed"
+    ],
+    "error_pathways": [
+      "declined when linked balance insufficient"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/overdraft"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-037",
+    "reasoning": "R-FIN-037 requires overdraft protection across three key partitions: (1) debit exceeds checking but savings covers it fully (positive/EP), (2) debit exceeds both checking and savings combined (negative/NEG), and (3) debit exactly equals the savings available balance (boundary/BVA). A fourth test covers the state transition from 'overdraft triggered' to 'fee assessed' (STC), and a fifth uses a decision table to cover the compound condition where checking is zero and savings partially covers (DT). Each test resets account state via fixtures to remain idempotent.",
+    "tests": [
+      {
+        "name": "test_overdraft_draws_from_savings_when_checking_insufficient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with checking_balance=50.00",
+          "Linked savings account exists with available_balance=200.00",
+          "Overdraft protection is enabled and linked",
+          "Overdraft fee is configured at 35.00"
+        ],
+        "actions": [
+          "POST /overdraft with debit_amount=100.00 against the checking account",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.result == 'approved'",
+          "checking account balance becomes 0.00 (50.00 consumed)",
+          "savings account balance becomes 150.00 (50.00 drawn for shortfall)",
+          "overdraft_fee of 35.00 is assessed on the checking account",
+          "transaction record shows overdraft_used=true"
+        ],
+        "trace": [
+          "R-FIN-037: linked savings debited when debit exceeds checking balance",
+          "R-FIN-037: fee assessed on successful overdraft draw"
+        ],
+        "executable": "def test_overdraft_draws_from_savings_when_checking_insufficient(\n    api_client,\n    reset_accounts\n):\n    accounts = reset_accounts(\n        checking_balance=50.00,\n        savings_balance=200.00\n    )\n    payload = {\n        \"account_id\": accounts[\"checking_id\"],\n        \"debit_amount\": 100.00\n    }\n    resp = api_client.post(\"/overdraft\", json=payload)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"result\"] == \"approved\"\n    assert body[\"overdraft_used\"] is True\n\n    checking = api_client.get(f\"/accounts/{accounts['checking_id']}\").json()\n    savings = api_client.get(f\"/accounts/{accounts['savings_id']}\").json()\n    assert checking[\"balance\"] == pytest.approx(0.00)\n    assert savings[\"balance\"] == pytest.approx(150.00)\n    assert body[\"overdraft_fee\"] == pytest.approx(35.00)"
+      },
+      {
+        "name": "test_overdraft_declined_when_savings_also_insufficient",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with checking_balance=10.00",
+          "Linked savings account exists with available_balance=30.00",
+          "Overdraft protection is enabled and linked"
+        ],
+        "actions": [
+          "POST /overdraft with debit_amount=100.00 against the checking account",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 or 402 returned (insufficient funds)",
+          "response.result == 'declined'",
+          "response.reason contains 'insufficient_funds'",
+          "checking account balance remains 10.00 (no change)",
+          "savings account balance remains 30.00 (no change)",
+          "no overdraft fee is assessed"
+        ],
+        "trace": [
+          "R-FIN-037: transaction declined when linked savings balance is insufficient",
+          "R-FIN-037: error pathway - declined when linked balance insufficient"
+        ],
+        "executable": "def test_overdraft_declined_when_savings_also_insufficient(\n    api_client,\n    reset_accounts\n):\n    accounts = reset_accounts(\n        checking_balance=10.00,\n        savings_balance=30.00\n    )\n    payload = {\n        \"account_id\": accounts[\"checking_id\"],\n        \"debit_amount\": 100.00\n    }\n    resp = api_client.post(\"/overdraft\", json=payload)\n    assert resp.status_code in (402, 422)\n    body = resp.json()\n    assert body[\"result\"] == \"declined\"\n    assert \"insufficient_funds\" in body.get(\"reason\", \"\")\n\n    checking = api_client.get(f\"/accounts/{accounts['checking_id']}\").json()\n    savings = api_client.get(f\"/accounts/{accounts['savings_id']}\").json()\n    assert checking[\"balance\"] == pytest.approx(10.00)\n    assert savings[\"balance\"] == pytest.approx(30.00)\n    assert body.get(\"overdraft_fee\", 0.00) == pytest.approx(0.00)"
+      },
+      {
+        "name": "test_overdraft_approved_when_debit_exactly_equals_savings_balance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with checking_balance=0.00",
+          "Linked savings account exists with available_balance=75.00",
+          "Overdraft protection is enabled and linked",
+          "Overdraft fee is configured at 35.00"
+        ],
+        "actions": [
+          "POST /overdraft with debit_amount=75.00 (exactly equal to savings available_balance)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.result == 'approved'",
+          "savings account balance becomes 0.00 (fully exhausted at boundary)",
+          "overdraft_fee of 35.00 is assessed",
+          "transaction record shows overdraft_used=true"
+        ],
+        "trace": [
+          "R-FIN-037: boundary behaviour at exact max threshold of linked savings balance",
+          "R-FIN-037: linked savings debited up to its full available balance"
+        ],
+        "executable": "def test_overdraft_approved_when_debit_exactly_equals_savings_balance(\n    api_client,\n    reset_accounts\n):\n    accounts = reset_accounts(\n        checking_balance=0.00,\n        savings_balance=75.00\n    )\n    payload = {\n        \"account_id\": accounts[\"checking_id\"],\n        \"debit_amount\": 75.00\n    }\n    resp = api_client.post(\"/overdraft\", json=payload)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"result\"] == \"approved\"\n    assert body[\"overdraft_used\"] is True\n\n    savings = api_client.get(f\"/accounts/{accounts['savings_id']}\").json()\n    assert savings[\"balance\"] == pytest.approx(0.00)\n    assert body[\"overdraft_fee\"] == pytest.approx(35.00)"
+      },
+      {
+        "name": "test_overdraft_declined_when_debit_exceeds_savings_by_one_cent",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with checking_balance=0.00",
+          "Linked savings account exists with available_balance=75.00",
+          "Overdraft protection is enabled and linked"
+        ],
+        "actions": [
+          "POST /overdraft with debit_amount=75.01 (one cent above savings available_balance)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 402 or 422 returned",
+          "response.result == 'declined'",
+          "savings account balance remains 75.00 (no change)",
+          "no overdraft fee is assessed"
+        ],
+        "trace": [
+          "R-FIN-037: boundary behaviour at max+1 threshold of linked savings balance",
+          "R-FIN-037: transaction declined when linked balance insufficient"
+        ],
+        "executable": "def test_overdraft_declined_when_debit_exceeds_savings_by_one_cent(\n    api_client,\n    reset_accounts\n):\n    accounts = reset_accounts(\n        checking_balance=0.00,\n        savings_balance=75.00\n    )\n    payload = {\n        \"account_id\": accounts[\"checking_id\"],\n        \"debit_amount\": 75.01\n    }\n    resp = api_client.post(\"/overdraft\", json=payload)\n    assert resp.status_code in (402, 422)\n    body = resp.json()\n    assert body[\"result\"] == \"declined\"\n\n    savings = api_client.get(f\"/accounts/{accounts['savings_id']}\").json()\n    assert savings[\"balance\"] == pytest.approx(75.00)\n    assert body.get(\"overdraft_fee\", 0.00) == pytest.approx(0.00)"
+      },
+      {
+        "name": "test_overdraft_state_transitions_from_triggered_to_fee_assessed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with checking_balance=20.00",
+          "Linked savings account exists with available_balance=100.00",
+          "Overdraft protection is enabled and linked",
+          "Account transaction_state is 'normal' prior to debit"
+        ],
+        "actions": [
+          "GET /accounts/{checking_id} and confirm transaction_state == 'normal'",
+          "POST /overdraft with debit_amount=70.00 to trigger overdraft",
+          "GET /accounts/{checking_id} to verify state transitioned to 'overdraft_triggered'",
+          "GET /accounts/{checking_id}/fees to verify fee_state == 'assessed'"
+        ],
+        "expected": [
+          "Initial state is 'normal'",
+          "After overdraft POST, transaction_state transitions to 'overdraft_triggered'",
+          "fee_state transitions to 'assessed' with amount 35.00",
+          "savings debited by 50.00 (shortfall after 20.00 checking consumed)"
+        ],
+        "trace": [
+          "R-FIN-037: state transition normal -> overdraft_triggered -> fee_assessed",
+          "R-FIN-037: linked savings debited for shortfall amount"
+        ],
+        "executable": "def test_overdraft_state_transitions_from_triggered_to_fee_assessed(\n    api_client,\n    reset_accounts\n):\n    accounts = reset_accounts(\n        checking_balance=20.00,\n        savings_balance=100.00\n    )\n    pre = api_client.get(f\"/accounts/{accounts['checking_id']}\").json()\n    assert pre[\"transaction_state\"] == \"normal\"\n\n    payload = {\"account_id\": accounts[\"checking_id\"], \"debit_amount\": 70.00}\n    resp = api_client.post(\"/overdraft\", json=payload)\n    assert resp.status_code == 200\n\n    post = api_client.get(f\"/accounts/{accounts['checking_id']}\").json()\n    assert post[\"transaction_state\"] == \"overdraft_triggered\"\n\n    fees = api_client.get(f\"/accounts/{accounts['checking_id']}/fees\").json()\n    assert fees[\"fee_state\"] == \"assessed\"\n    assert fees[\"amount\"] == pytest.approx(35.00)\n\n    savings = api_client.get(f\"/accounts/{accounts['savings_id']}\").json()\n    assert savings[\"balance\"] == pytest.approx(50.00)"
+      },
+      {
+        "name": "test_overdraft_decision_table_no_checking_partial_savings_covers_exactly",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists with checking_balance=0.00",
+          "Linked savings account exists with available_balance=55.00",
+          "Overdraft protection is enabled and linked",
+          "Overdraft fee is configured at 35.00",
+          "Decision table row: checking=0, savings>=debit, debit=55.00 -> approve"
+        ],
+        "actions": [
+          "POST /overdraft with debit_amount=55.00",
+          "Capture HTTP response and verify all decision outcomes"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.result == 'approved'",
+          "entire debit covered by savings (savings drawn down to 0.00)",
+          "overdraft_fee of 35.00 assessed",
+          "checking balance remains 0.00"
+        ],
+        "trace": [
+          "R-FIN-037: decision table - checking=0, savings=debit amount, outcome=approve+fee",
+          "R-FIN-037: linked savings debited; fee assessed"
+        ],
+        "executable": "def test_overdraft_decision_table_no_checking_partial_savings_covers_exactly(\n    api_client,\n    reset_accounts\n):\n    accounts = reset_accounts(\n        checking_balance=0.00,\n        savings_balance=55.00\n    )\n    payload = {\n        \"account_id\": accounts[\"checking_id\"],\n        \"debit_amount\": 55.00\n    }\n    resp = api_client.post(\"/overdraft\", json=payload)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"result\"] == \"approved\"\n    assert body[\"overdraft_fee\"] == pytest.approx(35.00)\n\n    checking = api_client.get(f\"/accounts/{accounts['checking_id']}\").json()\n    savings = api_client.get(f\"/accounts/{accounts['savings_id']}\").json()\n    assert checking[\"balance\"] == pytest.approx(0.00)\n    assert savings[\"balance\"] == pytest.approx(0.00)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-037",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 3749,
+    "latency_ms": 35096,
+    "wall_ms": 35096,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-037\",\n  \"reasoning\": \"R-FIN-037 requires overdraft protection across three key partitions: (1) debit exceeds checking but savings covers it fully (positive/EP), (2) debit exceeds both checking and savings combined (negative/NEG), and (3) debit exactly equals the savings available balance (boundary/BVA). A fourth test covers the state transition from 'overdraft triggered' to 'fee assessed' (STC), and a fifth uses a decision table to cover the compound condition where checking is zero and savings partially covers (DT). Each test resets account state via fixtures to remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_overdraft_draws_from_savings_when_checking_insufficient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with checking_balance=50.00\",\n        \"Linked savings account exists with available_balance=200.00\",\n        \"Overdraft protection is enabled and linked\",\n        \"Overdraft fee is configured at 35.00\"\n      ],\n      \"actions\": [\n        \"POST /overdraft with debit_amount=100.00 against the checking account\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"response.result == 'approved'\",\n        \"checking account balance becomes 0.00 (50.00 consumed)\",\n        \"savings account balance becomes 150.00 (50.00 drawn for shortfall)\",\n        \"overdraft_fee of 35.00 is assessed on the checking account\",\n        \"transaction record shows overdraft_used=true\"\n      ],\n      \"trace\": [\n        \"R-FIN-037: linked savings debited when debit exceeds checking balance\",\n        \"R-FIN-037: fee assessed on successful overdraft draw\"\n      ],\n      \"executable\": \"def test_overdraft_draws_from_savings_when_checking_insufficient(\\n    api_client,\\n    reset_accounts\\n):\\n    accounts = reset_accounts(\\n        checking_balance=50.00,\\n        savings_balance=200.00\\n    )\\n    payload = {\\n        \\\"account_id\\\": accounts[\\\"checking_id\\\"],\\n        \\\"debit_amount\\\": 100.00\\n    }\\n    resp = api_client.post(\\\"/overdraft\\\", json=payload)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"result\\\"] == \\\"approved\\\"\\n    assert body[\\\"overdraft_used\\\"] is True\\n\\n    checking = api_client.get(f\\\"/accounts/{accounts['checking_id']}\\\").json()\\n    savings = api_client.get(f\\\"/accounts/{accounts['savings_id']}\\\").json()\\n    assert checking[\\\"balance\\\"] == pytest.approx(0.00)\\n    assert savings[\\\"balance\\\"] == pytest.approx(150.00)\\n    assert body[\\\"overdraft_fee\\\"] == pytest.approx(35.00)\"\n    },\n    {\n      \"name\": \"test_overdraft_declined_when_savings_also_insufficient\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists with checking_balance=10.00\",\n        \"Linked savings account exists with available_balance=30.00\",\n        \"Overdraft protection is enabled and linked\"\n      ],\n      \"actions\": [\n        \"POST /overdraft with debit_amount=100.00 against the checking account\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 or 402 returned (insufficient funds)\",\n        \"response.result == 'declined'\",\n        \"response.reason contains 'insufficient_funds'\",\n        \"checking account balance remains 10.00 (no change)\",\n        \"savings account balance remains 30.00 (no change)\",\n        \"no overdraft fee is assessed\"\n      ],\n      \"trace\": [\n        \"R-FIN-037: transaction declined when linked savings balance is insufficient\",\n        \"R-FIN-037: error pathway - declined when linked balance insufficient\"\n      ],\n      \"executable\": \"def test_overdraft_declined_when_savings_also_insufficient(\\n    api_client,\\n    reset_accounts\\n):\\n    accounts = reset_accounts(\\n        checking_balance=10.00,\\n        savings_balance=30.00\\n    )\\n    payload = {\\n        \\\"account_id\\\": accounts[\\\"checking_id\\\"],\\n        \\\"debit_amount\\\": 1"
+  }
+}

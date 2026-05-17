@@ -1,0 +1,214 @@
+{
+  "req": {
+    "id": "R-HLT-080",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create observation (audit)",
+    "statement": "A clinician shall create an Observation tied to a patient with LOINC-coded code element; Observations without code shall be rejected. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician records observation"
+    ],
+    "expected_outcomes": [
+      "observation stored"
+    ],
+    "error_pathways": [
+      "422 when code missing"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-080",
+    "reasoning": "R-HLT-080 mandates three testable concerns: (1) a valid LOINC-coded Observation is accepted and persisted, (2) an Observation missing the code element is rejected with HTTP 422, and (3) an AuditEvent is emitted for every operation. I selected EP for the happy-path (valid partition), NEG for the missing-code rejection, BVA for the edge case of a code element present but with an empty coding array (minimum non-null boundary), DT for the audit-event emission rule across both success and failure outcomes, and STC to verify the resource lifecycle state transitions. Tests are self-contained via session-scoped fixtures for auth and patient setup, and each cleans up created resources in a finally block to remain idempotent.",
+    "tests": [
+      {
+        "name": "test_create_observation_with_loinc_code_returns_201",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician session exists",
+          "A patient resource with known ID exists in fhir-lite",
+          "LOINC system is registered in the server's code system list"
+        ],
+        "actions": [
+          "POST /Observation with resourceType, status, subject reference, and LOINC-coded code element",
+          "Assert HTTP 201 response",
+          "Assert response body contains an id field",
+          "Assert response code.coding[0].system equals LOINC system URL"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response JSON has resourceType = Observation",
+          "Response JSON has id (non-empty string)",
+          "code.coding[0].system = http://loinc.org",
+          "code.coding[0].code = 8310-5"
+        ],
+        "trace": [
+          "R-HLT-080: clinician shall create Observation tied to patient with LOINC-coded code element",
+          "R-HLT-080: observation stored"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_observation_with_loinc_code_returns_201(\n    clinician_auth_headers,  # <fixture>\n    existing_patient_id,     # <fixture>\n    fhir_base_url,           # <fixture>\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"8310-5\",\n                \"display\": \"Body temperature\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"}\n    }\n    obs_id = None\n    try:\n        r = requests.post(\n            f\"{fhir_base_url}/Observation\",\n            json=payload,\n            headers=clinician_auth_headers,\n        )\n        assert r.status_code == 201, r.text\n        body = r.json()\n        obs_id = body.get(\"id\")\n        assert obs_id, \"Response must include an id\"\n        assert body[\"resourceType\"] == \"Observation\"\n        assert body[\"code\"][\"coding\"][0][\"system\"] == \"http://loinc.org\"\n        assert body[\"code\"][\"coding\"][0][\"code\"] == \"8310-5\"\n    finally:\n        if obs_id:\n            requests.delete(\n                f\"{fhir_base_url}/Observation/{obs_id}\",\n                headers=clinician_auth_headers,\n            )\n"
+      },
+      {
+        "name": "test_create_observation_without_code_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician session exists",
+          "A patient resource with known ID exists in fhir-lite"
+        ],
+        "actions": [
+          "POST /Observation with resourceType and subject but WITHOUT code element",
+          "Assert HTTP 422 response",
+          "Assert response body contains an OperationOutcome or error detail mentioning code"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body indicates validation failure",
+          "Error detail references missing or invalid code element"
+        ],
+        "trace": [
+          "R-HLT-080: Observations without code shall be rejected",
+          "R-HLT-080: 422 when code missing"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_observation_without_code_returns_422(\n    clinician_auth_headers,  # <fixture>\n    existing_patient_id,     # <fixture>\n    fhir_base_url,           # <fixture>\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"}\n        # code element intentionally omitted\n    }\n    r = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert r.status_code == 422, (\n        f\"Expected 422 but got {r.status_code}: {r.text}\"\n    )\n    body = r.json()\n    # Server must return OperationOutcome or structured error\n    issue_text = str(body).lower()\n    assert \"code\" in issue_text or \"validation\" in issue_text, (\n        f\"Error body does not reference code field: {body}\"\n    )\n"
+      },
+      {
+        "name": "test_create_observation_with_empty_coding_array_returns_422",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician session exists",
+          "A patient resource with known ID exists in fhir-lite",
+          "code element is present but coding array contains zero items (boundary: length=0)"
+        ],
+        "actions": [
+          "POST /Observation with code present but coding set to empty array []",
+          "Assert HTTP 422 response (boundary: code exists but has no LOINC entry)",
+          "Assert response error references coding or code validation"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Server rejects the resource because coding array is empty (no LOINC code satisfies requirement)",
+          "Error detail references code or coding"
+        ],
+        "trace": [
+          "R-HLT-080: LOINC-coded code element required \u2014 empty coding array is the zero-item boundary",
+          "R-HLT-080: Observations without code shall be rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_observation_with_empty_coding_array_returns_422(\n    clinician_auth_headers,  # <fixture>\n    existing_patient_id,     # <fixture>\n    fhir_base_url,           # <fixture>\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": []},  # boundary: present but zero codings\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"}\n    }\n    r = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert r.status_code == 422, (\n        f\"Expected 422 for empty coding array but got {r.status_code}: {r.text}\"\n    )\n    body = r.json()\n    issue_text = str(body).lower()\n    assert \"cod\" in issue_text or \"loinc\" in issue_text or \"validation\" in issue_text, (\n        f\"Error body does not reference coding: {body}\"\n    )\n"
+      },
+      {
+        "name": "test_audit_event_emitted_for_successful_observation_creation",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician session exists",
+          "A patient resource with known ID exists in fhir-lite",
+          "AuditEvent endpoint is accessible via /AuditEvent"
+        ],
+        "actions": [
+          "POST /Observation with valid LOINC-coded payload",
+          "Capture the returned Observation id",
+          "GET /AuditEvent?entity=Observation/<id> or equivalent search",
+          "Assert at least one AuditEvent references the created Observation"
+        ],
+        "expected": [
+          "HTTP 201 for Observation creation",
+          "GET /AuditEvent search returns at least one matching event",
+          "AuditEvent.action or outcome indicates create/success",
+          "AuditEvent references the correct Observation id"
+        ],
+        "trace": [
+          "R-HLT-080: AuditEvent must be emitted for every operation",
+          "R-HLT-080: tested end-to-end"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_audit_event_emitted_for_successful_observation_creation(\n    clinician_auth_headers,  # <fixture>\n    existing_patient_id,     # <fixture>\n    fhir_base_url,           # <fixture>\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"8310-5\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"}\n    }\n    obs_id = None\n    try:\n        r = requests.post(\n            f\"{fhir_base_url}/Observation\",\n            json=payload,\n            headers=clinician_auth_headers,\n        )\n        assert r.status_code == 201, r.text\n        obs_id = r.json()[\"id\"]\n        audit_r = requests.get(\n            f\"{fhir_base_url}/AuditEvent\",\n            params={\"entity\": f\"Observation/{obs_id}\"},\n            headers=clinician_auth_headers,\n        )\n        assert audit_r.status_code == 200, audit_r.text\n        bundle = audit_r.json()\n        entries = bundle.get(\"entry\", [])\n        assert len(entries) >= 1, (\n            f\"Expected AuditEvent for Observation/{obs_id}, got none\"\n        )\n        ref_strs = str(entries).lower()\n        assert obs_id.lower() in ref_strs, \"AuditEvent does not reference Observation id\"\n    finally:\n        if obs_id:\n            requests.delete(\n                f\"{fhir_base_url}/Observation/{obs_id}\",\n                headers=clinician_auth_headers,\n            )\n"
+      },
+      {
+        "name": "test_audit_event_emitted_for_rejected_observation",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician session exists",
+          "A patient resource with known ID exists in fhir-lite",
+          "AuditEvent endpoint is accessible via /AuditEvent"
+        ],
+        "actions": [
+          "POST /Observation without code element to trigger rejection",
+          "Record approximate timestamp before and after the call",
+          "GET /AuditEvent filtered by agent (clinician) and recent timeframe",
+          "Assert a failure AuditEvent was recorded for the rejected create attempt"
+        ],
+        "expected": [
+          "HTTP 422 for Observation POST",
+          "At least one AuditEvent with outcome indicating failure/error exists",
+          "AuditEvent action corresponds to create attempt"
+        ],
+        "trace": [
+          "R-HLT-080: AuditEvent must be emitted for every operation including failures",
+          "R-HLT-080: tested end-to-end"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone\n\ndef test_audit_event_emitted_for_rejected_observation(\n    clinician_auth_headers,  # <fixture>\n    existing_patient_id,     # <fixture>\n    fhir_base_url,           # <fixture>\n    clinician_user_id,       # <fixture>\n):\n    before = datetime.now(timezone.utc).isoformat()\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"}\n    }\n    r = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert r.status_code == 422, r.text\n    audit_r = requests.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\n            \"agent\": clinician_user_id,\n            \"date\": f\"ge{before}\",\n            \"action\": \"C\",\n            \"outcome\": \"8\",  # 8 = serious failure in AuditEvent outcome codes\n        },\n        headers=clinician_auth_headers,\n    )\n    assert audit_r.status_code == 200, audit_r.text\n    bundle = audit_r.json()\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) >= 1, (\n        \"Expected at least one failure AuditEvent for rejected Observation create\"\n    )\n"
+      },
+      {
+        "name": "test_observation_state_transition_draft_to_final",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician session exists",
+          "A patient resource with known ID exists in fhir-lite",
+          "fhir-lite supports Observation status transitions from preliminary to final"
+        ],
+        "actions": [
+          "POST /Observation with status=preliminary and valid LOINC code",
+          "Assert HTTP 201 and status=preliminary in response",
+          "PUT /Observation/<id> updating status to final",
+          "Assert HTTP 200 and status=final in response",
+          "Verify AuditEvent exists for the update operation"
+        ],
+        "expected": [
+          "HTTP 201 with status=preliminary",
+          "HTTP 200 after PUT with status=final",
+          "AuditEvent recorded for the update transition"
+        ],
+        "trace": [
+          "R-HLT-080: observation stored (state transitions covered)",
+          "R-HLT-080: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_observation_state_transition_draft_to_final(\n    clinician_auth_headers,  # <fixture>\n    existing_patient_id,     # <fixture>\n    fhir_base_url,           # <fixture>\n):\n    base_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://loinc.org\",\n                \"code\": \"8310-5\"\n            }]\n        },\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"}\n    }\n    obs_id = None\n    try:\n        r1 = requests.post(\n            f\"{fhir_base_url}/Observation\",\n            json=base_payload,\n            headers=clinician_auth_headers,\n        )\n        assert r1.status_code == 201, r1.text\n        body1 = r1.json()\n        obs_id = body1[\"id\"]\n        assert body1[\"status\"] == \"preliminary\"\n        update_payload = {**base_payload, \"id\": obs_id, \"status\": \"final\"}\n        r2 = requests.put(\n            f\"{fhir_base_url}/Observation/{obs_id}\",\n            json=update_payload,\n            headers=clinician_auth_headers,\n        )\n        assert r2.status_code == 200, r2.text\n        assert r2.json()[\"status\"] == \"final\"\n        audit_r = requests.get(\n            f\"{fhir_base_url}/AuditEvent\",\n            params={\"entity\": f\"Observation/{obs_id}\", \"action\": \"U\"},\n            headers=clinician_auth_headers,\n        )\n        assert len(audit_r.json().get(\"entry\", [])) >= 1\n    finally:\n        if obs_id:\n            requests.delete(\n                f\"{fhir_base_url}/Observation/{obs_id}\",\n                headers=clinician_auth_headers,\n            )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-080",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1005,
+    "output_tokens": 4549,
+    "latency_ms": 54125,
+    "wall_ms": 54125,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-080\",\n  \"reasoning\": \"R-HLT-080 mandates three testable concerns: (1) a valid LOINC-coded Observation is accepted and persisted, (2) an Observation missing the code element is rejected with HTTP 422, and (3) an AuditEvent is emitted for every operation. I selected EP for the happy-path (valid partition), NEG for the missing-code rejection, BVA for the edge case of a code element present but with an empty coding array (minimum non-null boundary), DT for the audit-event emission rule across both success and failure outcomes, and STC to verify the resource lifecycle state transitions. Tests are self-contained via session-scoped fixtures for auth and patient setup, and each cleans up created resources in a finally block to remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_observation_with_loinc_code_returns_201\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician session exists\",\n        \"A patient resource with known ID exists in fhir-lite\",\n        \"LOINC system is registered in the server's code system list\"\n      ],\n      \"actions\": [\n        \"POST /Observation with resourceType, status, subject reference, and LOINC-coded code element\",\n        \"Assert HTTP 201 response\",\n        \"Assert response body contains an id field\",\n        \"Assert response code.coding[0].system equals LOINC system URL\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response JSON has resourceType = Observation\",\n        \"Response JSON has id (non-empty string)\",\n        \"code.coding[0].system = http://loinc.org\",\n        \"code.coding[0].code = 8310-5\"\n      ],\n      \"trace\": [\n        \"R-HLT-080: clinician shall create Observation tied to patient with LOINC-coded code element\",\n        \"R-HLT-080: observation stored\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_observation_with_loinc_code_returns_201(\\n    clinician_auth_headers,  # <fixture>\\n    existing_patient_id,     # <fixture>\\n    fhir_base_url,           # <fixture>\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\n            \\\"coding\\\": [{\\n                \\\"system\\\": \\\"http://loinc.org\\\",\\n                \\\"code\\\": \\\"8310-5\\\",\\n                \\\"display\\\": \\\"Body temperature\\\"\\n            }]\\n        },\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{existing_patient_id}\\\"}\\n    }\\n    obs_id = None\\n    try:\\n        r = requests.post(\\n            f\\\"{fhir_base_url}/Observation\\\",\\n            json=payload,\\n            headers=clinician_auth_headers,\\n        )\\n        assert r.status_code == 201, r.text\\n        body = r.json()\\n        obs_id = body.get(\\\"id\\\")\\n        assert obs_id, \\\"Response must include an id\\\"\\n        assert body[\\\"resourceType\\\"] == \\\"Observation\\\"\\n        assert body[\\\"code\\\"][\\\"coding\\\"][0][\\\"system\\\"] == \\\"http://loinc.org\\\"\\n        assert body[\\\"code\\\"][\\\"coding\\\"][0][\\\"code\\\"] == \\\"8310-5\\\"\\n    finally:\\n        if obs_id:\\n            requests.delete(\\n                f\\\"{fhir_base_url}/Observation/{obs_id}\\\",\\n                headers=clinician_auth_headers,\\n            )\\n\"\n    },\n    {\n      \"name\": \"test_create_observation_without_code_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician session exists\",\n        \"A patient resource with known ID exists in fhir-lite\"\n      ],\n      \"actions\": [\n        \"POST /Observation with resourceType and subject but WITHOUT code element\",\n        \"Assert HTTP 422 response\",\n        \"Assert response body contains an OperationOutcome or error detail mentioning code\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body indicates validation failure\",\n        \"Error detail references missing or invalid code element\"\n      ],\n      \"trace\": [\n        \"R-HLT-080: Observation"
+  }
+}

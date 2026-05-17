@@ -1,0 +1,158 @@
+{
+  "req": {
+    "id": "R-HLT-029",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Delete patient (soft) (boundary)",
+    "statement": "A system-admin shall soft-delete a patient resource; deletion shall not remove history. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin deletes patient"
+    ],
+    "expected_outcomes": [
+      "resource marked deleted",
+      "retrievable via _history"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-029",
+    "reasoning": "The requirement mandates that a system-admin can soft-delete a Patient resource via DELETE /Patient/{id}, the resource must be marked deleted (not physically removed), history must remain accessible via _history, and non-admin callers must receive 403. Four tests are designed: (1) EP/STC positive: admin soft-deletes an active patient and verifies the deleted marker plus history entry; (2) NEG: non-admin caller receives 403; (3) BVA: delete a patient whose birthDate is at the minimum FHIR date boundary (1900-01-01) and whose id is at the maximum allowed length to stress numeric/timestamp boundary conditions; (4) DT: attempt to delete an already-deleted patient to verify idempotent behaviour and persistent history.",
+    "tests": [
+      {
+        "name": "test_admin_soft_delete_active_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role:admin",
+          "Patient resource exists and is active"
+        ],
+        "actions": [
+          "Create a Patient resource via POST /Patient with admin credentials",
+          "Send DELETE /Patient/{id} with admin credentials",
+          "Send GET /Patient/{id} and expect 410 Gone or deleted flag",
+          "Send GET /Patient/{id}/_history and expect at least two entries"
+        ],
+        "expected": [
+          "DELETE returns 200 or 204",
+          "Subsequent GET returns 410 or resource with meta.tag deleted",
+          "_history contains the original version and the deleted version",
+          "No data is physically removed"
+        ],
+        "trace": [
+          "R-HLT-029: soft-delete marks resource deleted",
+          "R-HLT-029: deletion shall not remove history"
+        ],
+        "executable": "def test_admin_soft_delete_active_patient(admin_session, base_url, create_patient):\n    patient_id = create_patient(admin_session, base_url)\n\n    del_resp = admin_session.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert del_resp.status_code in (200, 204)\n\n    get_resp = admin_session.get(f\"{base_url}/Patient/{patient_id}\")\n    assert get_resp.status_code in (200, 410)\n    if get_resp.status_code == 200:\n        body = get_resp.json()\n        tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n        assert \"deleted\" in tags\n\n    hist_resp = admin_session.get(f\"{base_url}/Patient/{patient_id}/_history\")\n    assert hist_resp.status_code == 200\n    entries = hist_resp.json().get(\"entry\", [])\n    assert len(entries) >= 2\n"
+      },
+      {
+        "name": "test_non_admin_delete_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:practitioner (not admin)",
+          "Patient resource exists and is active"
+        ],
+        "actions": [
+          "Create a Patient resource via admin session",
+          "Send DELETE /Patient/{id} using a non-admin session",
+          "Assert response status is 403"
+        ],
+        "expected": [
+          "Response status is 403 Forbidden",
+          "Patient resource remains undeleted",
+          "Error body contains OperationOutcome or equivalent"
+        ],
+        "trace": [
+          "R-HLT-029: 403 when not admin"
+        ],
+        "executable": "def test_non_admin_delete_returns_403(admin_session, non_admin_session, base_url, create_patient):\n    patient_id = create_patient(admin_session, base_url)\n\n    del_resp = non_admin_session.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert del_resp.status_code == 403\n\n    get_resp = admin_session.get(f\"{base_url}/Patient/{patient_id}\")\n    assert get_resp.status_code == 200\n    body = get_resp.json()\n    tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n    assert \"deleted\" not in tags\n"
+      },
+      {
+        "name": "test_soft_delete_patient_boundary_birthdate_and_max_id_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:admin",
+          "FHIR server accepts date 1900-01-01 as a valid birthDate",
+          "Patient id length is at the maximum allowed boundary (64 chars per FHIR R4)"
+        ],
+        "actions": [
+          "Create Patient with birthDate=1900-01-01 and a 64-character id",
+          "Record lastUpdated timestamp before DELETE",
+          "Send DELETE /Patient/{id} with admin credentials",
+          "Retrieve _history and compare timestamps"
+        ],
+        "expected": [
+          "DELETE returns 200 or 204",
+          "Resource is marked deleted",
+          "_history entry for delete version has lastUpdated >= pre-delete timestamp",
+          "birthDate value 1900-01-01 preserved in history entry"
+        ],
+        "trace": [
+          "R-HLT-029: boundary cases on timestamps and numeric elements must be tested"
+        ],
+        "executable": "import datetime\n\ndef test_soft_delete_patient_boundary_birthdate_and_max_id_length(\n    admin_session, base_url, create_patient_with_payload\n):\n    boundary_id = \"a\" * 64\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": boundary_id,\n        \"birthDate\": \"1900-01-01\"\n    }\n    create_patient_with_payload(admin_session, base_url, payload)\n\n    pre_delete_ts = datetime.datetime.utcnow().replace(microsecond=0)\n\n    del_resp = admin_session.delete(f\"{base_url}/Patient/{boundary_id}\")\n    assert del_resp.status_code in (200, 204)\n\n    hist_resp = admin_session.get(f\"{base_url}/Patient/{boundary_id}/_history\")\n    assert hist_resp.status_code == 200\n    entries = hist_resp.json().get(\"entry\", [])\n    assert len(entries) >= 2\n\n    deleted_entry = max(\n        entries,\n        key=lambda e: e.get(\"resource\", {}).get(\"meta\", {}).get(\"lastUpdated\", \"\")\n    )\n    last_updated_str = deleted_entry[\"resource\"][\"meta\"][\"lastUpdated\"].rstrip(\"Z\")\n    last_updated = datetime.datetime.fromisoformat(last_updated_str)\n    assert last_updated >= pre_delete_ts\n\n    original_entry = min(\n        entries,\n        key=lambda e: e.get(\"resource\", {}).get(\"meta\", {}).get(\"lastUpdated\", \"\")\n    )\n    assert original_entry[\"resource\"].get(\"birthDate\") == \"1900-01-01\"\n"
+      },
+      {
+        "name": "test_soft_delete_already_deleted_patient_is_idempotent",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:admin",
+          "Patient resource has already been soft-deleted"
+        ],
+        "actions": [
+          "Create Patient via admin session",
+          "Send DELETE /Patient/{id} (first delete)",
+          "Send DELETE /Patient/{id} again (second delete)",
+          "Retrieve _history and verify entries"
+        ],
+        "expected": [
+          "Second DELETE returns 200, 204, or 404/410 (server may differ)",
+          "Resource remains in deleted state",
+          "_history still contains all prior versions",
+          "No server error (5xx) on second delete"
+        ],
+        "trace": [
+          "R-HLT-029: deletion shall not remove history",
+          "R-HLT-029: resource marked deleted"
+        ],
+        "executable": "def test_soft_delete_already_deleted_patient_is_idempotent(\n    admin_session, base_url, create_patient\n):\n    patient_id = create_patient(admin_session, base_url)\n\n    first_del = admin_session.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert first_del.status_code in (200, 204)\n\n    second_del = admin_session.delete(f\"{base_url}/Patient/{patient_id}\")\n    assert second_del.status_code < 500, \"Server must not return 5xx on repeat delete\"\n    assert second_del.status_code in (200, 204, 404, 410)\n\n    hist_resp = admin_session.get(f\"{base_url}/Patient/{patient_id}/_history\")\n    assert hist_resp.status_code == 200\n    entries = hist_resp.json().get(\"entry\", [])\n    assert len(entries) >= 2\n    methods = [\n        e.get(\"request\", {}).get(\"method\", \"\")\n        for e in entries\n    ]\n    assert \"DELETE\" in methods\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-029",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 2490,
+    "latency_ms": 32036,
+    "wall_ms": 32036,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-029\",\n  \"reasoning\": \"The requirement mandates that a system-admin can soft-delete a Patient resource via DELETE /Patient/{id}, the resource must be marked deleted (not physically removed), history must remain accessible via _history, and non-admin callers must receive 403. Four tests are designed: (1) EP/STC positive: admin soft-deletes an active patient and verifies the deleted marker plus history entry; (2) NEG: non-admin caller receives 403; (3) BVA: delete a patient whose birthDate is at the minimum FHIR date boundary (1900-01-01) and whose id is at the maximum allowed length to stress numeric/timestamp boundary conditions; (4) DT: attempt to delete an already-deleted patient to verify idempotent behaviour and persistent history.\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_soft_delete_active_patient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role:admin\",\n        \"Patient resource exists and is active\"\n      ],\n      \"actions\": [\n        \"Create a Patient resource via POST /Patient with admin credentials\",\n        \"Send DELETE /Patient/{id} with admin credentials\",\n        \"Send GET /Patient/{id} and expect 410 Gone or deleted flag\",\n        \"Send GET /Patient/{id}/_history and expect at least two entries\"\n      ],\n      \"expected\": [\n        \"DELETE returns 200 or 204\",\n        \"Subsequent GET returns 410 or resource with meta.tag deleted\",\n        \"_history contains the original version and the deleted version\",\n        \"No data is physically removed\"\n      ],\n      \"trace\": [\n        \"R-HLT-029: soft-delete marks resource deleted\",\n        \"R-HLT-029: deletion shall not remove history\"\n      ],\n      \"executable\": \"def test_admin_soft_delete_active_patient(admin_session, base_url, create_patient):\\n    patient_id = create_patient(admin_session, base_url)\\n\\n    del_resp = admin_session.delete(f\\\"{base_url}/Patient/{patient_id}\\\")\\n    assert del_resp.status_code in (200, 204)\\n\\n    get_resp = admin_session.get(f\\\"{base_url}/Patient/{patient_id}\\\")\\n    assert get_resp.status_code in (200, 410)\\n    if get_resp.status_code == 200:\\n        body = get_resp.json()\\n        tags = [t.get(\\\"code\\\") for t in body.get(\\\"meta\\\", {}).get(\\\"tag\\\", [])]\\n        assert \\\"deleted\\\" in tags\\n\\n    hist_resp = admin_session.get(f\\\"{base_url}/Patient/{patient_id}/_history\\\")\\n    assert hist_resp.status_code == 200\\n    entries = hist_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 2\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_delete_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:practitioner (not admin)\",\n        \"Patient resource exists and is active\"\n      ],\n      \"actions\": [\n        \"Create a Patient resource via admin session\",\n        \"Send DELETE /Patient/{id} using a non-admin session\",\n        \"Assert response status is 403\"\n      ],\n      \"expected\": [\n        \"Response status is 403 Forbidden\",\n        \"Patient resource remains undeleted\",\n        \"Error body contains OperationOutcome or equivalent\"\n      ],\n      \"trace\": [\n        \"R-HLT-029: 403 when not admin\"\n      ],\n      \"executable\": \"def test_non_admin_delete_returns_403(admin_session, non_admin_session, base_url, create_patient):\\n    patient_id = create_patient(admin_session, base_url)\\n\\n    del_resp = non_admin_session.delete(f\\\"{base_url}/Patient/{patient_id}\\\")\\n    assert del_resp.status_code == 403\\n\\n    get_resp = admin_session.get(f\\\"{base_url}/Patient/{patient_id}\\\")\\n    assert get_resp.status_code == 200\\n    body = get_resp.json()\\n    tags = [t.get(\\\"code\\\") for t in body.get(\\\"meta\\\", {}).get(\\\"tag\\\", [])]\\n    assert \\\"deleted\\\" not in tags\\n\"\n    },\n    {\n      \"name\": \"test_soft_delete_patient_boundary_birthdate_and_max_id_length\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Caller has role:admin\",\n        \"FHIR server accepts"
+  }
+}

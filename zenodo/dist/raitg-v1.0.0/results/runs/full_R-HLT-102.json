@@ -1,0 +1,190 @@
+{
+  "req": {
+    "id": "R-HLT-102",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient (consent)",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied. Consent state at the time of the operation must be tested, including post-revocation timing windows.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-102",
+    "reasoning": "R-HLT-102 governs clinician read access to Patient resources under three distinct conditions: (1) assigned clinician with active consent \u2014 happy path, (2) unassigned clinician \u2014 access denied, and (3) consent revoked immediately before the read \u2014 boundary on post-revocation timing window. EP partitions the space into assigned/unassigned clinician. NEG covers the unassigned path. BVA probes the revocation timing boundary (t=0 after revocation). STC covers the consent state machine: ACTIVE \u2192 REVOKED transition and its effect on read access. DT captures the combined decision of assignment \u00d7 consent-state.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_reads_patient_returns_200_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician has role=clinician and is assigned to the target patient",
+          "Patient resource exists with id=<PATIENT_ID>",
+          "Patient consent state is ACTIVE"
+        ],
+        "actions": [
+          "Authenticate as assigned clinician to obtain JWT",
+          "HTTP GET /Patient/<PATIENT_ID> with Authorization: Bearer <token>",
+          "Capture response status, body, and audit log entry"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body resourceType == 'Patient'",
+          "Response body id == '<PATIENT_ID>'",
+          "Audit log contains one entry with actor=<CLINICIAN_ID>, resource=Patient/<PATIENT_ID>, action=read, outcome=success"
+        ],
+        "trace": [
+          "R-HLT-102: clinician shall read a patient resource for patients in their care",
+          "R-HLT-102: resource returned",
+          "R-HLT-102: access audit written"
+        ],
+        "executable": "import pytest\n\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\n    assigned_clinician_token, patient_id, audit_log_client\n):\n    resp = <api_get>(f\"/Patient/{patient_id}\", token=assigned_clinician_token)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Patient\"\n    assert body[\"id\"] == patient_id\n\n    entries = audit_log_client.fetch_latest(resource=f\"Patient/{patient_id}\", action=\"read\")\n    assert len(entries) >= 1\n    latest = entries[0]\n    assert latest[\"outcome\"] == \"success\"\n    assert latest[\"actor\"] == <CLINICIAN_ID>\n"
+      },
+      {
+        "name": "test_unassigned_clinician_reads_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician has role=clinician but is NOT assigned to the target patient",
+          "Patient resource exists with id=<PATIENT_ID>",
+          "Patient consent state is ACTIVE"
+        ],
+        "actions": [
+          "Authenticate as unassigned clinician to obtain JWT",
+          "HTTP GET /Patient/<PATIENT_ID> with Authorization: Bearer <token>",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains OperationOutcome with issue.code == 'forbidden'",
+          "No patient data is present in the response body"
+        ],
+        "trace": [
+          "R-HLT-102: reading outside their assignment shall be denied",
+          "R-HLT-102: 403 when clinician not assigned"
+        ],
+        "executable": "import pytest\n\ndef test_unassigned_clinician_reads_patient_returns_403(\n    unassigned_clinician_token, patient_id\n):\n    resp = <api_get>(f\"/Patient/{patient_id}\", token=unassigned_clinician_token)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"code\") == \"forbidden\" for i in issues)\n    assert \"birthDate\" not in body\n    assert \"name\" not in body\n"
+      },
+      {
+        "name": "test_assigned_clinician_reads_patient_immediately_after_consent_revocation_returns_403",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician has role=clinician and is assigned to the target patient",
+          "Patient resource exists with id=<PATIENT_ID>",
+          "Patient consent state transitions from ACTIVE to REVOKED at time T"
+        ],
+        "actions": [
+          "Authenticate as assigned clinician to obtain JWT",
+          "Revoke patient consent via consent administration endpoint at time T",
+          "Immediately (delta < 1s) HTTP GET /Patient/<PATIENT_ID> with Authorization: Bearer <token>",
+          "Capture response status, body, and audit log entry"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden returned at or after T+0",
+          "Response body contains OperationOutcome indicating consent revoked",
+          "Audit log records read attempt with outcome=failure and reason=consent-revoked"
+        ],
+        "trace": [
+          "R-HLT-102: consent state at the time of the operation must be tested",
+          "R-HLT-102: post-revocation timing windows",
+          "R-HLT-102: 403 when clinician not assigned (by consent revocation)"
+        ],
+        "executable": "import time\nimport pytest\n\ndef test_assigned_clinician_reads_patient_immediately_after_consent_revocation_returns_403(\n    assigned_clinician_token, patient_id, consent_admin_token, audit_log_client\n):\n    rev_resp = <api_post>(\n        f\"/Consent/{patient_id}/revoke\",\n        token=consent_admin_token,\n        json={\"patientId\": patient_id, \"reason\": \"patient-request\"}\n    )\n    assert rev_resp.status_code in (200, 204), \"Consent revocation setup failed\"\n\n    resp = <api_get>(f\"/Patient/{patient_id}\", token=assigned_clinician_token)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\"consent\" in i.get(\"diagnostics\", \"\").lower() for i in issues)\n\n    entries = audit_log_client.fetch_latest(resource=f\"Patient/{patient_id}\", action=\"read\")\n    assert len(entries) >= 1\n    latest = entries[0]\n    assert latest[\"outcome\"] == \"failure\"\n    assert \"consent\" in latest.get(\"reason\", \"\").lower()\n"
+      },
+      {
+        "name": "test_assigned_clinician_read_denied_after_consent_active_to_revoked_state_transition",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician has role=clinician and is assigned to the target patient",
+          "Patient resource exists with id=<PATIENT_ID>",
+          "Consent begins in ACTIVE state"
+        ],
+        "actions": [
+          "Authenticate as assigned clinician to obtain JWT",
+          "Verify read succeeds while consent is ACTIVE (pre-transition)",
+          "Revoke patient consent \u2014 state transitions ACTIVE \u2192 REVOKED",
+          "Re-read /Patient/<PATIENT_ID> immediately after revocation (post-transition)"
+        ],
+        "expected": [
+          "Pre-revocation GET returns HTTP 200",
+          "Post-revocation GET returns HTTP 403",
+          "Both attempts are captured in audit log with correct outcomes"
+        ],
+        "trace": [
+          "R-HLT-102: consent state at the time of the operation must be tested",
+          "R-HLT-102: post-revocation timing windows",
+          "R-HLT-102: resource returned (pre-revocation)",
+          "R-HLT-102: access audit written"
+        ],
+        "executable": "import pytest\n\ndef test_assigned_clinician_read_denied_after_consent_active_to_revoked_state_transition(\n    assigned_clinician_token, patient_id, consent_admin_token, audit_log_client\n):\n    pre = <api_get>(f\"/Patient/{patient_id}\", token=assigned_clinician_token)\n    assert pre.status_code == 200, \"Expected 200 while consent is ACTIVE\"\n\n    rev = <api_post>(\n        f\"/Consent/{patient_id}/revoke\",\n        token=consent_admin_token,\n        json={\"patientId\": patient_id, \"reason\": \"patient-request\"}\n    )\n    assert rev.status_code in (200, 204)\n\n    post = <api_get>(f\"/Patient/{patient_id}\", token=assigned_clinician_token)\n    assert post.status_code == 403, \"Expected 403 after consent REVOKED\"\n\n    entries = audit_log_client.fetch_latest(resource=f\"Patient/{patient_id}\", action=\"read\", limit=2)\n    outcomes = [e[\"outcome\"] for e in entries]\n    assert \"success\" in outcomes\n    assert \"failure\" in outcomes\n"
+      },
+      {
+        "name": "test_decision_table_assignment_and_consent_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Two clinicians exist: assigned_clinician and unassigned_clinician",
+          "Patient resource exists with id=<PATIENT_ID>",
+          "Consent states tested: ACTIVE and REVOKED"
+        ],
+        "actions": [
+          "For each combination of (assigned|unassigned) x (active|revoked) consent, issue GET /Patient/<PATIENT_ID>",
+          "Record HTTP status code for each combination"
+        ],
+        "expected": [
+          "assigned + ACTIVE \u2192 200",
+          "assigned + REVOKED \u2192 403",
+          "unassigned + ACTIVE \u2192 403",
+          "unassigned + REVOKED \u2192 403"
+        ],
+        "trace": [
+          "R-HLT-102: clinician shall read a patient resource for patients in their care",
+          "R-HLT-102: reading outside their assignment shall be denied",
+          "R-HLT-102: consent state at the time of the operation must be tested"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"token_fixture,consent_state,expected_status\", [\n    (\"assigned_clinician_token\",   \"active\",   200),\n    (\"assigned_clinician_token\",   \"revoked\",  403),\n    (\"unassigned_clinician_token\", \"active\",   403),\n    (\"unassigned_clinician_token\", \"revoked\",  403),\n])\ndef test_decision_table_assignment_and_consent_combinations(\n    request, token_fixture, consent_state, expected_status,\n    patient_id, consent_admin_token\n):\n    token = request.getfixturevalue(token_fixture)\n    <set_consent_state>(patient_id, consent_state, admin_token=consent_admin_token)\n    resp = <api_get>(f\"/Patient/{patient_id}\", token=token)\n    assert resp.status_code == expected_status, (\n        f\"assignment={token_fixture}, consent={consent_state}: \"\n        f\"expected {expected_status}, got {resp.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-102",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 3106,
+    "latency_ms": 38838,
+    "wall_ms": 38838,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-102\",\n  \"reasoning\": \"R-HLT-102 governs clinician read access to Patient resources under three distinct conditions: (1) assigned clinician with active consent \u2014 happy path, (2) unassigned clinician \u2014 access denied, and (3) consent revoked immediately before the read \u2014 boundary on post-revocation timing window. EP partitions the space into assigned/unassigned clinician. NEG covers the unassigned path. BVA probes the revocation timing boundary (t=0 after revocation). STC covers the consent state machine: ACTIVE \u2192 REVOKED transition and its effect on read access. DT captures the combined decision of assignment \u00d7 consent-state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_returns_200_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician has role=clinician and is assigned to the target patient\",\n        \"Patient resource exists with id=<PATIENT_ID>\",\n        \"Patient consent state is ACTIVE\"\n      ],\n      \"actions\": [\n        \"Authenticate as assigned clinician to obtain JWT\",\n        \"HTTP GET /Patient/<PATIENT_ID> with Authorization: Bearer <token>\",\n        \"Capture response status, body, and audit log entry\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body resourceType == 'Patient'\",\n        \"Response body id == '<PATIENT_ID>'\",\n        \"Audit log contains one entry with actor=<CLINICIAN_ID>, resource=Patient/<PATIENT_ID>, action=read, outcome=success\"\n      ],\n      \"trace\": [\n        \"R-HLT-102: clinician shall read a patient resource for patients in their care\",\n        \"R-HLT-102: resource returned\",\n        \"R-HLT-102: access audit written\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\\n    assigned_clinician_token, patient_id, audit_log_client\\n):\\n    resp = <api_get>(f\\\"/Patient/{patient_id}\\\", token=assigned_clinician_token)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Patient\\\"\\n    assert body[\\\"id\\\"] == patient_id\\n\\n    entries = audit_log_client.fetch_latest(resource=f\\\"Patient/{patient_id}\\\", action=\\\"read\\\")\\n    assert len(entries) >= 1\\n    latest = entries[0]\\n    assert latest[\\\"outcome\\\"] == \\\"success\\\"\\n    assert latest[\\\"actor\\\"] == <CLINICIAN_ID>\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_reads_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician has role=clinician but is NOT assigned to the target patient\",\n        \"Patient resource exists with id=<PATIENT_ID>\",\n        \"Patient consent state is ACTIVE\"\n      ],\n      \"actions\": [\n        \"Authenticate as unassigned clinician to obtain JWT\",\n        \"HTTP GET /Patient/<PATIENT_ID> with Authorization: Bearer <token>\",\n        \"Capture response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome with issue.code == 'forbidden'\",\n        \"No patient data is present in the response body\"\n      ],\n      \"trace\": [\n        \"R-HLT-102: reading outside their assignment shall be denied\",\n        \"R-HLT-102: 403 when clinician not assigned\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_unassigned_clinician_reads_patient_returns_403(\\n    unassigned_clinician_token, patient_id\\n):\\n    resp = <api_get>(f\\\"/Patient/{patient_id}\\\", token=unassigned_clinician_token)\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\"\\n    issues = body.get(\\\"issue\\\", [])\\n    assert any(i.get(\\\"code\\\") == \\\"forbidden\\\" for i in issues)\\n    assert \\\"birthDate\\\" not in body\\n    assert \\\"name\\\" not in body\\n\"\n    },\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_immediately_after_consent_revocation_returns_403\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"precondition"
+  }
+}

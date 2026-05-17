@@ -1,0 +1,225 @@
+{
+  "req": {
+    "id": "R-FIN-043",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Joint account operations (boundary variant)",
+    "statement": "A joint-account holder shall perform transactions; the secondary holder shall not be able to modify ownership. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "holder is joint"
+    ],
+    "triggers": [
+      "holder performs operation"
+    ],
+    "expected_outcomes": [
+      "operation applied"
+    ],
+    "error_pathways": [
+      "403 when secondary holder attempts ownership change"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/joint"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-043",
+    "reasoning": "R-FIN-043 defines joint-account behaviour across three axes: (1) a primary holder can perform transactions (positive/EP), (2) a secondary holder is forbidden from modifying ownership (negative/NEG+DT), and (3) boundary thresholds on transaction amounts must be exercised at exact min/max values (boundary/BVA). A fourth test covers the state transition where a secondary holder attempts a legitimate read then an illegal write, verifying the state machine rejects the write while permitting the read (STC). Each test is self-contained via fixtures that create and tear down the joint account.",
+    "tests": [
+      {
+        "name": "test_primary_holder_can_perform_transaction",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A joint account exists with a primary and secondary holder",
+          "Primary holder auth token is valid",
+          "Account balance is sufficient for the transaction"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with a valid transaction payload (amount within allowed range)"
+        ],
+        "expected": [
+          "HTTP 200 or 201 is returned",
+          "Response body confirms transaction was applied",
+          "Account balance reflects the transaction"
+        ],
+        "trace": [
+          "R-FIN-043: 'A joint-account holder shall perform transactions'",
+          "Actor: customer (primary holder)",
+          "Expected outcome: operation applied"
+        ],
+        "executable": "import pytest\n\ndef test_primary_holder_can_perform_transaction(joint_account, primary_auth_token, api_client):\n    account_id = joint_account[\"id\"]\n    payload = {\"type\": \"deposit\", \"amount\": 500.00, \"currency\": \"USD\"}\n    headers = {\"Authorization\": f\"Bearer {primary_auth_token}\"}\n\n    resp = api_client.post(\n        f\"/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers\n    )\n\n    assert resp.status_code in (200, 201), (\n        f\"Expected 200/201, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body.get(\"status\") in (\"applied\", \"completed\", \"success\"), (\n        f\"Unexpected status in body: {body}\"\n    )\n    assert \"transaction_id\" in body, \"transaction_id missing from response\"\n"
+      },
+      {
+        "name": "test_secondary_holder_cannot_modify_ownership",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A joint account exists with a primary and secondary holder",
+          "Secondary holder auth token is valid",
+          "No pending ownership-change requests exist for this account"
+        ],
+        "actions": [
+          "Authenticate as the secondary holder",
+          "PATCH /accounts/{id}/joint with payload requesting ownership transfer to secondary holder"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden is returned",
+          "Response body contains an error indicating insufficient privileges",
+          "Account ownership remains unchanged"
+        ],
+        "trace": [
+          "R-FIN-043: 'the secondary holder shall not be able to modify ownership'",
+          "Error pathway: 403 when secondary holder attempts ownership change"
+        ],
+        "executable": "import pytest\n\ndef test_secondary_holder_cannot_modify_ownership(joint_account, secondary_auth_token, api_client):\n    account_id = joint_account[\"id\"]\n    payload = {\"action\": \"transfer_ownership\", \"new_primary\": joint_account[\"secondary_holder_id\"]}\n    headers = {\"Authorization\": f\"Bearer {secondary_auth_token}\"}\n\n    resp = api_client.patch(\n        f\"/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers\n    )\n\n    assert resp.status_code == 403, (\n        f\"Expected 403 Forbidden, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body, \"Error descriptor missing from 403 body\"\n    error_msg = body.get(\"error\", body.get(\"detail\", \"\")).lower()\n    assert any(kw in error_msg for kw in (\"forbidden\", \"unauthorized\", \"not permitted\", \"insufficient\")), (\n        f\"Error message does not indicate forbidden: {error_msg}\"\n    )\n"
+      },
+      {
+        "name": "test_transaction_at_minimum_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A joint account exists with a primary holder",
+          "Primary holder auth token is valid",
+          "Minimum allowed transaction amount is defined (e.g. 0.01)"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with amount equal to the exact minimum threshold (0.01)"
+        ],
+        "expected": [
+          "HTTP 200 or 201 is returned for amount == MIN_AMOUNT",
+          "Transaction is applied and reflected in the response"
+        ],
+        "trace": [
+          "R-FIN-043: 'Boundary behaviour at exact min/max thresholds must be tested'",
+          "BVA: exact lower boundary of transaction amount"
+        ],
+        "executable": "import pytest\n\nMIN_AMOUNT = 0.01\n\ndef test_transaction_at_minimum_threshold(joint_account, primary_auth_token, api_client):\n    account_id = joint_account[\"id\"]\n    payload = {\"type\": \"deposit\", \"amount\": MIN_AMOUNT, \"currency\": \"USD\"}\n    headers = {\"Authorization\": f\"Bearer {primary_auth_token}\"}\n\n    resp = api_client.post(\n        f\"/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers\n    )\n\n    assert resp.status_code in (200, 201), (\n        f\"Expected 200/201 at MIN boundary {MIN_AMOUNT}, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body.get(\"amount\") == MIN_AMOUNT or body.get(\"applied_amount\") == MIN_AMOUNT, (\n        f\"Response does not echo MIN_AMOUNT {MIN_AMOUNT}: {body}\"\n    )\n"
+      },
+      {
+        "name": "test_transaction_below_minimum_threshold_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A joint account exists with a primary holder",
+          "Primary holder auth token is valid",
+          "Minimum allowed transaction amount is 0.01; amounts below it are invalid"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with amount equal to MIN_AMOUNT - 0.01 (i.e. 0.00)"
+        ],
+        "expected": [
+          "HTTP 400 or 422 is returned",
+          "Response body describes the amount validation failure"
+        ],
+        "trace": [
+          "R-FIN-043: 'Boundary behaviour at exact min/max thresholds must be tested'",
+          "BVA: one step below lower boundary (off-by-one)"
+        ],
+        "executable": "import pytest\n\nBELOW_MIN_AMOUNT = 0.00\n\ndef test_transaction_below_minimum_threshold_rejected(joint_account, primary_auth_token, api_client):\n    account_id = joint_account[\"id\"]\n    payload = {\"type\": \"deposit\", \"amount\": BELOW_MIN_AMOUNT, \"currency\": \"USD\"}\n    headers = {\"Authorization\": f\"Bearer {primary_auth_token}\"}\n\n    resp = api_client.post(\n        f\"/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers\n    )\n\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400/422 below MIN boundary, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body, \"Validation error descriptor missing from body\"\n"
+      },
+      {
+        "name": "test_secondary_holder_read_then_write_state_transition",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "A joint account exists with a primary and secondary holder",
+          "Secondary holder auth token is valid",
+          "Account is in an active state"
+        ],
+        "actions": [
+          "Authenticate as the secondary holder",
+          "GET /accounts/{id}/joint to confirm read is permitted (account in READABLE state for secondary)",
+          "PATCH /accounts/{id}/joint with ownership-change payload to trigger forbidden write transition"
+        ],
+        "expected": [
+          "GET returns HTTP 200 with account details (read state is allowed)",
+          "PATCH returns HTTP 403 (write/ownership-change state transition is blocked)"
+        ],
+        "trace": [
+          "R-FIN-043: secondary holder read is permitted; ownership modification is not",
+          "STC: READABLE -> FORBIDDEN_WRITE transition for secondary holder role"
+        ],
+        "executable": "import pytest\n\ndef test_secondary_holder_read_then_write_state_transition(joint_account, secondary_auth_token, api_client):\n    account_id = joint_account[\"id\"]\n    headers = {\"Authorization\": f\"Bearer {secondary_auth_token}\"}\n\n    # State: READABLE \u2014 secondary holder may GET account info\n    get_resp = api_client.get(f\"/accounts/{account_id}/joint\", headers=headers)\n    assert get_resp.status_code == 200, (\n        f\"Expected 200 for secondary GET, got {get_resp.status_code}: {get_resp.text}\"\n    )\n\n    # State transition: attempt WRITE (ownership change) \u2014 must be rejected\n    patch_payload = {\"action\": \"transfer_ownership\", \"new_primary\": joint_account[\"secondary_holder_id\"]}\n    patch_resp = api_client.patch(\n        f\"/accounts/{account_id}/joint\",\n        json=patch_payload,\n        headers=headers\n    )\n    assert patch_resp.status_code == 403, (\n        f\"Expected 403 on ownership write attempt, got {patch_resp.status_code}: {patch_resp.text}\"\n    )\n"
+      },
+      {
+        "name": "test_transaction_at_maximum_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A joint account exists with a primary holder",
+          "Primary holder auth token is valid",
+          "Account balance is >= MAX_AMOUNT",
+          "Maximum single-transaction amount is defined (e.g. 1000000.00)"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with amount equal to the exact maximum threshold (1000000.00)"
+        ],
+        "expected": [
+          "HTTP 200 or 201 is returned for amount == MAX_AMOUNT",
+          "Transaction is applied and reflected in the response"
+        ],
+        "trace": [
+          "R-FIN-043: 'Boundary behaviour at exact min/max thresholds must be tested'",
+          "BVA: exact upper boundary of transaction amount"
+        ],
+        "executable": "import pytest\n\nMAX_AMOUNT = 1_000_000.00\n\ndef test_transaction_at_maximum_threshold(joint_account_high_balance, primary_auth_token, api_client):\n    account_id = joint_account_high_balance[\"id\"]\n    payload = {\"type\": \"withdrawal\", \"amount\": MAX_AMOUNT, \"currency\": \"USD\"}\n    headers = {\"Authorization\": f\"Bearer {primary_auth_token}\"}\n\n    resp = api_client.post(\n        f\"/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers\n    )\n\n    assert resp.status_code in (200, 201), (\n        f\"Expected 200/201 at MAX boundary {MAX_AMOUNT}, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body.get(\"amount\") == MAX_AMOUNT or body.get(\"applied_amount\") == MAX_AMOUNT, (\n        f\"Response does not echo MAX_AMOUNT {MAX_AMOUNT}: {body}\"\n    )\n"
+      },
+      {
+        "name": "test_decision_table_all_holder_role_and_operation_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A joint account exists with a primary and secondary holder",
+          "Both primary and secondary auth tokens are valid"
+        ],
+        "actions": [
+          "For each (role, operation) pair in the decision table, perform the corresponding API call",
+          "Verify the expected HTTP status code per rule"
+        ],
+        "expected": [
+          "primary + transaction -> 200 or 201",
+          "primary + ownership_change -> 200 or 201",
+          "secondary + transaction -> 200 or 201",
+          "secondary + ownership_change -> 403"
+        ],
+        "trace": [
+          "R-FIN-043: primary holder may transact AND modify ownership; secondary holder may only transact",
+          "DT: all combinations of {primary, secondary} x {transaction, ownership_change}"
+        ],
+        "executable": "import pytest\n\ndef test_decision_table_all_holder_role_and_operation_combinations(\n    joint_account, primary_auth_token, secondary_auth_token, api_client\n):\n    account_id = joint_account[\"id\"]\n    secondary_id = joint_account[\"secondary_holder_id\"]\n\n    rules = [\n        (primary_auth_token,   \"post\",  {\"type\": \"deposit\", \"amount\": 100.00, \"currency\": \"USD\"},                  (200, 201)),\n        (primary_auth_token,   \"patch\", {\"action\": \"transfer_ownership\", \"new_primary\": secondary_id},            (200, 201, 204)),\n        (secondary_auth_token, \"post\",  {\"type\": \"deposit\", \"amount\": 100.00, \"currency\": \"USD\"},                  (200, 201)),\n        (secondary_auth_token, \"patch\", {\"action\": \"transfer_ownership\", \"new_primary\": secondary_id},            (403,)),\n    ]\n\n    for token, method, payload, allowed_codes in rules:\n        headers = {\"Authorization\": f\"Bearer {token}\"}\n        fn = getattr(api_client, method)\n        resp = fn(f\"/accounts/{account_id}/joint\", json=payload, headers=headers)\n        assert resp.status_code in allowed_codes, (\n            f\"[{method.upper()} token={token[:8]}...] \"\n            f\"Expected {allowed_codes}, got {resp.status_code}: {resp.text}\"\n        )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-043",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 991,
+    "output_tokens": 4031,
+    "latency_ms": 45949,
+    "wall_ms": 45949,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-043\",\n  \"reasoning\": \"R-FIN-043 defines joint-account behaviour across three axes: (1) a primary holder can perform transactions (positive/EP), (2) a secondary holder is forbidden from modifying ownership (negative/NEG+DT), and (3) boundary thresholds on transaction amounts must be exercised at exact min/max values (boundary/BVA). A fourth test covers the state transition where a secondary holder attempts a legitimate read then an illegal write, verifying the state machine rejects the write while permitting the read (STC). Each test is self-contained via fixtures that create and tear down the joint account.\",\n  \"tests\": [\n    {\n      \"name\": \"test_primary_holder_can_perform_transaction\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A joint account exists with a primary and secondary holder\",\n        \"Primary holder auth token is valid\",\n        \"Account balance is sufficient for the transaction\"\n      ],\n      \"actions\": [\n        \"Authenticate as the primary holder\",\n        \"POST /accounts/{id}/joint with a valid transaction payload (amount within allowed range)\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 is returned\",\n        \"Response body confirms transaction was applied\",\n        \"Account balance reflects the transaction\"\n      ],\n      \"trace\": [\n        \"R-FIN-043: 'A joint-account holder shall perform transactions'\",\n        \"Actor: customer (primary holder)\",\n        \"Expected outcome: operation applied\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_primary_holder_can_perform_transaction(joint_account, primary_auth_token, api_client):\\n    account_id = joint_account[\\\"id\\\"]\\n    payload = {\\\"type\\\": \\\"deposit\\\", \\\"amount\\\": 500.00, \\\"currency\\\": \\\"USD\\\"}\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {primary_auth_token}\\\"}\\n\\n    resp = api_client.post(\\n        f\\\"/accounts/{account_id}/joint\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n\\n    assert resp.status_code in (200, 201), (\\n        f\\\"Expected 200/201, got {resp.status_code}: {resp.text}\\\"\\n    )\\n    body = resp.json()\\n    assert body.get(\\\"status\\\") in (\\\"applied\\\", \\\"completed\\\", \\\"success\\\"), (\\n        f\\\"Unexpected status in body: {body}\\\"\\n    )\\n    assert \\\"transaction_id\\\" in body, \\\"transaction_id missing from response\\\"\\n\"\n    },\n    {\n      \"name\": \"test_secondary_holder_cannot_modify_ownership\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A joint account exists with a primary and secondary holder\",\n        \"Secondary holder auth token is valid\",\n        \"No pending ownership-change requests exist for this account\"\n      ],\n      \"actions\": [\n        \"Authenticate as the secondary holder\",\n        \"PATCH /accounts/{id}/joint with payload requesting ownership transfer to secondary holder\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden is returned\",\n        \"Response body contains an error indicating insufficient privileges\",\n        \"Account ownership remains unchanged\"\n      ],\n      \"trace\": [\n        \"R-FIN-043: 'the secondary holder shall not be able to modify ownership'\",\n        \"Error pathway: 403 when secondary holder attempts ownership change\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_secondary_holder_cannot_modify_ownership(joint_account, secondary_auth_token, api_client):\\n    account_id = joint_account[\\\"id\\\"]\\n    payload = {\\\"action\\\": \\\"transfer_ownership\\\", \\\"new_primary\\\": joint_account[\\\"secondary_holder_id\\\"]}\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {secondary_auth_token}\\\"}\\n\\n    resp = api_client.patch(\\n        f\\\"/accounts/{account_id}/joint\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n\\n    assert resp.status_code == 403, (\\n        f\\\"Expected 403 Forbidden, got {resp.status_code}: {resp.text}\\\"\\n    )\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"detail\\\" in body, \\\"Error descriptor missing from 403 body\\\"\\n    "
+  }
+}

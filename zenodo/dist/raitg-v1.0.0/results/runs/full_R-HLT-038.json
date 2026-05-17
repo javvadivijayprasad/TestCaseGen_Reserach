@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-038",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients (boundary)",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-038",
+    "reasoning": "R-HLT-038 requires three orthogonal test dimensions: (1) correct filtering of patients by name/MRN/DOB for a clinician's own patients (EP positive), (2) access isolation ensuring patients outside the clinician's care are not returned (DT/NEG), (3) boundary values on DOB timestamps such as midnight UTC edge and max-date semantics (BVA). A fourth test covers the 400 error path for malformed queries (NEG). Each test uses a shared `clinician_auth_headers` fixture and a `fhir_base_url` fixture, plus a small `<assert_audit_log>` helper placeholder to verify access logging without inflating line counts.",
+    "tests": [
+      {
+        "name": "test_search_patient_by_mrn_returns_own_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient with MRN='MRN-00042' is assigned to this clinician",
+          "Patient with MRN='MRN-00099' is NOT assigned to this clinician"
+        ],
+        "actions": [
+          "GET /Patient?search with query param identifier=MRN-00042 using clinician auth headers",
+          "Capture HTTP status and response body",
+          "Verify audit log entry is created"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response is a FHIR Bundle with resourceType='Bundle'",
+          "Bundle contains exactly one entry matching MRN-00042",
+          "Audit log records the search event for this clinician"
+        ],
+        "trace": [
+          "R-HLT-038 / positive path: search by MRN",
+          "R-HLT-038 / expected outcome: filtered bundle returned",
+          "R-HLT-038 / expected outcome: access logged"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_patient_by_mrn_returns_own_patient(fhir_base_url, clinician_auth_headers):\n    mrn = \"MRN-00042\"\n    resp = requests.get(\n        f\"{fhir_base_url}/Patient\",\n        params={\"search\": \"\", \"identifier\": mrn},\n        headers=clinician_auth_headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Bundle\"\n    entries = body.get(\"entry\", [])\n    assert len(entries) == 1, f\"Expected 1 entry, got {len(entries)}\"\n    identifiers = entries[0][\"resource\"].get(\"identifier\", [])\n    mrn_values = [i[\"value\"] for i in identifiers if i.get(\"value\")]\n    assert mrn in mrn_values, f\"MRN {mrn} not found in {mrn_values}\"\n    <assert_audit_log>(clinician_auth_headers, event=\"patient-search\", mrn=mrn)\n"
+      },
+      {
+        "name": "test_search_patient_outside_care_not_returned",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient with MRN='MRN-00099' exists in the system but is NOT in this clinician's care",
+          "Clinician has zero patients sharing the name 'Outside Patient'"
+        ],
+        "actions": [
+          "GET /Patient?search with query param family=Outside using clinician auth headers",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Bundle entry list is empty (total=0 or entry absent)",
+          "Patient MRN-00099 is not present in any entry"
+        ],
+        "trace": [
+          "R-HLT-038 / access control: only patients in clinician's care returned",
+          "R-HLT-038 / negative: cross-patient isolation enforced"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_patient_outside_care_not_returned(fhir_base_url, clinician_auth_headers):\n    resp = requests.get(\n        f\"{fhir_base_url}/Patient\",\n        params={\"search\": \"\", \"family\": \"Outside\"},\n        headers=clinician_auth_headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Bundle\"\n    entries = body.get(\"entry\", [])\n    assert entries == [], f\"Expected empty bundle, got {len(entries)} entries\"\n    total = body.get(\"total\", 0)\n    assert total == 0, f\"Expected total=0, got {total}\"\n"
+      },
+      {
+        "name": "test_search_patient_by_dob_midnight_utc_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient 'P-BOUNDARY' has DOB='2000-01-01' (midnight UTC boundary) and is in clinician's care",
+          "No other patient in clinician's care shares this DOB"
+        ],
+        "actions": [
+          "GET /Patient?search with query param birthdate=2000-01-01 using clinician auth headers",
+          "Also probe one-day-before boundary: birthdate=1999-12-31",
+          "Capture both responses"
+        ],
+        "expected": [
+          "Response for 2000-01-01: HTTP 200, Bundle contains exactly P-BOUNDARY",
+          "Response for 1999-12-31: HTTP 200, Bundle entry list is empty",
+          "Both responses are FHIR Bundles"
+        ],
+        "trace": [
+          "R-HLT-038 / boundary cases on timestamps must be tested",
+          "R-HLT-038 / BVA: exact DOB match at day boundary and adjacent day"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_patient_by_dob_midnight_utc_boundary(fhir_base_url, clinician_auth_headers):\n    base = fhir_base_url\n    hdrs = clinician_auth_headers\n\n    resp_on = requests.get(\n        f\"{base}/Patient\",\n        params={\"search\": \"\", \"birthdate\": \"2000-01-01\"},\n        headers=hdrs, timeout=10,\n    )\n    assert resp_on.status_code == 200\n    body_on = resp_on.json()\n    assert body_on.get(\"resourceType\") == \"Bundle\"\n    entries_on = body_on.get(\"entry\", [])\n    assert len(entries_on) == 1, f\"Expected 1 entry for DOB 2000-01-01, got {len(entries_on)}\"\n    assert entries_on[0][\"resource\"].get(\"id\") == \"P-BOUNDARY\"\n\n    resp_before = requests.get(\n        f\"{base}/Patient\",\n        params={\"search\": \"\", \"birthdate\": \"1999-12-31\"},\n        headers=hdrs, timeout=10,\n    )\n    assert resp_before.status_code == 200\n    body_before = resp_before.json()\n    assert body_before.get(\"resourceType\") == \"Bundle\"\n    assert body_before.get(\"entry\", []) == [], \"Expected empty bundle for adjacent day\"\n"
+      },
+      {
+        "name": "test_search_patient_malformed_query_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician"
+        ],
+        "actions": [
+          "GET /Patient?search with query param birthdate=not-a-date (malformed date string)",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Response body contains a FHIR OperationOutcome with severity='error'",
+          "No patient data is leaked in the error response"
+        ],
+        "trace": [
+          "R-HLT-038 / error pathway: 400 when query malformed",
+          "R-HLT-038 / NEG: invalid parameter format rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_patient_malformed_query_returns_400(fhir_base_url, clinician_auth_headers):\n    resp = requests.get(\n        f\"{fhir_base_url}/Patient\",\n        params={\"search\": \"\", \"birthdate\": \"not-a-date\"},\n        headers=clinician_auth_headers,\n        timeout=10,\n    )\n    assert resp.status_code == 400, f\"Expected 400, got {resp.status_code}\"\n    body = resp.json()\n    resource_type = body.get(\"resourceType\")\n    assert resource_type == \"OperationOutcome\", (\n        f\"Expected OperationOutcome, got {resource_type}\"\n    )\n    issues = body.get(\"issue\", [])\n    assert len(issues) > 0, \"OperationOutcome must contain at least one issue\"\n    severities = [i.get(\"severity\") for i in issues]\n    assert \"error\" in severities or \"fatal\" in severities, (\n        f\"Expected error severity, got {severities}\"\n    )\n    assert \"entry\" not in body, \"Patient data must not appear in error response\"\n"
+      },
+      {
+        "name": "test_search_patient_by_name_returns_filtered_bundle",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient 'Jane Doe' with ID 'P-JANE' is in clinician's care",
+          "No other patient named 'Jane Doe' is in this clinician's care"
+        ],
+        "actions": [
+          "GET /Patient?search with query params family=Doe&given=Jane using clinician auth headers",
+          "Capture HTTP status, bundle, and audit log"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Bundle resourceType='Bundle'",
+          "Bundle contains exactly one entry with id='P-JANE'",
+          "Audit log records the search event"
+        ],
+        "trace": [
+          "R-HLT-038 / positive path: search by name",
+          "R-HLT-038 / expected outcome: filtered bundle returned",
+          "R-HLT-038 / expected outcome: access logged"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_patient_by_name_returns_filtered_bundle(fhir_base_url, clinician_auth_headers):\n    resp = requests.get(\n        f\"{fhir_base_url}/Patient\",\n        params={\"search\": \"\", \"family\": \"Doe\", \"given\": \"Jane\"},\n        headers=clinician_auth_headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Bundle\"\n    entries = body.get(\"entry\", [])\n    assert len(entries) == 1, f\"Expected 1 entry, got {len(entries)}\"\n    resource = entries[0].get(\"resource\", {})\n    assert resource.get(\"id\") == \"P-JANE\", (\n        f\"Expected P-JANE, got {resource.get('id')}\"\n    )\n    <assert_audit_log>(clinician_auth_headers, event=\"patient-search\", patient_id=\"P-JANE\")\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-038",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 995,
+    "output_tokens": 3236,
+    "latency_ms": 33306,
+    "wall_ms": 33306,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-038\",\n  \"reasoning\": \"R-HLT-038 requires three orthogonal test dimensions: (1) correct filtering of patients by name/MRN/DOB for a clinician's own patients (EP positive), (2) access isolation ensuring patients outside the clinician's care are not returned (DT/NEG), (3) boundary values on DOB timestamps such as midnight UTC edge and max-date semantics (BVA). A fourth test covers the 400 error path for malformed queries (NEG). Each test uses a shared `clinician_auth_headers` fixture and a `fhir_base_url` fixture, plus a small `<assert_audit_log>` helper placeholder to verify access logging without inflating line counts.\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_patient_by_mrn_returns_own_patient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient with MRN='MRN-00042' is assigned to this clinician\",\n        \"Patient with MRN='MRN-00099' is NOT assigned to this clinician\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param identifier=MRN-00042 using clinician auth headers\",\n        \"Capture HTTP status and response body\",\n        \"Verify audit log entry is created\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response is a FHIR Bundle with resourceType='Bundle'\",\n        \"Bundle contains exactly one entry matching MRN-00042\",\n        \"Audit log records the search event for this clinician\"\n      ],\n      \"trace\": [\n        \"R-HLT-038 / positive path: search by MRN\",\n        \"R-HLT-038 / expected outcome: filtered bundle returned\",\n        \"R-HLT-038 / expected outcome: access logged\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_search_patient_by_mrn_returns_own_patient(fhir_base_url, clinician_auth_headers):\\n    mrn = \\\"MRN-00042\\\"\\n    resp = requests.get(\\n        f\\\"{fhir_base_url}/Patient\\\",\\n        params={\\\"search\\\": \\\"\\\", \\\"identifier\\\": mrn},\\n        headers=clinician_auth_headers,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Bundle\\\"\\n    entries = body.get(\\\"entry\\\", [])\\n    assert len(entries) == 1, f\\\"Expected 1 entry, got {len(entries)}\\\"\\n    identifiers = entries[0][\\\"resource\\\"].get(\\\"identifier\\\", [])\\n    mrn_values = [i[\\\"value\\\"] for i in identifiers if i.get(\\\"value\\\")]\\n    assert mrn in mrn_values, f\\\"MRN {mrn} not found in {mrn_values}\\\"\\n    <assert_audit_log>(clinician_auth_headers, event=\\\"patient-search\\\", mrn=mrn)\\n\"\n    },\n    {\n      \"name\": \"test_search_patient_outside_care_not_returned\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient with MRN='MRN-00099' exists in the system but is NOT in this clinician's care\",\n        \"Clinician has zero patients sharing the name 'Outside Patient'\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param family=Outside using clinician auth headers\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Bundle entry list is empty (total=0 or entry absent)\",\n        \"Patient MRN-00099 is not present in any entry\"\n      ],\n      \"trace\": [\n        \"R-HLT-038 / access control: only patients in clinician's care returned\",\n        \"R-HLT-038 / negative: cross-patient isolation enforced\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_search_patient_outside_care_not_returned(fhir_base_url, clinician_auth_headers):\\n    resp = requests.get(\\n        f\\\"{fhir_base_url}/Patient\\\",\\n        params={\\\"search\\\": \\\"\\\", \\\"family\\\": \\\"Outside\\\"},\\n        headers=clinician_auth_headers,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourc"
+  }
+}

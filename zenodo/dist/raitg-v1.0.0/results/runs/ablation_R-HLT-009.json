@@ -1,0 +1,177 @@
+{
+  "req": {
+    "id": "R-HLT-009",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "integration",
+    "title": "Allergy intolerance",
+    "statement": "A clinician shall record an AllergyIntolerance linked to the patient; subsequent MedicationRequests shall warn on conflict.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records allergy"
+    ],
+    "expected_outcomes": [
+      "allergy stored",
+      "alerts regenerated"
+    ],
+    "error_pathways": [
+      "409 when exact duplicate"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AllergyIntolerance"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-009",
+    "reasoning": "R-HLT-009 requires three verifiable behaviours: (1) a clinician can POST a valid AllergyIntolerance and receive 201 with the resource stored, (2) a subsequent MedicationRequest for a conflicting substance triggers a warning/alert, (3) posting an exact duplicate returns 409. I cover these with EP (happy-path POST), STC (state transition: allergy recorded \u2192 MedicationRequest conflict alert fired), NEG (duplicate 409), BVA (minimum-viable payload with only required FHIR fields), and DT (conflicting vs non-conflicting medication). Five tests in total satisfy the \u22653 requirement while achieving broad coverage.",
+    "tests": [
+      {
+        "name": "test_post_valid_allergy_returns_201_and_stores_resource",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician auth token available via <clinician_token> fixture",
+          "Target patient exists via <patient_id> fixture",
+          "No prior allergy for this patient+substance combination"
+        ],
+        "actions": [
+          "Build a well-formed AllergyIntolerance payload referencing the patient",
+          "POST /AllergyIntolerance with clinician credentials",
+          "Capture response status and Location header"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType AllergyIntolerance",
+          "id field is populated",
+          "GET on returned Location returns the same resource"
+        ],
+        "trace": [
+          "R-HLT-009: allergy stored",
+          "R-HLT-009: clinician records allergy"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_post_valid_allergy_returns_201_and_stores_resource(\n    base_url, clinician_token, patient_id, unique_substance\n):\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\",\n                              \"code\": unique_substance}]},\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"code\": \"confirmed\"}]}\n    }\n    resp = requests.post(\n        f\"{base_url}/AllergyIntolerance\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code == 201, resp.text\n    body = resp.json()\n    assert body[\"resourceType\"] == \"AllergyIntolerance\"\n    assert body.get(\"id\"), \"id must be present\"\n    location = resp.headers.get(\"Location\") or \\\n        f\"{base_url}/AllergyIntolerance/{body['id']}\"\n    get_resp = requests.get(\n        location,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"id\"] == body[\"id\"]\n"
+      },
+      {
+        "name": "test_medication_request_for_allergen_triggers_conflict_warning",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician auth token available via <clinician_token> fixture",
+          "Target patient exists via <patient_id> fixture",
+          "AllergyIntolerance for substance S already stored (state: allergy-recorded)"
+        ],
+        "actions": [
+          "POST a MedicationRequest referencing the same substance S for the patient",
+          "Inspect response body for warnings or decision-support issues array"
+        ],
+        "expected": [
+          "HTTP 200 or 201 (request accepted)",
+          "Response body or X-Warnings header contains at least one allergy-conflict alert",
+          "Alert references the stored AllergyIntolerance id"
+        ],
+        "trace": [
+          "R-HLT-009: subsequent MedicationRequests shall warn on conflict",
+          "R-HLT-009: alerts regenerated"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_medication_request_for_allergen_triggers_conflict_warning(\n    base_url, clinician_token, patient_id, recorded_allergy\n):\n    # recorded_allergy fixture: dict with keys 'id' and 'substance_code'\n    substance_code = recorded_allergy[\"substance_code\"]\n    med_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"system\": \"http://snomed.info/sct\",\n                        \"code\": substance_code}]\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=med_payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code in (200, 201), resp.text\n    body = resp.json()\n    warnings = (\n        body.get(\"issue\") or\n        body.get(\"warnings\") or\n        body.get(\"decisionSupport\") or []\n    )\n    assert len(warnings) > 0, \"Expected at least one conflict warning\"\n    warning_text = str(warnings)\n    assert recorded_allergy[\"id\"] in warning_text or \\\n        substance_code in warning_text, \\\n        \"Warning must reference the allergen or AllergyIntolerance id\"\n"
+      },
+      {
+        "name": "test_duplicate_allergy_post_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician auth token available via <clinician_token> fixture",
+          "Target patient exists via <patient_id> fixture",
+          "Identical AllergyIntolerance already present for this patient+substance"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with the exact same patient+substance payload a second time",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body indicates duplicate resource error"
+        ],
+        "trace": [
+          "R-HLT-009: 409 when exact duplicate"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_duplicate_allergy_post_returns_409(\n    base_url, clinician_token, patient_id, recorded_allergy\n):\n    substance_code = recorded_allergy[\"substance_code\"]\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\",\n                              \"code\": substance_code}]},\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"code\": \"confirmed\"}]}\n    }\n    resp = requests.post(\n        f\"{base_url}/AllergyIntolerance\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code == 409, (\n        f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\" or \\\n        \"duplicate\" in str(body).lower() or \\\n        \"conflict\" in str(body).lower(), \\\n        \"Response should describe a duplicate/conflict error\"\n"
+      },
+      {
+        "name": "test_minimum_required_fields_allergy_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician auth token available via <clinician_token> fixture",
+          "Target patient exists via <patient_id> fixture",
+          "No prior allergy record for this patient+substance"
+        ],
+        "actions": [
+          "Build an AllergyIntolerance payload containing ONLY the mandatory FHIR R4 fields (patient + code)",
+          "POST /AllergyIntolerance",
+          "Capture response"
+        ],
+        "expected": [
+          "HTTP 201 Created (server accepts bare-minimum payload)",
+          "Returned resource contains the submitted patient reference and code"
+        ],
+        "trace": [
+          "R-HLT-009: allergy stored",
+          "BVA: minimum viable payload boundary"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_minimum_required_fields_allergy_accepted(\n    base_url, clinician_token, patient_id, unique_substance\n):\n    # Only mandatory FHIR R4 fields for AllergyIntolerance\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\n            \"coding\": [{\n                \"system\": \"http://snomed.info/sct\",\n                \"code\": unique_substance\n            }]\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/AllergyIntolerance\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code == 201, (\n        f\"Minimum payload rejected: {resp.status_code} {resp.text}\"\n    )\n    body = resp.json()\n    assert body[\"patient\"][\"reference\"] == f\"Patient/{patient_id}\"\n    codes = [c[\"code\"] for c in\n             body.get(\"code\", {}).get(\"coding\", [])]\n    assert unique_substance in codes\n"
+      },
+      {
+        "name": "test_non_conflicting_medication_produces_no_allergy_warning",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician auth token available via <clinician_token> fixture",
+          "Target patient exists via <patient_id> fixture",
+          "AllergyIntolerance for substance S already stored",
+          "A different substance T with no recorded allergy is available"
+        ],
+        "actions": [
+          "POST a MedicationRequest for substance T (no allergy on record)",
+          "Inspect response for conflict warnings"
+        ],
+        "expected": [
+          "HTTP 200 or 201",
+          "Response contains zero allergy-conflict warnings related to substance T"
+        ],
+        "trace": [
+          "R-HLT-009: alerts regenerated only when conflict exists",
+          "DT: allergy=no \u00d7 medication=non-conflicting \u2192 no warning"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_non_conflicting_medication_produces_no_allergy_warning(\n    base_url, clinician_token, patient_id, recorded_allergy,\n    non_allergenic_substance\n):\n    # non_allergenic_substance: a substance code NOT in the patient's allergy list\n    med_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\n                \"system\": \"http://snomed.info/sct\",\n                \"code\": non_allergenic_substance\n            }]\n        }\n    }\n    resp = requests.post(\n        f\"{base_url}/MedicationRequest\",\n        json=med_payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"}\n    )\n    assert resp.status_code in (200, 201), resp.text\n    body = resp.json()\n    warnings = (\n        body.get(\"issue\") or\n        body.get(\"warnings\") or\n        body.get(\"decisionSupport\") or []\n    )\n    allergy_conflicts = [\n        w for w in warnings\n        if \"allerg\" in str(w).lower() or \"conflict\" in str(w).lower()\n    ]\n    assert len(allergy_conflicts) == 0, (\n        f\"Unexpected allergy conflict for non-allergen: {allergy_conflicts}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-009",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 991,
+    "output_tokens": 3445,
+    "latency_ms": 42627,
+    "wall_ms": 42627,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-009\",\n  \"reasoning\": \"R-HLT-009 requires three verifiable behaviours: (1) a clinician can POST a valid AllergyIntolerance and receive 201 with the resource stored, (2) a subsequent MedicationRequest for a conflicting substance triggers a warning/alert, (3) posting an exact duplicate returns 409. I cover these with EP (happy-path POST), STC (state transition: allergy recorded \u2192 MedicationRequest conflict alert fired), NEG (duplicate 409), BVA (minimum-viable payload with only required FHIR fields), and DT (conflicting vs non-conflicting medication). Five tests in total satisfy the \u22653 requirement while achieving broad coverage.\",\n  \"tests\": [\n    {\n      \"name\": \"test_post_valid_allergy_returns_201_and_stores_resource\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician auth token available via <clinician_token> fixture\",\n        \"Target patient exists via <patient_id> fixture\",\n        \"No prior allergy for this patient+substance combination\"\n      ],\n      \"actions\": [\n        \"Build a well-formed AllergyIntolerance payload referencing the patient\",\n        \"POST /AllergyIntolerance with clinician credentials\",\n        \"Capture response status and Location header\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType AllergyIntolerance\",\n        \"id field is populated\",\n        \"GET on returned Location returns the same resource\"\n      ],\n      \"trace\": [\n        \"R-HLT-009: allergy stored\",\n        \"R-HLT-009: clinician records allergy\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_post_valid_allergy_returns_201_and_stores_resource(\\n    base_url, clinician_token, patient_id, unique_substance\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"AllergyIntolerance\\\",\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://snomed.info/sct\\\",\\n                              \\\"code\\\": unique_substance}]},\\n        \\\"clinicalStatus\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"active\\\"}]},\\n        \\\"verificationStatus\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"confirmed\\\"}]}\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/AllergyIntolerance\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n    )\\n    assert resp.status_code == 201, resp.text\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"AllergyIntolerance\\\"\\n    assert body.get(\\\"id\\\"), \\\"id must be present\\\"\\n    location = resp.headers.get(\\\"Location\\\") or \\\\\\n        f\\\"{base_url}/AllergyIntolerance/{body['id']}\\\"\\n    get_resp = requests.get(\\n        location,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n    )\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"id\\\"] == body[\\\"id\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_medication_request_for_allergen_triggers_conflict_warning\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Clinician auth token available via <clinician_token> fixture\",\n        \"Target patient exists via <patient_id> fixture\",\n        \"AllergyIntolerance for substance S already stored (state: allergy-recorded)\"\n      ],\n      \"actions\": [\n        \"POST a MedicationRequest referencing the same substance S for the patient\",\n        \"Inspect response body for warnings or decision-support issues array\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 (request accepted)\",\n        \"Response body or X-Warnings header contains at least one allergy-conflict alert\",\n        \"Alert references the stored AllergyIntolerance id\"\n      ],\n      \"trace\": [\n        \"R-HLT-009: subsequent MedicationRequests shall warn on conflict\",\n        \"R-HLT-009: alerts regenerated\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_medication_request_for_allergen_triggers_conflict_warning(\\n    base_url, clinician_token, patien"
+  }
+}

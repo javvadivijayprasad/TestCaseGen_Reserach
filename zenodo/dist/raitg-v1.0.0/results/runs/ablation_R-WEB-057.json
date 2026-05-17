@@ -1,0 +1,218 @@
+{
+  "req": {
+    "id": "R-WEB-057",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Submit leave request",
+    "statement": "A full-time employee shall be able to submit a leave request for between 1 and 30 business days; requests spanning more than 30 days require hr-admin approval.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated",
+      "employment_type:full_time"
+    ],
+    "triggers": [
+      "employee submits form"
+    ],
+    "expected_outcomes": [
+      "request created",
+      "manager notified",
+      "notification email sent"
+    ],
+    "error_pathways": [
+      "400 when start_date > end_date",
+      "409 when overlapping existing leave",
+      "422 when request exceeds 30 days without hr-admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-057",
+    "reasoning": "The requirement defines a leave-request submission flow with three key partitions: valid requests (1-30 business days), requests exceeding 30 days without hr-admin approval, and invalid date/overlap combinations. BVA targets the 1-day minimum, 30-day maximum, and 31-day threshold. NEG covers start_date > end_date (400), overlapping leave (409), and >30 days without hr-admin (422). STC covers the state change from no-request to pending. DT captures the hr-admin approval branching rule. Each test uses a fresh authenticated session fixture and a teardown hook to delete created resources, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_submit_valid_leave_request_within_30_days",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as full-time employee",
+          "No overlapping leave requests exist for the selected dates",
+          "SMTP stub is active to capture notification emails"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with next_monday() business date",
+          "Fill end_date with start_date + 9 business days (10-day request)",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 201 or redirect to confirmation page",
+          "Leave request record created in DB with status=pending",
+          "Manager notification event emitted",
+          "Notification email delivered to employee mailbox"
+        ],
+        "trace": [
+          "R-WEB-057: valid 1-30 day range",
+          "R-WEB-057: request created outcome",
+          "R-WEB-057: manager notified outcome",
+          "R-WEB-057: notification email sent outcome"
+        ],
+        "executable": "import pytest\nfrom datetime import date\n\ndef test_submit_valid_leave_request_within_30_days(\n    authenticated_page,   # <fixture>: Playwright page with full-time employee session\n    api_client,           # <fixture>: requests.Session with auth headers\n    smtp_stub,            # <fixture>: captures outbound emails\n    delete_leave_on_teardown,  # <fixture>: collects IDs for cleanup\n):\n    start, end = <helper_fn>.next_business_day(n=1), <helper_fn>.next_business_day(n=10)\n    page = authenticated_page\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start.isoformat())\n    page.fill(\"[data-testid='end-date']\", end.isoformat())\n    page.click(\"[data-testid='submit-leave']\")\n    page.wait_for_url(\"**/leave-requests/**\")\n\n    resp = api_client.get(\"/api/leave-requests\", params={\"start\": start, \"end\": end})\n    assert resp.status_code == 200\n    records = resp.json()[\"data\"]\n    assert len(records) == 1\n    leave_id = records[0][\"id\"]\n    delete_leave_on_teardown(leave_id)\n\n    assert records[0][\"status\"] == \"pending\"\n    assert <helper_fn>.manager_notification_exists(leave_id, api_client)\n    assert smtp_stub.has_email_for(records[0][\"employee_email\"])\n"
+      },
+      {
+        "name": "test_submit_leave_request_start_date_after_end_date_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as full-time employee",
+          "Form is loaded at /leave-requests/new"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with next_monday() + 5 business days",
+          "Fill end_date with next_monday() (earlier than start_date)",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 400 response returned by API",
+          "Inline validation error message displayed on UI",
+          "No leave request record created in DB"
+        ],
+        "trace": [
+          "R-WEB-057: error pathway 400 when start_date > end_date"
+        ],
+        "executable": "import pytest\n\ndef test_submit_leave_request_start_date_after_end_date_returns_400(\n    authenticated_page,  # <fixture>\n    api_client,          # <fixture>\n):\n    start = <helper_fn>.next_business_day(n=6)\n    end   = <helper_fn>.next_business_day(n=1)\n    page  = authenticated_page\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start.isoformat())\n    page.fill(\"[data-testid='end-date']\", end.isoformat())\n    page.click(\"[data-testid='submit-leave']\")\n\n    error_el = page.locator(\"[data-testid='date-error']\").first\n    assert error_el.is_visible()\n\n    resp = api_client.post(\n        \"/api/leave-requests\",\n        json={\"start_date\": start.isoformat(), \"end_date\": end.isoformat()},\n    )\n    assert resp.status_code == 400\n    assert \"start_date\" in resp.json().get(\"errors\", {})\n"
+      },
+      {
+        "name": "test_submit_leave_request_exactly_30_business_days_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as full-time employee",
+          "No overlapping leave requests exist for the selected 30-day range",
+          "SMTP stub is active"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with next_monday() business date",
+          "Fill end_date with start_date + 29 business days (exactly 30 business days inclusive)",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 201 or redirect to confirmation page",
+          "Leave request created with status=pending (no hr-admin approval required)",
+          "Manager notification emitted"
+        ],
+        "trace": [
+          "R-WEB-057: upper boundary of 30 business days, no hr-admin required",
+          "R-WEB-057: BVA upper boundary on valid range"
+        ],
+        "executable": "import pytest\n\ndef test_submit_leave_request_exactly_30_business_days_accepted(\n    authenticated_page,\n    api_client,\n    smtp_stub,\n    delete_leave_on_teardown,\n):\n    start = <helper_fn>.next_business_day(n=1)\n    end   = <helper_fn>.next_business_day(n=30)  # 30 inclusive business days\n    page  = authenticated_page\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start.isoformat())\n    page.fill(\"[data-testid='end-date']\", end.isoformat())\n    page.click(\"[data-testid='submit-leave']\")\n    page.wait_for_url(\"**/leave-requests/**\")\n\n    resp = api_client.get(\"/api/leave-requests\", params={\"start\": start, \"end\": end})\n    assert resp.status_code == 200\n    records = resp.json()[\"data\"]\n    assert len(records) == 1\n    leave = records[0]\n    delete_leave_on_teardown(leave[\"id\"])\n\n    assert leave[\"status\"] == \"pending\"\n    assert leave.get(\"requires_hr_admin\") is False\n    assert <helper_fn>.manager_notification_exists(leave[\"id\"], api_client)\n"
+      },
+      {
+        "name": "test_submit_leave_request_31_business_days_without_hr_admin_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as full-time employee (not hr-admin)",
+          "No overlapping leave requests exist for the selected dates"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with next_monday() business date",
+          "Fill end_date with start_date + 30 business days (31 business days inclusive)",
+          "Submit the form without hr-admin token"
+        ],
+        "expected": [
+          "HTTP 422 returned by API",
+          "UI displays error requiring hr-admin approval",
+          "No leave request record committed with status=pending"
+        ],
+        "trace": [
+          "R-WEB-057: error pathway 422 when request exceeds 30 days without hr-admin",
+          "R-WEB-057: DT rule - duration > 30 AND actor != hr-admin => reject"
+        ],
+        "executable": "import pytest\n\ndef test_submit_leave_request_31_business_days_without_hr_admin_returns_422(\n    authenticated_page,\n    api_client,\n):\n    start = <helper_fn>.next_business_day(n=1)\n    end   = <helper_fn>.next_business_day(n=31)  # 31 inclusive business days\n    page  = authenticated_page\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start.isoformat())\n    page.fill(\"[data-testid='end-date']\", end.isoformat())\n    page.click(\"[data-testid='submit-leave']\")\n\n    error_el = page.locator(\"[data-testid='hr-admin-approval-error']\").first\n    assert error_el.is_visible()\n\n    resp = api_client.post(\n        \"/api/leave-requests\",\n        json={\"start_date\": start.isoformat(), \"end_date\": end.isoformat()},\n    )\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"code\") == \"HR_ADMIN_APPROVAL_REQUIRED\"\n"
+      },
+      {
+        "name": "test_submit_leave_request_overlapping_existing_leave_returns_409",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as full-time employee",
+          "An approved leave request already exists for next_monday + 2 to next_monday + 6"
+        ],
+        "actions": [
+          "Seed an existing leave record via API for the overlapping window",
+          "Navigate to /leave-requests/new",
+          "Fill start_date with next_monday() + 4 business days (overlaps seeded record)",
+          "Fill end_date with next_monday() + 8 business days",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 409 returned by API",
+          "UI displays conflict error message referencing existing leave",
+          "No new leave request record created"
+        ],
+        "trace": [
+          "R-WEB-057: error pathway 409 when overlapping existing leave",
+          "R-WEB-057: STC - transition from approved-leave state blocks new overlapping submission"
+        ],
+        "executable": "import pytest\n\ndef test_submit_leave_request_overlapping_existing_leave_returns_409(\n    authenticated_page,\n    api_client,\n    delete_leave_on_teardown,\n):\n    # Seed overlapping approved leave\n    seed_start = <helper_fn>.next_business_day(n=2)\n    seed_end   = <helper_fn>.next_business_day(n=6)\n    seed_resp  = api_client.post(\n        \"/api/leave-requests\",\n        json={\"start_date\": seed_start.isoformat(), \"end_date\": seed_end.isoformat(),\n              \"_force_status\": \"approved\"},\n    )\n    assert seed_resp.status_code == 201\n    delete_leave_on_teardown(seed_resp.json()[\"id\"])\n\n    new_start = <helper_fn>.next_business_day(n=4)  # overlaps seed\n    new_end   = <helper_fn>.next_business_day(n=8)\n    page      = authenticated_page\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", new_start.isoformat())\n    page.fill(\"[data-testid='end-date']\", new_end.isoformat())\n    page.click(\"[data-testid='submit-leave']\")\n\n    error_el = page.locator(\"[data-testid='overlap-error']\").first\n    assert error_el.is_visible()\n\n    resp = api_client.post(\n        \"/api/leave-requests\",\n        json={\"start_date\": new_start.isoformat(), \"end_date\": new_end.isoformat()},\n    )\n    assert resp.status_code == 409\n"
+      },
+      {
+        "name": "test_submit_leave_request_minimum_1_business_day_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as full-time employee",
+          "No overlapping leave requests exist for the selected single-day window"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with next_monday() business date",
+          "Fill end_date with the same date as start_date (1 business day)",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP 201 or redirect to confirmation page",
+          "Leave request created with duration=1 and status=pending",
+          "Manager notification emitted"
+        ],
+        "trace": [
+          "R-WEB-057: lower boundary of 1 business day minimum",
+          "R-WEB-057: BVA lower boundary on valid range"
+        ],
+        "executable": "import pytest\n\ndef test_submit_leave_request_minimum_1_business_day_accepted(\n    authenticated_page,\n    api_client,\n    smtp_stub,\n    delete_leave_on_teardown,\n):\n    single_day = <helper_fn>.next_business_day(n=1)\n    page = authenticated_page\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", single_day.isoformat())\n    page.fill(\"[data-testid='end-date']\", single_day.isoformat())\n    page.click(\"[data-testid='submit-leave']\")\n    page.wait_for_url(\"**/leave-requests/**\")\n\n    resp = api_client.get(\"/api/leave-requests\",\n                          params={\"start\": single_day, \"end\": single_day})\n    assert resp.status_code == 200\n    records = resp.json()[\"data\"]\n    assert len(records) == 1\n    leave = records[0]\n    delete_leave_on_teardown(leave[\"id\"])\n\n    assert leave[\"business_days\"] == 1\n    assert leave[\"status\"] == \"pending\"\n    assert <helper_fn>.manager_notification_exists(leave[\"id\"], api_client)\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-057",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1033,
+    "output_tokens": 4142,
+    "latency_ms": 39401,
+    "wall_ms": 39401,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-057\",\n  \"reasoning\": \"The requirement defines a leave-request submission flow with three key partitions: valid requests (1-30 business days), requests exceeding 30 days without hr-admin approval, and invalid date/overlap combinations. BVA targets the 1-day minimum, 30-day maximum, and 31-day threshold. NEG covers start_date > end_date (400), overlapping leave (409), and >30 days without hr-admin (422). STC covers the state change from no-request to pending. DT captures the hr-admin approval branching rule. Each test uses a fresh authenticated session fixture and a teardown hook to delete created resources, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_valid_leave_request_within_30_days\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as full-time employee\",\n        \"No overlapping leave requests exist for the selected dates\",\n        \"SMTP stub is active to capture notification emails\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date with next_monday() business date\",\n        \"Fill end_date with start_date + 9 business days (10-day request)\",\n        \"Submit the form\"\n      ],\n      \"expected\": [\n        \"HTTP 201 or redirect to confirmation page\",\n        \"Leave request record created in DB with status=pending\",\n        \"Manager notification event emitted\",\n        \"Notification email delivered to employee mailbox\"\n      ],\n      \"trace\": [\n        \"R-WEB-057: valid 1-30 day range\",\n        \"R-WEB-057: request created outcome\",\n        \"R-WEB-057: manager notified outcome\",\n        \"R-WEB-057: notification email sent outcome\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import date\\n\\ndef test_submit_valid_leave_request_within_30_days(\\n    authenticated_page,   # <fixture>: Playwright page with full-time employee session\\n    api_client,           # <fixture>: requests.Session with auth headers\\n    smtp_stub,            # <fixture>: captures outbound emails\\n    delete_leave_on_teardown,  # <fixture>: collects IDs for cleanup\\n):\\n    start, end = <helper_fn>.next_business_day(n=1), <helper_fn>.next_business_day(n=10)\\n    page = authenticated_page\\n    page.goto(\\\"/leave-requests/new\\\")\\n    page.fill(\\\"[data-testid='start-date']\\\", start.isoformat())\\n    page.fill(\\\"[data-testid='end-date']\\\", end.isoformat())\\n    page.click(\\\"[data-testid='submit-leave']\\\")\\n    page.wait_for_url(\\\"**/leave-requests/**\\\")\\n\\n    resp = api_client.get(\\\"/api/leave-requests\\\", params={\\\"start\\\": start, \\\"end\\\": end})\\n    assert resp.status_code == 200\\n    records = resp.json()[\\\"data\\\"]\\n    assert len(records) == 1\\n    leave_id = records[0][\\\"id\\\"]\\n    delete_leave_on_teardown(leave_id)\\n\\n    assert records[0][\\\"status\\\"] == \\\"pending\\\"\\n    assert <helper_fn>.manager_notification_exists(leave_id, api_client)\\n    assert smtp_stub.has_email_for(records[0][\\\"employee_email\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_start_date_after_end_date_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as full-time employee\",\n        \"Form is loaded at /leave-requests/new\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date with next_monday() + 5 business days\",\n        \"Fill end_date with next_monday() (earlier than start_date)\",\n        \"Submit the form\"\n      ],\n      \"expected\": [\n        \"HTTP 400 response returned by API\",\n        \"Inline validation error message displayed on UI\",\n        \"No leave request record created in DB\"\n      ],\n      \"trace\": [\n        \"R-WEB-057: error pathway 400 when start_date > end_date\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_submit_leave_request_start_date_after_end_date_returns_400(\\n    authenticated_page,  # <fixture>\\n    api_client,          # <fixture>\\n):\\n    start = <helpe"
+  }
+}

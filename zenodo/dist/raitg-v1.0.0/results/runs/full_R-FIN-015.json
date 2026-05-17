@@ -1,0 +1,174 @@
+{
+  "req": {
+    "id": "R-FIN-015",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "KYC refresh",
+    "statement": "A customer shall complete a KYC refresh every 365 days; accounts beyond refresh window shall be restricted to inbound transactions only.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "refresh form submitted"
+    ],
+    "expected_outcomes": [
+      "customer.verified=true refreshed"
+    ],
+    "error_pathways": [
+      "403 when submission fails compliance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/kyc/refresh"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-015",
+    "reasoning": "R-FIN-015 defines three critical behavioural zones: (1) a valid KYC refresh submitted within the 365-day window must set customer.verified=true; (2) a refresh submitted with non-compliant data must return HTTP 403; (3) the exact boundary at day 365 must still be accepted, while day 366 must trigger restriction. We therefore need: one EP positive case (happy-path refresh), one NEG/DT case (compliance failure yields 403), and two BVA cases (day 364 inside window, day 366 outside window). We also add an STC case to confirm that a restricted account becomes fully active post-refresh. Fixtures and helpers are placeholders per the task instructions. Each test is self-contained via setup/teardown stubs and uses a dedicated test-scoped customer account to guarantee idempotency.",
+    "tests": [
+      {
+        "name": "test_kyc_refresh_within_window_sets_verified",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC was completed 180 days ago (within 365-day window)",
+          "KYC form payload passes all compliance rules"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid compliant payload and Authorization header"
+        ],
+        "expected": [
+          "HTTP 200 response",
+          "Response body contains customer.verified=true",
+          "Response body contains a refreshed_at timestamp within the last 60 seconds"
+        ],
+        "trace": [
+          "R-FIN-015: customer shall complete KYC refresh every 365 days",
+          "R-FIN-015: expected outcome customer.verified=true refreshed"
+        ],
+        "executable": "import pytest\nimport time\nfrom <helper_fn> import build_auth_header, assert_recent_timestamp\n\n@pytest.fixture(scope=\"function\")\ndef customer_180_days(<fixture_api_client>, <fixture_create_customer>):\n    customer = <fixture_create_customer>(kyc_age_days=180)\n    yield customer\n    <fixture_create_customer>.cleanup(customer[\"id\"])\n\ndef test_kyc_refresh_within_window_sets_verified(customer_180_days, <fixture_api_client>):\n    payload = {\n        \"customer_id\": customer_180_days[\"id\"],\n        \"document_type\": \"passport\",\n        \"document_number\": \"X123456789\",\n        \"expiry_date\": \"2030-01-01\"\n    }\n    headers = build_auth_header(customer_180_days[\"token\"])\n    response = <fixture_api_client>.post(\"/kyc/refresh\", json=payload, headers=headers)\n    assert response.status_code == 200\n    body = response.json()\n    assert body[\"customer\"][\"verified\"] is True\n    assert_recent_timestamp(body[\"refreshed_at\"], tolerance_seconds=60)\n"
+      },
+      {
+        "name": "test_kyc_refresh_compliance_failure_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC was completed 180 days ago (within 365-day window)",
+          "KYC form payload contains a document flagged by the compliance engine (e.g. sanctioned document number)"
+        ],
+        "actions": [
+          "POST /kyc/refresh with a non-compliant payload (sanctioned document number) and Authorization header"
+        ],
+        "expected": [
+          "HTTP 403 response",
+          "Response body contains an error code referencing compliance failure",
+          "customer.verified remains false"
+        ],
+        "trace": [
+          "R-FIN-015: error pathway 403 when submission fails compliance",
+          "R-FIN-015: verified state must not change on failed submission"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import build_auth_header, fetch_customer_verified_status\n\n@pytest.fixture(scope=\"function\")\ndef customer_compliance_fail(<fixture_api_client>, <fixture_create_customer>):\n    customer = <fixture_create_customer>(kyc_age_days=180, verified=False)\n    yield customer\n    <fixture_create_customer>.cleanup(customer[\"id\"])\n\ndef test_kyc_refresh_compliance_failure_returns_403(\n    customer_compliance_fail, <fixture_api_client>\n):\n    payload = {\n        \"customer_id\": customer_compliance_fail[\"id\"],\n        \"document_type\": \"passport\",\n        \"document_number\": \"SANCTIONED-DOC-001\",\n        \"expiry_date\": \"2030-01-01\"\n    }\n    headers = build_auth_header(customer_compliance_fail[\"token\"])\n    response = <fixture_api_client>.post(\"/kyc/refresh\", json=payload, headers=headers)\n    assert response.status_code == 403\n    body = response.json()\n    assert \"compliance\" in body.get(\"error_code\", \"\").lower()\n    verified = fetch_customer_verified_status(\n        <fixture_api_client>, customer_compliance_fail[\"id\"], customer_compliance_fail[\"token\"]\n    )\n    assert verified is False\n"
+      },
+      {
+        "name": "test_kyc_refresh_at_day_365_boundary_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC was completed exactly 365 days ago (boundary: last valid day of window)",
+          "KYC form payload passes all compliance rules"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid compliant payload on day 365 since last refresh"
+        ],
+        "expected": [
+          "HTTP 200 response",
+          "Response body contains customer.verified=true",
+          "Account is NOT restricted (outbound transactions remain permitted)"
+        ],
+        "trace": [
+          "R-FIN-015: every 365 days \u2014 day 365 is still within the refresh window",
+          "R-FIN-015: accounts beyond refresh window restricted; day 365 is not beyond"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import build_auth_header, fetch_account_restriction\n\n@pytest.fixture(scope=\"function\")\ndef customer_365_days(<fixture_api_client>, <fixture_create_customer>):\n    customer = <fixture_create_customer>(kyc_age_days=365)\n    yield customer\n    <fixture_create_customer>.cleanup(customer[\"id\"])\n\ndef test_kyc_refresh_at_day_365_boundary_accepted(\n    customer_365_days, <fixture_api_client>\n):\n    payload = {\n        \"customer_id\": customer_365_days[\"id\"],\n        \"document_type\": \"passport\",\n        \"document_number\": \"V987654321\",\n        \"expiry_date\": \"2031-06-15\"\n    }\n    headers = build_auth_header(customer_365_days[\"token\"])\n    response = <fixture_api_client>.post(\"/kyc/refresh\", json=payload, headers=headers)\n    assert response.status_code == 200\n    body = response.json()\n    assert body[\"customer\"][\"verified\"] is True\n    restriction = fetch_account_restriction(\n        <fixture_api_client>, customer_365_days[\"id\"], customer_365_days[\"token\"]\n    )\n    assert restriction[\"outbound_blocked\"] is False\n"
+      },
+      {
+        "name": "test_kyc_refresh_at_day_366_account_restricted_before_and_unrestricted_after",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid JWT",
+          "Customer last KYC was completed 366 days ago (one day beyond the window)",
+          "Account is currently in RESTRICTED state (inbound only)",
+          "KYC form payload passes all compliance rules"
+        ],
+        "actions": [
+          "Verify account is restricted before refresh (outbound blocked)",
+          "POST /kyc/refresh with valid compliant payload",
+          "Verify account transitions to ACTIVE state (outbound permitted)"
+        ],
+        "expected": [
+          "Pre-refresh: account restricted, outbound transactions blocked",
+          "POST /kyc/refresh returns HTTP 200",
+          "Post-refresh: customer.verified=true and outbound transactions unblocked"
+        ],
+        "trace": [
+          "R-FIN-015: accounts beyond refresh window restricted to inbound only (day 366 is beyond)",
+          "R-FIN-015: successful refresh transitions account from RESTRICTED to ACTIVE",
+          "R-FIN-015: state transition RESTRICTED -> ACTIVE on verified=true"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import build_auth_header, fetch_account_restriction\n\n@pytest.fixture(scope=\"function\")\ndef customer_366_days(<fixture_api_client>, <fixture_create_customer>):\n    customer = <fixture_create_customer>(kyc_age_days=366)\n    yield customer\n    <fixture_create_customer>.cleanup(customer[\"id\"])\n\ndef test_kyc_refresh_at_day_366_account_restricted_before_and_unrestricted_after(\n    customer_366_days, <fixture_api_client>\n):\n    cid = customer_366_days[\"id\"]\n    token = customer_366_days[\"token\"]\n    headers = build_auth_header(token)\n    pre = fetch_account_restriction(<fixture_api_client>, cid, token)\n    assert pre[\"outbound_blocked\"] is True, \"Account must be restricted before refresh\"\n    payload = {\n        \"customer_id\": cid,\n        \"document_type\": \"national_id\",\n        \"document_number\": \"NID-2024-00042\",\n        \"expiry_date\": \"2032-03-20\"\n    }\n    response = <fixture_api_client>.post(\"/kyc/refresh\", json=payload, headers=headers)\n    assert response.status_code == 200\n    body = response.json()\n    assert body[\"customer\"][\"verified\"] is True\n    post = fetch_account_restriction(<fixture_api_client>, cid, token)\n    assert post[\"outbound_blocked\"] is False, \"Account must be unrestricted after refresh\"\n"
+      },
+      {
+        "name": "test_kyc_refresh_missing_auth_returns_401",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "No Authorization header is provided",
+          "Payload is otherwise fully valid"
+        ],
+        "actions": [
+          "POST /kyc/refresh with a valid body but without an Authorization header"
+        ],
+        "expected": [
+          "HTTP 401 response",
+          "Response body contains an authentication error message",
+          "No KYC state change occurs"
+        ],
+        "trace": [
+          "R-FIN-015: precondition is authenticated \u2014 unauthenticated request must be rejected",
+          "R-FIN-015: decision table: auth=absent AND payload=valid => 401 Unauthorized"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_missing_auth_returns_401(<fixture_api_client>):\n    payload = {\n        \"customer_id\": \"cust-anon-test-001\",\n        \"document_type\": \"passport\",\n        \"document_number\": \"A000000001\",\n        \"expiry_date\": \"2033-01-01\"\n    }\n    response = <fixture_api_client>.post(\"/kyc/refresh\", json=payload)\n    assert response.status_code == 401\n    body = response.json()\n    assert \"error\" in body or \"message\" in body\n    error_text = (body.get(\"error\") or body.get(\"message\") or \"\").lower()\n    assert any(kw in error_text for kw in [\"unauthorized\", \"authentication\", \"token\"])\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-015",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 981,
+    "output_tokens": 3234,
+    "latency_ms": 40317,
+    "wall_ms": 40318,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-015\",\n  \"reasoning\": \"R-FIN-015 defines three critical behavioural zones: (1) a valid KYC refresh submitted within the 365-day window must set customer.verified=true; (2) a refresh submitted with non-compliant data must return HTTP 403; (3) the exact boundary at day 365 must still be accepted, while day 366 must trigger restriction. We therefore need: one EP positive case (happy-path refresh), one NEG/DT case (compliance failure yields 403), and two BVA cases (day 364 inside window, day 366 outside window). We also add an STC case to confirm that a restricted account becomes fully active post-refresh. Fixtures and helpers are placeholders per the task instructions. Each test is self-contained via setup/teardown stubs and uses a dedicated test-scoped customer account to guarantee idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_kyc_refresh_within_window_sets_verified\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"Customer last KYC was completed 180 days ago (within 365-day window)\",\n        \"KYC form payload passes all compliance rules\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with valid compliant payload and Authorization header\"\n      ],\n      \"expected\": [\n        \"HTTP 200 response\",\n        \"Response body contains customer.verified=true\",\n        \"Response body contains a refreshed_at timestamp within the last 60 seconds\"\n      ],\n      \"trace\": [\n        \"R-FIN-015: customer shall complete KYC refresh every 365 days\",\n        \"R-FIN-015: expected outcome customer.verified=true refreshed\"\n      ],\n      \"executable\": \"import pytest\\nimport time\\nfrom <helper_fn> import build_auth_header, assert_recent_timestamp\\n\\n@pytest.fixture(scope=\\\"function\\\")\\ndef customer_180_days(<fixture_api_client>, <fixture_create_customer>):\\n    customer = <fixture_create_customer>(kyc_age_days=180)\\n    yield customer\\n    <fixture_create_customer>.cleanup(customer[\\\"id\\\"])\\n\\ndef test_kyc_refresh_within_window_sets_verified(customer_180_days, <fixture_api_client>):\\n    payload = {\\n        \\\"customer_id\\\": customer_180_days[\\\"id\\\"],\\n        \\\"document_type\\\": \\\"passport\\\",\\n        \\\"document_number\\\": \\\"X123456789\\\",\\n        \\\"expiry_date\\\": \\\"2030-01-01\\\"\\n    }\\n    headers = build_auth_header(customer_180_days[\\\"token\\\"])\\n    response = <fixture_api_client>.post(\\\"/kyc/refresh\\\", json=payload, headers=headers)\\n    assert response.status_code == 200\\n    body = response.json()\\n    assert body[\\\"customer\\\"][\\\"verified\\\"] is True\\n    assert_recent_timestamp(body[\\\"refreshed_at\\\"], tolerance_seconds=60)\\n\"\n    },\n    {\n      \"name\": \"test_kyc_refresh_compliance_failure_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid JWT\",\n        \"Customer last KYC was completed 180 days ago (within 365-day window)\",\n        \"KYC form payload contains a document flagged by the compliance engine (e.g. sanctioned document number)\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with a non-compliant payload (sanctioned document number) and Authorization header\"\n      ],\n      \"expected\": [\n        \"HTTP 403 response\",\n        \"Response body contains an error code referencing compliance failure\",\n        \"customer.verified remains false\"\n      ],\n      \"trace\": [\n        \"R-FIN-015: error pathway 403 when submission fails compliance\",\n        \"R-FIN-015: verified state must not change on failed submission\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import build_auth_header, fetch_customer_verified_status\\n\\n@pytest.fixture(scope=\\\"function\\\")\\ndef customer_compliance_fail(<fixture_api_client>, <fixture_create_customer>):\\n    customer = <fixture_create_customer>(kyc_age_days=180, verified=False)\\n    yield customer\\n    <fixture_create_customer>.cleanup(customer[\\\"id\\\"])\\n\\ndef test_kyc_refre"
+  }
+}

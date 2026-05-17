@@ -1,0 +1,154 @@
+{
+  "req": {
+    "id": "R-FIN-048",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration (boundary variant)",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-048",
+    "reasoning": "R-FIN-048 mandates a 24-hour hold after biller registration and defers withdrawals during that period. Four tests cover the critical paths: (1) EP positive \u2013 a new valid biller lands in HOLD state with HTTP 201; (2) NEG negative \u2013 a duplicate biller registration returns HTTP 409; (3) BVA boundary \u2013 a biller registered at exactly 24 hours (86400 s) minus one second is still in HOLD, while one at exactly 86400 s transitions to ACTIVE, probing the exact threshold; (4) STC state-transition \u2013 the full lifecycle NEW\u2192HOLD\u2192ACTIVE is traced. Each test is self-contained via fixtures that create and clean up billers, and uses time injection via the API's test-clock header to remain deterministic.",
+    "tests": [
+      {
+        "name": "test_register_new_biller_enters_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "Biller with the target account number does not already exist for this customer"
+        ],
+        "actions": [
+          "POST /billers with valid biller payload (name, account_number, routing_number)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Response body contains status field equal to 'HOLD'",
+          "Response body contains a hold_expires_at timestamp approximately 24 hours in the future",
+          "GET /billers/{id} also returns status 'HOLD'"
+        ],
+        "trace": [
+          "R-FIN-048: customer adds biller \u2192 biller in hold state",
+          "R-FIN-048: 24-hour hold requirement \u2013 new biller must start in HOLD"
+        ],
+        "executable": "def test_register_new_biller_enters_hold_state(auth_headers, unique_biller_payload, cleanup_biller):\n    resp = <api_client>.post(\"/billers\", json=unique_biller_payload, headers=auth_headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    biller_id = body[\"id\"]\n    cleanup_biller(biller_id)\n    assert body[\"status\"] == \"HOLD\"\n    hold_expires = <parse_iso_datetime>(body[\"hold_expires_at\"])\n    now = <utcnow>()\n    delta_hours = (hold_expires - now).total_seconds() / 3600\n    assert 23.9 <= delta_hours <= 24.1, f\"hold window out of range: {delta_hours}h\"\n    get_resp = <api_client>.get(f\"/billers/{biller_id}\", headers=auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"HOLD\""
+      },
+      {
+        "name": "test_register_duplicate_biller_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A biller with the same account_number already exists for this customer"
+        ],
+        "actions": [
+          "POST /billers with biller payload for a pre-existing biller account_number",
+          "Capture HTTP response status and error body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict is returned",
+          "Response body contains error code 'DUPLICATE_BILLER'",
+          "No new biller record is created"
+        ],
+        "trace": [
+          "R-FIN-048: error pathway \u2013 409 if duplicate biller"
+        ],
+        "executable": "def test_register_duplicate_biller_returns_409(auth_headers, existing_biller_payload, cleanup_biller):\n    first = <api_client>.post(\"/billers\", json=existing_biller_payload, headers=auth_headers)\n    assert first.status_code == 201\n    biller_id = first.json()[\"id\"]\n    cleanup_biller(biller_id)\n    duplicate = <api_client>.post(\"/billers\", json=existing_biller_payload, headers=auth_headers)\n    assert duplicate.status_code == 409\n    err = duplicate.json()\n    assert err.get(\"error_code\") == \"DUPLICATE_BILLER\"\n    list_resp = <api_client>.get(\"/billers\", headers=auth_headers)\n    billers = list_resp.json()[\"items\"]\n    matching = [b for b in billers if b[\"account_number\"] == existing_biller_payload[\"account_number\"]]\n    assert len(matching) == 1, \"Duplicate biller must not be persisted\""
+      },
+      {
+        "name": "test_biller_hold_boundary_at_exactly_24_hours",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "API supports X-Test-Clock header to override server time",
+          "Two unique biller payloads are available (one for 86399 s, one for 86400 s)"
+        ],
+        "actions": [
+          "POST /billers for biller_A; advance test clock to T+86399 s (one second before threshold); GET /billers/{id_A}",
+          "POST /billers for biller_B; advance test clock to T+86400 s (exact threshold); GET /billers/{id_B}"
+        ],
+        "expected": [
+          "At T+86399 s biller_A status is still 'HOLD'",
+          "At T+86400 s biller_B status is 'ACTIVE'",
+          "Withdrawal attempt on biller_A at T+86399 s is deferred (HTTP 422 or equivalent)",
+          "Withdrawal attempt on biller_B at T+86400 s is accepted (HTTP 2xx)"
+        ],
+        "trace": [
+          "R-FIN-048: boundary behaviour at exact min/max thresholds must be tested",
+          "R-FIN-048: withdrawals to new billers shall be deferred during hold"
+        ],
+        "executable": "def test_biller_hold_boundary_at_exactly_24_hours(auth_headers, unique_biller_payload, cleanup_biller):\n    payload_a = {**unique_biller_payload, \"account_number\": <unique_account_number>()}\n    payload_b = {**unique_biller_payload, \"account_number\": <unique_account_number>()}\n    reg_a = <api_client>.post(\"/billers\", json=payload_a, headers=auth_headers)\n    assert reg_a.status_code == 201\n    id_a = reg_a.json()[\"id\"]\n    cleanup_biller(id_a)\n    headers_a = {**auth_headers, \"X-Test-Clock\": str(<utcnow_epoch>() + 86399)}\n    status_a = <api_client>.get(f\"/billers/{id_a}\", headers=headers_a).json()[\"status\"]\n    assert status_a == \"HOLD\", f\"Expected HOLD at T+86399, got {status_a}\"\n    wd_a = <api_client>.post(\"/withdrawals\", json={\"biller_id\": id_a, \"amount\": \"10.00\"}, headers=headers_a)\n    assert wd_a.status_code in (422, 423), \"Withdrawal must be deferred while in HOLD\"\n    reg_b = <api_client>.post(\"/billers\", json=payload_b, headers=auth_headers)\n    assert reg_b.status_code == 201\n    id_b = reg_b.json()[\"id\"]\n    cleanup_biller(id_b)\n    headers_b = {**auth_headers, \"X-Test-Clock\": str(<utcnow_epoch>() + 86400)}\n    status_b = <api_client>.get(f\"/billers/{id_b}\", headers=headers_b).json()[\"status\"]\n    assert status_b == \"ACTIVE\", f\"Expected ACTIVE at T+86400, got {status_b}\"\n    wd_b = <api_client>.post(\"/withdrawals\", json={\"biller_id\": id_b, \"amount\": \"10.00\"}, headers=headers_b)\n    assert wd_b.status_code in (200, 201, 202), \"Withdrawal must succeed after hold expires\""
+      },
+      {
+        "name": "test_biller_state_transitions_new_to_hold_to_active",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "API supports X-Test-Clock header",
+          "No existing biller with the target account_number for this customer"
+        ],
+        "actions": [
+          "POST /billers \u2192 confirm initial state is 'HOLD'",
+          "Advance clock to T+1 s \u2192 GET /billers/{id} \u2192 confirm still 'HOLD'",
+          "Advance clock to T+86400 s \u2192 GET /billers/{id} \u2192 confirm state transitions to 'ACTIVE'",
+          "Advance clock to T+86401 s \u2192 GET /billers/{id} \u2192 confirm remains 'ACTIVE'"
+        ],
+        "expected": [
+          "Immediately after POST: status == 'HOLD'",
+          "At T+1 s: status == 'HOLD'",
+          "At T+86400 s: status == 'ACTIVE'",
+          "At T+86401 s: status == 'ACTIVE' (stable, no regression)"
+        ],
+        "trace": [
+          "R-FIN-048: 24-hour hold before biller becomes usable",
+          "R-FIN-048: state path NEW \u2192 HOLD \u2192 ACTIVE"
+        ],
+        "executable": "def test_biller_state_transitions_new_to_hold_to_active(auth_headers, unique_biller_payload, cleanup_biller):\n    base_epoch = <utcnow_epoch>()\n    resp = <api_client>.post(\"/billers\", json=unique_biller_payload, headers=auth_headers)\n    assert resp.status_code == 201\n    biller_id = resp.json()[\"id\"]\n    cleanup_biller(biller_id)\n    assert resp.json()[\"status\"] == \"HOLD\"\n    def get_status(offset):\n        h = {**auth_headers, \"X-Test-Clock\": str(base_epoch + offset)}\n        r = <api_client>.get(f\"/billers/{biller_id}\", headers=h)\n        assert r.status_code == 200\n        return r.json()[\"status\"]\n    assert get_status(1) == \"HOLD\", \"1 s after creation must be HOLD\"\n    assert get_status(86400) == \"ACTIVE\", \"At exactly 86400 s must be ACTIVE\"\n    assert get_status(86401) == \"ACTIVE\", \"At 86401 s must remain ACTIVE\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-048",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 2902,
+    "latency_ms": 31148,
+    "wall_ms": 31148,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-048\",\n  \"reasoning\": \"R-FIN-048 mandates a 24-hour hold after biller registration and defers withdrawals during that period. Four tests cover the critical paths: (1) EP positive \u2013 a new valid biller lands in HOLD state with HTTP 201; (2) NEG negative \u2013 a duplicate biller registration returns HTTP 409; (3) BVA boundary \u2013 a biller registered at exactly 24 hours (86400 s) minus one second is still in HOLD, while one at exactly 86400 s transitions to ACTIVE, probing the exact threshold; (4) STC state-transition \u2013 the full lifecycle NEW\u2192HOLD\u2192ACTIVE is traced. Each test is self-contained via fixtures that create and clean up billers, and uses time injection via the API's test-clock header to remain deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_register_new_biller_enters_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"Biller with the target account number does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"POST /billers with valid biller payload (name, account_number, routing_number)\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created is returned\",\n        \"Response body contains status field equal to 'HOLD'\",\n        \"Response body contains a hold_expires_at timestamp approximately 24 hours in the future\",\n        \"GET /billers/{id} also returns status 'HOLD'\"\n      ],\n      \"trace\": [\n        \"R-FIN-048: customer adds biller \u2192 biller in hold state\",\n        \"R-FIN-048: 24-hour hold requirement \u2013 new biller must start in HOLD\"\n      ],\n      \"executable\": \"def test_register_new_biller_enters_hold_state(auth_headers, unique_biller_payload, cleanup_biller):\\n    resp = <api_client>.post(\\\"/billers\\\", json=unique_biller_payload, headers=auth_headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    biller_id = body[\\\"id\\\"]\\n    cleanup_biller(biller_id)\\n    assert body[\\\"status\\\"] == \\\"HOLD\\\"\\n    hold_expires = <parse_iso_datetime>(body[\\\"hold_expires_at\\\"])\\n    now = <utcnow>()\\n    delta_hours = (hold_expires - now).total_seconds() / 3600\\n    assert 23.9 <= delta_hours <= 24.1, f\\\"hold window out of range: {delta_hours}h\\\"\\n    get_resp = <api_client>.get(f\\\"/billers/{biller_id}\\\", headers=auth_headers)\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"HOLD\\\"\"\n    },\n    {\n      \"name\": \"test_register_duplicate_biller_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"A biller with the same account_number already exists for this customer\"\n      ],\n      \"actions\": [\n        \"POST /billers with biller payload for a pre-existing biller account_number\",\n        \"Capture HTTP response status and error body\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict is returned\",\n        \"Response body contains error code 'DUPLICATE_BILLER'\",\n        \"No new biller record is created\"\n      ],\n      \"trace\": [\n        \"R-FIN-048: error pathway \u2013 409 if duplicate biller\"\n      ],\n      \"executable\": \"def test_register_duplicate_biller_returns_409(auth_headers, existing_biller_payload, cleanup_biller):\\n    first = <api_client>.post(\\\"/billers\\\", json=existing_biller_payload, headers=auth_headers)\\n    assert first.status_code == 201\\n    biller_id = first.json()[\\\"id\\\"]\\n    cleanup_biller(biller_id)\\n    duplicate = <api_client>.post(\\\"/billers\\\", json=existing_biller_payload, headers=auth_headers)\\n    assert duplicate.status_code == 409\\n    err = duplicate.json()\\n    assert err.get(\\\"error_code\\\") == \\\"DUPLICATE_BILLER\\\"\\n    list_resp = <api_client>.get(\\\"/billers\\\", headers=auth_headers)\\n    billers = list_resp.json()[\\\"items\\\"]\\n    matching = [b for b in billers if b[\\\"account_number\\\"] == existing_biller_payload[\\\"account_number\\\"]]\\n    ass"
+  }
+}

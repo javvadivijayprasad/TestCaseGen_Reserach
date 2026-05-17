@@ -1,0 +1,187 @@
+{
+  "req": {
+    "id": "R-HLT-025",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-025",
+    "reasoning": "R-HLT-025 covers three distinct risk zones: (1) a valid message send with no attachment \u2014 happy path confirming storage and provider notification; (2) a message with an attachment containing disallowed PHI exfiltration patterns \u2014 must be blocked; (3) a boundary case at the exact maximum allowed attachment size with a clean file \u2014 system must accept without false-positive PHI rejection. EP drives the positive case (valid partition), NEG drives the blocked-attachment case, BVA drives the max-size boundary. An additional STC test covers the full state machine: draft \u2192 sent \u2192 provider-notified. A DT test covers the decision matrix of attachment present \u00d7 PHI detected combinations.",
+    "tests": [
+      {
+        "name": "test_send_plain_text_message_stores_and_notifies",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated and session cookie is valid",
+          "Provider exists in the system with a known provider_id",
+          "No prior unread messages exist for the provider (idempotent via <fixture_clean_inbox>)"
+        ],
+        "actions": [
+          "POST /messages with body {subject, body_text, provider_id} and no attachment",
+          "Assert HTTP 201 and capture message_id from response",
+          "GET /messages/{message_id} to verify storage",
+          "GET /notifications?provider_id=<provider_id> to verify notification created"
+        ],
+        "expected": [
+          "HTTP 201 returned with a non-null message_id",
+          "GET /messages/{message_id} returns 200 with matching subject and body",
+          "Provider notification record exists with status='unread'"
+        ],
+        "trace": [
+          "R-HLT-025: message stored",
+          "R-HLT-025: provider notified"
+        ],
+        "executable": "import pytest\n\ndef test_send_plain_text_message_stores_and_notifies(\n    authed_patient_session,   # <fixture>\n    api_client,               # <fixture>\n    clean_inbox,              # <fixture>\n    provider_id,              # <fixture>\n):\n    payload = {\n        \"subject\": \"Follow-up question\",\n        \"body\": \"When should I take the medication?\",\n        \"provider_id\": provider_id,\n    }\n    resp = api_client.post(\"/messages\", json=payload)\n    assert resp.status_code == 201\n    msg_id = resp.json()[\"message_id\"]\n    assert msg_id\n\n    get_resp = api_client.get(f\"/messages/{msg_id}\")\n    assert get_resp.status_code == 200\n    data = get_resp.json()\n    assert data[\"subject\"] == payload[\"subject\"]\n    assert data[\"body\"] == payload[\"body\"]\n\n    notif_resp = api_client.get(\"/notifications\", params={\"provider_id\": provider_id})\n    assert notif_resp.status_code == 200\n    notifs = notif_resp.json()[\"notifications\"]\n    assert any(n[\"message_id\"] == msg_id and n[\"status\"] == \"unread\" for n in notifs)"
+      },
+      {
+        "name": "test_attachment_with_phi_pattern_is_blocked",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated and session cookie is valid",
+          "Provider exists in the system with a known provider_id",
+          "A PDF fixture containing SSN and DOB PHI exfiltration patterns is available via <phi_attachment_fixture>"
+        ],
+        "actions": [
+          "POST /messages with a multipart body containing subject, body_text, provider_id, and the PHI-laden attachment",
+          "Assert HTTP 422 or 400 is returned",
+          "Assert response body contains a rejection reason referencing PHI policy",
+          "GET /messages to confirm no new message was stored"
+        ],
+        "expected": [
+          "HTTP 422 (or 400) returned \u2014 message rejected",
+          "Response JSON contains error code 'PHI_EXFILTRATION_DETECTED' or equivalent",
+          "No message record created in the system"
+        ],
+        "trace": [
+          "R-HLT-025: blocked when disallowed attachment detected"
+        ],
+        "executable": "import pytest\n\ndef test_attachment_with_phi_pattern_is_blocked(\n    authed_patient_session,   # <fixture>\n    api_client,               # <fixture>\n    phi_attachment_fixture,   # <fixture> returns (filename, bytes) with SSN/DOB patterns\n    provider_id,              # <fixture>\n):\n    fname, fbytes = phi_attachment_fixture\n    files = {\"attachment\": (fname, fbytes, \"application/pdf\")}\n    data = {\n        \"subject\": \"Test PHI attachment\",\n        \"body\": \"See attached.\",\n        \"provider_id\": provider_id,\n    }\n    resp = api_client.post(\"/messages\", data=data, files=files)\n    assert resp.status_code in (400, 422)\n    body = resp.json()\n    assert \"PHI_EXFILTRATION_DETECTED\" in body.get(\"error_code\", \"\")\n\n    list_resp = api_client.get(\"/messages\")\n    messages = list_resp.json().get(\"messages\", [])\n    subjects = [m[\"subject\"] for m in messages]\n    assert \"Test PHI attachment\" not in subjects"
+      },
+      {
+        "name": "test_attachment_at_max_allowed_size_without_phi_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated and session cookie is valid",
+          "Provider exists in the system with a known provider_id",
+          "System max attachment size is known (e.g., 10 MB); fixture generates a clean file of exactly that size via <max_size_clean_attachment_fixture>"
+        ],
+        "actions": [
+          "POST /messages with a multipart body containing a clean attachment of exactly MAX_ATTACHMENT_BYTES",
+          "Assert HTTP 201 is returned",
+          "GET /messages/{message_id} and verify attachment metadata reflects the correct size",
+          "Confirm no PHI rejection error is raised"
+        ],
+        "expected": [
+          "HTTP 201 returned \u2014 boundary-size clean attachment accepted",
+          "message_id present in response",
+          "Stored attachment size equals MAX_ATTACHMENT_BYTES"
+        ],
+        "trace": [
+          "R-HLT-025: messages containing attachments shall scan for disallowed PHI exfiltration patterns",
+          "R-HLT-025: message stored"
+        ],
+        "executable": "import pytest\n\nMAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB per system spec\n\ndef test_attachment_at_max_allowed_size_without_phi_is_accepted(\n    authed_patient_session,           # <fixture>\n    api_client,                       # <fixture>\n    max_size_clean_attachment_fixture, # <fixture> returns (filename, bytes) of exactly MAX bytes\n    provider_id,                      # <fixture>\n    clean_inbox,                      # <fixture>\n):\n    fname, fbytes = max_size_clean_attachment_fixture\n    assert len(fbytes) == MAX_ATTACHMENT_BYTES, \"Fixture size mismatch\"\n\n    files = {\"attachment\": (fname, fbytes, \"application/octet-stream\")}\n    data = {\n        \"subject\": \"Max size attachment test\",\n        \"body\": \"Boundary value test \u2014 no PHI.\",\n        \"provider_id\": provider_id,\n    }\n    resp = api_client.post(\"/messages\", data=data, files=files)\n    assert resp.status_code == 201\n    msg_id = resp.json()[\"message_id\"]\n    assert msg_id\n\n    get_resp = api_client.get(f\"/messages/{msg_id}\")\n    assert get_resp.status_code == 200\n    attachment_meta = get_resp.json().get(\"attachment\", {})\n    assert attachment_meta.get(\"size_bytes\") == MAX_ATTACHMENT_BYTES"
+      },
+      {
+        "name": "test_message_state_transitions_draft_to_sent_to_notified",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient is authenticated and session cookie is valid",
+          "Provider exists in the system with a known provider_id",
+          "System supports draft creation via POST /messages/drafts"
+        ],
+        "actions": [
+          "POST /messages/drafts to create a message in DRAFT state",
+          "Assert status='draft' in response",
+          "PATCH /messages/drafts/{draft_id}/send to transition to SENT",
+          "Assert HTTP 200 and status='sent'",
+          "GET /notifications?provider_id=<provider_id> and assert notification with status='unread' exists"
+        ],
+        "expected": [
+          "Draft created with status='draft'",
+          "Send transition returns status='sent'",
+          "Provider notification created with status='unread' after send"
+        ],
+        "trace": [
+          "R-HLT-025: message stored",
+          "R-HLT-025: provider notified"
+        ],
+        "executable": "import pytest\n\ndef test_message_state_transitions_draft_to_sent_to_notified(\n    authed_patient_session,  # <fixture>\n    api_client,              # <fixture>\n    clean_inbox,             # <fixture>\n    provider_id,             # <fixture>\n):\n    draft_payload = {\n        \"subject\": \"STC draft test\",\n        \"body\": \"Draft body.\",\n        \"provider_id\": provider_id,\n    }\n    draft_resp = api_client.post(\"/messages/drafts\", json=draft_payload)\n    assert draft_resp.status_code == 201\n    draft_data = draft_resp.json()\n    assert draft_data[\"status\"] == \"draft\"\n    draft_id = draft_data[\"draft_id\"]\n\n    send_resp = api_client.patch(f\"/messages/drafts/{draft_id}/send\")\n    assert send_resp.status_code == 200\n    assert send_resp.json()[\"status\"] == \"sent\"\n    msg_id = send_resp.json()[\"message_id\"]\n\n    notif_resp = api_client.get(\"/notifications\", params={\"provider_id\": provider_id})\n    assert notif_resp.status_code == 200\n    notifs = notif_resp.json()[\"notifications\"]\n    assert any(n[\"message_id\"] == msg_id and n[\"status\"] == \"unread\" for n in notifs)"
+      },
+      {
+        "name": "test_decision_table_attachment_present_vs_phi_detected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is authenticated and session cookie is valid",
+          "Provider exists in the system with a known provider_id",
+          "Fixtures available: clean_attachment_fixture (no PHI), phi_attachment_fixture (contains PHI patterns)"
+        ],
+        "actions": [
+          "Case A \u2014 No attachment, no PHI: POST plain message \u2192 expect 201",
+          "Case B \u2014 Attachment present, no PHI: POST with clean file \u2192 expect 201",
+          "Case C \u2014 Attachment present, PHI detected: POST with PHI file \u2192 expect 400/422",
+          "Assert stored message count increments by 2 (Cases A and B only)"
+        ],
+        "expected": [
+          "Case A: 201, message stored",
+          "Case B: 201, message stored",
+          "Case C: 400 or 422, message NOT stored, PHI_EXFILTRATION_DETECTED in error"
+        ],
+        "trace": [
+          "R-HLT-025: messages containing attachments shall scan for disallowed PHI exfiltration patterns",
+          "R-HLT-025: blocked when disallowed attachment detected"
+        ],
+        "executable": "import pytest\n\ndef test_decision_table_attachment_present_vs_phi_detected(\n    authed_patient_session,    # <fixture>\n    api_client,                # <fixture>\n    clean_inbox,               # <fixture>\n    provider_id,               # <fixture>\n    clean_attachment_fixture,  # <fixture> returns (fname, bytes) safe file\n    phi_attachment_fixture,    # <fixture> returns (fname, bytes) PHI file\n):\n    # Case A: no attachment\n    r_a = api_client.post(\"/messages\", json={\n        \"subject\": \"DT-A\", \"body\": \"no attach\", \"provider_id\": provider_id})\n    assert r_a.status_code == 201\n\n    # Case B: clean attachment\n    cf_name, cf_bytes = clean_attachment_fixture\n    r_b = api_client.post(\"/messages\",\n        data={\"subject\": \"DT-B\", \"body\": \"clean\", \"provider_id\": provider_id},\n        files={\"attachment\": (cf_name, cf_bytes, \"application/pdf\")})\n    assert r_b.status_code == 201\n\n    # Case C: PHI attachment\n    pf_name, pf_bytes = phi_attachment_fixture\n    r_c = api_client.post(\"/messages\",\n        data={\"subject\": \"DT-C\", \"body\": \"phi\", \"provider_id\": provider_id},\n        files={\"attachment\": (pf_name, pf_bytes, \"application/pdf\")})\n    assert r_c.status_code in (400, 422)\n    assert \"PHI_EXFILTRATION_DETECTED\" in r_c.json().get(\"error_code\", \"\")\n\n    msgs = api_client.get(\"/messages\").json().get(\"messages\", [])\n    subjects = [m[\"subject\"] for m in msgs]\n    assert \"DT-A\" in subjects\n    assert \"DT-B\" in subjects\n    assert \"DT-C\" not in subjects"
+      }
+    ]
+  },
+  "req_id": "R-HLT-025",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 978,
+    "output_tokens": 3747,
+    "latency_ms": 49533,
+    "wall_ms": 49533,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-025\",\n  \"reasoning\": \"R-HLT-025 covers three distinct risk zones: (1) a valid message send with no attachment \u2014 happy path confirming storage and provider notification; (2) a message with an attachment containing disallowed PHI exfiltration patterns \u2014 must be blocked; (3) a boundary case at the exact maximum allowed attachment size with a clean file \u2014 system must accept without false-positive PHI rejection. EP drives the positive case (valid partition), NEG drives the blocked-attachment case, BVA drives the max-size boundary. An additional STC test covers the full state machine: draft \u2192 sent \u2192 provider-notified. A DT test covers the decision matrix of attachment present \u00d7 PHI detected combinations.\",\n  \"tests\": [\n    {\n      \"name\": \"test_send_plain_text_message_stores_and_notifies\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated and session cookie is valid\",\n        \"Provider exists in the system with a known provider_id\",\n        \"No prior unread messages exist for the provider (idempotent via <fixture_clean_inbox>)\"\n      ],\n      \"actions\": [\n        \"POST /messages with body {subject, body_text, provider_id} and no attachment\",\n        \"Assert HTTP 201 and capture message_id from response\",\n        \"GET /messages/{message_id} to verify storage\",\n        \"GET /notifications?provider_id=<provider_id> to verify notification created\"\n      ],\n      \"expected\": [\n        \"HTTP 201 returned with a non-null message_id\",\n        \"GET /messages/{message_id} returns 200 with matching subject and body\",\n        \"Provider notification record exists with status='unread'\"\n      ],\n      \"trace\": [\n        \"R-HLT-025: message stored\",\n        \"R-HLT-025: provider notified\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_send_plain_text_message_stores_and_notifies(\\n    authed_patient_session,   # <fixture>\\n    api_client,               # <fixture>\\n    clean_inbox,              # <fixture>\\n    provider_id,              # <fixture>\\n):\\n    payload = {\\n        \\\"subject\\\": \\\"Follow-up question\\\",\\n        \\\"body\\\": \\\"When should I take the medication?\\\",\\n        \\\"provider_id\\\": provider_id,\\n    }\\n    resp = api_client.post(\\\"/messages\\\", json=payload)\\n    assert resp.status_code == 201\\n    msg_id = resp.json()[\\\"message_id\\\"]\\n    assert msg_id\\n\\n    get_resp = api_client.get(f\\\"/messages/{msg_id}\\\")\\n    assert get_resp.status_code == 200\\n    data = get_resp.json()\\n    assert data[\\\"subject\\\"] == payload[\\\"subject\\\"]\\n    assert data[\\\"body\\\"] == payload[\\\"body\\\"]\\n\\n    notif_resp = api_client.get(\\\"/notifications\\\", params={\\\"provider_id\\\": provider_id})\\n    assert notif_resp.status_code == 200\\n    notifs = notif_resp.json()[\\\"notifications\\\"]\\n    assert any(n[\\\"message_id\\\"] == msg_id and n[\\\"status\\\"] == \\\"unread\\\" for n in notifs)\"\n    },\n    {\n      \"name\": \"test_attachment_with_phi_pattern_is_blocked\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated and session cookie is valid\",\n        \"Provider exists in the system with a known provider_id\",\n        \"A PDF fixture containing SSN and DOB PHI exfiltration patterns is available via <phi_attachment_fixture>\"\n      ],\n      \"actions\": [\n        \"POST /messages with a multipart body containing subject, body_text, provider_id, and the PHI-laden attachment\",\n        \"Assert HTTP 422 or 400 is returned\",\n        \"Assert response body contains a rejection reason referencing PHI policy\",\n        \"GET /messages to confirm no new message was stored\"\n      ],\n      \"expected\": [\n        \"HTTP 422 (or 400) returned \u2014 message rejected\",\n        \"Response JSON contains error code 'PHI_EXFILTRATION_DETECTED' or equivalent\",\n        \"No message record created in the system\"\n      ],\n      \"trace\": [\n        \"R-HLT-025: blocked when disallowed attachment detected\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef "
+  }
+}

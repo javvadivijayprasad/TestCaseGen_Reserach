@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-WEB-103",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Reset employee password \u2014 variant 2",
+    "statement": "An employee shall reset their password via an email link that expires after 30 minutes; expired links must be rejected. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "valid reset token"
+    ],
+    "preconditions": [
+      "valid reset token"
+    ],
+    "triggers": [
+      "employee submits new password"
+    ],
+    "expected_outcomes": [
+      "password updated",
+      "all sessions invalidated",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "410 when token expired",
+      "422 when password fails policy"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/password/reset"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-103",
+    "reasoning": "R-WEB-103 defines four testable behaviours: (1) a valid, unexpired token allows a policy-compliant password reset and invalidates sessions; (2) a token used exactly at its 30-minute expiry boundary is rejected; (3) an already-expired token yields HTTP 410; (4) a password that violates policy yields HTTP 422. We also need to verify idempotency (resubmitting an already-used token is safe/rejected). Tests are mapped to EP (happy path partition), BVA (token age at boundary), STC (token state machine: valid\u2192used, valid\u2192expired), NEG (policy violation), and DT (expired token decision).",
+    "tests": [
+      {
+        "name": "test_reset_password_valid_token_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A valid, unexpired reset token exists for employee user",
+          "Token age is less than 30 minutes",
+          "New password satisfies the password policy"
+        ],
+        "actions": [
+          "POST /password/reset with valid token and policy-compliant new password",
+          "Attempt to authenticate with the old password",
+          "Attempt to authenticate with the new password"
+        ],
+        "expected": [
+          "HTTP 200 returned from /password/reset",
+          "Response body confirms password updated",
+          "Login with old password fails (sessions invalidated)",
+          "Login with new password succeeds"
+        ],
+        "trace": [
+          "R-WEB-103: password updated",
+          "R-WEB-103: all sessions invalidated"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import reset_password, login, get_valid_token\n\ndef test_reset_password_valid_token_success(<api_client>, <employee_fixture>):\n    token = get_valid_token(<employee_fixture>.email, age_seconds=0)\n    new_pw = \"ValidP@ss1!\"\n    old_pw = <employee_fixture>.password\n\n    resp = reset_password(<api_client>, token=token, new_password=new_pw)\n    assert resp.status_code == 200\n    assert resp.json().get(\"status\") == \"updated\"\n\n    old_login = login(<api_client>, <employee_fixture>.email, old_pw)\n    assert old_login.status_code == 401, \"Old password must be rejected after reset\"\n\n    new_login = login(<api_client>, <employee_fixture>.email, new_pw)\n    assert new_login.status_code == 200, \"New password must be accepted\"\n"
+      },
+      {
+        "name": "test_reset_password_expired_token_rejected_410",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A reset token exists for employee user",
+          "Token age is greater than 30 minutes (expired)"
+        ],
+        "actions": [
+          "POST /password/reset with expired token and policy-compliant new password"
+        ],
+        "expected": [
+          "HTTP 410 Gone returned",
+          "Password is NOT changed",
+          "Response body contains an error message indicating token expiry"
+        ],
+        "trace": [
+          "R-WEB-103: 410 when token expired"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import reset_password, login, get_valid_token\n\ndef test_reset_password_expired_token_rejected_410(<api_client>, <employee_fixture>):\n    token = get_valid_token(\n        <employee_fixture>.email, age_seconds=1801\n    )\n    original_pw = <employee_fixture>.password\n\n    resp = reset_password(<api_client>, token=token, new_password=\"ValidP@ss1!\")\n    assert resp.status_code == 410, f\"Expected 410, got {resp.status_code}\"\n    assert \"expired\" in resp.json().get(\"error\", \"\").lower()\n\n    still_valid = login(<api_client>, <employee_fixture>.email, original_pw)\n    assert still_valid.status_code == 200, \"Password must remain unchanged\"\n"
+      },
+      {
+        "name": "test_reset_password_token_at_exact_30_min_boundary_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A reset token exists for employee user",
+          "Token age is exactly 1800 seconds (30 minutes \u2014 the expiry boundary)"
+        ],
+        "actions": [
+          "POST /password/reset with token aged exactly 1800 seconds and policy-compliant new password"
+        ],
+        "expected": [
+          "HTTP 410 Gone returned (boundary is inclusive: expired at exactly 30 min)",
+          "Password is NOT changed"
+        ],
+        "trace": [
+          "R-WEB-103: expired links must be rejected",
+          "R-WEB-103: 410 when token expired"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import reset_password, login, get_valid_token\n\ndef test_reset_password_token_at_exact_30_min_boundary_rejected(\n    <api_client>, <employee_fixture>\n):\n    token = get_valid_token(\n        <employee_fixture>.email, age_seconds=1800\n    )\n    original_pw = <employee_fixture>.password\n\n    resp = reset_password(<api_client>, token=token, new_password=\"ValidP@ss2!\")\n    assert resp.status_code == 410, (\n        f\"Token at exact boundary (1800s) must be rejected with 410, got {resp.status_code}\"\n    )\n\n    login_resp = login(<api_client>, <employee_fixture>.email, original_pw)\n    assert login_resp.status_code == 200, \"Password must remain unchanged at boundary\"\n"
+      },
+      {
+        "name": "test_reset_password_policy_violation_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A valid, unexpired reset token exists for employee user",
+          "New password intentionally violates policy (too short, no special chars)"
+        ],
+        "actions": [
+          "POST /password/reset with valid token and policy-violating new password"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity returned",
+          "Response body contains a field-level validation error for password",
+          "Password is NOT changed"
+        ],
+        "trace": [
+          "R-WEB-103: 422 when password fails policy"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import reset_password, login, get_valid_token\n\ndef test_reset_password_policy_violation_returns_422(<api_client>, <employee_fixture>):\n    token = get_valid_token(<employee_fixture>.email, age_seconds=0)\n    weak_password = \"abc\"\n    original_pw = <employee_fixture>.password\n\n    resp = reset_password(<api_client>, token=token, new_password=weak_password)\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}\"\n    body = resp.json()\n    assert any(\n        \"password\" in str(err).lower() for err in body.get(\"errors\", [])\n    ), \"Response must flag password policy violation\"\n\n    login_resp = login(<api_client>, <employee_fixture>.email, original_pw)\n    assert login_resp.status_code == 200, \"Password must remain unchanged after 422\"\n"
+      },
+      {
+        "name": "test_reset_password_idempotent_second_submission_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "A valid, unexpired reset token exists for employee user",
+          "First submission with the token has already succeeded"
+        ],
+        "actions": [
+          "POST /password/reset with the same token a second time using a different valid password"
+        ],
+        "expected": [
+          "Second call returns HTTP 410 (token already consumed / state = used)",
+          "Password remains as set by the first call",
+          "No additional session invalidation side-effects"
+        ],
+        "trace": [
+          "R-WEB-103: action must be idempotent under retry",
+          "R-WEB-103: all sessions invalidated (only once)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import reset_password, login, get_valid_token\n\ndef test_reset_password_idempotent_second_submission_rejected(\n    <api_client>, <employee_fixture>\n):\n    token = get_valid_token(<employee_fixture>.email, age_seconds=0)\n    first_pw = \"ValidP@ss3!\"\n    second_pw = \"AnotherP@ss4!\"\n\n    first_resp = reset_password(<api_client>, token=token, new_password=first_pw)\n    assert first_resp.status_code == 200, \"First reset must succeed\"\n\n    second_resp = reset_password(<api_client>, token=token, new_password=second_pw)\n    assert second_resp.status_code == 410, (\n        f\"Reuse of consumed token must return 410, got {second_resp.status_code}\"\n    )\n\n    login_resp = login(<api_client>, <employee_fixture>.email, first_pw)\n    assert login_resp.status_code == 200, \"Password must remain as set by first call\"\n\n    rejected = login(<api_client>, <employee_fixture>.email, second_pw)\n    assert rejected.status_code == 401, \"Second password must not have been applied\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-103",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1012,
+    "output_tokens": 2551,
+    "latency_ms": 27421,
+    "wall_ms": 27421,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-103\",\n  \"reasoning\": \"R-WEB-103 defines four testable behaviours: (1) a valid, unexpired token allows a policy-compliant password reset and invalidates sessions; (2) a token used exactly at its 30-minute expiry boundary is rejected; (3) an already-expired token yields HTTP 410; (4) a password that violates policy yields HTTP 422. We also need to verify idempotency (resubmitting an already-used token is safe/rejected). Tests are mapped to EP (happy path partition), BVA (token age at boundary), STC (token state machine: valid\u2192used, valid\u2192expired), NEG (policy violation), and DT (expired token decision).\",\n  \"tests\": [\n    {\n      \"name\": \"test_reset_password_valid_token_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A valid, unexpired reset token exists for employee user\",\n        \"Token age is less than 30 minutes\",\n        \"New password satisfies the password policy\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with valid token and policy-compliant new password\",\n        \"Attempt to authenticate with the old password\",\n        \"Attempt to authenticate with the new password\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned from /password/reset\",\n        \"Response body confirms password updated\",\n        \"Login with old password fails (sessions invalidated)\",\n        \"Login with new password succeeds\"\n      ],\n      \"trace\": [\n        \"R-WEB-103: password updated\",\n        \"R-WEB-103: all sessions invalidated\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import reset_password, login, get_valid_token\\n\\ndef test_reset_password_valid_token_success(<api_client>, <employee_fixture>):\\n    token = get_valid_token(<employee_fixture>.email, age_seconds=0)\\n    new_pw = \\\"ValidP@ss1!\\\"\\n    old_pw = <employee_fixture>.password\\n\\n    resp = reset_password(<api_client>, token=token, new_password=new_pw)\\n    assert resp.status_code == 200\\n    assert resp.json().get(\\\"status\\\") == \\\"updated\\\"\\n\\n    old_login = login(<api_client>, <employee_fixture>.email, old_pw)\\n    assert old_login.status_code == 401, \\\"Old password must be rejected after reset\\\"\\n\\n    new_login = login(<api_client>, <employee_fixture>.email, new_pw)\\n    assert new_login.status_code == 200, \\\"New password must be accepted\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reset_password_expired_token_rejected_410\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"A reset token exists for employee user\",\n        \"Token age is greater than 30 minutes (expired)\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with expired token and policy-compliant new password\"\n      ],\n      \"expected\": [\n        \"HTTP 410 Gone returned\",\n        \"Password is NOT changed\",\n        \"Response body contains an error message indicating token expiry\"\n      ],\n      \"trace\": [\n        \"R-WEB-103: 410 when token expired\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import reset_password, login, get_valid_token\\n\\ndef test_reset_password_expired_token_rejected_410(<api_client>, <employee_fixture>):\\n    token = get_valid_token(\\n        <employee_fixture>.email, age_seconds=1801\\n    )\\n    original_pw = <employee_fixture>.password\\n\\n    resp = reset_password(<api_client>, token=token, new_password=\\\"ValidP@ss1!\\\")\\n    assert resp.status_code == 410, f\\\"Expected 410, got {resp.status_code}\\\"\\n    assert \\\"expired\\\" in resp.json().get(\\\"error\\\", \\\"\\\").lower()\\n\\n    still_valid = login(<api_client>, <employee_fixture>.email, original_pw)\\n    assert still_valid.status_code == 200, \\\"Password must remain unchanged\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reset_password_token_at_exact_30_min_boundary_rejected\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"A reset token exists for employee user\",\n        \"Token age is exactly 1800 seconds (30 minutes \u2014 the expiry boundary)\"\n      ],\n   "
+  }
+}

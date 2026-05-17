@@ -1,0 +1,180 @@
+{
+  "req": {
+    "id": "R-HLT-007",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Close encounter",
+    "statement": "A clinician shall close an Encounter; closed Encounters shall reject further modifications except for addendum Observations.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "encounter open"
+    ],
+    "triggers": [
+      "clinician closes encounter"
+    ],
+    "expected_outcomes": [
+      "encounter.status=finished"
+    ],
+    "error_pathways": [
+      "409 when modifying closed encounter"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-007",
+    "reasoning": "The requirement covers three distinct testing concerns: (1) the happy-path state transition from 'in-progress' to 'finished' via POST /Encounter/{id}/close, (2) the rejection of further modifications on a closed encounter (negative/error path returning 409), and (3) the boundary condition where an addendum Observation is the sole permitted write after closure. State Transition Coverage drives the happy-path and addendum tests because the system moves through well-defined states (open \u2192 finished). Negative Path and Decision Table drive the rejection tests. Equivalence Partitioning isolates the 'closed encounter' partition for the modification-rejection test. BVA targets the exact threshold between permitted (addendum) and forbidden (non-addendum) writes on a closed encounter.",
+    "tests": [
+      {
+        "name": "test_close_open_encounter_sets_status_finished",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "An Encounter exists with status='in-progress'",
+          "The acting user has clinician role",
+          "The FHIR-lite service is reachable"
+        ],
+        "actions": [
+          "Create a fresh open Encounter via <create_encounter_fixture>",
+          "POST /Encounter/{id}/close with valid clinician credentials",
+          "GET /Encounter/{id} to read back the resource"
+        ],
+        "expected": [
+          "POST /Encounter/{id}/close returns HTTP 200",
+          "Response body contains status='finished'",
+          "Subsequent GET confirms encounter.status == 'finished'"
+        ],
+        "trace": [
+          "R-HLT-007: 'A clinician shall close an Encounter'",
+          "R-HLT-007: 'closed Encounters \u2026 encounter.status=finished'"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_close_open_encounter_sets_status_finished(base_url, clinician_headers, open_encounter):\n    enc_id = open_encounter[\"id\"]\n\n    close_resp = requests.post(\n        f\"{base_url}/Encounter/{enc_id}/close\",\n        headers=clinician_headers,\n    )\n    assert close_resp.status_code == 200, close_resp.text\n\n    body = close_resp.json()\n    assert body.get(\"status\") == \"finished\", (\n        f\"Expected 'finished', got {body.get('status')!r}\"\n    )\n\n    get_resp = requests.get(\n        f\"{base_url}/Encounter/{enc_id}\",\n        headers=clinician_headers,\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"finished\"\n"
+      },
+      {
+        "name": "test_modify_closed_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "An Encounter exists with status='finished' (already closed)",
+          "The acting user has clinician role",
+          "The FHIR-lite service is reachable"
+        ],
+        "actions": [
+          "Create and close an Encounter via <create_and_close_encounter_fixture>",
+          "Attempt PUT /Encounter/{id} with a modified non-addendum field (e.g., change 'period.end')",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "PUT /Encounter/{id} returns HTTP 409",
+          "Response body contains an error message indicating the encounter is closed"
+        ],
+        "trace": [
+          "R-HLT-007: 'closed Encounters shall reject further modifications'",
+          "R-HLT-007: error pathway '409 when modifying closed encounter'"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_modify_closed_encounter_returns_409(base_url, clinician_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n\n    modified = dict(closed_encounter)\n    modified[\"period\"] = {\"end\": \"2099-12-31T23:59:59Z\"}\n\n    put_resp = requests.put(\n        f\"{base_url}/Encounter/{enc_id}\",\n        json=modified,\n        headers=clinician_headers,\n    )\n    assert put_resp.status_code == 409, (\n        f\"Expected 409 Conflict, got {put_resp.status_code}: {put_resp.text}\"\n    )\n\n    error_body = put_resp.json()\n    assert \"closed\" in str(error_body).lower() or \"finished\" in str(error_body).lower()\n"
+      },
+      {
+        "name": "test_addendum_observation_allowed_on_closed_encounter",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "An Encounter exists with status='finished'",
+          "The acting user has clinician role",
+          "The FHIR-lite service is reachable"
+        ],
+        "actions": [
+          "Create and close an Encounter via <create_and_close_encounter_fixture>",
+          "POST an Observation with category='addendum' linked to the closed Encounter",
+          "GET the Observation to verify persistence"
+        ],
+        "expected": [
+          "POST Observation returns HTTP 201",
+          "Observation is linked to the closed Encounter",
+          "Encounter status remains 'finished' (unaffected)"
+        ],
+        "trace": [
+          "R-HLT-007: 'closed Encounters shall reject further modifications EXCEPT for addendum Observations'",
+          "R-HLT-007: boundary between permitted and forbidden writes on a closed encounter"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_addendum_observation_allowed_on_closed_encounter(base_url, clinician_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n\n    addendum_obs = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"code\": \"addendum\"}]}],\n        \"code\": {\"text\": \"Addendum note\"},\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n    }\n\n    post_resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=addendum_obs,\n        headers=clinician_headers,\n    )\n    assert post_resp.status_code == 201, (\n        f\"Expected 201 for addendum Observation, got {post_resp.status_code}: {post_resp.text}\"\n    )\n\n    obs_id = post_resp.json()[\"id\"]\n    get_obs = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_headers)\n    assert get_obs.status_code == 200\n    assert f\"Encounter/{enc_id}\" in get_obs.json()[\"encounter\"][\"reference\"]\n\n    enc_resp = requests.get(f\"{base_url}/Encounter/{enc_id}\", headers=clinician_headers)\n    assert enc_resp.json()[\"status\"] == \"finished\"\n"
+      },
+      {
+        "name": "test_close_already_closed_encounter_returns_conflict",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "An Encounter exists with status='finished'",
+          "The acting user has clinician role",
+          "The FHIR-lite service is reachable"
+        ],
+        "actions": [
+          "Create and close an Encounter via <create_and_close_encounter_fixture>",
+          "POST /Encounter/{id}/close a second time on the already-closed Encounter",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "Second POST /Encounter/{id}/close returns HTTP 409",
+          "Response body signals that the encounter is already in a terminal state"
+        ],
+        "trace": [
+          "R-HLT-007: state (finished) x action (close) -> error, per Decision Table row",
+          "R-HLT-007: 'closed Encounters shall reject further modifications'"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_close_already_closed_encounter_returns_conflict(base_url, clinician_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n\n    second_close = requests.post(\n        f\"{base_url}/Encounter/{enc_id}/close\",\n        headers=clinician_headers,\n    )\n    assert second_close.status_code == 409, (\n        f\"Expected 409 on double-close, got {second_close.status_code}: {second_close.text}\"\n    )\n\n    error_body = second_close.json()\n    detail = str(error_body).lower()\n    assert \"finished\" in detail or \"already closed\" in detail or \"conflict\" in detail\n"
+      },
+      {
+        "name": "test_non_addendum_observation_on_closed_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "EP",
+        "preconditions": [
+          "An Encounter exists with status='finished'",
+          "The acting user has clinician role",
+          "The FHIR-lite service is reachable"
+        ],
+        "actions": [
+          "Create and close an Encounter via <create_and_close_encounter_fixture>",
+          "POST an Observation with category='exam' (non-addendum) linked to the closed Encounter",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "POST Observation returns HTTP 409",
+          "Non-addendum writes are rejected on a finished encounter"
+        ],
+        "trace": [
+          "R-HLT-007: only addendum Observations are exempted; all other writes are forbidden",
+          "R-HLT-007: error pathway '409 when modifying closed encounter'"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_non_addendum_observation_on_closed_encounter_returns_409(base_url, clinician_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n\n    non_addendum_obs = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"code\": \"exam\"}]}],\n        \"code\": {\"text\": \"Routine exam note\"},\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n    }\n\n    post_resp = requests.post(\n        f\"{base_url}/Observation\",\n        json=non_addendum_obs,\n        headers=clinician_headers,\n    )\n    assert post_resp.status_code == 409, (\n        f\"Expected 409 for non-addendum Observation on closed encounter, \"\n        f\"got {post_resp.status_code}: {post_resp.text}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-007",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=EP"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 978,
+    "output_tokens": 2931,
+    "latency_ms": 34901,
+    "wall_ms": 34901,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-007\",\n  \"reasoning\": \"The requirement covers three distinct testing concerns: (1) the happy-path state transition from 'in-progress' to 'finished' via POST /Encounter/{id}/close, (2) the rejection of further modifications on a closed encounter (negative/error path returning 409), and (3) the boundary condition where an addendum Observation is the sole permitted write after closure. State Transition Coverage drives the happy-path and addendum tests because the system moves through well-defined states (open \u2192 finished). Negative Path and Decision Table drive the rejection tests. Equivalence Partitioning isolates the 'closed encounter' partition for the modification-rejection test. BVA targets the exact threshold between permitted (addendum) and forbidden (non-addendum) writes on a closed encounter.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_open_encounter_sets_status_finished\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"An Encounter exists with status='in-progress'\",\n        \"The acting user has clinician role\",\n        \"The FHIR-lite service is reachable\"\n      ],\n      \"actions\": [\n        \"Create a fresh open Encounter via <create_encounter_fixture>\",\n        \"POST /Encounter/{id}/close with valid clinician credentials\",\n        \"GET /Encounter/{id} to read back the resource\"\n      ],\n      \"expected\": [\n        \"POST /Encounter/{id}/close returns HTTP 200\",\n        \"Response body contains status='finished'\",\n        \"Subsequent GET confirms encounter.status == 'finished'\"\n      ],\n      \"trace\": [\n        \"R-HLT-007: 'A clinician shall close an Encounter'\",\n        \"R-HLT-007: 'closed Encounters \u2026 encounter.status=finished'\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_close_open_encounter_sets_status_finished(base_url, clinician_headers, open_encounter):\\n    enc_id = open_encounter[\\\"id\\\"]\\n\\n    close_resp = requests.post(\\n        f\\\"{base_url}/Encounter/{enc_id}/close\\\",\\n        headers=clinician_headers,\\n    )\\n    assert close_resp.status_code == 200, close_resp.text\\n\\n    body = close_resp.json()\\n    assert body.get(\\\"status\\\") == \\\"finished\\\", (\\n        f\\\"Expected 'finished', got {body.get('status')!r}\\\"\\n    )\\n\\n    get_resp = requests.get(\\n        f\\\"{base_url}/Encounter/{enc_id}\\\",\\n        headers=clinician_headers,\\n    )\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"finished\\\"\\n\"\n    },\n    {\n      \"name\": \"test_modify_closed_encounter_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"An Encounter exists with status='finished' (already closed)\",\n        \"The acting user has clinician role\",\n        \"The FHIR-lite service is reachable\"\n      ],\n      \"actions\": [\n        \"Create and close an Encounter via <create_and_close_encounter_fixture>\",\n        \"Attempt PUT /Encounter/{id} with a modified non-addendum field (e.g., change 'period.end')\",\n        \"Capture the HTTP response\"\n      ],\n      \"expected\": [\n        \"PUT /Encounter/{id} returns HTTP 409\",\n        \"Response body contains an error message indicating the encounter is closed\"\n      ],\n      \"trace\": [\n        \"R-HLT-007: 'closed Encounters shall reject further modifications'\",\n        \"R-HLT-007: error pathway '409 when modifying closed encounter'\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_modify_closed_encounter_returns_409(base_url, clinician_headers, closed_encounter):\\n    enc_id = closed_encounter[\\\"id\\\"]\\n\\n    modified = dict(closed_encounter)\\n    modified[\\\"period\\\"] = {\\\"end\\\": \\\"2099-12-31T23:59:59Z\\\"}\\n\\n    put_resp = requests.put(\\n        f\\\"{base_url}/Encounter/{enc_id}\\\",\\n        json=modified,\\n        headers=clinician_headers,\\n    )\\n    assert put_resp.status_code == 409, (\\n        f\\\"Expected 409 Conflict, got {put_resp.status_code}: {put_resp.text}\\\"\\n    )\\n\\n    error_body = put_resp.js"
+  }
+}

@@ -1,0 +1,142 @@
+{
+  "req": {
+    "id": "R-HLT-092",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Inter-facility referral (audit)",
+    "statement": "A clinician shall send a referral to another facility; the referral shall trigger a secure message and consent check. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician sends referral"
+    ],
+    "expected_outcomes": [
+      "referral stored",
+      "secure message dispatched"
+    ],
+    "error_pathways": [
+      "403 when consent absent"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ReferralRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-092",
+    "reasoning": "R-HLT-092 mandates three verifiable slices: (1) happy-path referral creation by an authenticated clinician that stores the referral, dispatches a secure message, checks consent, and emits an AuditEvent; (2) rejection with HTTP 403 when patient consent is absent; (3) a boundary case exercising the minimum-viable referral payload (exactly 1 character subject note) to probe edge-of-valid input. Each test is isolated via fixture-supplied auth tokens and ephemeral patient/facility IDs so they can run in any order without shared state. AuditEvent verification is performed by querying the FHIR AuditEvent endpoint filtered by the referral entity reference, satisfying the end-to-end audit mandate. Heuristics selected: EP for the nominal flow, NEG for the consent-absent 403, and BVA for the minimal-payload boundary.",
+    "tests": [
+      {
+        "name": "test_referral_happy_path_stores_resource_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician JWT available via <clinician_auth_token> fixture",
+          "Target facility ID available via <target_facility_id> fixture",
+          "Patient has active consent recorded in the system",
+          "FHIR-Lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid clinician token, consented patient ID, and target facility ID",
+          "Assert HTTP 201 and capture referral ID from response Location header",
+          "GET /AuditEvent?entity=ReferralRequest/<referral_id> with clinician token",
+          "Assert at least one AuditEvent record is returned"
+        ],
+        "expected": [
+          "HTTP 201 Created on POST /ReferralRequest",
+          "Response body contains resourceType=ReferralRequest and a server-assigned id",
+          "AuditEvent query returns HTTP 200 with total >= 1",
+          "AuditEvent action field equals 'C' (create)"
+        ],
+        "trace": [
+          "R-HLT-092: referral stored",
+          "R-HLT-092: secure message dispatched",
+          "R-HLT-092: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_referral_happy_path_stores_resource_and_emits_audit(\n    base_url, clinician_auth_token, consented_patient_id, target_facility_id\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{consented_patient_id}\"},\n        \"recipient\": [{\"reference\": f\"Organization/{target_facility_id}\"}],\n        \"note\": [{\"text\": \"Routine cardiology referral\"}]\n    }\n    post_resp = requests.post(\n        f\"{base_url}/ReferralRequest\", json=payload, headers=headers\n    )\n    assert post_resp.status_code == 201, post_resp.text\n    referral_id = post_resp.json()[\"id\"]\n    assert referral_id, \"Server must assign an id\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"ReferralRequest/{referral_id}\"},\n        headers=headers\n    )\n    assert audit_resp.status_code == 200\n    bundle = audit_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"At least one AuditEvent must exist\"\n    actions = [e[\"resource\"][\"action\"]\n               for e in bundle.get(\"entry\", [])]\n    assert \"C\" in actions, \"AuditEvent action 'C' (create) must be present\"\n"
+      },
+      {
+        "name": "test_referral_rejected_403_when_consent_absent",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician JWT available via <clinician_auth_token> fixture",
+          "Patient has NO active consent recorded (non_consented_patient_id fixture)",
+          "Target facility ID available via <target_facility_id> fixture",
+          "FHIR-Lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid clinician token but non-consented patient ID",
+          "Assert HTTP 403 Forbidden is returned",
+          "Assert no ReferralRequest resource was persisted",
+          "GET /AuditEvent for the attempted referral and confirm a denial AuditEvent exists"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden on POST /ReferralRequest",
+          "Response body contains OperationOutcome with issue.code=forbidden",
+          "No ReferralRequest resource created for this patient",
+          "AuditEvent with outcome != 0 (failure) is recorded for the denied attempt"
+        ],
+        "trace": [
+          "R-HLT-092: error pathway - 403 when consent absent",
+          "R-HLT-092: AuditEvent emitted for every operation (including denied ones)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_referral_rejected_403_when_consent_absent(\n    base_url, clinician_auth_token, non_consented_patient_id, target_facility_id\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{non_consented_patient_id}\"},\n        \"recipient\": [{\"reference\": f\"Organization/{target_facility_id}\"}],\n        \"note\": [{\"text\": \"Neurology consult\"}]\n    }\n    post_resp = requests.post(\n        f\"{base_url}/ReferralRequest\", json=payload, headers=headers\n    )\n    assert post_resp.status_code == 403, (\n        f\"Expected 403, got {post_resp.status_code}: {post_resp.text}\"\n    )\n    body = post_resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    codes = [i.get(\"code\") for i in body.get(\"issue\", [])]\n    assert \"forbidden\" in codes, \"OperationOutcome must cite 'forbidden'\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"patient\": non_consented_patient_id, \"action\": \"C\",\n                \"outcome\": \"8\"},\n        headers=headers\n    )\n    assert audit_resp.status_code == 200\n    assert audit_resp.json().get(\"total\", 0) >= 1, (\n        \"A failed AuditEvent (outcome!=0) must be recorded even for denied ops\"\n    )\n"
+      },
+      {
+        "name": "test_referral_boundary_minimal_note_single_character",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician JWT available via <clinician_auth_token> fixture",
+          "Patient has active consent recorded (consented_patient_id fixture)",
+          "Target facility ID available via <target_facility_id> fixture",
+          "FHIR-Lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "POST /ReferralRequest with a note.text value of exactly 1 character ('A') \u2014 the minimum non-empty string",
+          "Assert HTTP 201 is returned",
+          "GET the created ReferralRequest by ID and verify note.text is preserved as 'A'",
+          "Confirm AuditEvent is emitted for the creation"
+        ],
+        "expected": [
+          "HTTP 201 Created on POST /ReferralRequest with 1-char note",
+          "Stored resource echoes note[0].text == 'A'",
+          "AuditEvent with action 'C' exists for the created referral ID",
+          "No validation error is raised for a single-character note"
+        ],
+        "trace": [
+          "R-HLT-092: referral stored (boundary input: minimal note length = 1 char)",
+          "R-HLT-092: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_referral_boundary_minimal_note_single_character(\n    base_url, clinician_auth_token, consented_patient_id, target_facility_id\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    minimal_note = \"A\"  # BVA: lower boundary of non-empty string\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{consented_patient_id}\"},\n        \"recipient\": [{\"reference\": f\"Organization/{target_facility_id}\"}],\n        \"note\": [{\"text\": minimal_note}]\n    }\n    post_resp = requests.post(\n        f\"{base_url}/ReferralRequest\", json=payload, headers=headers\n    )\n    assert post_resp.status_code == 201, post_resp.text\n    referral_id = post_resp.json()[\"id\"]\n\n    get_resp = requests.get(\n        f\"{base_url}/ReferralRequest/{referral_id}\", headers=headers\n    )\n    assert get_resp.status_code == 200\n    stored = get_resp.json()\n    assert stored[\"note\"][0][\"text\"] == minimal_note, (\n        \"Server must preserve exact 1-char note text\"\n    )\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"ReferralRequest/{referral_id}\"},\n        headers=headers\n    )\n    assert audit_resp.status_code == 200\n    assert audit_resp.json().get(\"total\", 0) >= 1, (\n        \"AuditEvent must be emitted even for boundary-input referrals\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-092",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1009,
+    "output_tokens": 2849,
+    "latency_ms": 38401,
+    "wall_ms": 38401,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-092\",\n  \"reasoning\": \"R-HLT-092 mandates three verifiable slices: (1) happy-path referral creation by an authenticated clinician that stores the referral, dispatches a secure message, checks consent, and emits an AuditEvent; (2) rejection with HTTP 403 when patient consent is absent; (3) a boundary case exercising the minimum-viable referral payload (exactly 1 character subject note) to probe edge-of-valid input. Each test is isolated via fixture-supplied auth tokens and ephemeral patient/facility IDs so they can run in any order without shared state. AuditEvent verification is performed by querying the FHIR AuditEvent endpoint filtered by the referral entity reference, satisfying the end-to-end audit mandate. Heuristics selected: EP for the nominal flow, NEG for the consent-absent 403, and BVA for the minimal-payload boundary.\",\n  \"tests\": [\n    {\n      \"name\": \"test_referral_happy_path_stores_resource_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician JWT available via <clinician_auth_token> fixture\",\n        \"Target facility ID available via <target_facility_id> fixture\",\n        \"Patient has active consent recorded in the system\",\n        \"FHIR-Lite service is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with valid clinician token, consented patient ID, and target facility ID\",\n        \"Assert HTTP 201 and capture referral ID from response Location header\",\n        \"GET /AuditEvent?entity=ReferralRequest/<referral_id> with clinician token\",\n        \"Assert at least one AuditEvent record is returned\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created on POST /ReferralRequest\",\n        \"Response body contains resourceType=ReferralRequest and a server-assigned id\",\n        \"AuditEvent query returns HTTP 200 with total >= 1\",\n        \"AuditEvent action field equals 'C' (create)\"\n      ],\n      \"trace\": [\n        \"R-HLT-092: referral stored\",\n        \"R-HLT-092: secure message dispatched\",\n        \"R-HLT-092: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_referral_happy_path_stores_resource_and_emits_audit(\\n    base_url, clinician_auth_token, consented_patient_id, target_facility_id\\n):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {clinician_auth_token}\\\",\\n               \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    payload = {\\n        \\\"resourceType\\\": \\\"ReferralRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{consented_patient_id}\\\"},\\n        \\\"recipient\\\": [{\\\"reference\\\": f\\\"Organization/{target_facility_id}\\\"}],\\n        \\\"note\\\": [{\\\"text\\\": \\\"Routine cardiology referral\\\"}]\\n    }\\n    post_resp = requests.post(\\n        f\\\"{base_url}/ReferralRequest\\\", json=payload, headers=headers\\n    )\\n    assert post_resp.status_code == 201, post_resp.text\\n    referral_id = post_resp.json()[\\\"id\\\"]\\n    assert referral_id, \\\"Server must assign an id\\\"\\n\\n    audit_resp = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"ReferralRequest/{referral_id}\\\"},\\n        headers=headers\\n    )\\n    assert audit_resp.status_code == 200\\n    bundle = audit_resp.json()\\n    assert bundle.get(\\\"total\\\", 0) >= 1, \\\"At least one AuditEvent must exist\\\"\\n    actions = [e[\\\"resource\\\"][\\\"action\\\"]\\n               for e in bundle.get(\\\"entry\\\", [])]\\n    assert \\\"C\\\" in actions, \\\"AuditEvent action 'C' (create) must be present\\\"\\n\"\n    },\n    {\n      \"name\": \"test_referral_rejected_403_when_consent_absent\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician JWT available via <clinician_auth_token> fixture\",\n        \"Patient has NO active consent recorded (non_consented_patient_id fixture)\",\n        \"Target facility ID available via <target_facility_id> fixture\",\n        \"FHIR-Lite service is reachable at BASE_URL\"\n   "
+  }
+}

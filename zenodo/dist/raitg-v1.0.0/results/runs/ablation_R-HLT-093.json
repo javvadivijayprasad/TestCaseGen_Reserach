@@ -1,0 +1,144 @@
+{
+  "req": {
+    "id": "R-HLT-093",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Lab order routing (audit)",
+    "statement": "A clinician shall order a lab test; orders shall route to the patient's preferred lab when available. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician orders lab"
+    ],
+    "expected_outcomes": [
+      "order routed",
+      "status tracked"
+    ],
+    "error_pathways": [
+      "fallback to default lab when preferred unavailable"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ServiceRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-093",
+    "reasoning": "R-HLT-093 requires three distinct test paths: (1) happy-path routing to the patient's preferred lab with AuditEvent emitted (EP \u2014 valid partition where preferred lab is available), (2) fallback routing when the preferred lab is unavailable (NEG/DT \u2014 decision table row where preferred lab down), and (3) a boundary case exercising the state transition from 'draft' through 'active' to 'completed' on a ServiceRequest with audit trail at each state (STC). Each test is isolated via fixture-supplied auth tokens and patient IDs, hits /ServiceRequest and /AuditEvent endpoints, and asserts both business routing logic and audit compliance.",
+    "tests": [
+      {
+        "name": "test_order_routes_to_preferred_lab_with_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient record exists with a preferred lab set to 'LabCorp-001'",
+          "LabCorp-001 is available and accepting orders"
+        ],
+        "actions": [
+          "POST /ServiceRequest with subject referencing the patient and requester referencing the clinician",
+          "Capture the returned ServiceRequest ID",
+          "GET /AuditEvent?entity=<ServiceRequest-ID>"
+        ],
+        "expected": [
+          "POST /ServiceRequest returns HTTP 201",
+          "Response body contains performer reference matching 'LabCorp-001'",
+          "Response body status is 'active'",
+          "At least one AuditEvent is returned for the ServiceRequest",
+          "AuditEvent.action is 'C' (create) and outcome is '0' (success)"
+        ],
+        "trace": [
+          "R-HLT-093: order routed to preferred lab",
+          "R-HLT-093: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_order_routes_to_preferred_lab_with_audit(\n    clinician_auth_headers,   # <fixture>\n    preferred_patient_id,     # <fixture> patient with preferred lab LabCorp-001\n    base_url,                 # <fixture>\n    make_service_request_payload,  # <helper_fn>\n    assert_audit_event,       # <helper_fn>\n):\n    payload = make_service_request_payload(\n        patient_id=preferred_patient_id,\n        code=\"58410-2\",\n    )\n    resp = requests.post(\n        f\"{base_url}/ServiceRequest\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 201, resp.text\n    body = resp.json()\n    sr_id = body[\"id\"]\n    performers = [p.get(\"reference\", \"\") for p in body.get(\"performer\", [])]\n    assert any(\"LabCorp-001\" in p for p in performers), \"Preferred lab not selected\"\n    assert body[\"status\"] == \"active\"\n    assert_audit_event(\n        base_url=base_url,\n        headers=clinician_auth_headers,\n        entity_id=sr_id,\n        expected_action=\"C\",\n        expected_outcome=\"0\",\n    )\n"
+      },
+      {
+        "name": "test_order_falls_back_to_default_lab_when_preferred_unavailable",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient record exists with preferred lab set to 'LabCorp-001'",
+          "LabCorp-001 is marked unavailable in the system (status=inactive)",
+          "A default lab 'DefaultLab-999' is configured and available"
+        ],
+        "actions": [
+          "POST /ServiceRequest with subject referencing the patient and requester referencing the clinician",
+          "Capture the returned ServiceRequest ID",
+          "GET /AuditEvent?entity=<ServiceRequest-ID>"
+        ],
+        "expected": [
+          "POST /ServiceRequest returns HTTP 201",
+          "Response body performer reference matches 'DefaultLab-999' (fallback), not 'LabCorp-001'",
+          "Response body status is 'active'",
+          "At least one AuditEvent is returned",
+          "AuditEvent contains a note or extension indicating fallback routing"
+        ],
+        "trace": [
+          "R-HLT-093: fallback to default lab when preferred unavailable",
+          "R-HLT-093: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_order_falls_back_to_default_lab_when_preferred_unavailable(\n    clinician_auth_headers,         # <fixture>\n    unavailable_preferred_patient_id,  # <fixture> patient whose preferred lab is inactive\n    base_url,                       # <fixture>\n    make_service_request_payload,   # <helper_fn>\n    assert_audit_event,             # <helper_fn>\n    get_audit_events,               # <helper_fn>\n):\n    payload = make_service_request_payload(\n        patient_id=unavailable_preferred_patient_id,\n        code=\"58410-2\",\n    )\n    resp = requests.post(\n        f\"{base_url}/ServiceRequest\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 201, resp.text\n    body = resp.json()\n    sr_id = body[\"id\"]\n    performers = [p.get(\"reference\", \"\") for p in body.get(\"performer\", [])]\n    assert not any(\"LabCorp-001\" in p for p in performers), \"Unavailable lab was selected\"\n    assert any(\"DefaultLab-999\" in p for p in performers), \"Fallback lab not selected\"\n    assert body[\"status\"] == \"active\"\n    events = get_audit_events(base_url, clinician_auth_headers, sr_id)\n    assert len(events) >= 1\n    notes = \" \".join(str(e) for e in events)\n    assert \"fallback\" in notes.lower() or \"DefaultLab-999\" in notes\n"
+      },
+      {
+        "name": "test_service_request_state_transition_draft_to_completed_with_audit_at_each_state",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient record exists with a preferred lab set to 'LabCorp-001'",
+          "LabCorp-001 is available"
+        ],
+        "actions": [
+          "POST /ServiceRequest with status='draft' to create the order",
+          "GET /AuditEvent?entity=<ServiceRequest-ID> to confirm create audit",
+          "PUT /ServiceRequest/<ID> with status='active' to activate the order",
+          "GET /AuditEvent?entity=<ServiceRequest-ID> to confirm update audit",
+          "PUT /ServiceRequest/<ID> with status='completed' to complete the order",
+          "GET /AuditEvent?entity=<ServiceRequest-ID> to confirm completion audit"
+        ],
+        "expected": [
+          "POST returns HTTP 201 with status='draft'",
+          "First AuditEvent query returns exactly 1 event with action='C'",
+          "First PUT returns HTTP 200 with status='active'",
+          "Second AuditEvent query returns at least 2 events, latest action='U'",
+          "Second PUT returns HTTP 200 with status='completed'",
+          "Third AuditEvent query returns at least 3 events, latest action='U' for completed transition"
+        ],
+        "trace": [
+          "R-HLT-093: status tracked across order lifecycle",
+          "R-HLT-093: AuditEvent emitted for every operation",
+          "R-HLT-093: order routed to preferred lab"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_service_request_state_transition_draft_to_completed_with_audit_at_each_state(\n    clinician_auth_headers,      # <fixture>\n    preferred_patient_id,        # <fixture>\n    base_url,                    # <fixture>\n    make_service_request_payload,  # <helper_fn>\n    get_audit_events,            # <helper_fn>\n):\n    payload = make_service_request_payload(\n        patient_id=preferred_patient_id,\n        code=\"58410-2\",\n        status=\"draft\",\n    )\n    r1 = requests.post(f\"{base_url}/ServiceRequest\", json=payload, headers=clinician_auth_headers)\n    assert r1.status_code == 201\n    sr = r1.json()\n    sr_id, sr_ver = sr[\"id\"], sr[\"meta\"][\"versionId\"]\n    assert sr[\"status\"] == \"draft\"\n    events = get_audit_events(base_url, clinician_auth_headers, sr_id)\n    assert len(events) >= 1 and events[0][\"action\"] == \"C\"\n\n    sr[\"status\"] = \"active\"\n    r2 = requests.put(f\"{base_url}/ServiceRequest/{sr_id}\", json=sr, headers=clinician_auth_headers)\n    assert r2.status_code == 200\n    assert r2.json()[\"status\"] == \"active\"\n    events = get_audit_events(base_url, clinician_auth_headers, sr_id)\n    assert len(events) >= 2\n    assert events[-1][\"action\"] == \"U\"\n\n    sr2 = r2.json()\n    sr2[\"status\"] = \"completed\"\n    r3 = requests.put(f\"{base_url}/ServiceRequest/{sr_id}\", json=sr2, headers=clinician_auth_headers)\n    assert r3.status_code == 200\n    assert r3.json()[\"status\"] == \"completed\"\n    events = get_audit_events(base_url, clinician_auth_headers, sr_id)\n    assert len(events) >= 3\n    assert events[-1][\"action\"] == \"U\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-093",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 2717,
+    "latency_ms": 34850,
+    "wall_ms": 34850,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-093\",\n  \"reasoning\": \"R-HLT-093 requires three distinct test paths: (1) happy-path routing to the patient's preferred lab with AuditEvent emitted (EP \u2014 valid partition where preferred lab is available), (2) fallback routing when the preferred lab is unavailable (NEG/DT \u2014 decision table row where preferred lab down), and (3) a boundary case exercising the state transition from 'draft' through 'active' to 'completed' on a ServiceRequest with audit trail at each state (STC). Each test is isolated via fixture-supplied auth tokens and patient IDs, hits /ServiceRequest and /AuditEvent endpoints, and asserts both business routing logic and audit compliance.\",\n  \"tests\": [\n    {\n      \"name\": \"test_order_routes_to_preferred_lab_with_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient record exists with a preferred lab set to 'LabCorp-001'\",\n        \"LabCorp-001 is available and accepting orders\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with subject referencing the patient and requester referencing the clinician\",\n        \"Capture the returned ServiceRequest ID\",\n        \"GET /AuditEvent?entity=<ServiceRequest-ID>\"\n      ],\n      \"expected\": [\n        \"POST /ServiceRequest returns HTTP 201\",\n        \"Response body contains performer reference matching 'LabCorp-001'\",\n        \"Response body status is 'active'\",\n        \"At least one AuditEvent is returned for the ServiceRequest\",\n        \"AuditEvent.action is 'C' (create) and outcome is '0' (success)\"\n      ],\n      \"trace\": [\n        \"R-HLT-093: order routed to preferred lab\",\n        \"R-HLT-093: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_order_routes_to_preferred_lab_with_audit(\\n    clinician_auth_headers,   # <fixture>\\n    preferred_patient_id,     # <fixture> patient with preferred lab LabCorp-001\\n    base_url,                 # <fixture>\\n    make_service_request_payload,  # <helper_fn>\\n    assert_audit_event,       # <helper_fn>\\n):\\n    payload = make_service_request_payload(\\n        patient_id=preferred_patient_id,\\n        code=\\\"58410-2\\\",\\n    )\\n    resp = requests.post(\\n        f\\\"{base_url}/ServiceRequest\\\",\\n        json=payload,\\n        headers=clinician_auth_headers,\\n    )\\n    assert resp.status_code == 201, resp.text\\n    body = resp.json()\\n    sr_id = body[\\\"id\\\"]\\n    performers = [p.get(\\\"reference\\\", \\\"\\\") for p in body.get(\\\"performer\\\", [])]\\n    assert any(\\\"LabCorp-001\\\" in p for p in performers), \\\"Preferred lab not selected\\\"\\n    assert body[\\\"status\\\"] == \\\"active\\\"\\n    assert_audit_event(\\n        base_url=base_url,\\n        headers=clinician_auth_headers,\\n        entity_id=sr_id,\\n        expected_action=\\\"C\\\",\\n        expected_outcome=\\\"0\\\",\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_order_falls_back_to_default_lab_when_preferred_unavailable\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient record exists with preferred lab set to 'LabCorp-001'\",\n        \"LabCorp-001 is marked unavailable in the system (status=inactive)\",\n        \"A default lab 'DefaultLab-999' is configured and available\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with subject referencing the patient and requester referencing the clinician\",\n        \"Capture the returned ServiceRequest ID\",\n        \"GET /AuditEvent?entity=<ServiceRequest-ID>\"\n      ],\n      \"expected\": [\n        \"POST /ServiceRequest returns HTTP 201\",\n        \"Response body performer reference matches 'DefaultLab-999' (fallback), not 'LabCorp-001'\",\n        \"Response body status is 'active'\",\n        \"At least one AuditEvent is returned\",\n        \"AuditEvent contains a note or extension indicating fallback routing\"\n      ],\n      \"trace\": [\n        \"R-HLT-093: fall"
+  }
+}

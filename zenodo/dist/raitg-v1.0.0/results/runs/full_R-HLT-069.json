@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-HLT-069",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation (negative)",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-069",
+    "reasoning": "The requirement covers vital-signs Observation validation with in-range acceptance, out-of-range flagging, and negative paths. I selected: (1) EP positive \u2013 a normal heart-rate value inside the plausible range to confirm storage without a flag; (2) NEG \u2013 POST without a mandatory 'subject' element to confirm 422 rejection; (3) BVA boundary \u2013 a heart-rate value exactly at the upper clinical boundary (100 bpm) to verify flag behaviour at the edge; (4) DT \u2013 conflicting status transition (final\u2192entered-in-error without required fields) to cover decision-table rules; (5) STC \u2013 state transition from 'preliminary' to 'final' for a valid out-of-range value to verify flag is raised and persisted through the status change. Each test uses a 'clinician' auth fixture and a shared FHIR-Lite base-URL fixture, keeping payloads inline and assertions tight.",
+    "tests": [
+      {
+        "name": "test_vitals_normal_heartrate_stored_no_flag",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "FHIR-Lite service is reachable at BASE_URL",
+          "Patient resource P-001 exists"
+        ],
+        "actions": [
+          "POST /Observation with category vital-signs, code 8867-4 (heart rate), valueQuantity 72 bpm"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains id field",
+          "Response body does NOT contain a 'review-flag' extension or extension list is absent"
+        ],
+        "trace": [
+          "R-HLT-069: observation stored",
+          "R-HLT-069: no flag raised for in-range value"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vitals_normal_heartrate_stored_no_flag(base_url, clinician_auth_headers):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"subject\": {\"reference\": \"Patient/P-001\"},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    extensions = body.get(\"extension\", [])\n    flag_urls = [e.get(\"url\", \"\") for e in extensions]\n    assert not any(\"review-flag\" in u for u in flag_urls)"
+      },
+      {
+        "name": "test_vitals_missing_subject_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "FHIR-Lite service is reachable at BASE_URL"
+        ],
+        "actions": [
+          "POST /Observation with category vital-signs but 'subject' element omitted"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains OperationOutcome with issue severity 'error'",
+          "Issue diagnostics reference missing 'subject' element"
+        ],
+        "trace": [
+          "R-HLT-069: missing mandatory elements error pathway"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vitals_missing_subject_rejected(base_url, clinician_auth_headers):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"severity\") == \"error\" for i in issues)\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues)\n    assert \"subject\" in diagnostics.lower()"
+      },
+      {
+        "name": "test_vitals_heartrate_at_upper_boundary_flagged",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "FHIR-Lite service is reachable at BASE_URL",
+          "Patient resource P-001 exists",
+          "Clinical upper boundary for resting heart rate is defined as 100 bpm"
+        ],
+        "actions": [
+          "POST /Observation with category vital-signs, code 8867-4, valueQuantity exactly 100 bpm (upper boundary)"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains id field",
+          "Response body contains 'review-flag' extension set to true OR a linked Task is returned in the response"
+        ],
+        "trace": [
+          "R-HLT-069: out-of-range flag raised at upper boundary",
+          "R-HLT-069: review task created error pathway"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vitals_heartrate_at_upper_boundary_flagged(base_url, clinician_auth_headers):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"subject\": {\"reference\": \"Patient/P-001\"},\n        \"valueQuantity\": {\"value\": 100, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    extensions = body.get(\"extension\", [])\n    flag_ext = next((e for e in extensions if \"review-flag\" in e.get(\"url\", \"\")), None)\n    contained = body.get(\"contained\", [])\n    task_present = any(r.get(\"resourceType\") == \"Task\" for r in contained)\n    assert flag_ext is not None or task_present, \"Expected review-flag extension or contained Task at boundary value\""
+      },
+      {
+        "name": "test_vitals_conflicting_status_transition_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "FHIR-Lite service is reachable at BASE_URL",
+          "A 'final' Observation OBS-FINAL-001 exists for Patient P-001"
+        ],
+        "actions": [
+          "PUT /Observation/OBS-FINAL-001 changing status from 'final' to 'entered-in-error' without required 'note' element mandated by business rule"
+        ],
+        "expected": [
+          "HTTP 409 Conflict OR 422 Unprocessable Entity",
+          "Response body contains OperationOutcome",
+          "Issue diagnostics indicate invalid state transition or missing required note"
+        ],
+        "trace": [
+          "R-HLT-069: conflicting state transitions negative path"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vitals_conflicting_status_transition_rejected(base_url, clinician_auth_headers, existing_final_observation_id):\n    obs_id = existing_final_observation_id\n    get_resp = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_auth_headers)\n    assert get_resp.status_code == 200\n    obs = get_resp.json()\n    obs[\"status\"] = \"entered-in-error\"\n    obs.pop(\"note\", None)\n    put_resp = requests.put(f\"{base_url}/Observation/{obs_id}\", json=obs, headers=clinician_auth_headers)\n    assert put_resp.status_code in (409, 422)\n    body = put_resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"severity\") == \"error\" for i in issues)"
+      },
+      {
+        "name": "test_vitals_preliminary_to_final_outofrange_flag_persists",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "FHIR-Lite service is reachable at BASE_URL",
+          "Patient resource P-001 exists"
+        ],
+        "actions": [
+          "POST /Observation with status 'preliminary', category vital-signs, heart-rate 220 bpm (out of range)",
+          "PUT /Observation/{id} updating status to 'final', keeping value 220 bpm"
+        ],
+        "expected": [
+          "POST returns HTTP 201 with review-flag extension present",
+          "PUT returns HTTP 200",
+          "GET /Observation/{id} returns status 'final' and review-flag extension still present"
+        ],
+        "trace": [
+          "R-HLT-069: observation stored",
+          "R-HLT-069: flag raised if out of range",
+          "R-HLT-069: review task created persists across state transition"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vitals_preliminary_to_final_outofrange_flag_persists(base_url, clinician_auth_headers):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/P-001\"},\n        \"valueQuantity\": {\"value\": 220, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    post_resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert post_resp.status_code == 201\n    obs = post_resp.json()\n    obs_id = obs[\"id\"]\n    exts = obs.get(\"extension\", [])\n    assert any(\"review-flag\" in e.get(\"url\", \"\") for e in exts)\n    obs[\"status\"] = \"final\"\n    put_resp = requests.put(f\"{base_url}/Observation/{obs_id}\", json=obs, headers=clinician_auth_headers)\n    assert put_resp.status_code == 200\n    get_resp = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_auth_headers)\n    assert get_resp.status_code == 200\n    final_obs = get_resp.json()\n    assert final_obs[\"status\"] == \"final\"\n    final_exts = final_obs.get(\"extension\", [])\n    assert any(\"review-flag\" in e.get(\"url\", \"\") for e in final_exts)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-069",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 3463,
+    "latency_ms": 34396,
+    "wall_ms": 34396,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-069\",\n  \"reasoning\": \"The requirement covers vital-signs Observation validation with in-range acceptance, out-of-range flagging, and negative paths. I selected: (1) EP positive \u2013 a normal heart-rate value inside the plausible range to confirm storage without a flag; (2) NEG \u2013 POST without a mandatory 'subject' element to confirm 422 rejection; (3) BVA boundary \u2013 a heart-rate value exactly at the upper clinical boundary (100 bpm) to verify flag behaviour at the edge; (4) DT \u2013 conflicting status transition (final\u2192entered-in-error without required fields) to cover decision-table rules; (5) STC \u2013 state transition from 'preliminary' to 'final' for a valid out-of-range value to verify flag is raised and persisted through the status change. Each test uses a 'clinician' auth fixture and a shared FHIR-Lite base-URL fixture, keeping payloads inline and assertions tight.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vitals_normal_heartrate_stored_no_flag\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated as role:clinician\",\n        \"FHIR-Lite service is reachable at BASE_URL\",\n        \"Patient resource P-001 exists\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category vital-signs, code 8867-4 (heart rate), valueQuantity 72 bpm\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains id field\",\n        \"Response body does NOT contain a 'review-flag' extension or extension list is absent\"\n      ],\n      \"trace\": [\n        \"R-HLT-069: observation stored\",\n        \"R-HLT-069: no flag raised for in-range value\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vitals_normal_heartrate_stored_no_flag(base_url, clinician_auth_headers):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/P-001\\\"},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_url}/Observation\\\", json=payload, headers=clinician_auth_headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"id\\\" in body\\n    extensions = body.get(\\\"extension\\\", [])\\n    flag_urls = [e.get(\\\"url\\\", \\\"\\\") for e in extensions]\\n    assert not any(\\\"review-flag\\\" in u for u in flag_urls)\"\n    },\n    {\n      \"name\": \"test_vitals_missing_subject_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated as role:clinician\",\n        \"FHIR-Lite service is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category vital-signs but 'subject' element omitted\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains OperationOutcome with issue severity 'error'\",\n        \"Issue diagnostics reference missing 'subject' element\"\n      ],\n      \"trace\": [\n        \"R-HLT-069: missing mandatory elements error pathway\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vitals_missing_subject_rejected(base_url, clinician_auth_headers):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\"}]},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_"
+  }
+}

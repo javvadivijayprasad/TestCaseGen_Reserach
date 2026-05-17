@@ -1,0 +1,206 @@
+{
+  "req": {
+    "id": "R-HLT-017",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Inter-facility referral",
+    "statement": "A clinician shall send a referral to another facility; the referral shall trigger a secure message and consent check.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician sends referral"
+    ],
+    "expected_outcomes": [
+      "referral stored",
+      "secure message dispatched"
+    ],
+    "error_pathways": [
+      "403 when consent absent"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ReferralRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-017",
+    "reasoning": "R-HLT-017 mandates secure referral dispatch with consent validation and message delivery. Test suite covers: (1) happy path with valid consent and role, (2) consent absence rejection, (3) boundary conditions on referral payload and consent state transitions. Design employs EP (valid/invalid consent partitions), NEG (missing consent), BVA (edge referral metadata), and DT (role \u00d7 consent matrix).",
+    "tests": [
+      {
+        "name": "test_referral_dispatch_with_valid_consent",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "user authenticated with role=clinician",
+          "patient has explicit consent record in system",
+          "recipient facility exists and is registered"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid referral payload",
+          "include Authorization header with clinician token",
+          "payload contains: referralType, targetFacility, patientId, clinicalNotes"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "response body contains referralId",
+          "referral persisted in database",
+          "secure message queued for recipient facility",
+          "audit log entry created"
+        ],
+        "trace": [
+          "R-HLT-017: clinician sends referral",
+          "R-HLT-017: referral stored",
+          "R-HLT-017: secure message dispatched"
+        ],
+        "executable": "import requests\nimport json\n\ndef test_referral_dispatch_with_valid_consent(api_base, clinician_token):\n    payload = {\n        \"referralType\": \"URGENT_CONSULTATION\",\n        \"targetFacility\": \"FAC-002\",\n        \"patientId\": \"PT-001\",\n        \"clinicalNotes\": \"Cardiology assessment required\"\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    resp = requests.post(\n        f\"{api_base}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert \"referralId\" in data\n    assert data[\"status\"] == \"DISPATCHED\"\n    assert data[\"messageQueued\"] is True"
+      },
+      {
+        "name": "test_referral_rejection_missing_consent",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "user authenticated with role=clinician",
+          "patient has NO consent record for inter-facility referral",
+          "recipient facility exists"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid referral structure",
+          "include clinician token",
+          "no consent record exists for patient"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "error code: CONSENT_ABSENT",
+          "referral NOT persisted",
+          "secure message NOT dispatched",
+          "error message: 'Patient consent required for inter-facility referral'"
+        ],
+        "trace": [
+          "R-HLT-017: Error pathways\u2014403 when consent absent",
+          "R-HLT-017: referral rejected at consent check"
+        ],
+        "executable": "import requests\n\ndef test_referral_rejection_missing_consent(api_base, clinician_token):\n    payload = {\n        \"referralType\": \"ROUTINE_CONSULTATION\",\n        \"targetFacility\": \"FAC-003\",\n        \"patientId\": \"PT-NO-CONSENT\",\n        \"clinicalNotes\": \"General follow-up\"\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    resp = requests.post(\n        f\"{api_base}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 403\n    error = resp.json()\n    assert error[\"errorCode\"] == \"CONSENT_ABSENT\"\n    assert \"consent\" in error[\"message\"].lower()"
+      },
+      {
+        "name": "test_referral_boundary_maximum_notes_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "user authenticated with role=clinician",
+          "patient has valid consent",
+          "clinicalNotes field has documented max length of 5000 chars"
+        ],
+        "actions": [
+          "POST /ReferralRequest with clinicalNotes at exactly 5000 characters",
+          "all other fields valid and minimal"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "referral accepted and stored",
+          "secure message dispatched"
+        ],
+        "trace": [
+          "R-HLT-017: boundary value\u2014maximum payload size accepted",
+          "R-HLT-017: referral stored; secure message dispatched"
+        ],
+        "executable": "import requests\n\ndef test_referral_boundary_maximum_notes_length(api_base, clinician_token):\n    long_notes = \"X\" * 5000\n    payload = {\n        \"referralType\": \"CONSULTATION\",\n        \"targetFacility\": \"FAC-004\",\n        \"patientId\": \"PT-002\",\n        \"clinicalNotes\": long_notes\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    resp = requests.post(\n        f\"{api_base}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert data[\"status\"] == \"DISPATCHED\""
+      },
+      {
+        "name": "test_referral_rejection_exceeded_notes_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "user authenticated with role=clinician",
+          "patient has valid consent",
+          "max clinicalNotes length documented as 5000 chars"
+        ],
+        "actions": [
+          "POST /ReferralRequest with clinicalNotes at 5001 characters"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "error code: FIELD_LENGTH_EXCEEDED",
+          "referral NOT persisted"
+        ],
+        "trace": [
+          "R-HLT-017: boundary value\u2014exceeds maximum payload size",
+          "R-HLT-017: referral rejected at validation"
+        ],
+        "executable": "import requests\n\ndef test_referral_rejection_exceeded_notes_length(api_base, clinician_token):\n    long_notes = \"X\" * 5001\n    payload = {\n        \"referralType\": \"CONSULTATION\",\n        \"targetFacility\": \"FAC-005\",\n        \"patientId\": \"PT-003\",\n        \"clinicalNotes\": long_notes\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    resp = requests.post(\n        f\"{api_base}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 400\n    error = resp.json()\n    assert \"FIELD_LENGTH\" in error[\"errorCode\"] or \"exceeds\" in error[\"message\"].lower()"
+      },
+      {
+        "name": "test_referral_rejection_non_clinician_role",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "user authenticated with role=admin (not clinician)",
+          "patient has valid consent"
+        ],
+        "actions": [
+          "POST /ReferralRequest with valid payload",
+          "include admin token (insufficient role)"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "error code: INSUFFICIENT_ROLE",
+          "referral NOT persisted"
+        ],
+        "trace": [
+          "R-HLT-017: Preconditions\u2014role:clinician required",
+          "R-HLT-017: role validation failure"
+        ],
+        "executable": "import requests\n\ndef test_referral_rejection_non_clinician_role(api_base, admin_token):\n    payload = {\n        \"referralType\": \"CONSULTATION\",\n        \"targetFacility\": \"FAC-006\",\n        \"patientId\": \"PT-004\",\n        \"clinicalNotes\": \"Test notes\"\n    }\n    headers = {\"Authorization\": f\"Bearer {admin_token}\"}\n    resp = requests.post(\n        f\"{api_base}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 403\n    error = resp.json()\n    assert \"INSUFFICIENT_ROLE\" in error[\"errorCode\"] or \"clinician\" in error[\"message\"].lower()"
+      },
+      {
+        "name": "test_referral_state_transition_consent_revoked_post_dispatch",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "clinician authenticated",
+          "patient has valid consent at time of referral submission"
+        ],
+        "actions": [
+          "POST /ReferralRequest (succeeds, 201 returned)",
+          "consent revoked before message delivery confirmation",
+          "query referral status endpoint"
+        ],
+        "expected": [
+          "initial POST returns 201 with referralId",
+          "referral state remains DISPATCHED despite consent revocation",
+          "message delivery audit trail preserved"
+        ],
+        "trace": [
+          "R-HLT-017: state transition\u2014consent checked at submission time",
+          "R-HLT-017: referral stored with snapshot consent state"
+        ],
+        "executable": "import requests\nimport time\n\ndef test_referral_state_transition_consent_revoked_post_dispatch(\n    api_base, clinician_token, patient_id\n):\n    payload = {\n        \"referralType\": \"CONSULTATION\",\n        \"targetFacility\": \"FAC-007\",\n        \"patientId\": patient_id,\n        \"clinicalNotes\": \"State transition test\"\n    }\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n    resp = requests.post(\n        f\"{api_base}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 201\n    referral_id = resp.json()[\"referralId\"]\n    \n    resp_status = requests.get(\n        f\"{api_base}/ReferralRequest/{referral_id}\",\n        headers=headers\n    )\n    assert resp_status.json()[\"status\"] == \"DISPATCHED\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-017",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1029,
+    "output_tokens": 2899,
+    "latency_ms": 15994,
+    "wall_ms": 15994,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-017\",\n  \"reasoning\": \"R-HLT-017 mandates secure referral dispatch with consent validation and message delivery. Test suite covers: (1) happy path with valid consent and role, (2) consent absence rejection, (3) boundary conditions on referral payload and consent state transitions. Design employs EP (valid/invalid consent partitions), NEG (missing consent), BVA (edge referral metadata), and DT (role \u00d7 consent matrix).\",\n  \"tests\": [\n    {\n      \"name\": \"test_referral_dispatch_with_valid_consent\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"user authenticated with role=clinician\",\n        \"patient has explicit consent record in system\",\n        \"recipient facility exists and is registered\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with valid referral payload\",\n        \"include Authorization header with clinician token\",\n        \"payload contains: referralType, targetFacility, patientId, clinicalNotes\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"response body contains referralId\",\n        \"referral persisted in database\",\n        \"secure message queued for recipient facility\",\n        \"audit log entry created\"\n      ],\n      \"trace\": [\n        \"R-HLT-017: clinician sends referral\",\n        \"R-HLT-017: referral stored\",\n        \"R-HLT-017: secure message dispatched\"\n      ],\n      \"executable\": \"import requests\\nimport json\\n\\ndef test_referral_dispatch_with_valid_consent(api_base, clinician_token):\\n    payload = {\\n        \\\"referralType\\\": \\\"URGENT_CONSULTATION\\\",\\n        \\\"targetFacility\\\": \\\"FAC-002\\\",\\n        \\\"patientId\\\": \\\"PT-001\\\",\\n        \\\"clinicalNotes\\\": \\\"Cardiology assessment required\\\"\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n    resp = requests.post(\\n        f\\\"{api_base}/ReferralRequest\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n    assert resp.status_code == 201\\n    data = resp.json()\\n    assert \\\"referralId\\\" in data\\n    assert data[\\\"status\\\"] == \\\"DISPATCHED\\\"\\n    assert data[\\\"messageQueued\\\"] is True\"\n    },\n    {\n      \"name\": \"test_referral_rejection_missing_consent\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"user authenticated with role=clinician\",\n        \"patient has NO consent record for inter-facility referral\",\n        \"recipient facility exists\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with valid referral structure\",\n        \"include clinician token\",\n        \"no consent record exists for patient\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"error code: CONSENT_ABSENT\",\n        \"referral NOT persisted\",\n        \"secure message NOT dispatched\",\n        \"error message: 'Patient consent required for inter-facility referral'\"\n      ],\n      \"trace\": [\n        \"R-HLT-017: Error pathways\u2014403 when consent absent\",\n        \"R-HLT-017: referral rejected at consent check\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_referral_rejection_missing_consent(api_base, clinician_token):\\n    payload = {\\n        \\\"referralType\\\": \\\"ROUTINE_CONSULTATION\\\",\\n        \\\"targetFacility\\\": \\\"FAC-003\\\",\\n        \\\"patientId\\\": \\\"PT-NO-CONSENT\\\",\\n        \\\"clinicalNotes\\\": \\\"General follow-up\\\"\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"}\\n    resp = requests.post(\\n        f\\\"{api_base}/ReferralRequest\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n    assert resp.status_code == 403\\n    error = resp.json()\\n    assert error[\\\"errorCode\\\"] == \\\"CONSENT_ABSENT\\\"\\n    assert \\\"consent\\\" in error[\\\"message\\\"].lower()\"\n    },\n    {\n      \"name\": \"test_referral_boundary_maximum_notes_length\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"user authenticated with role=clinician\",\n        \"patient has valid consent\",\n        \"clinicalNotes field has documented max length of 5000 chars\""
+  }
+}

@@ -1,0 +1,242 @@
+{
+  "req": {
+    "id": "R-FIN-013",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Fraud alert response",
+    "statement": "A customer shall confirm or deny a suspected-fraud alert within 24 hours; unacknowledged alerts shall auto-freeze the account.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "alert active"
+    ],
+    "triggers": [
+      "customer responds"
+    ],
+    "expected_outcomes": [
+      "alert closed",
+      "card reissued if fraud"
+    ],
+    "error_pathways": [
+      "410 when alert expired"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/alerts/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-013",
+    "reasoning": "R-FIN-013 mandates time-bound fraud alert acknowledgment with auto-freeze on timeout and card reissuance on confirmed fraud. Test coverage targets: (1) Happy path\u2014customer confirms fraud within 24h, alert closes, card reissued; (2) Negative\u2014expired alert returns 410; (3) Boundary\u2014alert at exactly 24h threshold; (4) State transitions\u2014denial pathway; (5) Auto-freeze timeout. Heuristics: EP partitions response types (confirm/deny/timeout); BVA tests 24h boundary; STC covers alert lifecycle; NEG validates error handling.",
+    "tests": [
+      {
+        "name": "test_fraud_alert_confirmed_within_24h",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Alert ID exists with status='active'",
+          "Alert created < 24 hours ago",
+          "Customer authenticated",
+          "Card in active state"
+        ],
+        "actions": [
+          "POST /alerts/{id} with body {\"response\": \"confirm\"}",
+          "Verify response status code",
+          "Query alert status",
+          "Query card reissuance queue"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Alert status changes to 'closed'",
+          "Card marked for reissuance",
+          "Fraud flag persisted in audit log"
+        ],
+        "trace": [
+          "R-FIN-013: customer confirms fraud",
+          "Outcome: alert closed; card reissued"
+        ],
+        "executable": "import requests\nimport pytest\nfrom datetime import datetime, timedelta\n\ndef test_fraud_alert_confirmed_within_24h(base_url, auth_token, test_alert_id):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'response': 'confirm'}\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{test_alert_id}',\n        json=payload,\n        headers=headers,\n        timeout=5\n    )\n    assert resp.status_code == 200, f'Expected 200, got {resp.status_code}'\n    data = resp.json()\n    assert data['status'] == 'closed'\n    assert data['card_reissue_initiated'] is True\n    assert 'confirm' in data['audit_log']"
+      },
+      {
+        "name": "test_fraud_alert_denied_within_24h",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Alert ID exists with status='active'",
+          "Alert created < 24 hours ago",
+          "Customer authenticated",
+          "Card in active state"
+        ],
+        "actions": [
+          "POST /alerts/{id} with body {\"response\": \"deny\"}",
+          "Verify response status code",
+          "Query alert status",
+          "Query card status"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Alert status changes to 'closed'",
+          "Card remains active (no reissuance)",
+          "Denial recorded in audit log"
+        ],
+        "trace": [
+          "R-FIN-013: customer denies fraud",
+          "Outcome: alert closed; card active"
+        ],
+        "executable": "import requests\n\ndef test_fraud_alert_denied_within_24h(base_url, auth_token, test_alert_id):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'response': 'deny'}\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{test_alert_id}',\n        json=payload,\n        headers=headers,\n        timeout=5\n    )\n    assert resp.status_code == 200\n    data = resp.json()\n    assert data['status'] == 'closed'\n    assert data['card_reissue_initiated'] is False\n    assert 'deny' in data['audit_log']"
+      },
+      {
+        "name": "test_fraud_alert_expired_410_response",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Alert ID exists with status='expired'",
+          "Alert created > 24 hours ago",
+          "Account auto-frozen due to timeout",
+          "Customer authenticated"
+        ],
+        "actions": [
+          "POST /alerts/{id} with body {\"response\": \"confirm\"}",
+          "Capture HTTP status code",
+          "Verify error response body"
+        ],
+        "expected": [
+          "HTTP 410 Gone returned",
+          "Error message: 'Alert expired'",
+          "Account remains frozen",
+          "Response includes retry guidance"
+        ],
+        "trace": [
+          "R-FIN-013 error pathway: alert unacknowledged > 24h",
+          "Expected outcome: 410 when alert expired"
+        ],
+        "executable": "import requests\n\ndef test_fraud_alert_expired_410_response(base_url, auth_token, expired_alert_id):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'response': 'confirm'}\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{expired_alert_id}',\n        json=payload,\n        headers=headers,\n        timeout=5\n    )\n    assert resp.status_code == 410, f'Expected 410, got {resp.status_code}'\n    data = resp.json()\n    assert 'expired' in data.get('error', '').lower()\n    assert data['account_frozen'] is True"
+      },
+      {
+        "name": "test_fraud_alert_at_24h_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Alert ID exists with status='active'",
+          "Alert created exactly 23h 59m 59s ago",
+          "Customer authenticated",
+          "System clock synchronized"
+        ],
+        "actions": [
+          "POST /alerts/{id} with body {\"response\": \"confirm\"}",
+          "Measure response latency",
+          "Verify alert closes before 24h threshold"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Alert closes successfully",
+          "Timestamp recorded before 24h expiry",
+          "Card reissuance initiated"
+        ],
+        "trace": [
+          "R-FIN-013: boundary condition at 24h limit",
+          "Customer response must succeed before auto-freeze"
+        ],
+        "executable": "import requests\nfrom datetime import datetime\n\ndef test_fraud_alert_at_24h_boundary(base_url, auth_token, boundary_alert_id):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'response': 'confirm'}\n    start_ts = datetime.utcnow()\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{boundary_alert_id}',\n        json=payload,\n        headers=headers,\n        timeout=5\n    )\n    response_ts = datetime.utcnow()\n    \n    assert resp.status_code == 200\n    data = resp.json()\n    assert data['status'] == 'closed'\n    elapsed = (response_ts - start_ts).total_seconds()\n    assert elapsed < 1.0, 'Response processing must be sub-second'"
+      },
+      {
+        "name": "test_fraud_alert_auto_freeze_on_timeout",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Alert ID exists with status='active'",
+          "Alert created > 23h 59m 59s ago",
+          "Customer has not responded",
+          "Account in 'active' state"
+        ],
+        "actions": [
+          "Wait or trigger background auto-freeze job",
+          "Query account status",
+          "Attempt transaction on frozen card"
+        ],
+        "expected": [
+          "Account status changes to 'frozen'",
+          "Fraud alert auto-closed with status='auto_frozen'",
+          "Card transactions rejected with frozen flag",
+          "Customer notified via registered channel"
+        ],
+        "trace": [
+          "R-FIN-013: unacknowledged alerts shall auto-freeze account",
+          "State transition: active \u2192 auto_frozen after 24h"
+        ],
+        "executable": "import requests\nimport time\n\ndef test_fraud_alert_auto_freeze_on_timeout(base_url, admin_token, timeout_alert_id):\n    headers = {'Authorization': f'Bearer {admin_token}'}\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{timeout_alert_id}/process-timeout',\n        headers=headers,\n        timeout=5\n    )\n    assert resp.status_code == 200\n    \n    data = resp.json()\n    assert data['account_status'] == 'frozen'\n    assert data['alert_status'] == 'auto_frozen'\n    assert data['auto_freeze_timestamp'] is not None"
+      },
+      {
+        "name": "test_fraud_alert_invalid_response_value",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Alert ID exists with status='active'",
+          "Alert created < 24 hours ago",
+          "Customer authenticated"
+        ],
+        "actions": [
+          "POST /alerts/{id} with body {\"response\": \"maybe\"}",
+          "Capture HTTP status and error details"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request returned",
+          "Error message: 'Invalid response value'",
+          "Alert remains in 'active' state",
+          "No state mutation"
+        ],
+        "trace": [
+          "R-FIN-013: invalid input validation",
+          "Only 'confirm' or 'deny' are valid responses"
+        ],
+        "executable": "import requests\n\ndef test_fraud_alert_invalid_response_value(base_url, auth_token, test_alert_id):\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'response': 'maybe'}\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{test_alert_id}',\n        json=payload,\n        headers=headers,\n        timeout=5\n    )\n    assert resp.status_code == 400\n    data = resp.json()\n    assert 'invalid' in data.get('error', '').lower()"
+      },
+      {
+        "name": "test_fraud_alert_unauthenticated_access",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Alert ID exists",
+          "No authentication token provided"
+        ],
+        "actions": [
+          "POST /alerts/{id} without Authorization header",
+          "Capture response"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized returned",
+          "No alert state change",
+          "Error message indicates missing credentials"
+        ],
+        "trace": [
+          "R-FIN-013: authentication enforcement",
+          "Only authenticated customers can respond to alerts"
+        ],
+        "executable": "import requests\n\ndef test_fraud_alert_unauthenticated_access(base_url, test_alert_id):\n    payload = {'response': 'confirm'}\n    \n    resp = requests.post(\n        f'{base_url}/alerts/{test_alert_id}',\n        json=payload,\n        timeout=5\n    )\n    assert resp.status_code == 401"
+      }
+    ]
+  },
+  "req_id": "R-FIN-013",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1027,
+    "output_tokens": 3028,
+    "latency_ms": 17024,
+    "wall_ms": 17024,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-013\",\n  \"reasoning\": \"R-FIN-013 mandates time-bound fraud alert acknowledgment with auto-freeze on timeout and card reissuance on confirmed fraud. Test coverage targets: (1) Happy path\u2014customer confirms fraud within 24h, alert closes, card reissued; (2) Negative\u2014expired alert returns 410; (3) Boundary\u2014alert at exactly 24h threshold; (4) State transitions\u2014denial pathway; (5) Auto-freeze timeout. Heuristics: EP partitions response types (confirm/deny/timeout); BVA tests 24h boundary; STC covers alert lifecycle; NEG validates error handling.\",\n  \"tests\": [\n    {\n      \"name\": \"test_fraud_alert_confirmed_within_24h\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Alert ID exists with status='active'\",\n        \"Alert created < 24 hours ago\",\n        \"Customer authenticated\",\n        \"Card in active state\"\n      ],\n      \"actions\": [\n        \"POST /alerts/{id} with body {\\\"response\\\": \\\"confirm\\\"}\",\n        \"Verify response status code\",\n        \"Query alert status\",\n        \"Query card reissuance queue\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Alert status changes to 'closed'\",\n        \"Card marked for reissuance\",\n        \"Fraud flag persisted in audit log\"\n      ],\n      \"trace\": [\n        \"R-FIN-013: customer confirms fraud\",\n        \"Outcome: alert closed; card reissued\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\nfrom datetime import datetime, timedelta\\n\\ndef test_fraud_alert_confirmed_within_24h(base_url, auth_token, test_alert_id):\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {'response': 'confirm'}\\n    \\n    resp = requests.post(\\n        f'{base_url}/alerts/{test_alert_id}',\\n        json=payload,\\n        headers=headers,\\n        timeout=5\\n    )\\n    assert resp.status_code == 200, f'Expected 200, got {resp.status_code}'\\n    data = resp.json()\\n    assert data['status'] == 'closed'\\n    assert data['card_reissue_initiated'] is True\\n    assert 'confirm' in data['audit_log']\"\n    },\n    {\n      \"name\": \"test_fraud_alert_denied_within_24h\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Alert ID exists with status='active'\",\n        \"Alert created < 24 hours ago\",\n        \"Customer authenticated\",\n        \"Card in active state\"\n      ],\n      \"actions\": [\n        \"POST /alerts/{id} with body {\\\"response\\\": \\\"deny\\\"}\",\n        \"Verify response status code\",\n        \"Query alert status\",\n        \"Query card status\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Alert status changes to 'closed'\",\n        \"Card remains active (no reissuance)\",\n        \"Denial recorded in audit log\"\n      ],\n      \"trace\": [\n        \"R-FIN-013: customer denies fraud\",\n        \"Outcome: alert closed; card active\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_fraud_alert_denied_within_24h(base_url, auth_token, test_alert_id):\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {'response': 'deny'}\\n    \\n    resp = requests.post(\\n        f'{base_url}/alerts/{test_alert_id}',\\n        json=payload,\\n        headers=headers,\\n        timeout=5\\n    )\\n    assert resp.status_code == 200\\n    data = resp.json()\\n    assert data['status'] == 'closed'\\n    assert data['card_reissue_initiated'] is False\\n    assert 'deny' in data['audit_log']\"\n    },\n    {\n      \"name\": \"test_fraud_alert_expired_410_response\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Alert ID exists with status='expired'\",\n        \"Alert created > 24 hours ago\",\n        \"Account auto-frozen due to timeout\",\n        \"Customer authenticated\"\n      ],\n      \"actions\": [\n        \"POST /alerts/{id} with body {\\\"response\\\": \\\"confirm\\\"}\",\n        \"Capture HTTP status code\",\n        \"Verify error response body\"\n      ],\n      \"expected\": [\n        \"HTTP 410 Gone returned\",\n        \"Error message: 'Alert expired'\""
+  }
+}

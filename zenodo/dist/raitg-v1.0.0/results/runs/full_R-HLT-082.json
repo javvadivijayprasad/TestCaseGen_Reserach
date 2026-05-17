@@ -1,0 +1,159 @@
+{
+  "req": {
+    "id": "R-HLT-082",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Close encounter (audit)",
+    "statement": "A clinician shall close an Encounter; closed Encounters shall reject further modifications except for addendum Observations. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "encounter open"
+    ],
+    "triggers": [
+      "clinician closes encounter"
+    ],
+    "expected_outcomes": [
+      "encounter.status=finished"
+    ],
+    "error_pathways": [
+      "409 when modifying closed encounter"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-082",
+    "reasoning": "R-HLT-082 defines a state machine (open\u2192finished) with three testable axes: (1) happy-path close sets status=finished and emits AuditEvent, (2) negative path rejects modifications to a finished encounter with HTTP 409, and (3) boundary case tests the single allowed exception\u2014addendum Observations on a closed encounter must succeed. STC drives the primary positive case; NEG drives the rejection case; BVA drives the addendum boundary. A fourth DT case covers the audit trail completeness requirement end-to-end. Together these achieve full Decision-Table coverage of the two-condition table: {encounter_state \u00d7 operation_type}.",
+    "tests": [
+      {
+        "name": "test_close_encounter_sets_status_finished_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "An Encounter exists with status=in-progress",
+          "Clinician auth token is available via <auth_token fixture>",
+          "Base URL is available via <base_url fixture>"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close with valid clinician credentials",
+          "Fetch the Encounter resource via GET /Encounter/{id}",
+          "Query AuditEvent feed for the close operation"
+        ],
+        "expected": [
+          "POST /Encounter/{id}/close returns HTTP 200",
+          "Response body contains encounter.status == 'finished'",
+          "GET /Encounter/{id} confirms persisted status == 'finished'",
+          "At least one AuditEvent record exists referencing the encounter id and action 'close'"
+        ],
+        "trace": [
+          "R-HLT-082: clinician shall close an Encounter",
+          "R-HLT-082: encounter.status=finished",
+          "R-HLT-082: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "def test_close_encounter_sets_status_finished_and_emits_audit(base_url, auth_headers, open_encounter):\n    enc_id = open_encounter[\"id\"]\n\n    close_resp = <api_post>(f\"{base_url}/Encounter/{enc_id}/close\", headers=auth_headers)\n    assert close_resp.status_code == 200\n    assert close_resp.json()[\"status\"] == \"finished\"\n\n    get_resp = <api_get>(f\"{base_url}/Encounter/{enc_id}\", headers=auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"finished\"\n\n    audit_resp = <api_get>(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Encounter/{enc_id}\", \"action\": \"close\"},\n        headers=auth_headers,\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1\n    actions = [e[\"resource\"].get(\"action\") for e in entries]\n    assert \"close\" in actions or any(\"close\" in str(a) for a in actions)"
+      },
+      {
+        "name": "test_modify_closed_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "An Encounter exists with status=finished (already closed)",
+          "Clinician auth token is available via <auth_token fixture>",
+          "Base URL is available via <base_url fixture>"
+        ],
+        "actions": [
+          "Attempt PUT /Encounter/{id} with a payload that changes encounter.class",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "Response status code is 409",
+          "Response body contains an OperationOutcome or error message indicating the encounter is closed",
+          "Encounter resource remains unchanged (status still 'finished')"
+        ],
+        "trace": [
+          "R-HLT-082: closed Encounters shall reject further modifications",
+          "R-HLT-082: Error pathway 409 when modifying closed encounter"
+        ],
+        "executable": "def test_modify_closed_encounter_returns_409(base_url, auth_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n    mutated = dict(closed_encounter)\n    mutated[\"class\"] = {\"code\": \"AMB\", \"display\": \"ambulatory\"}\n\n    put_resp = <api_put>(\n        f\"{base_url}/Encounter/{enc_id}\",\n        json=mutated,\n        headers=auth_headers,\n    )\n    assert put_resp.status_code == 409\n\n    body = put_resp.json()\n    assert \"closed\" in str(body).lower() or \"finished\" in str(body).lower() or \"conflict\" in str(body).lower()\n\n    verify_resp = <api_get>(f\"{base_url}/Encounter/{enc_id}\", headers=auth_headers)\n    assert verify_resp.json()[\"status\"] == \"finished\""
+      },
+      {
+        "name": "test_addendum_observation_allowed_on_closed_encounter",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "An Encounter exists with status=finished",
+          "Clinician auth token is available via <auth_token fixture>",
+          "Base URL is available via <base_url fixture>"
+        ],
+        "actions": [
+          "POST /Observation with category=addendum referencing the closed Encounter",
+          "Verify the Observation is persisted",
+          "Query AuditEvent for the addendum operation"
+        ],
+        "expected": [
+          "POST /Observation returns HTTP 201",
+          "Created Observation links to the closed Encounter id",
+          "Observation.status or Observation.category indicates addendum",
+          "AuditEvent is emitted for the addendum Observation creation"
+        ],
+        "trace": [
+          "R-HLT-082: closed Encounters shall reject further modifications EXCEPT for addendum Observations",
+          "R-HLT-082: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "def test_addendum_observation_allowed_on_closed_encounter(base_url, auth_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"code\": \"addendum\"}]}],\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"55607006\"}]},\n        \"valueString\": \"Addendum note\",\n    }\n\n    post_resp = <api_post>(f\"{base_url}/Observation\", json=payload, headers=auth_headers)\n    assert post_resp.status_code == 201\n\n    obs = post_resp.json()\n    assert obs[\"encounter\"][\"reference\"] == f\"Encounter/{enc_id}\"\n    assert any(\"addendum\" in str(c) for c in obs.get(\"category\", []))\n\n    obs_id = obs[\"id\"]\n    audit_resp = <api_get>(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Observation/{obs_id}\"},\n        headers=auth_headers,\n    )\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json().get(\"entry\", [])) >= 1"
+      },
+      {
+        "name": "test_close_already_closed_encounter_returns_conflict",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "An Encounter exists with status=finished",
+          "Clinician auth token is available via <auth_token fixture>",
+          "Base URL is available via <base_url fixture>"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close on an already-finished Encounter",
+          "Capture HTTP status and body",
+          "Query AuditEvent to confirm failed attempt is also recorded"
+        ],
+        "expected": [
+          "Response status code is 409",
+          "Encounter status remains 'finished' (no regression to another state)",
+          "AuditEvent is emitted for the failed close attempt (audit of every operation including errors)"
+        ],
+        "trace": [
+          "R-HLT-082: closed Encounters shall reject further modifications",
+          "R-HLT-082: AuditEvent must be emitted for every operation",
+          "R-HLT-082: Error pathway 409 when modifying closed encounter"
+        ],
+        "executable": "def test_close_already_closed_encounter_returns_conflict(base_url, auth_headers, closed_encounter):\n    enc_id = closed_encounter[\"id\"]\n\n    close_resp = <api_post>(f\"{base_url}/Encounter/{enc_id}/close\", headers=auth_headers)\n    assert close_resp.status_code == 409\n\n    get_resp = <api_get>(f\"{base_url}/Encounter/{enc_id}\", headers=auth_headers)\n    assert get_resp.json()[\"status\"] == \"finished\"\n\n    audit_resp = <api_get>(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Encounter/{enc_id}\", \"outcome\": \"8\"},\n        headers=auth_headers,\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1"
+      }
+    ]
+  },
+  "req_id": "R-HLT-082",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 2595,
+    "latency_ms": 33134,
+    "wall_ms": 33134,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-082\",\n  \"reasoning\": \"R-HLT-082 defines a state machine (open\u2192finished) with three testable axes: (1) happy-path close sets status=finished and emits AuditEvent, (2) negative path rejects modifications to a finished encounter with HTTP 409, and (3) boundary case tests the single allowed exception\u2014addendum Observations on a closed encounter must succeed. STC drives the primary positive case; NEG drives the rejection case; BVA drives the addendum boundary. A fourth DT case covers the audit trail completeness requirement end-to-end. Together these achieve full Decision-Table coverage of the two-condition table: {encounter_state \u00d7 operation_type}.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_encounter_sets_status_finished_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"An Encounter exists with status=in-progress\",\n        \"Clinician auth token is available via <auth_token fixture>\",\n        \"Base URL is available via <base_url fixture>\"\n      ],\n      \"actions\": [\n        \"POST /Encounter/{id}/close with valid clinician credentials\",\n        \"Fetch the Encounter resource via GET /Encounter/{id}\",\n        \"Query AuditEvent feed for the close operation\"\n      ],\n      \"expected\": [\n        \"POST /Encounter/{id}/close returns HTTP 200\",\n        \"Response body contains encounter.status == 'finished'\",\n        \"GET /Encounter/{id} confirms persisted status == 'finished'\",\n        \"At least one AuditEvent record exists referencing the encounter id and action 'close'\"\n      ],\n      \"trace\": [\n        \"R-HLT-082: clinician shall close an Encounter\",\n        \"R-HLT-082: encounter.status=finished\",\n        \"R-HLT-082: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"def test_close_encounter_sets_status_finished_and_emits_audit(base_url, auth_headers, open_encounter):\\n    enc_id = open_encounter[\\\"id\\\"]\\n\\n    close_resp = <api_post>(f\\\"{base_url}/Encounter/{enc_id}/close\\\", headers=auth_headers)\\n    assert close_resp.status_code == 200\\n    assert close_resp.json()[\\\"status\\\"] == \\\"finished\\\"\\n\\n    get_resp = <api_get>(f\\\"{base_url}/Encounter/{enc_id}\\\", headers=auth_headers)\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"finished\\\"\\n\\n    audit_resp = <api_get>(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Encounter/{enc_id}\\\", \\\"action\\\": \\\"close\\\"},\\n        headers=auth_headers,\\n    )\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1\\n    actions = [e[\\\"resource\\\"].get(\\\"action\\\") for e in entries]\\n    assert \\\"close\\\" in actions or any(\\\"close\\\" in str(a) for a in actions)\"\n    },\n    {\n      \"name\": \"test_modify_closed_encounter_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"An Encounter exists with status=finished (already closed)\",\n        \"Clinician auth token is available via <auth_token fixture>\",\n        \"Base URL is available via <base_url fixture>\"\n      ],\n      \"actions\": [\n        \"Attempt PUT /Encounter/{id} with a payload that changes encounter.class\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"Response status code is 409\",\n        \"Response body contains an OperationOutcome or error message indicating the encounter is closed\",\n        \"Encounter resource remains unchanged (status still 'finished')\"\n      ],\n      \"trace\": [\n        \"R-HLT-082: closed Encounters shall reject further modifications\",\n        \"R-HLT-082: Error pathway 409 when modifying closed encounter\"\n      ],\n      \"executable\": \"def test_modify_closed_encounter_returns_409(base_url, auth_headers, closed_encounter):\\n    enc_id = closed_encounter[\\\"id\\\"]\\n    mutated = dict(closed_encounter)\\n    mutated[\\\"class\\\"] = {\\\"code\\\": \\\"AMB\\\", \\\"display\\\": \\\"ambulatory\\\"}\\n\\n    put_resp = <api_put>(\\n    "
+  }
+}

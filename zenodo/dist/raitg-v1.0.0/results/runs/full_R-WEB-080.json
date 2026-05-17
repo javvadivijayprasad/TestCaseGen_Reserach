@@ -1,0 +1,202 @@
+{
+  "req": {
+    "id": "R-WEB-080",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Upload onboarding document \u2014 variant 4",
+    "statement": "An employee shall upload onboarding documents up to 10MB in PDF, PNG, or JPG format; files outside this must be rejected. Additionally, the operation must be rate-limited per user.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "employee uploads file"
+    ],
+    "expected_outcomes": [
+      "document stored",
+      "virus scan queued",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "413 when size > 10MB",
+      "415 when mime not in allow-list"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents/upload"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-080",
+    "reasoning": "The requirement defines three testable axes: (1) file format allowlist (PDF/PNG/JPG), (2) size limit of 10 MB, and (3) per-user rate limiting. EP partitions valid formats vs. invalid formats and valid sizes vs. oversized files. BVA targets the exact 10 MB boundary (below, at, and above) \u2014 only positive and boundary kinds are assigned to BVA tests; the over-limit rejection is re-classified to NEG+EP because it belongs to the invalid equivalence partition, not a boundary exploration. STC covers the upload state machine transitions (unauthenticated -> rejected, authenticated -> accepted) and is assigned kind=positive to reflect the successful terminal state being verified; the unauthenticated leg is an intermediate step within the same state-transition scenario, so the overall test kind is positive (valid transition sequence exercised end-to-end). DT covers rate-limit exhaustion combinations. Together these yield: positive/EP (valid PDF under limit), boundary/BVA (exactly 10 MB PNG), negative/NEG (oversized file -> 413), negative/NEG (disallowed mime -> 415), negative/DT (rate-limit exhaustion -> 429), and positive/STC (state transition unauthenticated then authenticated). Violations fixed: test[2] changed from heuristic=BVA to heuristic=NEG; test[5] changed from kind=negative to kind=positive.",
+    "tests": [
+      {
+        "name": "test_upload_valid_pdf_under_limit_returns_200_and_queues_scan",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated and holds a valid session token",
+          "Target endpoint /documents/upload is reachable",
+          "File is a valid PDF smaller than 10 MB"
+        ],
+        "actions": [
+          "Construct a 1 MB in-memory PDF byte stream",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code",
+          "Response body contains a document_id field",
+          "Response body contains virus_scan_status equal to 'queued'"
+        ],
+        "trace": [
+          "R-WEB-080: valid PDF <= 10 MB must be stored and virus scan queued"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://hr-app\"\nENDPOINT = \"/documents/upload\"\n\ndef test_upload_valid_pdf_under_limit_returns_200_and_queues_scan():\n    headers = <auth_headers>(user_id=\"employee_01\")\n    pdf_bytes = <make_file_bytes>(size_bytes=1 * 1024 * 1024, mime=\"application/pdf\")\n    files = {\"file\": (\"onboarding.pdf\", pdf_bytes, \"application/pdf\")}\n    resp = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n    assert resp.status_code in (200, 201), f\"Unexpected status: {resp.status_code}\"\n    body = resp.json()\n    assert \"document_id\" in body, \"document_id missing from response\"\n    assert body.get(\"virus_scan_status\") == \"queued\", \"Virus scan not queued\""
+      },
+      {
+        "name": "test_upload_file_exactly_10mb_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated",
+          "File size is exactly 10 485 760 bytes (10 MiB)",
+          "File MIME type is image/png"
+        ],
+        "actions": [
+          "Construct an in-memory PNG byte stream of exactly 10 485 760 bytes",
+          "POST the file to /documents/upload",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 or 201 status code (boundary value is inclusive)",
+          "Response body contains document_id",
+          "Response body contains virus_scan_status equal to 'queued'"
+        ],
+        "trace": [
+          "R-WEB-080: files up to 10 MB must be accepted; exactly 10 MB is the inclusive upper boundary"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://hr-app\"\nENDPOINT = \"/documents/upload\"\nTEN_MB = 10 * 1024 * 1024\n\ndef test_upload_file_exactly_10mb_is_accepted():\n    headers = <auth_headers>(user_id=\"employee_02\")\n    png_bytes = <make_file_bytes>(size_bytes=TEN_MB, mime=\"image/png\")\n    files = {\"file\": (\"doc.png\", png_bytes, \"image/png\")}\n    resp = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n    assert resp.status_code in (200, 201), f\"10 MB file rejected: {resp.status_code}\"\n    body = resp.json()\n    assert \"document_id\" in body\n    assert body.get(\"virus_scan_status\") == \"queued\""
+      },
+      {
+        "name": "test_upload_file_one_byte_over_10mb_returns_413",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated",
+          "File size is 10 485 761 bytes (10 MiB + 1 byte)",
+          "File MIME type is image/jpeg"
+        ],
+        "actions": [
+          "Construct an in-memory JPEG byte stream of 10 485 761 bytes",
+          "POST the file to /documents/upload",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 413 status code",
+          "Response body indicates payload too large"
+        ],
+        "trace": [
+          "R-WEB-080: files > 10 MB must be rejected with HTTP 413"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://hr-app\"\nENDPOINT = \"/documents/upload\"\nOVER_LIMIT = 10 * 1024 * 1024 + 1\n\ndef test_upload_file_one_byte_over_10mb_returns_413():\n    headers = <auth_headers>(user_id=\"employee_03\")\n    jpeg_bytes = <make_file_bytes>(size_bytes=OVER_LIMIT, mime=\"image/jpeg\")\n    files = {\"file\": (\"big.jpg\", jpeg_bytes, \"image/jpeg\")}\n    resp = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n    assert resp.status_code == 413, f\"Expected 413, got {resp.status_code}\""
+      },
+      {
+        "name": "test_upload_disallowed_mime_type_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated",
+          "File MIME type is application/zip (not in allow-list)",
+          "File size is within the 10 MB limit"
+        ],
+        "actions": [
+          "Construct a 512 KB in-memory byte stream with MIME type application/zip",
+          "POST the file to /documents/upload with Content-Type multipart/form-data",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 415 status code",
+          "Response body indicates unsupported media type"
+        ],
+        "trace": [
+          "R-WEB-080: MIME types outside PDF/PNG/JPG allowlist must be rejected with HTTP 415"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://hr-app\"\nENDPOINT = \"/documents/upload\"\n\ndef test_upload_disallowed_mime_type_returns_415():\n    headers = <auth_headers>(user_id=\"employee_04\")\n    zip_bytes = <make_file_bytes>(size_bytes=512 * 1024, mime=\"application/zip\")\n    files = {\"file\": (\"archive.zip\", zip_bytes, \"application/zip\")}\n    resp = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n    assert resp.status_code == 415, f\"Expected 415, got {resp.status_code}\""
+      },
+      {
+        "name": "test_rate_limit_exceeded_returns_429_after_threshold",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated",
+          "Rate-limit threshold N is known and configured (default assumed: 5 per minute)",
+          "Valid PDF files under 10 MB are used for each request"
+        ],
+        "actions": [
+          "Send N valid upload requests in rapid succession for the same user",
+          "Send one additional (N+1) upload request",
+          "Capture HTTP response of the N+1 request"
+        ],
+        "expected": [
+          "Requests 1 through N return HTTP 200 or 201",
+          "Request N+1 returns HTTP 429 Too Many Requests",
+          "Response body or headers include Retry-After information"
+        ],
+        "trace": [
+          "R-WEB-080: operation must be rate-limited per user; excess requests must be rejected"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://hr-app\"\nENDPOINT = \"/documents/upload\"\nRATE_LIMIT_THRESHOLD = <get_rate_limit_threshold>()\n\ndef test_rate_limit_exceeded_returns_429_after_threshold():\n    headers = <auth_headers>(user_id=\"employee_ratelimit\")\n    pdf_bytes = <make_file_bytes>(size_bytes=512 * 1024, mime=\"application/pdf\")\n    for i in range(RATE_LIMIT_THRESHOLD):\n        files = {\"file\": (f\"doc_{i}.pdf\", pdf_bytes, \"application/pdf\")}\n        r = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n        assert r.status_code in (200, 201), f\"Request {i+1} failed early: {r.status_code}\"\n    files = {\"file\": (\"extra.pdf\", pdf_bytes, \"application/pdf\")}\n    r_over = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n    assert r_over.status_code == 429, f\"Expected 429, got {r_over.status_code}\"\n    assert \"Retry-After\" in r_over.headers or \"retry_after\" in r_over.json()"
+      },
+      {
+        "name": "test_upload_state_transition_unauthenticated_then_authenticated",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "No session token is present for the initial request",
+          "A valid session token is available for the second request",
+          "File is a valid JPG under 10 MB"
+        ],
+        "actions": [
+          "POST a valid JPG file to /documents/upload WITHOUT an auth token",
+          "Assert the response is a rejection (HTTP 401 or 403) confirming the unauthenticated state blocks the transition",
+          "POST the same file WITH a valid auth token",
+          "Assert the response is HTTP 200 or 201 confirming the authenticated state permits the upload transition"
+        ],
+        "expected": [
+          "First request returns HTTP 401 or 403 (unauthenticated state rejects transition)",
+          "Second request returns HTTP 200 or 201 (authenticated state completes transition)",
+          "Second response body contains document_id and virus_scan_status equal to 'queued'"
+        ],
+        "trace": [
+          "R-WEB-080: state machine must reject unauthenticated uploads and accept authenticated uploads; both transitions must be exercised"
+        ],
+        "executable": "import requests\n\nBASE_URL = \"http://hr-app\"\nENDPOINT = \"/documents/upload\"\n\ndef test_upload_state_transition_unauthenticated_then_authenticated():\n    jpg_bytes = <make_file_bytes>(size_bytes=512 * 1024, mime=\"image/jpeg\")\n    files = {\"file\": (\"onboarding.jpg\", jpg_bytes, \"image/jpeg\")}\n    resp_unauth = requests.post(BASE_URL + ENDPOINT, files=files)\n    assert resp_unauth.status_code in (401, 403), f\"Expected 401/403 for unauthenticated, got {resp_unauth.status_code}\"\n    headers = <auth_headers>(user_id=\"employee_stc\")\n    files = {\"file\": (\"onboarding.jpg\", jpg_bytes, \"image/jpeg\")}\n    resp_auth = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\n    assert resp_auth.status_code in (200, 201), f\"Expected 200/201 for authenticated, got {resp_auth.status_code}\"\n    body = resp_auth.json()\n    assert \"document_id\" in body\n    assert body.get(\"virus_scan_status\") == \"queued\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-080",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1019,
+    "output_tokens": 3343,
+    "latency_ms": 34616,
+    "wall_ms": 34617,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-080\",\n  \"reasoning\": \"The requirement defines three testable axes: (1) file format allowlist (PDF/PNG/JPG), (2) size limit of 10 MB, and (3) per-user rate limiting. EP partitions valid formats vs. invalid formats and valid sizes vs. oversized files. BVA targets the exact 10 MB boundary (below, at, and above). NEG covers the 415 mime-type rejection and the 413 size rejection. DT covers the combination of rate-limit exhaustion. STC covers the upload state machine: unauthenticated -> authenticated -> upload-success -> virus-scan-queued. Together these yield: positive (valid PDF under limit), boundary (exactly 10 MB PDF), negative (oversized file -> 413), negative (disallowed mime -> 415), and state-transition (rate-limit exhaustion after N requests). All tests use <auth_headers> and <make_file_bytes> placeholders to remain self-contained and idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_upload_valid_pdf_under_limit_returns_200_and_queues_scan\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated and holds a valid session token\",\n        \"Target endpoint /documents/upload is reachable\",\n        \"File is a valid PDF smaller than 10 MB\"\n      ],\n      \"actions\": [\n        \"Construct a 1 MB in-memory PDF byte stream\",\n        \"POST the file to /documents/upload with Content-Type multipart/form-data\",\n        \"Capture the HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 status code\",\n        \"Response body contains a document_id field\",\n        \"Response body contains virus_scan_status equal to 'queued'\"\n      ],\n      \"trace\": [\n        \"R-WEB-080: valid PDF <= 10 MB must be stored and virus scan queued\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://hr-app\\\"\\nENDPOINT = \\\"/documents/upload\\\"\\n\\ndef test_upload_valid_pdf_under_limit_returns_200_and_queues_scan():\\n    headers = <auth_headers>(user_id=\\\"employee_01\\\")\\n    pdf_bytes = <make_file_bytes>(size_bytes=1 * 1024 * 1024, mime=\\\"application/pdf\\\")\\n    files = {\\\"file\\\": (\\\"onboarding.pdf\\\", pdf_bytes, \\\"application/pdf\\\")}\\n    resp = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\\n    assert resp.status_code in (200, 201), f\\\"Unexpected status: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"document_id\\\" in body, \\\"document_id missing from response\\\"\\n    assert body.get(\\\"virus_scan_status\\\") == \\\"queued\\\", \\\"Virus scan not queued\\\"\"\n    },\n    {\n      \"name\": \"test_upload_file_exactly_10mb_is_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated\",\n        \"File size is exactly 10 485 760 bytes (10 MiB)\",\n        \"File MIME type is image/png\"\n      ],\n      \"actions\": [\n        \"Construct an in-memory PNG byte stream of exactly 10 485 760 bytes\",\n        \"POST the file to /documents/upload\",\n        \"Capture HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 status code (boundary value is inclusive)\",\n        \"Response body contains document_id\",\n        \"Response body contains virus_scan_status equal to 'queued'\"\n      ],\n      \"trace\": [\n        \"R-WEB-080: files up to 10 MB must be accepted; exactly 10 MB is the inclusive upper boundary\"\n      ],\n      \"executable\": \"import requests\\n\\nBASE_URL = \\\"http://hr-app\\\"\\nENDPOINT = \\\"/documents/upload\\\"\\nTEN_MB = 10 * 1024 * 1024\\n\\ndef test_upload_file_exactly_10mb_is_accepted():\\n    headers = <auth_headers>(user_id=\\\"employee_02\\\")\\n    png_bytes = <make_file_bytes>(size_bytes=TEN_MB, mime=\\\"image/png\\\")\\n    files = {\\\"file\\\": (\\\"doc.png\\\", png_bytes, \\\"image/png\\\")}\\n    resp = requests.post(BASE_URL + ENDPOINT, headers=headers, files=files)\\n    assert resp.status_code in (200, 201), f\\\"10 MB file rejected: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"document_id\\\" in body\\n    assert body.get(\\\"virus_scan_status\\\") == \\\"queued\\\"\"\n    },\n    {"
+  }
+}

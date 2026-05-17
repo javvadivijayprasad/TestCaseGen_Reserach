@@ -1,0 +1,176 @@
+{
+  "req": {
+    "id": "R-FIN-022",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Card PIN change",
+    "statement": "A customer shall change their card PIN at most 5 times per 24-hour window.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer changes PIN"
+    ],
+    "expected_outcomes": [
+      "PIN updated"
+    ],
+    "error_pathways": [
+      "429 when rate limit exceeded"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/pin"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-022",
+    "reasoning": "R-FIN-022 mandates rate-limiting on card PIN changes: maximum 5 changes per 24-hour window. Test suite validates: (1) successful PIN change within limit (positive/EP), (2) rejection on 6th attempt within window (negative/NEG), (3) boundary transitions at exactly 5 changes (boundary/BVA), and (4) state behavior across time windows (STC). Tests use deterministic mocking of time and API responses to ensure idempotence and repeatability.",
+    "tests": [
+      {
+        "name": "test_pin_change_within_limit_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer authenticated with valid session token",
+          "Card ID exists and belongs to caller",
+          "Customer has made 0 PIN changes in the last 24 hours",
+          "New PIN is valid format (4-6 digits)"
+        ],
+        "actions": [
+          "POST /cards/{id}/pin with new_pin=1234 and current_pin=0000"
+        ],
+        "expected": [
+          "Response status is 200 OK",
+          "Response body contains updated_at timestamp",
+          "Card PIN is updated in backend"
+        ],
+        "trace": [
+          "R-FIN-022: expected outcome - PIN updated",
+          "Equivalence partition: valid request within rate limit"
+        ],
+        "executable": "def test_pin_change_within_limit_succeeds(api_client, valid_card_id, mocker):\n    mocker.patch('requests.post') as mock_post\n    mock_post.return_value.status_code = 200\n    mock_post.return_value.json.return_value = {\n        'card_id': valid_card_id,\n        'updated_at': '2024-01-15T10:30:00Z'\n    }\n    \n    resp = api_client.post(\n        f'/cards/{valid_card_id}/pin',\n        json={'new_pin': '1234', 'current_pin': '0000'}\n    )\n    \n    assert resp.status_code == 200\n    assert 'updated_at' in resp.json()\n    mock_post.assert_called_once()"
+      },
+      {
+        "name": "test_pin_change_exceeds_rate_limit_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer authenticated with valid session token",
+          "Card ID exists and belongs to caller",
+          "Customer has made exactly 5 PIN changes in the last 24 hours",
+          "New PIN is valid format"
+        ],
+        "actions": [
+          "POST /cards/{id}/pin with new_pin=5678 (6th attempt within 24h)"
+        ],
+        "expected": [
+          "Response status is 429 Too Many Requests",
+          "Response body contains error code RATE_LIMIT_EXCEEDED",
+          "PIN is NOT updated in backend"
+        ],
+        "trace": [
+          "R-FIN-022: error pathway - 429 when rate limit exceeded",
+          "Negative test: exceeding maximum 5 changes per 24-hour window"
+        ],
+        "executable": "def test_pin_change_exceeds_rate_limit_rejected(api_client, valid_card_id, mocker):\n    mocker.patch('requests.post') as mock_post\n    mock_post.return_value.status_code = 429\n    mock_post.return_value.json.return_value = {\n        'error_code': 'RATE_LIMIT_EXCEEDED',\n        'message': 'Maximum 5 PIN changes per 24 hours exceeded'\n    }\n    \n    resp = api_client.post(\n        f'/cards/{valid_card_id}/pin',\n        json={'new_pin': '5678', 'current_pin': '1234'}\n    )\n    \n    assert resp.status_code == 429\n    assert resp.json()['error_code'] == 'RATE_LIMIT_EXCEEDED'"
+      },
+      {
+        "name": "test_pin_change_at_boundary_limit_5th_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer authenticated with valid session token",
+          "Card ID exists and belongs to caller",
+          "Customer has made exactly 4 PIN changes in the last 24 hours",
+          "New PIN is valid format"
+        ],
+        "actions": [
+          "POST /cards/{id}/pin with new_pin=9999 (5th attempt within 24h)"
+        ],
+        "expected": [
+          "Response status is 200 OK",
+          "Response body contains updated_at timestamp",
+          "Customer is now at maximum limit (5/5)"
+        ],
+        "trace": [
+          "R-FIN-022: boundary condition - at most 5 times per 24-hour window",
+          "Boundary value: 5th change (valid), 6th would fail"
+        ],
+        "executable": "def test_pin_change_at_boundary_limit_5th_succeeds(api_client, valid_card_id, mocker):\n    mocker.patch('requests.post') as mock_post\n    mock_post.return_value.status_code = 200\n    mock_post.return_value.json.return_value = {\n        'card_id': valid_card_id,\n        'updated_at': '2024-01-15T10:45:00Z',\n        'remaining_changes_24h': 0\n    }\n    \n    resp = api_client.post(\n        f'/cards/{valid_card_id}/pin',\n        json={'new_pin': '9999', 'current_pin': '5678'}\n    )\n    \n    assert resp.status_code == 200\n    assert resp.json()['remaining_changes_24h'] == 0"
+      },
+      {
+        "name": "test_pin_change_resets_after_24hour_window",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer authenticated with valid session token",
+          "Card ID exists and belongs to caller",
+          "Customer made 5 PIN changes, last one was 23 hours 59 minutes ago",
+          "New PIN is valid format"
+        ],
+        "actions": [
+          "Wait for window to expire (mocked time advancement)",
+          "POST /cards/{id}/pin with new_pin=2222"
+        ],
+        "expected": [
+          "Response status is 200 OK",
+          "Customer counter resets to 1 change in new 24-hour window",
+          "PIN is successfully updated"
+        ],
+        "trace": [
+          "R-FIN-022: state transition - window expiry resets counter",
+          "STC: transition from exhausted (5/5) to available (1/5) after time window"
+        ],
+        "executable": "def test_pin_change_resets_after_24hour_window(api_client, valid_card_id, mocker):\n    mock_time = mocker.patch('time.time')\n    mock_post = mocker.patch('requests.post')\n    \n    mock_time.return_value = 86400 + 1\n    mock_post.return_value.status_code = 200\n    mock_post.return_value.json.return_value = {\n        'card_id': valid_card_id,\n        'updated_at': '2024-01-16T10:46:00Z',\n        'changes_in_window': 1\n    }\n    \n    resp = api_client.post(\n        f'/cards/{valid_card_id}/pin',\n        json={'new_pin': '2222', 'current_pin': '9999'}\n    )\n    \n    assert resp.status_code == 200\n    assert resp.json()['changes_in_window'] == 1"
+      },
+      {
+        "name": "test_pin_change_invalid_card_ownership",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer authenticated with valid session token",
+          "Card ID does NOT belong to caller",
+          "Precondition violated: card belongs to caller"
+        ],
+        "actions": [
+          "POST /cards/{other_card_id}/pin with new_pin=1111"
+        ],
+        "expected": [
+          "Response status is 403 Forbidden",
+          "Response body contains error code UNAUTHORIZED_CARD",
+          "PIN is NOT modified"
+        ],
+        "trace": [
+          "R-FIN-022: precondition violation - card does not belong to caller",
+          "Negative test: unauthorized access to card"
+        ],
+        "executable": "def test_pin_change_invalid_card_ownership(api_client, other_customer_card_id, mocker):\n    mock_post = mocker.patch('requests.post')\n    mock_post.return_value.status_code = 403\n    mock_post.return_value.json.return_value = {\n        'error_code': 'UNAUTHORIZED_CARD',\n        'message': 'Card does not belong to caller'\n    }\n    \n    resp = api_client.post(\n        f'/cards/{other_customer_card_id}/pin',\n        json={'new_pin': '1111', 'current_pin': '0000'}\n    )\n    \n    assert resp.status_code == 403\n    assert resp.json()['error_code'] == 'UNAUTHORIZED_CARD'"
+      }
+    ]
+  },
+  "req_id": "R-FIN-022",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1014,
+    "output_tokens": 2494,
+    "latency_ms": 13939,
+    "wall_ms": 13939,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-022\",\n  \"reasoning\": \"R-FIN-022 mandates rate-limiting on card PIN changes: maximum 5 changes per 24-hour window. Test suite validates: (1) successful PIN change within limit (positive/EP), (2) rejection on 6th attempt within window (negative/BVA), (3) boundary transitions at exactly 5 changes (boundary/BVA), and (4) state behavior across time windows (STC). Tests use deterministic mocking of time and API responses to ensure idempotence and repeatability.\",\n  \"tests\": [\n    {\n      \"name\": \"test_pin_change_within_limit_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer authenticated with valid session token\",\n        \"Card ID exists and belongs to caller\",\n        \"Customer has made 0 PIN changes in the last 24 hours\",\n        \"New PIN is valid format (4-6 digits)\"\n      ],\n      \"actions\": [\n        \"POST /cards/{id}/pin with new_pin=1234 and current_pin=0000\"\n      ],\n      \"expected\": [\n        \"Response status is 200 OK\",\n        \"Response body contains updated_at timestamp\",\n        \"Card PIN is updated in backend\"\n      ],\n      \"trace\": [\n        \"R-FIN-022: expected outcome - PIN updated\",\n        \"Equivalence partition: valid request within rate limit\"\n      ],\n      \"executable\": \"def test_pin_change_within_limit_succeeds(api_client, valid_card_id, mocker):\\n    mocker.patch('requests.post') as mock_post\\n    mock_post.return_value.status_code = 200\\n    mock_post.return_value.json.return_value = {\\n        'card_id': valid_card_id,\\n        'updated_at': '2024-01-15T10:30:00Z'\\n    }\\n    \\n    resp = api_client.post(\\n        f'/cards/{valid_card_id}/pin',\\n        json={'new_pin': '1234', 'current_pin': '0000'}\\n    )\\n    \\n    assert resp.status_code == 200\\n    assert 'updated_at' in resp.json()\\n    mock_post.assert_called_once()\"\n    },\n    {\n      \"name\": \"test_pin_change_exceeds_rate_limit_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer authenticated with valid session token\",\n        \"Card ID exists and belongs to caller\",\n        \"Customer has made exactly 5 PIN changes in the last 24 hours\",\n        \"New PIN is valid format\"\n      ],\n      \"actions\": [\n        \"POST /cards/{id}/pin with new_pin=5678 (6th attempt within 24h)\"\n      ],\n      \"expected\": [\n        \"Response status is 429 Too Many Requests\",\n        \"Response body contains error code RATE_LIMIT_EXCEEDED\",\n        \"PIN is NOT updated in backend\"\n      ],\n      \"trace\": [\n        \"R-FIN-022: error pathway - 429 when rate limit exceeded\",\n        \"Negative test: exceeding maximum 5 changes per 24-hour window\"\n      ],\n      \"executable\": \"def test_pin_change_exceeds_rate_limit_rejected(api_client, valid_card_id, mocker):\\n    mocker.patch('requests.post') as mock_post\\n    mock_post.return_value.status_code = 429\\n    mock_post.return_value.json.return_value = {\\n        'error_code': 'RATE_LIMIT_EXCEEDED',\\n        'message': 'Maximum 5 PIN changes per 24 hours exceeded'\\n    }\\n    \\n    resp = api_client.post(\\n        f'/cards/{valid_card_id}/pin',\\n        json={'new_pin': '5678', 'current_pin': '1234'}\\n    )\\n    \\n    assert resp.status_code == 429\\n    assert resp.json()['error_code'] == 'RATE_LIMIT_EXCEEDED'\"\n    },\n    {\n      \"name\": \"test_pin_change_at_boundary_limit_5th_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer authenticated with valid session token\",\n        \"Card ID exists and belongs to caller\",\n        \"Customer has made exactly 4 PIN changes in the last 24 hours\",\n        \"New PIN is valid format\"\n      ],\n      \"actions\": [\n        \"POST /cards/{id}/pin with new_pin=9999 (5th attempt within 24h)\"\n      ],\n      \"expected\": [\n        \"Response status is 200 OK\",\n        \"Response body contains updated_at timestamp\",\n        \"Customer is now at maximum limit (5/5)\"\n      ],\n      \"trace\": [\n        \"R-FIN-022: boundar"
+  }
+}

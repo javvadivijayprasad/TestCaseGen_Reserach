@@ -1,0 +1,197 @@
+{
+  "req": {
+    "id": "R-FIN-056",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Wire transfer (negative variant)",
+    "statement": "A customer shall initiate a wire transfer requiring two-factor authentication; transfers above $100,000 require manual review. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "2fa verified in last 5 min"
+    ],
+    "triggers": [
+      "customer submits wire"
+    ],
+    "expected_outcomes": [
+      "wire queued",
+      "compliance check started"
+    ],
+    "error_pathways": [
+      "401 when 2fa stale",
+      "202 when manual review required"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/wire"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-056",
+    "reasoning": "The requirement mandates wire transfer with 2FA gating, a $100,000 manual-review threshold, and explicit error codes for stale 2FA (401), manual review (202), insufficient funds, unauthorised access, and exceeded limits. Test design covers: (1) EP positive path \u2013 valid 2FA, amount below threshold, funds available; (2) NEG \u2013 stale/missing 2FA token yields 401; (3) BVA \u2013 amount exactly at $100,000 boundary triggers 202 manual-review path; (4) NEG \u2013 insufficient funds yields 422/400; (5) DT positive \u2013 amount above $100,000 with valid 2FA yields 202 and compliance check; (6) STC positive \u2013 2FA state transition from verified to stale is modelled as a state-transition positive scenario verifying that a freshly verified 2FA token allows the transfer to proceed (the verified state is the valid partition; the stale outcome is already covered by test[1] as NEG/NEG). Violation fix: test[5] had kind=negative with heuristic=STC; STC must map to a positive or boundary kind because it models valid state sequences. The stale-2FA negative outcome is already fully covered by test[1] (NEG/NEG). Test[5] is therefore redesigned as a positive STC test verifying the valid state path: 2FA verified \u2192 transfer submitted within window \u2192 wire queued, confirming the state machine traversal of the happy path.",
+    "tests": [
+      {
+        "name": "test_wire_transfer_valid_below_threshold",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with balance >= $5,000",
+          "2FA verified within the last 5 minutes",
+          "Valid bearer token present in session"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=5000, valid 2FA header, sufficient balance"
+        ],
+        "expected": [
+          "HTTP 200 or 201 returned",
+          "Response body contains transfer_id",
+          "Response body contains status='queued'",
+          "Response body contains compliance_check_started=true"
+        ],
+        "trace": [
+          "R-FIN-056: wire queued; compliance check started",
+          "R-FIN-056: preconditions \u2013 2FA verified in last 5 min"
+        ],
+        "executable": "import pytest\n\ndef test_wire_transfer_valid_below_threshold(api_client, fresh_2fa_token, funded_account):\n    headers = {\n        \"Authorization\": f\"Bearer {funded_account['token']}\",\n        \"X-2FA-Token\": fresh_2fa_token,\n    }\n    payload = {\n        \"from_account\": funded_account[\"account_id\"],\n        \"to_routing\": \"<routing_number>\",\n        \"to_account\": \"<beneficiary_account>\",\n        \"amount\": 5000,\n        \"currency\": \"USD\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201)\n    body = resp.json()\n    assert \"transfer_id\" in body\n    assert body.get(\"status\") == \"queued\"\n    assert body.get(\"compliance_check_started\") is True\n"
+      },
+      {
+        "name": "test_wire_transfer_stale_2fa_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with sufficient funds",
+          "2FA token is older than 5 minutes (stale)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=5000, stale 2FA header"
+        ],
+        "expected": [
+          "HTTP 401 returned",
+          "Response body contains error code indicating stale or expired 2FA"
+        ],
+        "trace": [
+          "R-FIN-056 error pathway: 401 when 2fa stale"
+        ],
+        "executable": "import pytest\n\ndef test_wire_transfer_stale_2fa_returns_401(api_client, stale_2fa_token, funded_account):\n    headers = {\n        \"Authorization\": f\"Bearer {funded_account['token']}\",\n        \"X-2FA-Token\": stale_2fa_token,\n    }\n    payload = {\n        \"from_account\": funded_account[\"account_id\"],\n        \"to_routing\": \"<routing_number>\",\n        \"to_account\": \"<beneficiary_account>\",\n        \"amount\": 5000,\n        \"currency\": \"USD\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 401\n    body = resp.json()\n    error = body.get(\"error\", \"\").lower()\n    assert any(kw in error for kw in (\"2fa\", \"authentication\", \"expired\", \"stale\"))\n"
+      },
+      {
+        "name": "test_wire_transfer_boundary_100000_requires_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with balance >= $100,000",
+          "2FA verified within the last 5 minutes"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=100000 (exact boundary value)"
+        ],
+        "expected": [
+          "HTTP 202 returned",
+          "Response body contains status indicating manual review required"
+        ],
+        "trace": [
+          "R-FIN-056: transfers above $100,000 require manual review",
+          "R-FIN-056 error pathway: 202 when manual review required",
+          "BVA: exact boundary $100,000"
+        ],
+        "executable": "import pytest\n\ndef test_wire_transfer_boundary_100000_requires_manual_review(\n    api_client, fresh_2fa_token, high_balance_account\n):\n    headers = {\n        \"Authorization\": f\"Bearer {high_balance_account['token']}\",\n        \"X-2FA-Token\": fresh_2fa_token,\n    }\n    payload = {\n        \"from_account\": high_balance_account[\"account_id\"],\n        \"to_routing\": \"<routing_number>\",\n        \"to_account\": \"<beneficiary_account>\",\n        \"amount\": 100000,\n        \"currency\": \"USD\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    status = body.get(\"status\", \"\").lower()\n    assert \"manual\" in status or \"review\" in status\n"
+      },
+      {
+        "name": "test_wire_transfer_insufficient_funds_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with balance of $100",
+          "2FA verified within the last 5 minutes"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=5000 (exceeds balance)"
+        ],
+        "expected": [
+          "HTTP 422 or 400 returned",
+          "Response body contains error indicating insufficient funds"
+        ],
+        "trace": [
+          "R-FIN-056 error pathway: insufficient funds negative path"
+        ],
+        "executable": "import pytest\n\ndef test_wire_transfer_insufficient_funds_rejected(\n    api_client, fresh_2fa_token, low_balance_account\n):\n    headers = {\n        \"Authorization\": f\"Bearer {low_balance_account['token']}\",\n        \"X-2FA-Token\": fresh_2fa_token,\n    }\n    payload = {\n        \"from_account\": low_balance_account[\"account_id\"],\n        \"to_routing\": \"<routing_number>\",\n        \"to_account\": \"<beneficiary_account>\",\n        \"amount\": 5000,\n        \"currency\": \"USD\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code in (400, 422)\n    body = resp.json()\n    error = body.get(\"error\", \"\").lower()\n    assert any(kw in error for kw in (\"insufficient\", \"funds\", \"balance\"))\n"
+      },
+      {
+        "name": "test_wire_transfer_above_threshold_triggers_compliance",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists with balance >= $200,000",
+          "2FA verified within the last 5 minutes",
+          "Transfer amount above $100,000"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount=150000, valid 2FA, sufficient balance"
+        ],
+        "expected": [
+          "HTTP 202 returned",
+          "Response body contains transfer_id",
+          "Response body contains compliance_check_started=true",
+          "Response body contains status indicating manual review"
+        ],
+        "trace": [
+          "R-FIN-056: transfers above $100,000 require manual review",
+          "R-FIN-056: compliance check started",
+          "R-FIN-056 error pathway: 202 when manual review required",
+          "DT: condition \u2013 amount > 100000 AND 2FA valid AND funds sufficient"
+        ],
+        "executable": "import pytest\n\ndef test_wire_transfer_above_threshold_triggers_compliance(\n    api_client, fresh_2fa_token, high_balance_account\n):\n    headers = {\n        \"Authorization\": f\"Bearer {high_balance_account['token']}\",\n        \"X-2FA-Token\": fresh_2fa_token,\n    }\n    payload = {\n        \"from_account\": high_balance_account[\"account_id\"],\n        \"to_routing\": \"<routing_number>\",\n        \"to_account\": \"<beneficiary_account>\",\n        \"amount\": 150000,\n        \"currency\": \"USD\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert \"transfer_id\" in body\n    assert body.get(\"compliance_check_started\") is True\n    status = body.get(\"status\", \"\").lower()\n    assert \"manual\" in status or \"review\" in status\n"
+      },
+      {
+        "name": "test_wire_transfer_2fa_state_transition_verified_to_queued",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with balance >= $5,000",
+          "2FA verification event occurs immediately before transfer submission (within 5-minute window)",
+          "System 2FA state is in 'verified' partition"
+        ],
+        "actions": [
+          "Trigger 2FA verification to enter 'verified' state",
+          "Immediately POST /transfers/wire with amount=5000, fresh 2FA token, sufficient balance",
+          "Confirm system transitions from 'verified' state to 'transfer queued' state"
+        ],
+        "expected": [
+          "HTTP 200 or 201 returned",
+          "Response body contains status='queued'",
+          "Response body contains transfer_id confirming state transition completed",
+          "Response body contains compliance_check_started=true"
+        ],
+        "trace": [
+          "R-FIN-056: preconditions \u2013 2FA verified in last 5 min",
+          "R-FIN-056: wire queued; compliance check started",
+          "STC: state path \u2013 Unauthenticated \u2192 2FA Verified \u2192 Transfer Queued (valid traversal of happy-path state machine)"
+        ],
+        "executable": "import pytest\nimport time\n\ndef test_wire_transfer_2fa_state_transition_verified_to_queued(\n    api_client, funded_account, perform_2fa_verification\n):\n    # Drive system into '2FA verified' state\n    fresh_token = perform_2fa_verification(funded_account[\"user_id\"])\n    assert fresh_token is not None, \"2FA verification must succeed to enter verified state\"\n\n    headers = {\n        \"Authorization\": f\"Bearer {funded_account['token']}\",\n        \"X-2FA-Token\": fresh_token,\n    }\n    payload = {\n        \"from_account\": funded_account[\"account_id\"],\n        \"to_routing\": \"<routing_number>\",\n        \"to_account\": \"<beneficiary_account>\",\n        \"amount\": 5000,\n        \"currency\": \"USD\",\n    }\n    # Submit transfer while still within verified window \u2013 state transitions to queued\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201), (\n        f\"Expected 200/201 from verified state, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"transfer_id\" in body, \"transfer_id must be present confirming queued state\"\n    assert body.get(\"status\") == \"queued\", \"State must transition to queued\"\n    assert body.get(\"compliance_check_started\") is True\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-056",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1016,
+    "output_tokens": 3356,
+    "latency_ms": 38575,
+    "wall_ms": 38575,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-056\",\n  \"reasoning\": \"The requirement mandates wire transfer with 2FA gating, a $100,000 manual-review threshold, and explicit error codes for stale 2FA (401), manual review (202), insufficient funds, unauthorised access, and exceeded limits. Test design covers: (1) EP positive path \u2013 valid 2FA, amount below threshold, funds available; (2) NEG \u2013 stale/missing 2FA token yields 401; (3) BVA \u2013 amount exactly at $100,000 boundary triggers 202 manual-review path; (4) NEG \u2013 insufficient funds yields 422/400; (5) DT \u2013 amount above $100,000 with valid 2FA yields 202 and compliance check; (6) STC \u2013 2FA expires mid-session transitions auth state from verified to stale. Together these achieve full negative-path, boundary, and positive coverage traceable to R-FIN-056.\",\n  \"tests\": [\n    {\n      \"name\": \"test_wire_transfer_valid_below_threshold\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with balance >= $5,000\",\n        \"2FA verified within the last 5 minutes\",\n        \"Valid bearer token present in session\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=5000, valid 2FA header, sufficient balance\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 returned\",\n        \"Response body contains transfer_id\",\n        \"Response body contains status='queued'\",\n        \"Response body contains compliance_check_started=true\"\n      ],\n      \"trace\": [\n        \"R-FIN-056: wire queued; compliance check started\",\n        \"R-FIN-056: preconditions \u2013 2FA verified in last 5 min\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timedelta\\n\\ndef test_wire_transfer_valid_below_threshold(api_client, fresh_2fa_token, funded_account):\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {funded_account['token']}\\\",\\n        \\\"X-2FA-Token\\\": fresh_2fa_token,\\n    }\\n    payload = {\\n        \\\"from_account\\\": funded_account[\\\"account_id\\\"],\\n        \\\"to_routing\\\": \\\"<routing_number>\\\",\\n        \\\"to_account\\\": \\\"<beneficiary_account>\\\",\\n        \\\"amount\\\": 5000,\\n        \\\"currency\\\": \\\"USD\\\",\\n    }\\n    resp = api_client.post(\\\"/transfers/wire\\\", json=payload, headers=headers)\\n    assert resp.status_code in (200, 201)\\n    body = resp.json()\\n    assert \\\"transfer_id\\\" in body\\n    assert body.get(\\\"status\\\") == \\\"queued\\\"\\n    assert body.get(\\\"compliance_check_started\\\") is True\\n\"\n    },\n    {\n      \"name\": \"test_wire_transfer_stale_2fa_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient funds\",\n        \"2FA token is older than 5 minutes (stale)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with amount=5000, stale 2FA header\"\n      ],\n      \"expected\": [\n        \"HTTP 401 returned\",\n        \"Response body contains error code indicating stale or expired 2FA\"\n      ],\n      \"trace\": [\n        \"R-FIN-056 error pathway: 401 when 2fa stale\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_wire_transfer_stale_2fa_returns_401(api_client, stale_2fa_token, funded_account):\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {funded_account['token']}\\\",\\n        \\\"X-2FA-Token\\\": stale_2fa_token,\\n    }\\n    payload = {\\n        \\\"from_account\\\": funded_account[\\\"account_id\\\"],\\n        \\\"to_routing\\\": \\\"<routing_number>\\\",\\n        \\\"to_account\\\": \\\"<beneficiary_account>\\\",\\n        \\\"amount\\\": 5000,\\n        \\\"currency\\\": \\\"USD\\\",\\n    }\\n    resp = api_client.post(\\\"/transfers/wire\\\", json=payload, headers=headers)\\n    assert resp.status_code == 401\\n    body = resp.json()\\n    error = body.get(\\\"error\\\", \\\"\\\").lower()\\n    assert any(kw in error for kw in (\\\"2fa\\\", \\\"authentication\\\", \\\"expired\\\", \\\"stale\\\"))\\n\"\n    },\n    {\n      \"name\": \"test_wire_transfer_boundary_100000_requires_manual_review\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer accoun"
+  }
+}

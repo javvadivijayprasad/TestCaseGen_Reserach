@@ -1,0 +1,196 @@
+{
+  "req": {
+    "id": "R-WEB-101",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Bulk import employees \u2014 variant 5",
+    "statement": "An hr-admin shall bulk-import employees via CSV; the import shall validate each row and commit only rows that pass validation, reporting errors per row. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin uploads CSV"
+    ],
+    "expected_outcomes": [
+      "valid rows imported",
+      "error report generated",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "415 when file not CSV",
+      "422 when header missing required columns"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/employees/import"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-101",
+    "reasoning": "The requirement covers: (1) happy-path bulk CSV import with mixed valid/invalid rows, (2) 2FA confirmation gate, (3) wrong MIME type rejection (415), (4) missing required header rejection (422), and (5) boundary edge of a single-row CSV. EP partitions data into valid rows vs invalid rows vs wrong file type vs missing headers. BVA targets the minimal CSV (1 data row). STC models the 2FA state transition required before import commits. DT covers the combinatorial outcome matrix of file-type x header validity. NEG covers the error pathways explicitly stated in the requirement. Fix applied: test[4] (2FA bypass) was negative kind with heuristic=STC \u2014 STC is reserved for state-transition coverage which is inherently structural/positive in nature. The 2FA bypass test is a negative scenario testing an error pathway, so its heuristic is corrected to NEG.",
+    "tests": [
+      {
+        "name": "test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "2FA device is available and enrolled",
+          "CSV file contains 3 valid rows and 2 invalid rows (missing required field)",
+          "No pre-existing employees with the valid rows' IDs"
+        ],
+        "actions": [
+          "Navigate to /employees/import",
+          "Complete 2FA confirmation prompt",
+          "Upload a CSV file with 3 valid rows and 2 invalid rows",
+          "Submit the import form",
+          "Capture the response/results page"
+        ],
+        "expected": [
+          "HTTP 200 or success UI state",
+          "Exactly 3 employees created in the system",
+          "Error report lists exactly 2 row-level errors with row numbers",
+          "Valid rows are persisted and retrievable via /employees"
+        ],
+        "trace": [
+          "R-WEB-101: valid rows imported",
+          "R-WEB-101: error report generated per row",
+          "R-WEB-101: 2FA confirmation required"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors(\n    hr_admin_page: Page,\n    mixed_csv_file: str,\n    complete_2fa: callable,\n    api_client,\n    cleanup_imported_employees,\n):\n    page = hr_admin_page\n    page.goto(\"/employees/import\")\n    complete_2fa(page)\n    page.set_input_files(\"input[type='file']\", mixed_csv_file)\n    page.click(\"button[type='submit']\")\n    page.wait_for_selector(\".import-result\")\n\n    success_count = int(page.inner_text(\".import-success-count\"))\n    error_rows = page.query_selector_all(\".import-error-row\")\n\n    assert success_count == 3, f\"Expected 3 imported, got {success_count}\"\n    assert len(error_rows) == 2, f\"Expected 2 error rows, got {len(error_rows)}\"\n\n    employees = api_client.get(\"/employees\").json()\n    imported_ids = {e[\"id\"] for e in employees}\n    for eid in [\"EMP001\", \"EMP002\", \"EMP003\"]:\n        assert eid in imported_ids, f\"{eid} not found after import\"\n"
+      },
+      {
+        "name": "test_bulk_import_non_csv_file_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "2FA device is available and enrolled",
+          "A .xlsx file (non-CSV) is prepared"
+        ],
+        "actions": [
+          "Navigate to /employees/import",
+          "Complete 2FA confirmation prompt",
+          "Upload a .xlsx file instead of a CSV",
+          "Submit the import form",
+          "Capture the HTTP response status or UI error message"
+        ],
+        "expected": [
+          "HTTP 415 Unsupported Media Type OR UI displays 415 error message",
+          "No employees are created in the system",
+          "Error message references unsupported file type"
+        ],
+        "trace": [
+          "R-WEB-101 error pathway: 415 when file not CSV"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_bulk_import_non_csv_file_returns_415(\n    hr_admin_page: Page,\n    xlsx_file: str,\n    complete_2fa: callable,\n    api_client,\n):\n    page = hr_admin_page\n    page.goto(\"/employees/import\")\n    complete_2fa(page)\n\n    with page.expect_response(lambda r: \"/employees/import\" in r.url) as resp_info:\n        page.set_input_files(\"input[type='file']\", xlsx_file)\n        page.click(\"button[type='submit']\")\n\n    response = resp_info.value\n    assert response.status == 415 or page.query_selector(\".error-415\") is not None, \\\n        f\"Expected 415, got {response.status}\"\n\n    employees_before = api_client.get(\"/employees\").json()\n    assert all(e.get(\"source\") != \"xlsx_test\" for e in employees_before), \\\n        \"No employees should be created from rejected upload\"\n"
+      },
+      {
+        "name": "test_bulk_import_csv_missing_required_header_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "2FA device is available and enrolled",
+          "CSV file prepared without required header columns (e.g., missing 'email')"
+        ],
+        "actions": [
+          "Navigate to /employees/import",
+          "Complete 2FA confirmation prompt",
+          "Upload a CSV missing required header columns",
+          "Submit the import form",
+          "Capture the HTTP response status or UI error message"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity OR UI displays 422 error message",
+          "No employees are created",
+          "Error message identifies the missing header column(s)"
+        ],
+        "trace": [
+          "R-WEB-101 error pathway: 422 when header missing required columns"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_bulk_import_csv_missing_required_header_returns_422(\n    hr_admin_page: Page,\n    csv_missing_header_file: str,\n    complete_2fa: callable,\n    api_client,\n):\n    page = hr_admin_page\n    page.goto(\"/employees/import\")\n    complete_2fa(page)\n\n    with page.expect_response(lambda r: \"/employees/import\" in r.url) as resp_info:\n        page.set_input_files(\"input[type='file']\", csv_missing_header_file)\n        page.click(\"button[type='submit']\")\n\n    response = resp_info.value\n    assert response.status == 422 or page.query_selector(\".error-422\") is not None, \\\n        f\"Expected 422, got {response.status}\"\n\n    error_text = page.inner_text(\".import-error-message\")\n    assert \"email\" in error_text.lower() or \"header\" in error_text.lower(), \\\n        f\"Error should mention missing header, got: {error_text}\"\n"
+      },
+      {
+        "name": "test_bulk_import_single_row_csv_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "2FA device is available and enrolled",
+          "CSV file contains exactly 1 valid data row (minimum non-empty input)",
+          "No pre-existing employee with that row's ID"
+        ],
+        "actions": [
+          "Navigate to /employees/import",
+          "Complete 2FA confirmation prompt",
+          "Upload a CSV file with header + exactly 1 valid data row",
+          "Submit the import form",
+          "Verify system state via API"
+        ],
+        "expected": [
+          "HTTP 200 or success UI state",
+          "Exactly 1 employee created",
+          "Error report shows 0 errors",
+          "The single employee is retrievable via /employees"
+        ],
+        "trace": [
+          "R-WEB-101: valid rows imported",
+          "BVA: minimum boundary of 1 data row"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_bulk_import_single_row_csv_boundary(\n    hr_admin_page: Page,\n    single_row_csv_file: str,\n    complete_2fa: callable,\n    api_client,\n    cleanup_imported_employees,\n):\n    page = hr_admin_page\n    page.goto(\"/employees/import\")\n    complete_2fa(page)\n    page.set_input_files(\"input[type='file']\", single_row_csv_file)\n    page.click(\"button[type='submit']\")\n    page.wait_for_selector(\".import-result\")\n\n    success_count = int(page.inner_text(\".import-success-count\"))\n    error_rows = page.query_selector_all(\".import-error-row\")\n\n    assert success_count == 1, f\"Expected 1 imported row, got {success_count}\"\n    assert len(error_rows) == 0, f\"Expected 0 errors, got {len(error_rows)}\"\n\n    employees = api_client.get(\"/employees\").json()\n    assert any(e[\"id\"] == \"EMP_SINGLE\" for e in employees), \\\n        \"Single-row employee not found after import\"\n"
+      },
+      {
+        "name": "test_bulk_import_blocked_without_2fa_confirmation",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "2FA prompt is presented but NOT completed (user dismisses or skips it)",
+          "Valid CSV file is prepared"
+        ],
+        "actions": [
+          "Navigate to /employees/import",
+          "Dismiss or skip the 2FA confirmation prompt without completing it",
+          "Attempt to upload a valid CSV and submit the import form",
+          "Capture the HTTP response status or UI error message"
+        ],
+        "expected": [
+          "Import is blocked \u2014 HTTP 403 Forbidden OR UI displays 2FA required error",
+          "No employees are created in the system",
+          "Error message indicates 2FA confirmation is required to proceed"
+        ],
+        "trace": [
+          "R-WEB-101: additional variant semantics honoured \u2014 2FA confirmation required",
+          "R-WEB-101 error pathway: import blocked when 2FA not confirmed"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_bulk_import_blocked_without_2fa_confirmation(\n    hr_admin_page: Page,\n    valid_csv_file: str,\n    api_client,\n):\n    page = hr_admin_page\n    page.goto(\"/employees/import\")\n\n    # Dismiss the 2FA prompt without completing it\n    dismiss_btn = page.query_selector(\".2fa-dismiss, button[data-action='cancel-2fa']\")\n    if dismiss_btn:\n        dismiss_btn.click()\n    # Do not call complete_2fa \u2014 intentionally skip it\n\n    with page.expect_response(lambda r: \"/employees/import\" in r.url) as resp_info:\n        file_input = page.query_selector(\"input[type='file']\")\n        if file_input:\n            page.set_input_files(\"input[type='file']\", valid_csv_file)\n            page.click(\"button[type='submit']\")\n\n    response = resp_info.value\n    assert response.status in (401, 403) or page.query_selector(\".error-2fa-required\") is not None, \\\n        f\"Expected 401/403 when 2FA not completed, got {response.status}\"\n\n    employees = api_client.get(\"/employees\").json()\n    assert all(e.get(\"source\") != \"2fa_bypass_test\" for e in employees), \\\n        \"No employees should be imported without 2FA confirmation\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-101",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 3181,
+    "latency_ms": 41166,
+    "wall_ms": 41166,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-101\",\n  \"reasoning\": \"The requirement covers: (1) happy-path bulk CSV import with mixed valid/invalid rows, (2) 2FA confirmation gate, (3) wrong MIME type rejection (415), (4) missing required header rejection (422), and (5) boundary edge of a single-row CSV. EP partitions data into valid rows vs invalid rows vs wrong file type vs missing headers. BVA targets the minimal CSV (1 data row). STC models the 2FA state transition required before import commits. DT covers the combinatorial outcome matrix of file-type \u00d7 header validity. NEG covers the error pathways explicitly stated in the requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as hr-admin\",\n        \"2FA device is available and enrolled\",\n        \"CSV file contains 3 valid rows and 2 invalid rows (missing required field)\",\n        \"No pre-existing employees with the valid rows' IDs\"\n      ],\n      \"actions\": [\n        \"Navigate to /employees/import\",\n        \"Complete 2FA confirmation prompt\",\n        \"Upload a CSV file with 3 valid rows and 2 invalid rows\",\n        \"Submit the import form\",\n        \"Capture the response/results page\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or success UI state\",\n        \"Exactly 3 employees created in the system\",\n        \"Error report lists exactly 2 row-level errors with row numbers\",\n        \"Valid rows are persisted and retrievable via /employees\"\n      ],\n      \"trace\": [\n        \"R-WEB-101: valid rows imported\",\n        \"R-WEB-101: error report generated per row\",\n        \"R-WEB-101: 2FA confirmation required\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import Page\\n\\ndef test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors(\\n    hr_admin_page: Page,\\n    mixed_csv_file: str,\\n    complete_2fa: callable,\\n    api_client,\\n    cleanup_imported_employees,\\n):\\n    page = hr_admin_page\\n    page.goto(\\\"/employees/import\\\")\\n    complete_2fa(page)\\n    page.set_input_files(\\\"input[type='file']\\\", mixed_csv_file)\\n    page.click(\\\"button[type='submit']\\\")\\n    page.wait_for_selector(\\\".import-result\\\")\\n\\n    success_count = int(page.inner_text(\\\".import-success-count\\\"))\\n    error_rows = page.query_selector_all(\\\".import-error-row\\\")\\n\\n    assert success_count == 3, f\\\"Expected 3 imported, got {success_count}\\\"\\n    assert len(error_rows) == 2, f\\\"Expected 2 error rows, got {len(error_rows)}\\\"\\n\\n    employees = api_client.get(\\\"/employees\\\").json()\\n    imported_ids = {e[\\\"id\\\"] for e in employees}\\n    for eid in [\\\"EMP001\\\", \\\"EMP002\\\", \\\"EMP003\\\"]:\\n        assert eid in imported_ids, f\\\"{eid} not found after import\\\"\\n\"\n    },\n    {\n      \"name\": \"test_bulk_import_non_csv_file_returns_415\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as hr-admin\",\n        \"2FA device is available and enrolled\",\n        \"A .xlsx file (non-CSV) is prepared\"\n      ],\n      \"actions\": [\n        \"Navigate to /employees/import\",\n        \"Complete 2FA confirmation prompt\",\n        \"Upload a .xlsx file instead of a CSV\",\n        \"Submit the import form\",\n        \"Capture the HTTP response status or UI error message\"\n      ],\n      \"expected\": [\n        \"HTTP 415 Unsupported Media Type OR UI displays 415 error message\",\n        \"No employees are created in the system\",\n        \"Error message references unsupported file type\"\n      ],\n      \"trace\": [\n        \"R-WEB-101 error pathway: 415 when file not CSV\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import Page\\n\\ndef test_bulk_import_non_csv_file_returns_415(\\n    hr_admin_page: Page,\\n    xlsx_file: str,\\n    complete_2fa: callable,\\n    api_client,\\n):\\n    page = hr_admin_page\\n    page.goto(\\\"/employees/import\\\")\\n    complete_2fa(page)\\n\\n    with page.expect_re"
+  }
+}

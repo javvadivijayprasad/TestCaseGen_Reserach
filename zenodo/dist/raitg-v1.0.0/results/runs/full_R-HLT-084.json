@@ -1,0 +1,176 @@
+{
+  "req": {
+    "id": "R-HLT-084",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "integration",
+    "title": "Allergy intolerance (audit)",
+    "statement": "A clinician shall record an AllergyIntolerance linked to the patient; subsequent MedicationRequests shall warn on conflict. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records allergy"
+    ],
+    "expected_outcomes": [
+      "allergy stored",
+      "alerts regenerated"
+    ],
+    "error_pathways": [
+      "409 when exact duplicate"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AllergyIntolerance"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-084",
+    "reasoning": "R-HLT-084 requires: (1) a clinician can POST a valid AllergyIntolerance and get 201 + AuditEvent (positive/EP); (2) a duplicate POST returns 409 (negative/NEG); (3) a MedicationRequest for a substance matching the stored allergy triggers a conflict warning (state transition/STC); (4) the allergy code field at its minimum valid length (1-char system code) is accepted (boundary/BVA); (5) a decision-table case covering the combination of missing required fields returns 422 (DT). Five tests satisfy the >=3 minimum and cover all required heuristics. Each test uses a fresh patient fixture to remain idempotent.",
+    "tests": [
+      {
+        "name": "test_create_allergy_intolerance_happy_path",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role:clinician JWT",
+          "Target patient exists (patient_id fixture)",
+          "No prior AllergyIntolerance for this patient+substance"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with valid FHIR R4 payload referencing patient_id and substance code 372687004",
+          "Assert HTTP 201 and resource id in response",
+          "GET /AuditEvent?entity=AllergyIntolerance/<new_id> and assert at least one event recorded"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType AllergyIntolerance",
+          "AuditEvent list is non-empty and action equals C"
+        ],
+        "trace": [
+          "R-HLT-084 / allergy stored",
+          "R-HLT-084 / AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_allergy_intolerance_happy_path(clinician_headers, fresh_patient_id, base_url):\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{fresh_patient_id}\"},\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\", \"display\": \"Amoxicillin\"}]}\n    }\n    r = requests.post(f\"{base_url}/AllergyIntolerance\", json=payload, headers=clinician_headers)\n    assert r.status_code == 201, r.text\n    allergy_id = r.json()[\"id\"]\n    assert r.json()[\"resourceType\"] == \"AllergyIntolerance\"\n\n    audit_r = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"AllergyIntolerance/{allergy_id}\"},\n        headers=clinician_headers\n    )\n    assert audit_r.status_code == 200\n    entries = audit_r.json().get(\"entry\", [])\n    assert len(entries) >= 1\n    actions = [e[\"resource\"][\"action\"] for e in entries]\n    assert \"C\" in actions\n"
+      },
+      {
+        "name": "test_duplicate_allergy_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:clinician JWT",
+          "An AllergyIntolerance for the same patient+substance already exists (seeded by fixture)"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with identical patient reference and substance code as the pre-existing record",
+          "Assert HTTP 409 Conflict"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains OperationOutcome with issue code duplicate"
+        ],
+        "trace": [
+          "R-HLT-084 / error pathway: 409 when exact duplicate"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_duplicate_allergy_returns_409(clinician_headers, fresh_patient_id, base_url):\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{fresh_patient_id}\"},\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\", \"display\": \"Amoxicillin\"}]}\n    }\n    first = requests.post(f\"{base_url}/AllergyIntolerance\", json=payload, headers=clinician_headers)\n    assert first.status_code == 201, f\"Seed failed: {first.text}\"\n\n    second = requests.post(f\"{base_url}/AllergyIntolerance\", json=payload, headers=clinician_headers)\n    assert second.status_code == 409, second.text\n    body = second.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    codes = [i.get(\"code\") for i in body.get(\"issue\", [])]\n    assert \"duplicate\" in codes\n"
+      },
+      {
+        "name": "test_medication_request_triggers_conflict_warning",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:clinician JWT",
+          "AllergyIntolerance for substance 372687004 (Amoxicillin) already stored for patient (state: allergy active)"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance for the patient with Amoxicillin to establish state",
+          "POST /MedicationRequest referencing same patient and medication code 372687004",
+          "Assert response contains a detectedIssue or warning indicating conflict",
+          "Assert AuditEvent emitted for the MedicationRequest operation"
+        ],
+        "expected": [
+          "HTTP 201 or 200 for MedicationRequest",
+          "Response or detectedIssue endpoint indicates allergy conflict warning",
+          "AuditEvent recorded for the MedicationRequest with action C"
+        ],
+        "trace": [
+          "R-HLT-084 / subsequent MedicationRequests shall warn on conflict",
+          "R-HLT-084 / alerts regenerated",
+          "R-HLT-084 / AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_medication_request_triggers_conflict_warning(clinician_headers, fresh_patient_id, base_url):\n    allergy_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{fresh_patient_id}\"},\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\"}]}\n    }\n    ar = requests.post(f\"{base_url}/AllergyIntolerance\", json=allergy_payload, headers=clinician_headers)\n    assert ar.status_code == 201, ar.text\n\n    med_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{fresh_patient_id}\"},\n        \"medicationCodeableConcept\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\", \"display\": \"Amoxicillin\"}]}\n    }\n    mr = requests.post(f\"{base_url}/MedicationRequest\", json=med_payload, headers=clinician_headers)\n    assert mr.status_code in (200, 201), mr.text\n    mr_id = mr.json()[\"id\"]\n\n    di = requests.get(f\"{base_url}/DetectedIssue\", params={\"patient\": fresh_patient_id, \"implicated\": f\"MedicationRequest/{mr_id}\"}, headers=clinician_headers)\n    assert di.status_code == 200\n    assert len(di.json().get(\"entry\", [])) >= 1, \"Expected allergy conflict DetectedIssue\"\n\n    audit_r = requests.get(f\"{base_url}/AuditEvent\", params={\"entity\": f\"MedicationRequest/{mr_id}\"}, headers=clinician_headers)\n    assert len(audit_r.json().get(\"entry\", [])) >= 1\n"
+      },
+      {
+        "name": "test_allergy_with_minimal_single_char_code",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:clinician JWT",
+          "No prior AllergyIntolerance for this patient"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with a substance code value of exactly 1 character (minimum length)",
+          "Assert HTTP 201 or 422 according to FHIR code min-length specification"
+        ],
+        "expected": [
+          "HTTP 201 if 1-char code is valid per FHIR R4 code datatype (min length 1)",
+          "Response resourceType is AllergyIntolerance on success",
+          "AuditEvent recorded on 201"
+        ],
+        "trace": [
+          "R-HLT-084 / allergy stored",
+          "R-HLT-084 / AuditEvent emitted for every operation",
+          "BVA: FHIR code datatype minimum length boundary = 1"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_allergy_with_minimal_single_char_code(clinician_headers, fresh_patient_id, base_url):\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"patient\": {\"reference\": f\"Patient/{fresh_patient_id}\"},\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://example.org/custom\", \"code\": \"X\"}]}\n    }\n    r = requests.post(f\"{base_url}/AllergyIntolerance\", json=payload, headers=clinician_headers)\n    assert r.status_code in (201, 422), f\"Unexpected status: {r.status_code} {r.text}\"\n    if r.status_code == 201:\n        allergy_id = r.json()[\"id\"]\n        assert r.json()[\"resourceType\"] == \"AllergyIntolerance\"\n        audit_r = requests.get(\n            f\"{base_url}/AuditEvent\",\n            params={\"entity\": f\"AllergyIntolerance/{allergy_id}\"},\n            headers=clinician_headers\n        )\n        assert len(audit_r.json().get(\"entry\", [])) >= 1\n    else:\n        issues = r.json().get(\"issue\", [])\n        assert any(i.get(\"severity\") in (\"error\", \"fatal\") for i in issues)\n"
+      },
+      {
+        "name": "test_missing_required_fields_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller has role:clinician JWT"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with payload missing both 'patient' and 'code' required fields",
+          "Assert HTTP 422 Unprocessable Entity",
+          "Assert OperationOutcome lists issues for missing fields"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "OperationOutcome with at least one issue of severity error",
+          "No AuditEvent of type C created (invalid operation not persisted)"
+        ],
+        "trace": [
+          "R-HLT-084 / error pathway (invalid input)",
+          "DT: decision table row \u2014 patient=absent, code=absent => validation failure"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_missing_required_fields_returns_422(clinician_headers, base_url):\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]}\n    }\n    r = requests.post(f\"{base_url}/AllergyIntolerance\", json=payload, headers=clinician_headers)\n    assert r.status_code == 422, f\"Expected 422, got {r.status_code}: {r.text}\"\n    body = r.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert len(issues) >= 1\n    severities = {i.get(\"severity\") for i in issues}\n    assert severities & {\"error\", \"fatal\"}, f\"No error-level issue found: {issues}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-084",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 3896,
+    "latency_ms": 39089,
+    "wall_ms": 39089,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-084\",\n  \"reasoning\": \"R-HLT-084 requires: (1) a clinician can POST a valid AllergyIntolerance and get 201 + AuditEvent (positive/EP); (2) a duplicate POST returns 409 (negative/NEG); (3) a MedicationRequest for a substance matching the stored allergy triggers a conflict warning (state transition/STC); (4) the allergy code field at its minimum valid length (1-char system code) is accepted (boundary/BVA); (5) a decision-table case covering the combination of missing required fields returns 422 (DT). Five tests satisfy the >=3 minimum and cover all required heuristics. Each test uses a fresh patient fixture to remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_allergy_intolerance_happy_path\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role:clinician JWT\",\n        \"Target patient exists (patient_id fixture)\",\n        \"No prior AllergyIntolerance for this patient+substance\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with valid FHIR R4 payload referencing patient_id and substance code 372687004\",\n        \"Assert HTTP 201 and resource id in response\",\n        \"GET /AuditEvent?entity=AllergyIntolerance/<new_id> and assert at least one event recorded\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType AllergyIntolerance\",\n        \"AuditEvent list is non-empty and action equals C\"\n      ],\n      \"trace\": [\n        \"R-HLT-084 / allergy stored\",\n        \"R-HLT-084 / AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_allergy_intolerance_happy_path(clinician_headers, fresh_patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"AllergyIntolerance\\\",\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{fresh_patient_id}\\\"},\\n        \\\"clinicalStatus\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\\\", \\\"code\\\": \\\"active\\\"}]},\\n        \\\"verificationStatus\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\\\", \\\"code\\\": \\\"confirmed\\\"}]},\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://snomed.info/sct\\\", \\\"code\\\": \\\"372687004\\\", \\\"display\\\": \\\"Amoxicillin\\\"}]}\\n    }\\n    r = requests.post(f\\\"{base_url}/AllergyIntolerance\\\", json=payload, headers=clinician_headers)\\n    assert r.status_code == 201, r.text\\n    allergy_id = r.json()[\\\"id\\\"]\\n    assert r.json()[\\\"resourceType\\\"] == \\\"AllergyIntolerance\\\"\\n\\n    audit_r = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"AllergyIntolerance/{allergy_id}\\\"},\\n        headers=clinician_headers\\n    )\\n    assert audit_r.status_code == 200\\n    entries = audit_r.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1\\n    actions = [e[\\\"resource\\\"][\\\"action\\\"] for e in entries]\\n    assert \\\"C\\\" in actions\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_allergy_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:clinician JWT\",\n        \"An AllergyIntolerance for the same patient+substance already exists (seeded by fixture)\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with identical patient reference and substance code as the pre-existing record\",\n        \"Assert HTTP 409 Conflict\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response body contains OperationOutcome with issue code duplicate\"\n      ],\n      \"trace\": [\n        \"R-HLT-084 / error pathway: 409 when exact duplicate\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_duplicate_allergy_returns_409(clinician_headers, fresh_patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"AllergyIntolerance\\\",\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{fresh_patient_id}\\\"},\\n        \\\"clinicalStatus\\\": {\\\"coding\\\": [{\\\"system"
+  }
+}

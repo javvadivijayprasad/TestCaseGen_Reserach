@@ -1,0 +1,186 @@
+{
+  "req": {
+    "id": "R-HLT-096",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Break-glass access (audit)",
+    "statement": "A clinician shall invoke break-glass access for an emergent patient; break-glass use shall be audited and trigger a post-event review. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician asserts emergency"
+    ],
+    "expected_outcomes": [
+      "access granted",
+      "audit event emitted"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/BreakGlass"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-096",
+    "reasoning": "The requirement mandates that (1) a clinician can invoke break-glass access for an emergent patient and receive access, (2) every invocation emits an AuditEvent, and (3) a post-event review task is created. Test design covers: EP \u2013 valid clinician role triggers access + audit; NEG \u2013 non-clinician role is denied and audit still emitted; BVA \u2013 simultaneous duplicate break-glass requests (boundary on idempotency/deduplication); STC \u2013 state transition from normal-access \u2192 break-glass-active \u2192 post-review-created; DT \u2013 decision table covering role \u00d7 emergency-flag combinations. Each test is self-contained via fixtures that create and clean up their own patient and session resources.",
+    "tests": [
+      {
+        "name": "test_break_glass_grants_access_and_emits_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "A patient record exists with a known patient_id",
+          "The /BreakGlass endpoint is reachable"
+        ],
+        "actions": [
+          "POST /BreakGlass with body {\"patientId\": \"<patient_id>\", \"reason\": \"emergency\"}",
+          "Capture HTTP response status and body",
+          "GET /AuditEvent?entity=<patient_id>&action=break-glass to retrieve audit log"
+        ],
+        "expected": [
+          "HTTP 200 returned from /BreakGlass",
+          "Response body contains accessGranted=true",
+          "At least one AuditEvent with action=break-glass and entity matching patient_id is present",
+          "AuditEvent.outcome equals '0' (success)"
+        ],
+        "trace": [
+          "R-HLT-096: access granted on valid clinician break-glass invocation",
+          "R-HLT-096: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_break_glass_grants_access_and_emits_audit_event(\n    clinician_session,   # <fixture>: returns authenticated requests.Session for role=clinician\n    existing_patient,    # <fixture>: returns {\"patient_id\": \"...\"}  (created + torn down)\n    fhir_base_url,       # <fixture>: returns base URL string\n):\n    patient_id = existing_patient[\"patient_id\"]\n    payload = {\"patientId\": patient_id, \"reason\": \"emergency\"}\n\n    resp = clinician_session.post(f\"{fhir_base_url}/BreakGlass\", json=payload)\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    assert body.get(\"accessGranted\") is True, \"accessGranted must be True\"\n\n    audit_resp = clinician_session.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": patient_id, \"action\": \"break-glass\"},\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"At least one AuditEvent must exist\"\n\n    event = entries[-1][\"resource\"]\n    assert event.get(\"outcome\") == \"0\", \"AuditEvent outcome must indicate success\"\n    assert event.get(\"action\") == \"break-glass\"\n"
+      },
+      {
+        "name": "test_non_clinician_break_glass_is_denied_and_audit_emitted",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role=nurse (non-clinician)",
+          "A patient record exists with a known patient_id",
+          "The /BreakGlass endpoint is reachable"
+        ],
+        "actions": [
+          "POST /BreakGlass with body {\"patientId\": \"<patient_id>\", \"reason\": \"emergency\"} using nurse session",
+          "Capture HTTP response status and body",
+          "GET /AuditEvent?entity=<patient_id>&action=break-glass&outcome=8 to check denied audit entry"
+        ],
+        "expected": [
+          "HTTP 403 returned from /BreakGlass",
+          "Response body contains accessGranted=false or equivalent denial message",
+          "An AuditEvent with outcome=8 (serious failure) is emitted for the denied attempt"
+        ],
+        "trace": [
+          "R-HLT-096: only role=clinician may invoke break-glass; others must be denied",
+          "R-HLT-096: AuditEvent must be emitted for every operation including denied ones"
+        ],
+        "executable": "import pytest\n\ndef test_non_clinician_break_glass_is_denied_and_audit_emitted(\n    nurse_session,       # <fixture>: authenticated requests.Session for role=nurse\n    existing_patient,    # <fixture>: returns {\"patient_id\": \"...\"}\n    fhir_base_url,       # <fixture>: base URL string\n):\n    patient_id = existing_patient[\"patient_id\"]\n    payload = {\"patientId\": patient_id, \"reason\": \"emergency\"}\n\n    resp = nurse_session.post(f\"{fhir_base_url}/BreakGlass\", json=payload)\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    access_granted = body.get(\"accessGranted\", True)\n    assert access_granted is False, \"accessGranted must be False for unauthorized role\"\n\n    audit_resp = nurse_session.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": patient_id, \"action\": \"break-glass\", \"outcome\": \"8\"},\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"AuditEvent with outcome=8 must exist for denied break-glass\"\n"
+      },
+      {
+        "name": "test_duplicate_break_glass_within_same_session_is_idempotent_and_single_review_task_created",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "A patient record exists with a known patient_id",
+          "No prior break-glass session active for the patient"
+        ],
+        "actions": [
+          "POST /BreakGlass {\"patientId\": \"<patient_id>\", \"reason\": \"emergency\"} \u2014 first call",
+          "Immediately POST /BreakGlass {\"patientId\": \"<patient_id>\", \"reason\": \"emergency\"} \u2014 second call (boundary: exactly 2 identical requests)",
+          "GET /Task?patient=<patient_id>&code=break-glass-review to count created review tasks"
+        ],
+        "expected": [
+          "Both POST calls return HTTP 200",
+          "accessGranted=true in both responses",
+          "Exactly one post-event review Task is created (idempotent deduplication at boundary)",
+          "Exactly two AuditEvents are emitted (one per operation call)"
+        ],
+        "trace": [
+          "R-HLT-096: break-glass use shall trigger a post-event review (not duplicated on retry)",
+          "R-HLT-096: AuditEvent must be emitted for every operation (both calls audited)"
+        ],
+        "executable": "import pytest\n\ndef test_duplicate_break_glass_within_same_session_is_idempotent_and_single_review_task_created(\n    clinician_session,   # <fixture>\n    existing_patient,    # <fixture>\n    fhir_base_url,       # <fixture>\n):\n    patient_id = existing_patient[\"patient_id\"]\n    payload = {\"patientId\": patient_id, \"reason\": \"emergency\"}\n\n    resp1 = clinician_session.post(f\"{fhir_base_url}/BreakGlass\", json=payload)\n    assert resp1.status_code == 200, f\"First call failed: {resp1.text}\"\n    assert resp1.json().get(\"accessGranted\") is True\n\n    resp2 = clinician_session.post(f\"{fhir_base_url}/BreakGlass\", json=payload)\n    assert resp2.status_code == 200, f\"Second call failed: {resp2.text}\"\n    assert resp2.json().get(\"accessGranted\") is True\n\n    task_resp = clinician_session.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"patient\": patient_id, \"code\": \"break-glass-review\"},\n    )\n    assert task_resp.status_code == 200\n    tasks = task_resp.json().get(\"entry\", [])\n    assert len(tasks) == 1, f\"Expected exactly 1 review Task, found {len(tasks)}\"\n\n    audit_resp = clinician_session.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": patient_id, \"action\": \"break-glass\"},\n    )\n    events = audit_resp.json().get(\"entry\", [])\n    assert len(events) >= 2, f\"Expected at least 2 AuditEvents, found {len(events)}\"\n"
+      },
+      {
+        "name": "test_break_glass_state_transitions_to_post_review_created",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "A patient record exists with a known patient_id",
+          "No active break-glass session for the patient (state: NORMAL)"
+        ],
+        "actions": [
+          "Assert patient access state is NORMAL (no active break-glass Task)",
+          "POST /BreakGlass {\"patientId\": \"<patient_id>\", \"reason\": \"emergency\"} \u2014 transition to BREAK_GLASS_ACTIVE",
+          "Assert access is granted and AuditEvent emitted \u2014 state: BREAK_GLASS_ACTIVE",
+          "GET /Task?patient=<patient_id>&code=break-glass-review \u2014 confirm transition to POST_REVIEW_CREATED"
+        ],
+        "expected": [
+          "Initial state: no active break-glass Task (NORMAL)",
+          "After POST /BreakGlass: HTTP 200, accessGranted=true (BREAK_GLASS_ACTIVE)",
+          "AuditEvent present with outcome=0",
+          "POST_REVIEW_CREATED: exactly one Task with status=requested and code=break-glass-review exists"
+        ],
+        "trace": [
+          "R-HLT-096: break-glass use shall trigger a post-event review",
+          "R-HLT-096: state transition NORMAL \u2192 BREAK_GLASS_ACTIVE \u2192 POST_REVIEW_CREATED"
+        ],
+        "executable": "import pytest\n\ndef test_break_glass_state_transitions_to_post_review_created(\n    clinician_session,   # <fixture>\n    existing_patient,    # <fixture>\n    fhir_base_url,       # <fixture>\n):\n    patient_id = existing_patient[\"patient_id\"]\n\n    # Assert NORMAL state: no pre-existing review task\n    pre_task = clinician_session.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"patient\": patient_id, \"code\": \"break-glass-review\"},\n    )\n    assert len(pre_task.json().get(\"entry\", [])) == 0, \"Pre-condition: no review task must exist\"\n\n    # Transition to BREAK_GLASS_ACTIVE\n    resp = clinician_session.post(\n        f\"{fhir_base_url}/BreakGlass\",\n        json={\"patientId\": patient_id, \"reason\": \"emergency\"},\n    )\n    assert resp.status_code == 200\n    assert resp.json().get(\"accessGranted\") is True\n\n    # Verify AuditEvent (BREAK_GLASS_ACTIVE confirmed)\n    audit = clinician_session.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": patient_id, \"action\": \"break-glass\", \"outcome\": \"0\"},\n    )\n    assert len(audit.json().get(\"entry\", [])) >= 1, \"AuditEvent with outcome=0 must exist\"\n\n    # Verify POST_REVIEW_CREATED state\n    task_resp = clinician_session.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"patient\": patient_id, \"code\": \"break-glass-review\", \"status\": \"requested\"},\n    )\n    tasks = task_resp.json().get(\"entry\", [])\n    assert len(tasks) == 1, f\"Expected 1 review Task in requested status, got {len(tasks)}\"\n"
+      },
+      {
+        "name": "test_break_glass_decision_table_missing_reason_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated session exists for a user with role=clinician",
+          "A patient record exists with a known patient_id"
+        ],
+        "actions": [
+          "POST /BreakGlass with body {\"patientId\": \"<patient_id>\"} \u2014 reason field omitted (decision: role=clinician, emergency=absent)",
+          "Capture HTTP response status and body",
+          "GET /AuditEvent?entity=<patient_id>&action=break-glass to verify audit even on bad input"
+        ],
+        "expected": [
+          "HTTP 400 returned (missing mandatory reason field)",
+          "Response body contains a validation error referencing 'reason'",
+          "An AuditEvent with outcome=8 (failure) is still emitted for the attempted operation"
+        ],
+        "trace": [
+          "R-HLT-096: AuditEvent must be emitted for every operation including malformed requests",
+          "DT: role=clinician + emergency_flag=absent \u2192 deny + audit"
+        ],
+        "executable": "import pytest\n\ndef test_break_glass_decision_table_missing_reason_rejected(\n    clinician_session,   # <fixture>\n    existing_patient,    # <fixture>\n    fhir_base_url,       # <fixture>\n):\n    patient_id = existing_patient[\"patient_id\"]\n\n    # Omit 'reason' to exercise the DT cell: valid role, missing emergency flag\n    resp = clinician_session.post(\n        f\"{fhir_base_url}/BreakGlass\",\n        json={\"patientId\": patient_id},\n    )\n    assert resp.status_code == 400, f\"Expected 400 for missing reason, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    error_text = str(body).lower()\n    assert \"reason\" in error_text, \"Validation error must reference missing 'reason' field\"\n\n    # Audit must still be emitted for the failed attempt\n    audit_resp = clinician_session.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": patient_id, \"action\": \"break-glass\", \"outcome\": \"8\"},\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"AuditEvent outcome=8 must be emitted even for malformed break-glass request\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-096",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 4248,
+    "latency_ms": 52237,
+    "wall_ms": 52237,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-096\",\n  \"reasoning\": \"The requirement mandates that (1) a clinician can invoke break-glass access for an emergent patient and receive access, (2) every invocation emits an AuditEvent, and (3) a post-event review task is created. Test design covers: EP \u2013 valid clinician role triggers access + audit; NEG \u2013 non-clinician role is denied and audit still emitted; BVA \u2013 simultaneous duplicate break-glass requests (boundary on idempotency/deduplication); STC \u2013 state transition from normal-access \u2192 break-glass-active \u2192 post-review-created; DT \u2013 decision table covering role \u00d7 emergency-flag combinations. Each test is self-contained via fixtures that create and clean up their own patient and session resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_break_glass_grants_access_and_emits_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role=clinician\",\n        \"A patient record exists with a known patient_id\",\n        \"The /BreakGlass endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with body {\\\"patientId\\\": \\\"<patient_id>\\\", \\\"reason\\\": \\\"emergency\\\"}\",\n        \"Capture HTTP response status and body\",\n        \"GET /AuditEvent?entity=<patient_id>&action=break-glass to retrieve audit log\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned from /BreakGlass\",\n        \"Response body contains accessGranted=true\",\n        \"At least one AuditEvent with action=break-glass and entity matching patient_id is present\",\n        \"AuditEvent.outcome equals '0' (success)\"\n      ],\n      \"trace\": [\n        \"R-HLT-096: access granted on valid clinician break-glass invocation\",\n        \"R-HLT-096: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_break_glass_grants_access_and_emits_audit_event(\\n    clinician_session,   # <fixture>: returns authenticated requests.Session for role=clinician\\n    existing_patient,    # <fixture>: returns {\\\"patient_id\\\": \\\"...\\\"}  (created + torn down)\\n    fhir_base_url,       # <fixture>: returns base URL string\\n):\\n    patient_id = existing_patient[\\\"patient_id\\\"]\\n    payload = {\\\"patientId\\\": patient_id, \\\"reason\\\": \\\"emergency\\\"}\\n\\n    resp = clinician_session.post(f\\\"{fhir_base_url}/BreakGlass\\\", json=payload)\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}: {resp.text}\\\"\\n\\n    body = resp.json()\\n    assert body.get(\\\"accessGranted\\\") is True, \\\"accessGranted must be True\\\"\\n\\n    audit_resp = clinician_session.get(\\n        f\\\"{fhir_base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": patient_id, \\\"action\\\": \\\"break-glass\\\"},\\n    )\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"At least one AuditEvent must exist\\\"\\n\\n    event = entries[-1][\\\"resource\\\"]\\n    assert event.get(\\\"outcome\\\") == \\\"0\\\", \\\"AuditEvent outcome must indicate success\\\"\\n    assert event.get(\\\"action\\\") == \\\"break-glass\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_clinician_break_glass_is_denied_and_audit_emitted\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role=nurse (non-clinician)\",\n        \"A patient record exists with a known patient_id\",\n        \"The /BreakGlass endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with body {\\\"patientId\\\": \\\"<patient_id>\\\", \\\"reason\\\": \\\"emergency\\\"} using nurse session\",\n        \"Capture HTTP response status and body\",\n        \"GET /AuditEvent?entity=<patient_id>&action=break-glass&outcome=8 to check denied audit entry\"\n      ],\n      \"expected\": [\n        \"HTTP 403 returned from /BreakGlass\",\n        \"Response body contains accessGranted=false or equivalent denial message\",\n        \"An AuditEvent with outcome=8 (serious failure) is emitted for the denied attempt\"\n      ],"
+  }
+}

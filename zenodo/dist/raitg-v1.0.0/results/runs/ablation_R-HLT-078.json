@@ -1,0 +1,157 @@
+{
+  "req": {
+    "id": "R-HLT-078",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Update patient (audit)",
+    "statement": "A clinician shall update patient demographics; historical versions must be preserved. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician updates resource"
+    ],
+    "expected_outcomes": [
+      "new version stored",
+      "history preserved"
+    ],
+    "error_pathways": [
+      "409 on version conflict"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-078",
+    "reasoning": "The requirement mandates: (1) successful demographic update with version history preserved, (2) AuditEvent emission for every operation, and (3) 409 on version conflict. Four tests are designed: a positive EP/STC test confirming update + history + audit; a negative NEG test for version conflict (409); a boundary BVA test for updating with exactly the current versionId (off-by-one boundary); and a DT test covering the decision matrix of role \u00d7 version correctness \u00d7 resource existence. Together they achieve full coverage of the stated outcomes and error pathways.",
+    "tests": [
+      {
+        "name": "test_update_patient_demographics_preserves_history_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:clinician with valid Bearer token",
+          "A Patient resource with id=<test_patient_id> exists at version 1",
+          "AuditEvent endpoint is queryable"
+        ],
+        "actions": [
+          "GET /Patient/<test_patient_id> to capture current ETag/versionId",
+          "PUT /Patient/<test_patient_id> with If-Match header set to current versionId and updated family name",
+          "GET /Patient/<test_patient_id>/_history to verify both versions exist",
+          "GET /AuditEvent?entity=Patient/<test_patient_id> to verify audit record"
+        ],
+        "expected": [
+          "PUT returns HTTP 200",
+          "Response body versionId is incremented by 1",
+          "History endpoint returns 2 entries",
+          "AuditEvent list contains at least one record with action='U' referencing the patient id"
+        ],
+        "trace": [
+          "R-HLT-078: new version stored",
+          "R-HLT-078: history preserved",
+          "R-HLT-078: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_update_patient_demographics_preserves_history_and_emits_audit(\n    clinician_session,   # <fixture> returns requests.Session with auth header\n    base_url,            # <fixture> returns str e.g. 'http://fhir-lite'\n    existing_patient,    # <fixture> creates patient, yields {id, versionId}\n):\n    pid = existing_patient[\"id\"]\n    v1  = existing_patient[\"versionId\"]\n\n    payload = <helper_fn>.patient_payload(pid, v1, family=\"UpdatedFamily\")\n    resp = clinician_session.put(\n        f\"{base_url}/Patient/{pid}\",\n        json=payload,\n        headers={\"If-Match\": f'W/\"{v1}\"'},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    v2 = body[\"meta\"][\"versionId\"]\n    assert int(v2) == int(v1) + 1\n\n    hist = clinician_session.get(f\"{base_url}/Patient/{pid}/_history\")\n    assert hist.status_code == 200\n    entries = hist.json().get(\"entry\", [])\n    assert len(entries) >= 2\n\n    audit = clinician_session.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Patient/{pid}\", \"action\": \"U\"},\n    )\n    assert audit.status_code == 200\n    audit_entries = audit.json().get(\"entry\", [])\n    assert len(audit_entries) >= 1\n    actions = [e[\"resource\"][\"action\"] for e in audit_entries]\n    assert \"U\" in actions\n"
+      },
+      {
+        "name": "test_update_patient_version_conflict_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:clinician with valid Bearer token",
+          "A Patient resource with id=<test_patient_id> exists at version 3",
+          "Caller intentionally supplies a stale versionId (version 1)"
+        ],
+        "actions": [
+          "PUT /Patient/<test_patient_id> with If-Match header set to stale versionId=1"
+        ],
+        "expected": [
+          "HTTP 409 Conflict is returned",
+          "Response body contains OperationOutcome with issue.code='conflict'",
+          "No new version is created in history"
+        ],
+        "trace": [
+          "R-HLT-078: error pathway - 409 on version conflict"
+        ],
+        "executable": "import pytest\n\ndef test_update_patient_version_conflict_returns_409(\n    clinician_session,\n    base_url,\n    existing_patient_at_version_3,  # <fixture> patient at versionId=3\n):\n    pid         = existing_patient_at_version_3[\"id\"]\n    stale_vid   = \"1\"\n\n    payload = <helper_fn>.patient_payload(pid, stale_vid, family=\"StaleUpdate\")\n    resp = clinician_session.put(\n        f\"{base_url}/Patient/{pid}\",\n        json=payload,\n        headers={\"If-Match\": f'W/\"{stale_vid}\"'},\n    )\n    assert resp.status_code == 409\n\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    codes = [i.get(\"code\") for i in issues]\n    assert \"conflict\" in codes\n\n    hist = clinician_session.get(f\"{base_url}/Patient/{pid}/_history\")\n    versions = [e[\"resource\"][\"meta\"][\"versionId\"] for e in hist.json().get(\"entry\", [])]\n    assert \"4\" not in versions\n"
+      },
+      {
+        "name": "test_update_patient_with_exact_current_versionid_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:clinician with valid Bearer token",
+          "A Patient resource exists with a known current versionId N",
+          "Test supplies If-Match exactly equal to N (not N-1, not N+1)"
+        ],
+        "actions": [
+          "GET /Patient/<id> to read exact current versionId N",
+          "PUT /Patient/<id> with If-Match: W/\"N\" (no off-by-one deviation)",
+          "Verify response versionId equals N+1"
+        ],
+        "expected": [
+          "HTTP 200 is returned",
+          "Response versionId is exactly N+1",
+          "History contains N+1 entries"
+        ],
+        "trace": [
+          "R-HLT-078: new version stored",
+          "R-HLT-078: BVA on versionId boundary - exact match vs conflict boundary"
+        ],
+        "executable": "import pytest\n\ndef test_update_patient_with_exact_current_versionid_succeeds(\n    clinician_session,\n    base_url,\n    existing_patient,\n):\n    pid = existing_patient[\"id\"]\n\n    get_resp = clinician_session.get(f\"{base_url}/Patient/{pid}\")\n    assert get_resp.status_code == 200\n    current_vid = get_resp.json()[\"meta\"][\"versionId\"]\n    expected_next = str(int(current_vid) + 1)\n\n    payload = <helper_fn>.patient_payload(pid, current_vid, family=\"BoundaryFamily\")\n    put_resp = clinician_session.put(\n        f\"{base_url}/Patient/{pid}\",\n        json=payload,\n        headers={\"If-Match\": f'W/\"{current_vid}\"'},\n    )\n    assert put_resp.status_code == 200\n    new_vid = put_resp.json()[\"meta\"][\"versionId\"]\n    assert new_vid == expected_next\n\n    hist = clinician_session.get(f\"{base_url}/Patient/{pid}/_history\")\n    versions = [\n        e[\"resource\"][\"meta\"][\"versionId\"]\n        for e in hist.json().get(\"entry\", [])\n    ]\n    assert expected_next in versions\n    assert current_vid in versions\n"
+      },
+      {
+        "name": "test_update_patient_decision_table_role_version_existence",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Two sessions available: clinician_session (role:clinician) and guest_session (role:none)",
+          "A Patient resource exists with a known id and current versionId",
+          "A non-existent patient id is available (uuid not in store)"
+        ],
+        "actions": [
+          "Attempt PUT as guest (no role) with correct versionId - expect 403",
+          "Attempt PUT as clinician with correct versionId on non-existent id - expect 404",
+          "Confirm clinician with correct versionId on existing id returns 200 (control row)"
+        ],
+        "expected": [
+          "Guest PUT returns HTTP 403 Forbidden",
+          "Clinician PUT on missing resource returns HTTP 404",
+          "Clinician PUT on existing resource returns HTTP 200"
+        ],
+        "trace": [
+          "R-HLT-078: precondition role:clinician enforced",
+          "R-HLT-078: DT covers role \u00d7 existence \u00d7 version correctness decision matrix"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_update_patient_decision_table_role_version_existence(\n    clinician_session,\n    guest_session,       # <fixture> unauthenticated / no-role session\n    base_url,\n    existing_patient,\n):\n    pid     = existing_patient[\"id\"]\n    vid     = existing_patient[\"versionId\"]\n    missing = str(uuid.uuid4())\n\n    # Row 1: wrong role, correct version, existing resource -> 403\n    payload_existing = <helper_fn>.patient_payload(pid, vid, family=\"GuestAttempt\")\n    r_forbidden = guest_session.put(\n        f\"{base_url}/Patient/{pid}\",\n        json=payload_existing,\n        headers={\"If-Match\": f'W/\"{vid}\"'},\n    )\n    assert r_forbidden.status_code == 403\n\n    # Row 2: correct role, correct version, non-existent resource -> 404\n    payload_missing = <helper_fn>.patient_payload(missing, \"1\", family=\"GhostPatient\")\n    r_not_found = clinician_session.put(\n        f\"{base_url}/Patient/{missing}\",\n        json=payload_missing,\n        headers={\"If-Match\": 'W/\"1\"'},\n    )\n    assert r_not_found.status_code == 404\n\n    # Row 3 (control): correct role, correct version, existing resource -> 200\n    payload_ok = <helper_fn>.patient_payload(pid, vid, family=\"DTableFamily\")\n    r_ok = clinician_session.put(\n        f\"{base_url}/Patient/{pid}\",\n        json=payload_ok,\n        headers={\"If-Match\": f'W/\"{vid}\"'},\n    )\n    assert r_ok.status_code == 200\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-078",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 3040,
+    "latency_ms": 35779,
+    "wall_ms": 35779,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-078\",\n  \"reasoning\": \"The requirement mandates: (1) successful demographic update with version history preserved, (2) AuditEvent emission for every operation, and (3) 409 on version conflict. Four tests are designed: a positive EP/STC test confirming update + history + audit; a negative NEG test for version conflict (409); a boundary BVA test for updating with exactly the current versionId (off-by-one boundary); and a DT test covering the decision matrix of role \u00d7 version correctness \u00d7 resource existence. Together they achieve full coverage of the stated outcomes and error pathways.\",\n  \"tests\": [\n    {\n      \"name\": \"test_update_patient_demographics_preserves_history_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Caller has role:clinician with valid Bearer token\",\n        \"A Patient resource with id=<test_patient_id> exists at version 1\",\n        \"AuditEvent endpoint is queryable\"\n      ],\n      \"actions\": [\n        \"GET /Patient/<test_patient_id> to capture current ETag/versionId\",\n        \"PUT /Patient/<test_patient_id> with If-Match header set to current versionId and updated family name\",\n        \"GET /Patient/<test_patient_id>/_history to verify both versions exist\",\n        \"GET /AuditEvent?entity=Patient/<test_patient_id> to verify audit record\"\n      ],\n      \"expected\": [\n        \"PUT returns HTTP 200\",\n        \"Response body versionId is incremented by 1\",\n        \"History endpoint returns 2 entries\",\n        \"AuditEvent list contains at least one record with action='U' referencing the patient id\"\n      ],\n      \"trace\": [\n        \"R-HLT-078: new version stored\",\n        \"R-HLT-078: history preserved\",\n        \"R-HLT-078: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_update_patient_demographics_preserves_history_and_emits_audit(\\n    clinician_session,   # <fixture> returns requests.Session with auth header\\n    base_url,            # <fixture> returns str e.g. 'http://fhir-lite'\\n    existing_patient,    # <fixture> creates patient, yields {id, versionId}\\n):\\n    pid = existing_patient[\\\"id\\\"]\\n    v1  = existing_patient[\\\"versionId\\\"]\\n\\n    payload = <helper_fn>.patient_payload(pid, v1, family=\\\"UpdatedFamily\\\")\\n    resp = clinician_session.put(\\n        f\\\"{base_url}/Patient/{pid}\\\",\\n        json=payload,\\n        headers={\\\"If-Match\\\": f'W/\\\"{v1}\\\"'},\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    v2 = body[\\\"meta\\\"][\\\"versionId\\\"]\\n    assert int(v2) == int(v1) + 1\\n\\n    hist = clinician_session.get(f\\\"{base_url}/Patient/{pid}/_history\\\")\\n    assert hist.status_code == 200\\n    entries = hist.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 2\\n\\n    audit = clinician_session.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Patient/{pid}\\\", \\\"action\\\": \\\"U\\\"},\\n    )\\n    assert audit.status_code == 200\\n    audit_entries = audit.json().get(\\\"entry\\\", [])\\n    assert len(audit_entries) >= 1\\n    actions = [e[\\\"resource\\\"][\\\"action\\\"] for e in audit_entries]\\n    assert \\\"U\\\" in actions\\n\"\n    },\n    {\n      \"name\": \"test_update_patient_version_conflict_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:clinician with valid Bearer token\",\n        \"A Patient resource with id=<test_patient_id> exists at version 3\",\n        \"Caller intentionally supplies a stale versionId (version 1)\"\n      ],\n      \"actions\": [\n        \"PUT /Patient/<test_patient_id> with If-Match header set to stale versionId=1\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict is returned\",\n        \"Response body contains OperationOutcome with issue.code='conflict'\",\n        \"No new version is created in history\"\n      ],\n      \"trace\": [\n        \"R-HLT-078: error pathway - 409 on version conflict\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_update_patient_version"
+  }
+}

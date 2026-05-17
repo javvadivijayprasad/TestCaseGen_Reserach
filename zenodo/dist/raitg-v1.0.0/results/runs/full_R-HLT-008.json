@@ -1,0 +1,197 @@
+{
+  "req": {
+    "id": "R-HLT-008",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Create medication request",
+    "statement": "A prescribing clinician shall issue a MedicationRequest; requests for controlled substances shall require schedule verification.",
+    "actors": [
+      "prescriber"
+    ],
+    "preconditions": [
+      "role:prescriber"
+    ],
+    "triggers": [
+      "clinician prescribes"
+    ],
+    "expected_outcomes": [
+      "request stored",
+      "pharmacy notified"
+    ],
+    "error_pathways": [
+      "403 without schedule verification for CII"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/MedicationRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-008",
+    "reasoning": "R-HLT-008 has two distinct decision branches: (1) non-controlled substance prescriptions that any valid prescriber may submit, and (2) controlled substance (CII) prescriptions that additionally require schedule verification. The test suite covers: EP \u2013 a routine non-controlled MedicationRequest that must succeed (positive); NEG \u2013 a CII request missing schedule verification that must be rejected with 403 (negative); BVA \u2013 a CII request where schedule verification is present but set to the exact minimum accepted value (boundary); DT \u2013 a decision-table case covering the cross-product of prescriber role \u00d7 schedule verification flag for a Schedule II drug; STC \u2013 a state-transition case that first creates a draft request and then transitions it to 'active', verifying pharmacy notification fires only on the active transition. Each test is self-contained via fixtures and cleans up created resources in a finalizer.",
+    "tests": [
+      {
+        "name": "test_prescriber_creates_non_controlled_medication_request",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated user holds role: prescriber",
+          "Target patient exists in the system",
+          "Medication is non-controlled (Schedule V or unscheduled)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with valid prescriber token, patientId, and non-controlled medicationCode",
+          "Assert HTTP 201 response",
+          "Assert response body contains 'status': 'active' and a resource id",
+          "Assert pharmacy notification event is recorded"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response JSON contains 'resourceType': 'MedicationRequest'",
+          "Response JSON 'status' equals 'active'",
+          "Pharmacy notification endpoint received exactly one event for the new request id"
+        ],
+        "trace": [
+          "R-HLT-008: request stored",
+          "R-HLT-008: pharmacy notified",
+          "R-HLT-008: actors: prescriber"
+        ],
+        "executable": "import pytest\n\ndef test_prescriber_creates_non_controlled_medication_request(\n    prescriber_auth_headers,\n    api_client,\n    test_patient_id,\n    non_controlled_medication_code,\n    pharmacy_notification_spy,\n    cleanup_medication_request,\n):\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{test_patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"code\": non_controlled_medication_code}]\n        },\n    }\n    resp = api_client.post(\n        \"/MedicationRequest\",\n        json=payload,\n        headers=prescriber_auth_headers,\n    )\n    resource_id = resp.json().get(\"id\")\n    cleanup_medication_request(resource_id)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"resourceType\"] == \"MedicationRequest\"\n    assert body[\"status\"] == \"active\"\n    assert resource_id is not None\n    notifications = pharmacy_notification_spy.get_events(resource_id)\n    assert len(notifications) == 1"
+      },
+      {
+        "name": "test_cii_request_without_schedule_verification_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user holds role: prescriber",
+          "Target patient exists in the system",
+          "Medication is a Schedule II controlled substance (CII)",
+          "Request payload does NOT include schedule verification token"
+        ],
+        "actions": [
+          "POST /MedicationRequest with valid prescriber token, patientId, CII medicationCode, and no scheduleVerification field",
+          "Assert HTTP 403 response",
+          "Assert no MedicationRequest resource was persisted",
+          "Assert pharmacy notification was NOT sent"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response JSON 'issue[0].code' equals 'forbidden'",
+          "Response JSON 'issue[0].details.text' references schedule verification",
+          "No pharmacy notification event emitted"
+        ],
+        "trace": [
+          "R-HLT-008: error pathway \u2013 403 without schedule verification for CII",
+          "R-HLT-008: controlled substances shall require schedule verification"
+        ],
+        "executable": "import pytest\n\ndef test_cii_request_without_schedule_verification_returns_403(\n    prescriber_auth_headers,\n    api_client,\n    test_patient_id,\n    cii_medication_code,\n    pharmacy_notification_spy,\n):\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{test_patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"code\": cii_medication_code}]\n        },\n        # scheduleVerification intentionally omitted\n    }\n    resp = api_client.post(\n        \"/MedicationRequest\",\n        json=payload,\n        headers=prescriber_auth_headers,\n    )\n\n    assert resp.status_code == 403\n    body = resp.json()\n    issue = body.get(\"issue\", [{}])[0]\n    assert issue.get(\"code\") == \"forbidden\"\n    detail_text = issue.get(\"details\", {}).get(\"text\", \"\").lower()\n    assert \"schedule\" in detail_text\n    assert pharmacy_notification_spy.total_events() == 0"
+      },
+      {
+        "name": "test_cii_request_with_exact_minimum_schedule_verification_value",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated user holds role: prescriber",
+          "Target patient exists in the system",
+          "Medication is a Schedule II controlled substance (CII)",
+          "scheduleVerification token is present and equals the minimum accepted non-empty value (single character token boundary)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with valid prescriber token, CII medicationCode, and scheduleVerification set to the minimum accepted 1-character valid token",
+          "Assert HTTP 201 response",
+          "Assert resource is persisted with correct schedule metadata",
+          "Assert pharmacy notification fired"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response JSON 'status' equals 'active'",
+          "Response JSON contains scheduleVerification acknowledgement",
+          "Pharmacy notification event count equals 1 for the new resource id"
+        ],
+        "trace": [
+          "R-HLT-008: controlled substances shall require schedule verification",
+          "R-HLT-008: request stored; pharmacy notified",
+          "BVA: minimum valid scheduleVerification token boundary"
+        ],
+        "executable": "import pytest\n\ndef test_cii_request_with_exact_minimum_schedule_verification_value(\n    prescriber_auth_headers,\n    api_client,\n    test_patient_id,\n    cii_medication_code,\n    pharmacy_notification_spy,\n    cleanup_medication_request,\n    minimum_schedule_verification_token,\n):\n    payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{test_patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"code\": cii_medication_code}]\n        },\n        \"scheduleVerification\": minimum_schedule_verification_token,\n    }\n    resp = api_client.post(\n        \"/MedicationRequest\",\n        json=payload,\n        headers=prescriber_auth_headers,\n    )\n    resource_id = resp.json().get(\"id\")\n    cleanup_medication_request(resource_id)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"active\"\n    assert resource_id is not None\n    notifications = pharmacy_notification_spy.get_events(resource_id)\n    assert len(notifications) == 1"
+      },
+      {
+        "name": "test_decision_table_cii_with_and_without_verification",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated user holds role: prescriber",
+          "Target patient exists in the system",
+          "Medication is CII",
+          "Two cases exercised: (prescriber + CII + verification=present) and (prescriber + CII + verification=absent)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with scheduleVerification present; assert 201",
+          "POST /MedicationRequest with scheduleVerification absent; assert 403",
+          "Confirm first resource is stored and second is not"
+        ],
+        "expected": [
+          "Case A (verification present): HTTP 201, resource persisted",
+          "Case B (verification absent): HTTP 403, resource NOT persisted",
+          "Decision table fully covers the schedule-verification gate"
+        ],
+        "trace": [
+          "R-HLT-008: error pathway \u2013 403 without schedule verification for CII",
+          "R-HLT-008: controlled substances shall require schedule verification",
+          "DT: all combinations of CII \u00d7 schedule-verification flag"
+        ],
+        "executable": "import pytest\n\ndef test_decision_table_cii_with_and_without_verification(\n    prescriber_auth_headers,\n    api_client,\n    test_patient_id,\n    cii_medication_code,\n    valid_schedule_verification_token,\n    cleanup_medication_request,\n):\n    base = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{test_patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"code\": cii_medication_code}]\n        },\n    }\n    # Case A: verification present -> 201\n    payload_a = {**base, \"scheduleVerification\": valid_schedule_verification_token}\n    resp_a = api_client.post(\"/MedicationRequest\", json=payload_a, headers=prescriber_auth_headers)\n    rid_a = resp_a.json().get(\"id\")\n    cleanup_medication_request(rid_a)\n    assert resp_a.status_code == 201\n    assert rid_a is not None\n\n    # Case B: verification absent -> 403\n    resp_b = api_client.post(\"/MedicationRequest\", json=base, headers=prescriber_auth_headers)\n    assert resp_b.status_code == 403\n    assert resp_b.json().get(\"id\") is None"
+      },
+      {
+        "name": "test_medication_request_draft_to_active_triggers_pharmacy_notification",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated user holds role: prescriber",
+          "Target patient exists in the system",
+          "Non-controlled MedicationRequest is first created in 'draft' status",
+          "Pharmacy notification spy is reset before state transition"
+        ],
+        "actions": [
+          "POST /MedicationRequest with status='draft'; assert 201 and no pharmacy notification",
+          "PATCH /MedicationRequest/{id} setting status='active'; assert 200",
+          "Assert pharmacy notification fires exactly once after transition to active"
+        ],
+        "expected": [
+          "HTTP 201 on draft creation; pharmacy notification count = 0",
+          "HTTP 200 on activation PATCH",
+          "Pharmacy notification count = 1 after transition to active",
+          "Resource status in GET response equals 'active'"
+        ],
+        "trace": [
+          "R-HLT-008: pharmacy notified (expected outcome on active request)",
+          "R-HLT-008: request stored",
+          "STC: draft -> active state transition coverage"
+        ],
+        "executable": "import pytest\n\ndef test_medication_request_draft_to_active_triggers_pharmacy_notification(\n    prescriber_auth_headers,\n    api_client,\n    test_patient_id,\n    non_controlled_medication_code,\n    pharmacy_notification_spy,\n    cleanup_medication_request,\n):\n    draft_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"draft\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{test_patient_id}\"},\n        \"medicationCodeableConcept\": {\n            \"coding\": [{\"code\": non_controlled_medication_code}]\n        },\n    }\n    resp_create = api_client.post(\"/MedicationRequest\", json=draft_payload, headers=prescriber_auth_headers)\n    assert resp_create.status_code == 201\n    resource_id = resp_create.json()[\"id\"]\n    cleanup_medication_request(resource_id)\n    assert len(pharmacy_notification_spy.get_events(resource_id)) == 0\n\n    patch_payload = {\"status\": \"active\"}\n    resp_patch = api_client.patch(f\"/MedicationRequest/{resource_id}\", json=patch_payload, headers=prescriber_auth_headers)\n    assert resp_patch.status_code == 200\n\n    notifications = pharmacy_notification_spy.get_events(resource_id)\n    assert len(notifications) == 1\n    resp_get = api_client.get(f\"/MedicationRequest/{resource_id}\", headers=prescriber_auth_headers)\n    assert resp_get.json()[\"status\"] == \"active\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-008",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 983,
+    "output_tokens": 3717,
+    "latency_ms": 39313,
+    "wall_ms": 39313,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-008\",\n  \"reasoning\": \"R-HLT-008 has two distinct decision branches: (1) non-controlled substance prescriptions that any valid prescriber may submit, and (2) controlled substance (CII) prescriptions that additionally require schedule verification. The test suite covers: EP \u2013 a routine non-controlled MedicationRequest that must succeed (positive); NEG \u2013 a CII request missing schedule verification that must be rejected with 403 (negative); BVA \u2013 a CII request where schedule verification is present but set to the exact minimum accepted value (boundary); DT \u2013 a decision-table case covering the cross-product of prescriber role \u00d7 schedule verification flag for a Schedule II drug; STC \u2013 a state-transition case that first creates a draft request and then transitions it to 'active', verifying pharmacy notification fires only on the active transition. Each test is self-contained via fixtures and cleans up created resources in a finalizer.\",\n  \"tests\": [\n    {\n      \"name\": \"test_prescriber_creates_non_controlled_medication_request\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated user holds role: prescriber\",\n        \"Target patient exists in the system\",\n        \"Medication is non-controlled (Schedule V or unscheduled)\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with valid prescriber token, patientId, and non-controlled medicationCode\",\n        \"Assert HTTP 201 response\",\n        \"Assert response body contains 'status': 'active' and a resource id\",\n        \"Assert pharmacy notification event is recorded\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response JSON contains 'resourceType': 'MedicationRequest'\",\n        \"Response JSON 'status' equals 'active'\",\n        \"Pharmacy notification endpoint received exactly one event for the new request id\"\n      ],\n      \"trace\": [\n        \"R-HLT-008: request stored\",\n        \"R-HLT-008: pharmacy notified\",\n        \"R-HLT-008: actors: prescriber\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_prescriber_creates_non_controlled_medication_request(\\n    prescriber_auth_headers,\\n    api_client,\\n    test_patient_id,\\n    non_controlled_medication_code,\\n    pharmacy_notification_spy,\\n    cleanup_medication_request,\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"MedicationRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{test_patient_id}\\\"},\\n        \\\"medicationCodeableConcept\\\": {\\n            \\\"coding\\\": [{\\\"code\\\": non_controlled_medication_code}]\\n        },\\n    }\\n    resp = api_client.post(\\n        \\\"/MedicationRequest\\\",\\n        json=payload,\\n        headers=prescriber_auth_headers,\\n    )\\n    resource_id = resp.json().get(\\\"id\\\")\\n    cleanup_medication_request(resource_id)\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"MedicationRequest\\\"\\n    assert body[\\\"status\\\"] == \\\"active\\\"\\n    assert resource_id is not None\\n    notifications = pharmacy_notification_spy.get_events(resource_id)\\n    assert len(notifications) == 1\"\n    },\n    {\n      \"name\": \"test_cii_request_without_schedule_verification_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated user holds role: prescriber\",\n        \"Target patient exists in the system\",\n        \"Medication is a Schedule II controlled substance (CII)\",\n        \"Request payload does NOT include schedule verification token\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with valid prescriber token, patientId, CII medicationCode, and no scheduleVerification field\",\n        \"Assert HTTP 403 response\",\n        \"Assert no MedicationRequest resource was persisted\",\n        \"Assert pharmacy notification was NOT sent\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response JSON 'issue[0].code' equal"
+  }
+}

@@ -1,0 +1,157 @@
+{
+  "req": {
+    "id": "R-HLT-082",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Close encounter (audit)",
+    "statement": "A clinician shall close an Encounter; closed Encounters shall reject further modifications except for addendum Observations. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "encounter open"
+    ],
+    "triggers": [
+      "clinician closes encounter"
+    ],
+    "expected_outcomes": [
+      "encounter.status=finished"
+    ],
+    "error_pathways": [
+      "409 when modifying closed encounter"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-082",
+    "reasoning": "The requirement defines a state machine (open -> finished), a guard on further modifications to closed encounters, an addendum exception, and mandatory AuditEvent emission. Four tests are generated: (1) positive/EP: happy-path close sets status=finished and emits AuditEvent; (2) negative/NEG: modifying a closed encounter yields HTTP 409; (3) boundary/BVA: addendum Observation is the sole allowed write after close; (4) state-transition/STC: double-close attempt verifies idempotency or correct error on already-finished encounter. Each test creates its own encounter fixture to remain self-contained and idempotent.",
+    "tests": [
+      {
+        "name": "test_close_encounter_sets_finished_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "FHIR-lite service is reachable",
+          "A new Encounter exists with status=in-progress",
+          "Clinician auth token is available"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close with valid clinician token",
+          "GET /Encounter/{id} to read resulting status",
+          "Query AuditEvent store for the close operation"
+        ],
+        "expected": [
+          "POST /Encounter/{id}/close returns HTTP 200",
+          "Encounter.status equals 'finished'",
+          "At least one AuditEvent exists referencing the Encounter id with action='close'"
+        ],
+        "trace": [
+          "R-HLT-082: clinician shall close an Encounter",
+          "R-HLT-082: encounter.status=finished",
+          "R-HLT-082: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_close_encounter_sets_finished_and_emits_audit(\n    api_client, create_encounter, clinician_token, audit_query\n):\n    enc_id = create_encounter(status=\"in-progress\", token=clinician_token)\n\n    resp = api_client.post(\n        f\"/Encounter/{enc_id}/close\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n\n    enc = api_client.get(\n        f\"/Encounter/{enc_id}\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    ).json()\n    assert enc[\"status\"] == \"finished\", f\"status={enc['status']}\"\n\n    events = audit_query(resource_type=\"Encounter\", resource_id=enc_id, action=\"close\")\n    assert len(events) >= 1, \"No AuditEvent emitted for close operation\"\n    assert events[0][\"resourceId\"] == enc_id\n"
+      },
+      {
+        "name": "test_modify_closed_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "FHIR-lite service is reachable",
+          "A new Encounter exists and has been closed (status=finished)",
+          "Clinician auth token is available"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close to move encounter to finished",
+          "Attempt PATCH /Encounter/{id} with a non-addendum field update"
+        ],
+        "expected": [
+          "PATCH /Encounter/{id} returns HTTP 409",
+          "Response body contains an error indicating encounter is closed",
+          "AuditEvent is still emitted for the rejected modification attempt"
+        ],
+        "trace": [
+          "R-HLT-082: closed Encounters shall reject further modifications",
+          "R-HLT-082: 409 when modifying closed encounter",
+          "R-HLT-082: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_modify_closed_encounter_returns_409(\n    api_client, create_encounter, clinician_token, audit_query\n):\n    enc_id = create_encounter(status=\"in-progress\", token=clinician_token)\n    close_resp = api_client.post(\n        f\"/Encounter/{enc_id}/close\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert close_resp.status_code == 200\n\n    patch_resp = api_client.patch(\n        f\"/Encounter/{enc_id}\",\n        json={\"period\": {\"end\": \"2099-12-31\"}},\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert patch_resp.status_code == 409, (\n        f\"Expected 409 for closed-encounter modification, got {patch_resp.status_code}\"\n    )\n    body = patch_resp.json()\n    assert \"closed\" in str(body).lower() or \"finished\" in str(body).lower()\n\n    events = audit_query(resource_type=\"Encounter\", resource_id=enc_id, action=\"update\")\n    assert len(events) >= 1, \"AuditEvent must be emitted even for rejected attempts\"\n"
+      },
+      {
+        "name": "test_addendum_observation_allowed_on_closed_encounter",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "FHIR-lite service is reachable",
+          "A new Encounter exists and has been closed (status=finished)",
+          "Clinician auth token is available"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close to set status=finished",
+          "POST /Observation with encounter reference and note.extension indicating addendum",
+          "Verify Observation is persisted and AuditEvent is emitted"
+        ],
+        "expected": [
+          "POST /Observation returns HTTP 201",
+          "Observation.encounter references the closed Encounter id",
+          "AuditEvent is emitted for the addendum write"
+        ],
+        "trace": [
+          "R-HLT-082: closed Encounters shall reject further modifications EXCEPT addendum Observations",
+          "R-HLT-082: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_addendum_observation_allowed_on_closed_encounter(\n    api_client, create_encounter, clinician_token, audit_query\n):\n    enc_id = create_encounter(status=\"in-progress\", token=clinician_token)\n    api_client.post(\n        f\"/Encounter/{enc_id}/close\",\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n\n    obs_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"text\": \"addendum\"}],\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n        \"code\": {\"text\": \"Addendum note\"},\n    }\n    obs_resp = api_client.post(\n        \"/Observation\",\n        json=obs_payload,\n        headers={\"Authorization\": f\"Bearer {clinician_token}\"},\n    )\n    assert obs_resp.status_code == 201, (\n        f\"Addendum Observation should be accepted, got {obs_resp.status_code}\"\n    )\n    obs_id = obs_resp.json()[\"id\"]\n\n    events = audit_query(resource_type=\"Observation\", resource_id=obs_id, action=\"create\")\n    assert len(events) >= 1, \"AuditEvent must be emitted for addendum Observation\"\n"
+      },
+      {
+        "name": "test_double_close_encounter_state_transition",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "FHIR-lite service is reachable",
+          "A new Encounter exists with status=in-progress",
+          "Clinician auth token is available"
+        ],
+        "actions": [
+          "POST /Encounter/{id}/close (first close \u2014 valid transition open->finished)",
+          "POST /Encounter/{id}/close again (second close \u2014 already-finished state)"
+        ],
+        "expected": [
+          "First POST returns HTTP 200 and status becomes finished",
+          "Second POST returns HTTP 409 or HTTP 422 (invalid state transition)",
+          "AuditEvent is emitted for both close attempts"
+        ],
+        "trace": [
+          "R-HLT-082: state transition open->finished is valid exactly once",
+          "R-HLT-082: closed Encounters shall reject further modifications",
+          "R-HLT-082: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_double_close_encounter_state_transition(\n    api_client, create_encounter, clinician_token, audit_query\n):\n    enc_id = create_encounter(status=\"in-progress\", token=clinician_token)\n    headers = {\"Authorization\": f\"Bearer {clinician_token}\"}\n\n    first = api_client.post(f\"/Encounter/{enc_id}/close\", headers=headers)\n    assert first.status_code == 200, f\"First close failed: {first.status_code}\"\n\n    enc = api_client.get(f\"/Encounter/{enc_id}\", headers=headers).json()\n    assert enc[\"status\"] == \"finished\"\n\n    second = api_client.post(f\"/Encounter/{enc_id}/close\", headers=headers)\n    assert second.status_code in (409, 422), (\n        f\"Expected 409/422 on double-close, got {second.status_code}\"\n    )\n\n    events = audit_query(resource_type=\"Encounter\", resource_id=enc_id, action=\"close\")\n    assert len(events) >= 2, (\n        f\"Expected AuditEvent for both close attempts, found {len(events)}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-082",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 2672,
+    "latency_ms": 32494,
+    "wall_ms": 32494,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-082\",\n  \"reasoning\": \"The requirement defines a state machine (open -> finished), a guard on further modifications to closed encounters, an addendum exception, and mandatory AuditEvent emission. Four tests are generated: (1) positive/EP: happy-path close sets status=finished and emits AuditEvent; (2) negative/NEG: modifying a closed encounter yields HTTP 409; (3) boundary/BVA: addendum Observation is the sole allowed write after close; (4) state-transition/STC: double-close attempt verifies idempotency or correct error on already-finished encounter. Each test creates its own encounter fixture to remain self-contained and idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_encounter_sets_finished_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"FHIR-lite service is reachable\",\n        \"A new Encounter exists with status=in-progress\",\n        \"Clinician auth token is available\"\n      ],\n      \"actions\": [\n        \"POST /Encounter/{id}/close with valid clinician token\",\n        \"GET /Encounter/{id} to read resulting status\",\n        \"Query AuditEvent store for the close operation\"\n      ],\n      \"expected\": [\n        \"POST /Encounter/{id}/close returns HTTP 200\",\n        \"Encounter.status equals 'finished'\",\n        \"At least one AuditEvent exists referencing the Encounter id with action='close'\"\n      ],\n      \"trace\": [\n        \"R-HLT-082: clinician shall close an Encounter\",\n        \"R-HLT-082: encounter.status=finished\",\n        \"R-HLT-082: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_close_encounter_sets_finished_and_emits_audit(\\n    api_client, create_encounter, clinician_token, audit_query\\n):\\n    enc_id = create_encounter(status=\\\"in-progress\\\", token=clinician_token)\\n\\n    resp = api_client.post(\\n        f\\\"/Encounter/{enc_id}/close\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"},\\n    )\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n\\n    enc = api_client.get(\\n        f\\\"/Encounter/{enc_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"},\\n    ).json()\\n    assert enc[\\\"status\\\"] == \\\"finished\\\", f\\\"status={enc['status']}\\\"\\n\\n    events = audit_query(resource_type=\\\"Encounter\\\", resource_id=enc_id, action=\\\"close\\\")\\n    assert len(events) >= 1, \\\"No AuditEvent emitted for close operation\\\"\\n    assert events[0][\\\"resourceId\\\"] == enc_id\\n\"\n    },\n    {\n      \"name\": \"test_modify_closed_encounter_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"FHIR-lite service is reachable\",\n        \"A new Encounter exists and has been closed (status=finished)\",\n        \"Clinician auth token is available\"\n      ],\n      \"actions\": [\n        \"POST /Encounter/{id}/close to move encounter to finished\",\n        \"Attempt PATCH /Encounter/{id} with a non-addendum field update\"\n      ],\n      \"expected\": [\n        \"PATCH /Encounter/{id} returns HTTP 409\",\n        \"Response body contains an error indicating encounter is closed\",\n        \"AuditEvent is still emitted for the rejected modification attempt\"\n      ],\n      \"trace\": [\n        \"R-HLT-082: closed Encounters shall reject further modifications\",\n        \"R-HLT-082: 409 when modifying closed encounter\",\n        \"R-HLT-082: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_modify_closed_encounter_returns_409(\\n    api_client, create_encounter, clinician_token, audit_query\\n):\\n    enc_id = create_encounter(status=\\\"in-progress\\\", token=clinician_token)\\n    close_resp = api_client.post(\\n        f\\\"/Encounter/{enc_id}/close\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {clinician_token}\\\"},\\n    )\\n    assert close_resp.status_code == 200\\n\\n    patch_resp = api_client.patch(\\n        f\\\"/Encounter/{enc_id}\\\",\\n        json={\\\"period\\\": {\\\"end"
+  }
+}

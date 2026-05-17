@@ -1,0 +1,175 @@
+{
+  "req": {
+    "id": "R-HLT-047",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Device data ingest (boundary)",
+    "statement": "A registered device shall push Observations via FHIR ingest; unregistered devices shall be rejected. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "device registered"
+    ],
+    "triggers": [
+      "device submits"
+    ],
+    "expected_outcomes": [
+      "observations stored",
+      "normalization applied"
+    ],
+    "error_pathways": [
+      "401 when device cert invalid"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Ingest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-047",
+    "reasoning": "R-HLT-047 mandates three distinct test axes: (1) happy-path ingest from a registered device (EP \u2013 valid partition), (2) rejection of an unregistered/invalid-cert device (NEG), and (3) boundary values on timestamp and numeric elements (BVA). A fourth test covers the state transition from unregistered\u2192registered to assert the device must be in the correct state before ingest succeeds (STC). A fifth decision-table test exercises the cross-product of cert validity \u00d7 device registration to confirm all rejection paths are covered (DT). Together these five cases achieve the minimum required coverage of positive, negative, and boundary kinds while applying all five mandated heuristics.",
+    "tests": [
+      {
+        "name": "test_registered_device_ingest_valid_observation",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Device is registered in fhir-lite device registry",
+          "Device holds a valid mTLS certificate",
+          "FHIR Observation payload is schema-valid"
+        ],
+        "actions": [
+          "Construct a minimal FHIR Observation resource with a typical numeric value and current ISO-8601 timestamp",
+          "POST payload to /Ingest using the registered device certificate"
+        ],
+        "expected": [
+          "HTTP 201 Created returned",
+          "Response body contains an id field",
+          "Stored Observation is retrievable via GET /Observation/{id}",
+          "Numeric value is normalised per server-side rules"
+        ],
+        "trace": [
+          "R-HLT-047: registered device shall push Observations via FHIR ingest",
+          "R-HLT-047: observations stored; normalization applied"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite.local\"\n\n@pytest.fixture\ndef registered_device_session():\n    return <fixture_registered_device_session>\n\ndef test_registered_device_ingest_valid_observation(registered_device_session):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": \"2024-06-01T12:00:00Z\",\n        \"valueQuantity\": {\"value\": 72.0, \"unit\": \"beats/min\"}\n    }\n    resp = registered_device_session.post(f\"{BASE_URL}/Ingest\", json=payload)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    obs_id = body[\"id\"]\n    get_resp = registered_device_session.get(f\"{BASE_URL}/Observation/{obs_id}\")\n    assert get_resp.status_code == 200\n    stored = get_resp.json()\n    assert stored[\"valueQuantity\"][\"value\"] == <expected_normalised_value>(72.0)"
+      },
+      {
+        "name": "test_unregistered_device_cert_rejected_with_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Device certificate is invalid or belongs to an unregistered device",
+          "FHIR Observation payload is otherwise schema-valid"
+        ],
+        "actions": [
+          "Construct a valid FHIR Observation payload",
+          "POST payload to /Ingest using an invalid/unregistered device certificate"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized returned",
+          "Response body contains an OperationOutcome with severity error",
+          "No Observation resource is persisted"
+        ],
+        "trace": [
+          "R-HLT-047: unregistered devices shall be rejected",
+          "R-HLT-047: 401 when device cert invalid"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite.local\"\n\n@pytest.fixture\ndef unregistered_device_session():\n    return <fixture_unregistered_device_session>\n\ndef test_unregistered_device_cert_rejected_with_401(unregistered_device_session):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": \"2024-06-01T12:00:00Z\",\n        \"valueQuantity\": {\"value\": 72.0, \"unit\": \"beats/min\"}\n    }\n    resp = unregistered_device_session.post(f\"{BASE_URL}/Ingest\", json=payload)\n    assert resp.status_code == 401\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    severities = [i[\"severity\"] for i in body.get(\"issue\", [])]\n    assert \"error\" in severities"
+      },
+      {
+        "name": "test_boundary_timestamp_max_precision_and_min_numeric",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Device is registered in fhir-lite device registry",
+          "Device holds a valid mTLS certificate"
+        ],
+        "actions": [
+          "Construct Observation with effectiveDateTime at maximum sub-second precision (nanoseconds boundary)",
+          "Set valueQuantity to the system-defined minimum positive numeric (0.000001)",
+          "POST payload to /Ingest"
+        ],
+        "expected": [
+          "HTTP 201 Created returned",
+          "Stored Observation timestamp is normalised without truncation error",
+          "Stored numeric value equals the minimum positive value after normalisation"
+        ],
+        "trace": [
+          "R-HLT-047: Boundary cases on timestamps and numeric elements must be tested"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite.local\"\nMIN_POSITIVE_VALUE = 0.000001\n\n@pytest.fixture\ndef registered_device_session():\n    return <fixture_registered_device_session>\n\ndef test_boundary_timestamp_max_precision_and_min_numeric(registered_device_session):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": \"2024-06-01T23:59:59.999999999Z\",\n        \"valueQuantity\": {\"value\": MIN_POSITIVE_VALUE, \"unit\": \"mg/dL\"}\n    }\n    resp = registered_device_session.post(f\"{BASE_URL}/Ingest\", json=payload)\n    assert resp.status_code == 201\n    obs_id = resp.json()[\"id\"]\n    stored = registered_device_session.get(f\"{BASE_URL}/Observation/{obs_id}\").json()\n    assert \"effectiveDateTime\" in stored\n    assert stored[\"valueQuantity\"][\"value\"] == pytest.approx(MIN_POSITIVE_VALUE, rel=1e-6)"
+      },
+      {
+        "name": "test_state_transition_device_registers_then_ingests",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Device exists in the system but is in UNREGISTERED state",
+          "Device holds a valid certificate"
+        ],
+        "actions": [
+          "Attempt ingest while device is UNREGISTERED \u2014 expect 401",
+          "Register the device via /Device registration endpoint",
+          "Attempt ingest again with same payload \u2014 expect 201"
+        ],
+        "expected": [
+          "First POST returns 401",
+          "Device registration returns 200 or 201",
+          "Second POST returns 201 and observation is stored"
+        ],
+        "trace": [
+          "R-HLT-047: A registered device shall push Observations",
+          "R-HLT-047: preconditions: device registered"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite.local\"\n\n@pytest.fixture\ndef pending_device_session():\n    return <fixture_pending_device_session>\n\n@pytest.fixture\ndef device_registration_token():\n    return <fixture_device_registration_token>\n\ndef test_state_transition_device_registers_then_ingests(\n    pending_device_session, device_registration_token\n):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": \"2024-06-01T10:00:00Z\",\n        \"valueQuantity\": {\"value\": 98.6, \"unit\": \"degF\"}\n    }\n    pre_resp = pending_device_session.post(f\"{BASE_URL}/Ingest\", json=payload)\n    assert pre_resp.status_code == 401\n    reg_resp = requests.post(\n        f\"{BASE_URL}/Device\",\n        headers={\"Authorization\": f\"Bearer {device_registration_token}\"},\n        json=<fixture_device_registration_body>\n    )\n    assert reg_resp.status_code in (200, 201)\n    post_resp = pending_device_session.post(f\"{BASE_URL}/Ingest\", json=payload)\n    assert post_resp.status_code == 201\n    assert \"id\" in post_resp.json()"
+      },
+      {
+        "name": "test_decision_table_cert_validity_x_registration_status",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Four device configurations prepared: (valid cert + registered), (valid cert + unregistered), (invalid cert + registered), (invalid cert + unregistered)"
+        ],
+        "actions": [
+          "POST a valid Observation to /Ingest for each of the four device configurations",
+          "Record HTTP status for each"
+        ],
+        "expected": [
+          "valid cert + registered \u2192 201",
+          "valid cert + unregistered \u2192 401",
+          "invalid cert + registered \u2192 401",
+          "invalid cert + unregistered \u2192 401"
+        ],
+        "trace": [
+          "R-HLT-047: registered device shall push; unregistered shall be rejected",
+          "R-HLT-047: 401 when device cert invalid"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite.local\"\n\n@pytest.fixture\ndef device_sessions():\n    return <fixture_four_device_sessions>\n\n@pytest.mark.parametrize(\"cert_valid,registered,expected_status\", [\n    (True,  True,  201),\n    (True,  False, 401),\n    (False, True,  401),\n    (False, False, 401),\n])\ndef test_decision_table_cert_validity_x_registration_status(\n    device_sessions, cert_valid, registered, expected_status\n):\n    session = device_sessions[(cert_valid, registered)]\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": \"2024-06-01T08:00:00Z\",\n        \"valueQuantity\": {\"value\": 37.0, \"unit\": \"Cel\"}\n    }\n    resp = session.post(f\"{BASE_URL}/Ingest\", json=payload)\n    assert resp.status_code == expected_status"
+      }
+    ]
+  },
+  "req_id": "R-HLT-047",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 3243,
+    "latency_ms": 32118,
+    "wall_ms": 32118,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-047\",\n  \"reasoning\": \"R-HLT-047 mandates three distinct test axes: (1) happy-path ingest from a registered device (EP \u2013 valid partition), (2) rejection of an unregistered/invalid-cert device (NEG), and (3) boundary values on timestamp and numeric elements (BVA). A fourth test covers the state transition from unregistered\u2192registered to assert the device must be in the correct state before ingest succeeds (STC). A fifth decision-table test exercises the cross-product of cert validity \u00d7 device registration to confirm all rejection paths are covered (DT). Together these five cases achieve the minimum required coverage of positive, negative, and boundary kinds while applying all five mandated heuristics.\",\n  \"tests\": [\n    {\n      \"name\": \"test_registered_device_ingest_valid_observation\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Device is registered in fhir-lite device registry\",\n        \"Device holds a valid mTLS certificate\",\n        \"FHIR Observation payload is schema-valid\"\n      ],\n      \"actions\": [\n        \"Construct a minimal FHIR Observation resource with a typical numeric value and current ISO-8601 timestamp\",\n        \"POST payload to /Ingest using the registered device certificate\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created returned\",\n        \"Response body contains an id field\",\n        \"Stored Observation is retrievable via GET /Observation/{id}\",\n        \"Numeric value is normalised per server-side rules\"\n      ],\n      \"trace\": [\n        \"R-HLT-047: registered device shall push Observations via FHIR ingest\",\n        \"R-HLT-047: observations stored; normalization applied\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite.local\\\"\\n\\n@pytest.fixture\\ndef registered_device_session():\\n    return <fixture_registered_device_session>\\n\\ndef test_registered_device_ingest_valid_observation(registered_device_session):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\"}]},\\n        \\\"effectiveDateTime\\\": \\\"2024-06-01T12:00:00Z\\\",\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72.0, \\\"unit\\\": \\\"beats/min\\\"}\\n    }\\n    resp = registered_device_session.post(f\\\"{BASE_URL}/Ingest\\\", json=payload)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"id\\\" in body\\n    obs_id = body[\\\"id\\\"]\\n    get_resp = registered_device_session.get(f\\\"{BASE_URL}/Observation/{obs_id}\\\")\\n    assert get_resp.status_code == 200\\n    stored = get_resp.json()\\n    assert stored[\\\"valueQuantity\\\"][\\\"value\\\"] == <expected_normalised_value>(72.0)\"\n    },\n    {\n      \"name\": \"test_unregistered_device_cert_rejected_with_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Device certificate is invalid or belongs to an unregistered device\",\n        \"FHIR Observation payload is otherwise schema-valid\"\n      ],\n      \"actions\": [\n        \"Construct a valid FHIR Observation payload\",\n        \"POST payload to /Ingest using an invalid/unregistered device certificate\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized returned\",\n        \"Response body contains an OperationOutcome with severity error\",\n        \"No Observation resource is persisted\"\n      ],\n      \"trace\": [\n        \"R-HLT-047: unregistered devices shall be rejected\",\n        \"R-HLT-047: 401 when device cert invalid\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite.local\\\"\\n\\n@pytest.fixture\\ndef unregistered_device_session():\\n    return <fixture_unregistered_device_session>\\n\\ndef test_unregistered_device_cert_rejected_with_401(unregistered_device_session):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"88"
+  }
+}

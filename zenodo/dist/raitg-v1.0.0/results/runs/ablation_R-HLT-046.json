@@ -1,0 +1,206 @@
+{
+  "req": {
+    "id": "R-HLT-046",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Break-glass access (boundary)",
+    "statement": "A clinician shall invoke break-glass access for an emergent patient; break-glass use shall be audited and trigger a post-event review. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician asserts emergency"
+    ],
+    "expected_outcomes": [
+      "access granted",
+      "audit event emitted"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/BreakGlass"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-046",
+    "reasoning": "R-HLT-046 requires: (1) a clinician can invoke break-glass to gain emergent access, (2) the event is audited, and (3) a post-event review task is created. Test design covers: EP \u2013 valid clinician role triggers access; NEG \u2013 non-clinician role is rejected; BVA \u2013 timestamp at exact epoch boundary (0) and max numeric patient-id boundary; STC \u2013 state transition from normal\u2192break-glass\u2192audit-emitted; DT \u2013 decision table covering role\u00d7emergency-flag combinations. Each test is self-contained via fixtures that create and tear down patient resources, and uses a shared API client helper.",
+    "tests": [
+      {
+        "name": "test_breakglass_valid_clinician_grants_access_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated user has role=clinician",
+          "Patient with known patient_id exists in fhir-lite",
+          "No prior break-glass session is active for this patient"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician JWT, patient_id, reason='cardiac_arrest'",
+          "Capture HTTP response status and body",
+          "GET /AuditEvent?entity=patient_id to verify audit record"
+        ],
+        "expected": [
+          "HTTP 200 with body containing access_granted=true",
+          "AuditEvent record exists with action='break-glass' and actor=clinician_id",
+          "Response body contains review_task_id (post-event review created)"
+        ],
+        "trace": [
+          "R-HLT-046: clinician invokes break-glass \u2192 access granted",
+          "R-HLT-046: break-glass use shall be audited",
+          "R-HLT-046: trigger a post-event review"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, get_audit_events\n\ndef test_breakglass_valid_clinician_grants_access_and_emits_audit(<fixture>_clinician_token, <fixture>_existing_patient):\n    patient_id = <fixture>_existing_patient[\"id\"]\n    payload = {\n        \"patient_id\": patient_id,\n        \"reason\": \"cardiac_arrest\",\n        \"emergency\": True\n    }\n    resp = api_client.post(\n        \"/BreakGlass\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {<fixture>_clinician_token}\"}\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"access_granted\"] is True\n    assert \"review_task_id\" in body\n    assert body[\"review_task_id\"] is not None\n    audit_events = get_audit_events(patient_id, token=<fixture>_clinician_token)\n    assert any(\n        e[\"action\"] == \"break-glass\" for e in audit_events\n    ), \"Audit event not found for break-glass access\"\n"
+      },
+      {
+        "name": "test_breakglass_non_clinician_role_is_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user has role=nurse (not clinician)",
+          "Patient with known patient_id exists in fhir-lite"
+        ],
+        "actions": [
+          "POST /BreakGlass with nurse JWT, patient_id, reason='cardiac_arrest'",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains error code INSUFFICIENT_ROLE or equivalent",
+          "No AuditEvent with action='break-glass' is created for this attempt"
+        ],
+        "trace": [
+          "R-HLT-046: only clinician role may invoke break-glass",
+          "R-HLT-046 precondition: role=clinician required"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, get_audit_events\n\ndef test_breakglass_non_clinician_role_is_rejected(<fixture>_nurse_token, <fixture>_existing_patient):\n    patient_id = <fixture>_existing_patient[\"id\"]\n    payload = {\n        \"patient_id\": patient_id,\n        \"reason\": \"cardiac_arrest\",\n        \"emergency\": True\n    }\n    resp = api_client.post(\n        \"/BreakGlass\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {<fixture>_nurse_token}\"}\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"error\" in body\n    assert body[\"error\"] in (\"INSUFFICIENT_ROLE\", \"FORBIDDEN\")\n    audit_events = get_audit_events(patient_id, token=<fixture>_nurse_token)\n    assert not any(\n        e[\"action\"] == \"break-glass\" for e in audit_events\n    ), \"Unexpected audit event created for rejected access\"\n"
+      },
+      {
+        "name": "test_breakglass_timestamp_at_unix_epoch_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated user has role=clinician",
+          "Patient with known patient_id exists in fhir-lite",
+          "System or test harness can inject a custom 'event_timestamp' into the request"
+        ],
+        "actions": [
+          "POST /BreakGlass with clinician JWT, patient_id, event_timestamp=0 (Unix epoch boundary)",
+          "Capture HTTP response status and body",
+          "GET /AuditEvent to verify timestamp stored correctly"
+        ],
+        "expected": [
+          "HTTP 200 or 422 depending on system policy for epoch-zero timestamps",
+          "If 200: audit record stores event_timestamp=0 without truncation or overflow",
+          "If 422: error message references invalid timestamp value"
+        ],
+        "trace": [
+          "R-HLT-046: boundary cases on timestamps must be tested",
+          "BVA: minimum boundary of Unix timestamp (0 = 1970-01-01T00:00:00Z)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, get_audit_events\n\nEPOCH_BOUNDARY_TS = 0\n\ndef test_breakglass_timestamp_at_unix_epoch_boundary(<fixture>_clinician_token, <fixture>_existing_patient):\n    patient_id = <fixture>_existing_patient[\"id\"]\n    payload = {\n        \"patient_id\": patient_id,\n        \"reason\": \"cardiac_arrest\",\n        \"emergency\": True,\n        \"event_timestamp\": EPOCH_BOUNDARY_TS\n    }\n    resp = api_client.post(\n        \"/BreakGlass\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {<fixture>_clinician_token}\"}\n    )\n    assert resp.status_code in (200, 422), (\n        f\"Unexpected status {resp.status_code} for epoch-zero timestamp\"\n    )\n    if resp.status_code == 200:\n        audit_events = get_audit_events(patient_id, token=<fixture>_clinician_token)\n        matching = [e for e in audit_events if e[\"action\"] == \"break-glass\"]\n        assert matching, \"No audit event found\"\n        assert matching[-1][\"event_timestamp\"] == EPOCH_BOUNDARY_TS\n    else:\n        body = resp.json()\n        assert \"timestamp\" in body.get(\"error\", \"\").lower() or \"invalid\" in body.get(\"error\", \"\").lower()\n"
+      },
+      {
+        "name": "test_breakglass_state_transition_normal_to_active_to_reviewed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated user has role=clinician",
+          "Patient with known patient_id exists in fhir-lite",
+          "No active break-glass session for patient"
+        ],
+        "actions": [
+          "POST /BreakGlass to transition state from NORMAL to BREAK_GLASS_ACTIVE",
+          "GET /BreakGlass/{session_id} to confirm state=ACTIVE",
+          "POST /BreakGlass/{session_id}/review to transition state to REVIEWED",
+          "GET /BreakGlass/{session_id} to confirm state=REVIEWED"
+        ],
+        "expected": [
+          "Initial POST returns state=ACTIVE and session_id",
+          "GET confirms state=ACTIVE",
+          "POST /review returns state=REVIEWED",
+          "Final GET confirms state=REVIEWED and review_completed_at is set"
+        ],
+        "trace": [
+          "R-HLT-046: break-glass access granted (NORMAL\u2192ACTIVE)",
+          "R-HLT-046: post-event review created and completable (ACTIVE\u2192REVIEWED)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client\n\ndef test_breakglass_state_transition_normal_to_active_to_reviewed(<fixture>_clinician_token, <fixture>_existing_patient):\n    patient_id = <fixture>_existing_patient[\"id\"]\n    headers = {\"Authorization\": f\"Bearer {<fixture>_clinician_token}\"}\n    init_resp = api_client.post(\n        \"/BreakGlass\",\n        json={\"patient_id\": patient_id, \"reason\": \"trauma\", \"emergency\": True},\n        headers=headers\n    )\n    assert init_resp.status_code == 200\n    body = init_resp.json()\n    assert body[\"state\"] == \"ACTIVE\"\n    session_id = body[\"session_id\"]\n    get_resp = api_client.get(f\"/BreakGlass/{session_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"state\"] == \"ACTIVE\"\n    review_resp = api_client.post(\n        f\"/BreakGlass/{session_id}/review\",\n        json={\"outcome\": \"justified\"},\n        headers=headers\n    )\n    assert review_resp.status_code == 200\n    assert review_resp.json()[\"state\"] == \"REVIEWED\"\n    final_resp = api_client.get(f\"/BreakGlass/{session_id}\", headers=headers)\n    assert final_resp.json()[\"state\"] == \"REVIEWED\"\n    assert final_resp.json().get(\"review_completed_at\") is not None\n"
+      },
+      {
+        "name": "test_breakglass_decision_table_missing_emergency_flag",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated user has role=clinician",
+          "Patient with known patient_id exists in fhir-lite"
+        ],
+        "actions": [
+          "POST /BreakGlass with clinician JWT and patient_id but emergency=False",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 400 or 422 \u2013 emergency flag must be true to invoke break-glass",
+          "Response body contains an error indicating emergency assertion is required",
+          "No break-glass session created"
+        ],
+        "trace": [
+          "R-HLT-046: clinician must assert emergency to invoke break-glass",
+          "DT: role=clinician AND emergency=False \u2192 access denied"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client\n\ndef test_breakglass_decision_table_missing_emergency_flag(<fixture>_clinician_token, <fixture>_existing_patient):\n    patient_id = <fixture>_existing_patient[\"id\"]\n    payload = {\n        \"patient_id\": patient_id,\n        \"reason\": \"routine_check\",\n        \"emergency\": False\n    }\n    resp = api_client.post(\n        \"/BreakGlass\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {<fixture>_clinician_token}\"}\n    )\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400/422 when emergency=False, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"error\" in body\n    err_msg = body[\"error\"].lower()\n    assert \"emergency\" in err_msg or \"assertion\" in err_msg or \"required\" in err_msg\n"
+      },
+      {
+        "name": "test_breakglass_max_boundary_patient_id",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated user has role=clinician",
+          "System under test accepts numeric patient IDs",
+          "Max allowed patient_id value is known (INT32_MAX = 2147483647)"
+        ],
+        "actions": [
+          "POST /BreakGlass with clinician JWT and patient_id=2147483647 (INT32_MAX)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 404 (patient not found at max boundary ID) or 422 (out-of-range ID rejected)",
+          "Response body contains appropriate error; no access granted",
+          "No audit event created for non-existent patient at boundary ID"
+        ],
+        "trace": [
+          "R-HLT-046: boundary cases on numeric elements must be tested",
+          "BVA: maximum numeric boundary of patient_id field (INT32_MAX)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, get_audit_events\n\nINT32_MAX = 2147483647\n\ndef test_breakglass_max_boundary_patient_id(<fixture>_clinician_token):\n    payload = {\n        \"patient_id\": INT32_MAX,\n        \"reason\": \"cardiac_arrest\",\n        \"emergency\": True\n    }\n    resp = api_client.post(\n        \"/BreakGlass\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {<fixture>_clinician_token}\"}\n    )\n    assert resp.status_code in (404, 422), (\n        f\"Expected 404 or 422 for boundary patient_id {INT32_MAX}, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"error\" in body\n    assert body.get(\"access_granted\", False) is False\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-046",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 3914,
+    "latency_ms": 40818,
+    "wall_ms": 40818,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-046\",\n  \"reasoning\": \"R-HLT-046 requires: (1) a clinician can invoke break-glass to gain emergent access, (2) the event is audited, and (3) a post-event review task is created. Test design covers: EP \u2013 valid clinician role triggers access; NEG \u2013 non-clinician role is rejected; BVA \u2013 timestamp at exact epoch boundary (0) and max numeric patient-id boundary; STC \u2013 state transition from normal\u2192break-glass\u2192audit-emitted; DT \u2013 decision table covering role\u00d7emergency-flag combinations. Each test is self-contained via fixtures that create and tear down patient resources, and uses a shared API client helper.\",\n  \"tests\": [\n    {\n      \"name\": \"test_breakglass_valid_clinician_grants_access_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated user has role=clinician\",\n        \"Patient with known patient_id exists in fhir-lite\",\n        \"No prior break-glass session is active for this patient\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with valid clinician JWT, patient_id, reason='cardiac_arrest'\",\n        \"Capture HTTP response status and body\",\n        \"GET /AuditEvent?entity=patient_id to verify audit record\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body containing access_granted=true\",\n        \"AuditEvent record exists with action='break-glass' and actor=clinician_id\",\n        \"Response body contains review_task_id (post-event review created)\"\n      ],\n      \"trace\": [\n        \"R-HLT-046: clinician invokes break-glass \u2192 access granted\",\n        \"R-HLT-046: break-glass use shall be audited\",\n        \"R-HLT-046: trigger a post-event review\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import api_client, get_audit_events\\n\\ndef test_breakglass_valid_clinician_grants_access_and_emits_audit(<fixture>_clinician_token, <fixture>_existing_patient):\\n    patient_id = <fixture>_existing_patient[\\\"id\\\"]\\n    payload = {\\n        \\\"patient_id\\\": patient_id,\\n        \\\"reason\\\": \\\"cardiac_arrest\\\",\\n        \\\"emergency\\\": True\\n    }\\n    resp = api_client.post(\\n        \\\"/BreakGlass\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {<fixture>_clinician_token}\\\"}\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"access_granted\\\"] is True\\n    assert \\\"review_task_id\\\" in body\\n    assert body[\\\"review_task_id\\\"] is not None\\n    audit_events = get_audit_events(patient_id, token=<fixture>_clinician_token)\\n    assert any(\\n        e[\\\"action\\\"] == \\\"break-glass\\\" for e in audit_events\\n    ), \\\"Audit event not found for break-glass access\\\"\\n\"\n    },\n    {\n      \"name\": \"test_breakglass_non_clinician_role_is_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated user has role=nurse (not clinician)\",\n        \"Patient with known patient_id exists in fhir-lite\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with nurse JWT, patient_id, reason='cardiac_arrest'\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains error code INSUFFICIENT_ROLE or equivalent\",\n        \"No AuditEvent with action='break-glass' is created for this attempt\"\n      ],\n      \"trace\": [\n        \"R-HLT-046: only clinician role may invoke break-glass\",\n        \"R-HLT-046 precondition: role=clinician required\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import api_client, get_audit_events\\n\\ndef test_breakglass_non_clinician_role_is_rejected(<fixture>_nurse_token, <fixture>_existing_patient):\\n    patient_id = <fixture>_existing_patient[\\\"id\\\"]\\n    payload = {\\n        \\\"patient_id\\\": patient_id,\\n        \\\"reason\\\": \\\"cardiac_arrest\\\",\\n        \\\"emergency\\\": True\\n    }\\n    resp = api_client.post(\\n        \\\"/BreakGlass\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {<fixture>_nurse_token}\\\"}\\"
+  }
+}

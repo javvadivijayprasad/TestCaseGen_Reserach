@@ -1,0 +1,140 @@
+{
+  "req": {
+    "id": "R-HLT-091",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Bulk data export (audit)",
+    "statement": "A provisioned client shall request a FHIR bulk export; large datasets shall be paginated with NDJSON output. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authorized bulk-client"
+    ],
+    "triggers": [
+      "client requests export"
+    ],
+    "expected_outcomes": [
+      "export job queued",
+      "NDJSON stream produced"
+    ],
+    "error_pathways": [
+      "403 when unauthorised"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/$export"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-091",
+    "reasoning": "R-HLT-091 mandates three test slices: (1) EP positive \u2013 an authorised bulk-client triggers /$export, receives 202 + Content-Location, polls to completion, and gets valid NDJSON with a matching AuditEvent; (2) NEG negative \u2013 an unauthorised caller receives 403 and no AuditEvent of type 'export-success' is emitted; (3) BVA boundary \u2013 a dataset whose size sits exactly at the pagination threshold is split across exactly two NDJSON pages, confirming the fence-post split and that an AuditEvent is emitted per page chunk. State-transition coverage (STC) is embedded in the positive case by walking the job through queued\u2192in-progress\u2192completed states. All tests are self-contained via fixtures and helper placeholders; no shared mutable state.",
+    "tests": [
+      {
+        "name": "test_authorised_bulk_export_end_to_end",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "Client holds a valid Bearer token with bulk-export scope",
+          "At least one Patient resource exists in the test tenant"
+        ],
+        "actions": [
+          "POST /$export with Accept: application/fhir+json and Prefer: respond-async using authorised token",
+          "Assert HTTP 202 and capture Content-Location header",
+          "Poll Content-Location until status is 'completed' (max 30 s, 2 s interval)",
+          "Fetch each output URL listed in the completed manifest",
+          "Retrieve AuditEvents for this export operation"
+        ],
+        "expected": [
+          "Initial response is HTTP 202",
+          "Content-Location header is present",
+          "Job reaches 'completed' state within timeout",
+          "Each output file is valid NDJSON (one JSON object per line)",
+          "At least one AuditEvent with outcome '0' and entity referencing the export job ID exists"
+        ],
+        "trace": [
+          "R-HLT-091: export job queued",
+          "R-HLT-091: NDJSON stream produced",
+          "R-HLT-091: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest, time, json\n\ndef test_authorised_bulk_export_end_to_end(authorised_client, fhir_base_url, poll_job):\n    resp = authorised_client.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\"Accept\": \"application/fhir+json\", \"Prefer\": \"respond-async\"},\n    )\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    content_location = resp.headers.get(\"Content-Location\")\n    assert content_location, \"Content-Location header missing\"\n\n    manifest = poll_job(authorised_client, content_location, timeout=30, interval=2)\n    assert manifest.get(\"status\") == \"completed\"\n    output_files = manifest.get(\"output\", [])\n    assert len(output_files) > 0, \"No output files in manifest\"\n\n    for file_entry in output_files:\n        dl = authorised_client.get(file_entry[\"url\"])\n        assert dl.status_code == 200\n        for line in dl.text.strip().splitlines():\n            json.loads(line)  # raises if not valid JSON\n\n    job_id = content_location.split(\"/\")[-1]\n    audit_resp = authorised_client.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": job_id, \"outcome\": \"0\"},\n    )\n    assert audit_resp.status_code == 200\n    bundle = audit_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"Expected at least one success AuditEvent\"\n"
+      },
+      {
+        "name": "test_unauthorised_bulk_export_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "Client holds NO valid token (or a token lacking bulk-export scope)"
+        ],
+        "actions": [
+          "GET /$export with an invalid/missing Bearer token",
+          "Capture HTTP status code and response body",
+          "Query AuditEvents for any export-success event linked to this attempt"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden is returned",
+          "Response body contains a FHIR OperationOutcome with severity 'error'",
+          "No AuditEvent with outcome '0' for this attempt exists"
+        ],
+        "trace": [
+          "R-HLT-091: 403 when unauthorised"
+        ],
+        "executable": "import pytest, json, uuid\n\ndef test_unauthorised_bulk_export_returns_403(unauthorised_client, fhir_base_url):\n    correlation = str(uuid.uuid4())\n    resp = unauthorised_client.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\n            \"Accept\": \"application/fhir+json\",\n            \"Prefer\": \"respond-async\",\n            \"X-Correlation-Id\": correlation,\n        },\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    severities = [i.get(\"severity\") for i in body.get(\"issue\", [])]\n    assert \"error\" in severities, \"OperationOutcome must contain an error issue\"\n\n    # Verify no success AuditEvent was recorded for this correlation id\n    audit_check = unauthorised_client.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": correlation, \"outcome\": \"0\"},\n    )\n    # A 401/403 here is acceptable; if reachable, total must be 0\n    if audit_check.status_code == 200:\n        assert audit_check.json().get(\"total\", 0) == 0, \"No success AuditEvent expected\"\n"
+      },
+      {
+        "name": "test_bulk_export_pagination_at_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "Client holds a valid Bearer token with bulk-export scope",
+          "Test tenant has been seeded with exactly PAGE_SIZE Patient resources (fence-post boundary)"
+        ],
+        "actions": [
+          "Seed the tenant with exactly PAGE_SIZE Patient records via seed_patients fixture",
+          "GET /$export with Prefer: respond-async",
+          "Poll job to completion",
+          "Count the number of NDJSON output chunks returned in the manifest",
+          "Verify record count across all chunks equals PAGE_SIZE",
+          "Retrieve AuditEvents and count one per chunk"
+        ],
+        "expected": [
+          "HTTP 202 on initial request",
+          "Job completes successfully",
+          "Manifest contains exactly 2 output file entries (one full page + one boundary overflow page)",
+          "Total NDJSON records across all files equals PAGE_SIZE",
+          "An AuditEvent exists for each output file chunk (count >= 2)"
+        ],
+        "trace": [
+          "R-HLT-091: large datasets shall be paginated with NDJSON output",
+          "R-HLT-091: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest, json\n\nPAGE_SIZE = 1000  # configured page size in fhir-lite\n\ndef test_bulk_export_pagination_at_threshold(\n    authorised_client, fhir_base_url, poll_job, seed_patients, cleanup_patients\n):\n    patient_ids = seed_patients(authorised_client, fhir_base_url, count=PAGE_SIZE)\n\n    resp = authorised_client.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\"Accept\": \"application/fhir+json\", \"Prefer\": \"respond-async\"},\n        params={\"_type\": \"Patient\"},\n    )\n    assert resp.status_code == 202\n    content_location = resp.headers[\"Content-Location\"]\n    job_id = content_location.split(\"/\")[-1]\n\n    manifest = poll_job(authorised_client, content_location, timeout=60, interval=3)\n    assert manifest[\"status\"] == \"completed\"\n    output_files = manifest.get(\"output\", [])\n    assert len(output_files) == 2, f\"Expected 2 chunks at boundary, got {len(output_files)}\"\n\n    total_records = 0\n    for entry in output_files:\n        dl = authorised_client.get(entry[\"url\"])\n        assert dl.status_code == 200\n        lines = [l for l in dl.text.strip().splitlines() if l]\n        for line in lines:\n            json.loads(line)\n        total_records += len(lines)\n    assert total_records == PAGE_SIZE, f\"Record count mismatch: {total_records}\"\n\n    audit_resp = authorised_client.get(\n        f\"{fhir_base_url}/AuditEvent\", params={\"entity\": job_id}\n    )\n    assert audit_resp.status_code == 200\n    assert audit_resp.json().get(\"total\", 0) >= 2, \"Expected >=2 AuditEvents (one per chunk)\"\n\n    cleanup_patients(authorised_client, fhir_base_url, patient_ids)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-091",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1009,
+    "output_tokens": 2614,
+    "latency_ms": 31068,
+    "wall_ms": 31068,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-091\",\n  \"reasoning\": \"R-HLT-091 mandates three test slices: (1) EP positive \u2013 an authorised bulk-client triggers /$export, receives 202 + Content-Location, polls to completion, and gets valid NDJSON with a matching AuditEvent; (2) NEG negative \u2013 an unauthorised caller receives 403 and no AuditEvent of type 'export-success' is emitted; (3) BVA boundary \u2013 a dataset whose size sits exactly at the pagination threshold is split across exactly two NDJSON pages, confirming the fence-post split and that an AuditEvent is emitted per page chunk. State-transition coverage (STC) is embedded in the positive case by walking the job through queued\u2192in-progress\u2192completed states. All tests are self-contained via fixtures and helper placeholders; no shared mutable state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_authorised_bulk_export_end_to_end\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"Client holds a valid Bearer token with bulk-export scope\",\n        \"At least one Patient resource exists in the test tenant\"\n      ],\n      \"actions\": [\n        \"POST /$export with Accept: application/fhir+json and Prefer: respond-async using authorised token\",\n        \"Assert HTTP 202 and capture Content-Location header\",\n        \"Poll Content-Location until status is 'completed' (max 30 s, 2 s interval)\",\n        \"Fetch each output URL listed in the completed manifest\",\n        \"Retrieve AuditEvents for this export operation\"\n      ],\n      \"expected\": [\n        \"Initial response is HTTP 202\",\n        \"Content-Location header is present\",\n        \"Job reaches 'completed' state within timeout\",\n        \"Each output file is valid NDJSON (one JSON object per line)\",\n        \"At least one AuditEvent with outcome '0' and entity referencing the export job ID exists\"\n      ],\n      \"trace\": [\n        \"R-HLT-091: export job queued\",\n        \"R-HLT-091: NDJSON stream produced\",\n        \"R-HLT-091: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest, time, json\\n\\ndef test_authorised_bulk_export_end_to_end(authorised_client, fhir_base_url, poll_job):\\n    resp = authorised_client.get(\\n        f\\\"{fhir_base_url}/$export\\\",\\n        headers={\\\"Accept\\\": \\\"application/fhir+json\\\", \\\"Prefer\\\": \\\"respond-async\\\"},\\n    )\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}\\\"\\n    content_location = resp.headers.get(\\\"Content-Location\\\")\\n    assert content_location, \\\"Content-Location header missing\\\"\\n\\n    manifest = poll_job(authorised_client, content_location, timeout=30, interval=2)\\n    assert manifest.get(\\\"status\\\") == \\\"completed\\\"\\n    output_files = manifest.get(\\\"output\\\", [])\\n    assert len(output_files) > 0, \\\"No output files in manifest\\\"\\n\\n    for file_entry in output_files:\\n        dl = authorised_client.get(file_entry[\\\"url\\\"])\\n        assert dl.status_code == 200\\n        for line in dl.text.strip().splitlines():\\n            json.loads(line)  # raises if not valid JSON\\n\\n    job_id = content_location.split(\\\"/\\\")[-1]\\n    audit_resp = authorised_client.get(\\n        f\\\"{fhir_base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": job_id, \\\"outcome\\\": \\\"0\\\"},\\n    )\\n    assert audit_resp.status_code == 200\\n    bundle = audit_resp.json()\\n    assert bundle.get(\\\"total\\\", 0) >= 1, \\\"Expected at least one success AuditEvent\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unauthorised_bulk_export_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"Client holds NO valid token (or a token lacking bulk-export scope)\"\n      ],\n      \"actions\": [\n        \"GET /$export with an invalid/missing Bearer token\",\n        \"Capture HTTP status code and response body\",\n        \"Query AuditEvents for any export-success event linked to this attempt\"\n      ],\n      \"expected\": [\n        \"HTTP 403"
+  }
+}

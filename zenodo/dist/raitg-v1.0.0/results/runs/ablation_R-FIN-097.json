@@ -1,0 +1,189 @@
+{
+  "req": {
+    "id": "R-FIN-097",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Card PIN change (idempotency variant)",
+    "statement": "A customer shall change their card PIN at most 5 times per 24-hour window. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer changes PIN"
+    ],
+    "expected_outcomes": [
+      "PIN updated"
+    ],
+    "error_pathways": [
+      "429 when rate limit exceeded"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/pin"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-097",
+    "reasoning": "The requirement has two distinct concerns: (1) a rate limit of 5 PIN changes per 24-hour window, and (2) idempotency via Idempotency-Key. Tests are designed using EP (valid single change), BVA (exactly 5th change succeeds, 6th fails), NEG (duplicate key returns cached result, and exceeding limit returns 429), and STC (state transitions: fresh -> 1 change -> ... -> 5 changes -> blocked). The 40-line limit per executable is respected by delegating setup to fixtures and helpers.",
+    "tests": [
+      {
+        "name": "test_pin_change_single_valid_request",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer with a valid card ID",
+          "Zero PIN changes made in the current 24-hour window",
+          "Valid new PIN provided"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with a valid new PIN and a unique Idempotency-Key",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 204 response",
+          "Response body indicates PIN updated successfully"
+        ],
+        "trace": [
+          "R-FIN-097: PIN updated (happy path)",
+          "R-FIN-097: card belongs to caller (precondition)"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pin_change_single_valid_request(api_client, owned_card_id, reset_pin_change_counter):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"new_pin\": \"<valid_pin>\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    response = api_client.patch(\n        f\"/cards/{owned_card_id}/pin\",\n        json=payload,\n        headers=headers\n    )\n\n    assert response.status_code in (200, 204), (\n        f\"Expected 200 or 204, got {response.status_code}: {response.text}\"\n    )\n"
+      },
+      {
+        "name": "test_pin_change_idempotent_duplicate_key_returns_original_result",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer with a valid card ID",
+          "Zero PIN changes made in the current 24-hour window",
+          "Same Idempotency-Key to be used twice"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with a valid new PIN and Idempotency-Key X (first submission)",
+          "PATCH /cards/{id}/pin with the same Idempotency-Key X (duplicate submission)",
+          "Compare both responses"
+        ],
+        "expected": [
+          "Both requests return 200 or 204",
+          "Both responses are identical (status code and body)",
+          "PIN change counter increments by 1, not 2"
+        ],
+        "trace": [
+          "R-FIN-097: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pin_change_idempotent_duplicate_key_returns_original_result(\n    api_client, owned_card_id, reset_pin_change_counter\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"new_pin\": \"<valid_pin>\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    first = api_client.patch(\n        f\"/cards/{owned_card_id}/pin\", json=payload, headers=headers\n    )\n    second = api_client.patch(\n        f\"/cards/{owned_card_id}/pin\", json=payload, headers=headers\n    )\n\n    assert first.status_code in (200, 204)\n    assert second.status_code == first.status_code\n    assert second.json() == first.json(), \"Idempotent responses must match\"\n    count = get_pin_change_count(api_client, owned_card_id)\n    assert count == 1, f\"Counter should be 1, got {count}\"\n"
+      },
+      {
+        "name": "test_pin_change_fifth_attempt_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer with a valid card ID",
+          "Exactly 4 PIN changes already made in the current 24-hour window"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with a valid new PIN and a unique Idempotency-Key (5th attempt)"
+        ],
+        "expected": [
+          "HTTP 200 or 204 \u2014 the 5th change (upper boundary) is permitted"
+        ],
+        "trace": [
+          "R-FIN-097: at most 5 times per 24-hour window (upper boundary \u2014 inclusive)"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pin_change_fifth_attempt_succeeds(\n    api_client, owned_card_id, reset_pin_change_counter\n):\n    make_pin_changes(api_client, owned_card_id, count=4)\n\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"new_pin\": \"<valid_pin_5>\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    response = api_client.patch(\n        f\"/cards/{owned_card_id}/pin\",\n        json=payload,\n        headers=headers\n    )\n\n    assert response.status_code in (200, 204), (\n        f\"5th PIN change should succeed, got {response.status_code}: {response.text}\"\n    )\n"
+      },
+      {
+        "name": "test_pin_change_sixth_attempt_returns_429",
+        "kind": "negative",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer with a valid card ID",
+          "Exactly 5 PIN changes already made in the current 24-hour window"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with a valid new PIN and a unique Idempotency-Key (6th attempt)"
+        ],
+        "expected": [
+          "HTTP 429 Too Many Requests",
+          "Response body contains rate-limit error details"
+        ],
+        "trace": [
+          "R-FIN-097: 429 when rate limit exceeded",
+          "R-FIN-097: at most 5 times per 24-hour window (exceeding upper boundary)"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pin_change_sixth_attempt_returns_429(\n    api_client, owned_card_id, reset_pin_change_counter\n):\n    make_pin_changes(api_client, owned_card_id, count=5)\n\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"new_pin\": \"<valid_pin_6>\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    response = api_client.patch(\n        f\"/cards/{owned_card_id}/pin\",\n        json=payload,\n        headers=headers\n    )\n\n    assert response.status_code == 429, (\n        f\"Expected 429, got {response.status_code}: {response.text}\"\n    )\n    body = response.json()\n    assert \"error\" in body or \"message\" in body, \"429 body must contain error info\"\n"
+      },
+      {
+        "name": "test_pin_change_unauthenticated_request_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No authentication token provided",
+          "A valid card ID exists"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin without Authorization header"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Rate limit counter is not incremented"
+        ],
+        "trace": [
+          "R-FIN-097: card belongs to caller (precondition \u2014 violated)",
+          "R-FIN-097: negative path, unauthenticated actor"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pin_change_unauthenticated_request_rejected(unauthenticated_client, owned_card_id):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"new_pin\": \"<valid_pin>\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    response = unauthenticated_client.patch(\n        f\"/cards/{owned_card_id}/pin\",\n        json=payload,\n        headers=headers\n    )\n\n    assert response.status_code == 401, (\n        f\"Expected 401 for unauthenticated request, got {response.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_pin_change_state_transitions_fresh_to_rate_limited",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer with a valid card ID",
+          "Zero PIN changes made in the current 24-hour window (fresh state)"
+        ],
+        "actions": [
+          "Send 5 successive PATCH /cards/{id}/pin requests each with a unique Idempotency-Key",
+          "Send a 6th PATCH /cards/{id}/pin request with a new unique Idempotency-Key"
+        ],
+        "expected": [
+          "Requests 1-5 each return 200 or 204 (state: allowed -> allowed -> ... -> limit reached)",
+          "Request 6 returns 429 (state: rate-limited)"
+        ],
+        "trace": [
+          "R-FIN-097: at most 5 times per 24-hour window",
+          "R-FIN-097: 429 when rate limit exceeded",
+          "STC: covers full state chain fresh->1->2->3->4->5->blocked"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_pin_change_state_transitions_fresh_to_rate_limited(\n    api_client, owned_card_id, reset_pin_change_counter\n):\n    for i in range(5):\n        resp = api_client.patch(\n            f\"/cards/{owned_card_id}/pin\",\n            json={\"new_pin\": f\"<valid_pin_{i}>\"},\n            headers={\"Idempotency-Key\": str(uuid.uuid4())}\n        )\n        assert resp.status_code in (200, 204), (\n            f\"Change {i+1} should succeed, got {resp.status_code}\"\n        )\n\n    sixth = api_client.patch(\n        f\"/cards/{owned_card_id}/pin\",\n        json={\"new_pin\": \"<valid_pin_6>\"},\n        headers={\"Idempotency-Key\": str(uuid.uuid4())}\n    )\n    assert sixth.status_code == 429, (\n        f\"6th change must be blocked with 429, got {sixth.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-097",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=BVA"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1005,
+    "output_tokens": 3034,
+    "latency_ms": 36168,
+    "wall_ms": 36168,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-097\",\n  \"reasoning\": \"The requirement has two distinct concerns: (1) a rate limit of 5 PIN changes per 24-hour window, and (2) idempotency via Idempotency-Key. Tests are designed using EP (valid single change), BVA (exactly 5th change succeeds, 6th fails), NEG (duplicate key returns cached result, and exceeding limit returns 429), and STC (state transitions: fresh -> 1 change -> ... -> 5 changes -> blocked). The 40-line limit per executable is respected by delegating setup to fixtures and helpers.\",\n  \"tests\": [\n    {\n      \"name\": \"test_pin_change_single_valid_request\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer with a valid card ID\",\n        \"Zero PIN changes made in the current 24-hour window\",\n        \"Valid new PIN provided\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/pin with a valid new PIN and a unique Idempotency-Key\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 response\",\n        \"Response body indicates PIN updated successfully\"\n      ],\n      \"trace\": [\n        \"R-FIN-097: PIN updated (happy path)\",\n        \"R-FIN-097: card belongs to caller (precondition)\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_pin_change_single_valid_request(api_client, owned_card_id, reset_pin_change_counter):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\\"new_pin\\\": \\\"<valid_pin>\\\"}\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n\\n    response = api_client.patch(\\n        f\\\"/cards/{owned_card_id}/pin\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n\\n    assert response.status_code in (200, 204), (\\n        f\\\"Expected 200 or 204, got {response.status_code}: {response.text}\\\"\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_pin_change_idempotent_duplicate_key_returns_original_result\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Authenticated customer with a valid card ID\",\n        \"Zero PIN changes made in the current 24-hour window\",\n        \"Same Idempotency-Key to be used twice\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/pin with a valid new PIN and Idempotency-Key X (first submission)\",\n        \"PATCH /cards/{id}/pin with the same Idempotency-Key X (duplicate submission)\",\n        \"Compare both responses\"\n      ],\n      \"expected\": [\n        \"Both requests return 200 or 204\",\n        \"Both responses are identical (status code and body)\",\n        \"PIN change counter increments by 1, not 2\"\n      ],\n      \"trace\": [\n        \"R-FIN-097: duplicate submission with same Idempotency-Key must return original result\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_pin_change_idempotent_duplicate_key_returns_original_result(\\n    api_client, owned_card_id, reset_pin_change_counter\\n):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\\"new_pin\\\": \\\"<valid_pin>\\\"}\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n\\n    first = api_client.patch(\\n        f\\\"/cards/{owned_card_id}/pin\\\", json=payload, headers=headers\\n    )\\n    second = api_client.patch(\\n        f\\\"/cards/{owned_card_id}/pin\\\", json=payload, headers=headers\\n    )\\n\\n    assert first.status_code in (200, 204)\\n    assert second.status_code == first.status_code\\n    assert second.json() == first.json(), \\\"Idempotent responses must match\\\"\\n    count = get_pin_change_count(api_client, owned_card_id)\\n    assert count == 1, f\\\"Counter should be 1, got {count}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_pin_change_fifth_attempt_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer with a valid card ID\",\n        \"Exactly 4 PIN changes already made in the current 24-hour window\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/pin with a valid new PIN and a unique Idempotency-Key (5th attempt)\"\n      ],\n      \"expected\""
+  }
+}

@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-FIN-086",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Beneficiary management (idempotency variant)",
+    "statement": "A customer shall add a beneficiary which enters a 24-hour cooling-off period before it can receive transfers. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds beneficiary"
+    ],
+    "expected_outcomes": [
+      "beneficiary saved in pending state"
+    ],
+    "error_pathways": [
+      "409 if duplicate account"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/beneficiaries"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-086",
+    "reasoning": "R-FIN-086 covers three orthogonal concerns: (1) happy-path beneficiary creation entering pending/cooling-off state, (2) idempotency via Idempotency-Key, (3) duplicate account rejection with 409. A fourth test covers the boundary between pending and active states at the 24-hour mark (state transition). Together these form a minimal yet complete suite using EP, NEG, BVA, STC, and DT heuristics. Each test is self-contained via fixture teardown and uses a unique idempotency key seeded from the test name to remain deterministic.",
+    "tests": [
+      {
+        "name": "test_add_beneficiary_returns_pending_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid JWT available via <auth_fixture>)",
+          "Target account number does not already exist for this customer"
+        ],
+        "actions": [
+          "Generate unique idempotency key and unique account number",
+          "POST /beneficiaries with valid payload and Idempotency-Key header",
+          "Capture HTTP response status and JSON body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status == 'pending'",
+          "Response body contains cooling_off_ends_at timestamp approximately 24 hours from now",
+          "Response body contains beneficiary id"
+        ],
+        "trace": [
+          "R-FIN-086: beneficiary saved in pending state",
+          "R-FIN-086: 24-hour cooling-off period"
+        ],
+        "executable": "def test_add_beneficiary_returns_pending_state(auth_headers, api_client, unique_account):\n    idempotency_key = <generate_uuid>(\"test_add_beneficiary_returns_pending_state\")\n    payload = {\n        \"account_number\": unique_account,\n        \"account_name\": \"Alice Tester\",\n        \"bank_code\": \"001\"\n    }\n    headers = {**auth_headers, \"Idempotency-Key\": idempotency_key}\n\n    resp = api_client.post(\"/beneficiaries\", json=payload, headers=headers)\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert \"id\" in body\n    assert \"cooling_off_ends_at\" in body\n    ends_at = <parse_iso8601>(body[\"cooling_off_ends_at\"])\n    now = <utcnow>()\n    delta_hours = (ends_at - now).total_seconds() / 3600\n    assert 23.9 <= delta_hours <= 24.1\n"
+      },
+      {
+        "name": "test_duplicate_idempotency_key_returns_original_response",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated",
+          "A beneficiary has already been created with a known Idempotency-Key"
+        ],
+        "actions": [
+          "POST /beneficiaries with payload P1 and Idempotency-Key K1 (first call)",
+          "Record first response status code and body",
+          "POST /beneficiaries with identical payload P1 and same Idempotency-Key K1 (second call)",
+          "Compare second response against first"
+        ],
+        "expected": [
+          "Both calls return HTTP 201",
+          "Second response body is identical to first response body",
+          "No duplicate beneficiary record created"
+        ],
+        "trace": [
+          "R-FIN-086: operation must be idempotent",
+          "R-FIN-086: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "def test_duplicate_idempotency_key_returns_original_response(auth_headers, api_client, unique_account):\n    idempotency_key = <generate_uuid>(\"test_duplicate_idempotency_key\")\n    payload = {\n        \"account_number\": unique_account,\n        \"account_name\": \"Bob Idempotent\",\n        \"bank_code\": \"002\"\n    }\n    headers = {**auth_headers, \"Idempotency-Key\": idempotency_key}\n\n    first = api_client.post(\"/beneficiaries\", json=payload, headers=headers)\n    assert first.status_code == 201\n    first_body = first.json()\n\n    second = api_client.post(\"/beneficiaries\", json=payload, headers=headers)\n    assert second.status_code == 201\n    second_body = second.json()\n\n    assert second_body[\"id\"] == first_body[\"id\"]\n    assert second_body[\"status\"] == first_body[\"status\"]\n    assert second_body[\"cooling_off_ends_at\"] == first_body[\"cooling_off_ends_at\"]\n\n    beneficiaries = api_client.get(\"/beneficiaries\", headers=auth_headers).json()\n    matches = [b for b in beneficiaries if b[\"account_number\"] == unique_account]\n    assert len(matches) == 1\n"
+      },
+      {
+        "name": "test_duplicate_account_number_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated",
+          "A beneficiary with account_number X already exists for this customer"
+        ],
+        "actions": [
+          "POST /beneficiaries with account_number X and a new Idempotency-Key (first call succeeds)",
+          "POST /beneficiaries with the same account_number X but a different Idempotency-Key (second call)"
+        ],
+        "expected": [
+          "First call returns HTTP 201",
+          "Second call returns HTTP 409 Conflict",
+          "Second response body contains error code DUPLICATE_ACCOUNT or equivalent"
+        ],
+        "trace": [
+          "R-FIN-086: error pathway \u2014 409 if duplicate account"
+        ],
+        "executable": "def test_duplicate_account_number_returns_409(auth_headers, api_client, unique_account):\n    payload = {\n        \"account_number\": unique_account,\n        \"account_name\": \"Carol Conflict\",\n        \"bank_code\": \"003\"\n    }\n\n    first_key = <generate_uuid>(\"test_409_first\")\n    first = api_client.post(\n        \"/beneficiaries\",\n        json=payload,\n        headers={**auth_headers, \"Idempotency-Key\": first_key}\n    )\n    assert first.status_code == 201\n\n    second_key = <generate_uuid>(\"test_409_second\")\n    second = api_client.post(\n        \"/beneficiaries\",\n        json=payload,\n        headers={**auth_headers, \"Idempotency-Key\": second_key}\n    )\n    assert second.status_code == 409\n    error_body = second.json()\n    assert error_body.get(\"error_code\") == \"DUPLICATE_ACCOUNT\"\n"
+      },
+      {
+        "name": "test_beneficiary_status_transitions_to_active_after_cooling_off",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated",
+          "System clock can be manipulated via <advance_clock_fixture> or a test backdoor exists",
+          "Beneficiary has been created and is in pending state"
+        ],
+        "actions": [
+          "POST /beneficiaries to create beneficiary (status == pending)",
+          "Advance system clock by exactly 24 hours using <advance_clock_fixture>",
+          "GET /beneficiaries/{id} to retrieve updated status"
+        ],
+        "expected": [
+          "Before clock advance: status == 'pending', transfers rejected",
+          "After exactly 24 hours: status transitions to 'active'",
+          "Transfer attempt after activation returns success (not cooling-off error)"
+        ],
+        "trace": [
+          "R-FIN-086: 24-hour cooling-off period before beneficiary can receive transfers",
+          "R-FIN-086: beneficiary saved in pending state (boundary at expiry)"
+        ],
+        "executable": "def test_beneficiary_status_transitions_to_active_after_cooling_off(\n    auth_headers, api_client, unique_account, advance_clock_fixture\n):\n    payload = {\n        \"account_number\": unique_account,\n        \"account_name\": \"Dave Boundary\",\n        \"bank_code\": \"004\"\n    }\n    key = <generate_uuid>(\"test_cooling_off_boundary\")\n    create_resp = api_client.post(\n        \"/beneficiaries\",\n        json=payload,\n        headers={**auth_headers, \"Idempotency-Key\": key}\n    )\n    assert create_resp.status_code == 201\n    beneficiary_id = create_resp.json()[\"id\"]\n\n    pending = api_client.get(f\"/beneficiaries/{beneficiary_id}\", headers=auth_headers)\n    assert pending.json()[\"status\"] == \"pending\"\n\n    advance_clock_fixture(hours=24)\n\n    active = api_client.get(f\"/beneficiaries/{beneficiary_id}\", headers=auth_headers)\n    assert active.json()[\"status\"] == \"active\"\n"
+      },
+      {
+        "name": "test_missing_idempotency_key_header_is_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated",
+          "Request payload is otherwise valid"
+        ],
+        "actions": [
+          "POST /beneficiaries with valid payload but without Idempotency-Key header"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request or 422 Unprocessable Entity",
+          "Response body contains error indicating Idempotency-Key is required"
+        ],
+        "trace": [
+          "R-FIN-086: idempotency key is a mandatory protocol contract for the operation"
+        ],
+        "executable": "def test_missing_idempotency_key_header_is_rejected(auth_headers, api_client, unique_account):\n    payload = {\n        \"account_number\": unique_account,\n        \"account_name\": \"Eve NoKey\",\n        \"bank_code\": \"005\"\n    }\n    resp = api_client.post(\"/beneficiaries\", json=payload, headers=auth_headers)\n\n    assert resp.status_code in (400, 422)\n    body = resp.json()\n    raw = str(body).lower()\n    assert \"idempotency\" in raw or \"idempotency-key\" in raw or \"idempotency_key\" in raw\n"
+      },
+      {
+        "name": "test_beneficiary_account_number_at_max_length_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated",
+          "Maximum allowed account number length is known (assumed 34 chars per IBAN spec)"
+        ],
+        "actions": [
+          "POST /beneficiaries with account_number of exactly 34 characters",
+          "POST /beneficiaries with account_number of exactly 35 characters (one over max)"
+        ],
+        "expected": [
+          "34-character account number: HTTP 201, beneficiary created in pending state",
+          "35-character account number: HTTP 400 or 422, validation error on account_number field"
+        ],
+        "trace": [
+          "R-FIN-086: beneficiary saved in pending state (valid input boundary)",
+          "R-FIN-086: error pathway for invalid account data"
+        ],
+        "executable": "def test_beneficiary_account_number_at_max_length_boundary(auth_headers, api_client):\n    max_len = 34\n    valid_account = \"A\" * max_len\n    over_account = \"A\" * (max_len + 1)\n\n    valid_key = <generate_uuid>(\"test_bva_valid\")\n    valid_resp = api_client.post(\n        \"/beneficiaries\",\n        json={\"account_number\": valid_account, \"account_name\": \"Frank BVA\", \"bank_code\": \"006\"},\n        headers={**auth_headers, \"Idempotency-Key\": valid_key}\n    )\n    assert valid_resp.status_code == 201\n    assert valid_resp.json()[\"status\"] == \"pending\"\n\n    over_key = <generate_uuid>(\"test_bva_over\")\n    over_resp = api_client.post(\n        \"/beneficiaries\",\n        json={\"account_number\": over_account, \"account_name\": \"Frank BVA Over\", \"bank_code\": \"006\"},\n        headers={**auth_headers, \"Idempotency-Key\": over_key}\n    )\n    assert over_resp.status_code in (400, 422)\n    body = over_resp.json()\n    assert \"account_number\" in str(body).lower()\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-086",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1009,
+    "output_tokens": 3485,
+    "latency_ms": 35733,
+    "wall_ms": 35733,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-086\",\n  \"reasoning\": \"R-FIN-086 covers three orthogonal concerns: (1) happy-path beneficiary creation entering pending/cooling-off state, (2) idempotency via Idempotency-Key, (3) duplicate account rejection with 409. A fourth test covers the boundary between pending and active states at the 24-hour mark (state transition). Together these form a minimal yet complete suite using EP, NEG, BVA, STC, and DT heuristics. Each test is self-contained via fixture teardown and uses a unique idempotency key seeded from the test name to remain deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_add_beneficiary_returns_pending_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT available via <auth_fixture>)\",\n        \"Target account number does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"Generate unique idempotency key and unique account number\",\n        \"POST /beneficiaries with valid payload and Idempotency-Key header\",\n        \"Capture HTTP response status and JSON body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status == 'pending'\",\n        \"Response body contains cooling_off_ends_at timestamp approximately 24 hours from now\",\n        \"Response body contains beneficiary id\"\n      ],\n      \"trace\": [\n        \"R-FIN-086: beneficiary saved in pending state\",\n        \"R-FIN-086: 24-hour cooling-off period\"\n      ],\n      \"executable\": \"def test_add_beneficiary_returns_pending_state(auth_headers, api_client, unique_account):\\n    idempotency_key = <generate_uuid>(\\\"test_add_beneficiary_returns_pending_state\\\")\\n    payload = {\\n        \\\"account_number\\\": unique_account,\\n        \\\"account_name\\\": \\\"Alice Tester\\\",\\n        \\\"bank_code\\\": \\\"001\\\"\\n    }\\n    headers = {**auth_headers, \\\"Idempotency-Key\\\": idempotency_key}\\n\\n    resp = api_client.post(\\\"/beneficiaries\\\", json=payload, headers=headers)\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert \\\"id\\\" in body\\n    assert \\\"cooling_off_ends_at\\\" in body\\n    ends_at = <parse_iso8601>(body[\\\"cooling_off_ends_at\\\"])\\n    now = <utcnow>()\\n    delta_hours = (ends_at - now).total_seconds() / 3600\\n    assert 23.9 <= delta_hours <= 24.1\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_idempotency_key_returns_original_response\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"A beneficiary has already been created with a known Idempotency-Key\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with payload P1 and Idempotency-Key K1 (first call)\",\n        \"Record first response status code and body\",\n        \"POST /beneficiaries with identical payload P1 and same Idempotency-Key K1 (second call)\",\n        \"Compare second response against first\"\n      ],\n      \"expected\": [\n        \"Both calls return HTTP 201\",\n        \"Second response body is identical to first response body\",\n        \"No duplicate beneficiary record created\"\n      ],\n      \"trace\": [\n        \"R-FIN-086: operation must be idempotent\",\n        \"R-FIN-086: duplicate submission with same Idempotency-Key must return original result\"\n      ],\n      \"executable\": \"def test_duplicate_idempotency_key_returns_original_response(auth_headers, api_client, unique_account):\\n    idempotency_key = <generate_uuid>(\\\"test_duplicate_idempotency_key\\\")\\n    payload = {\\n        \\\"account_number\\\": unique_account,\\n        \\\"account_name\\\": \\\"Bob Idempotent\\\",\\n        \\\"bank_code\\\": \\\"002\\\"\\n    }\\n    headers = {**auth_headers, \\\"Idempotency-Key\\\": idempotency_key}\\n\\n    first = api_client.post(\\\"/beneficiaries\\\", json=payload, headers=headers)\\n    assert first.status_code == 201\\n    first_body = first.json()\\n\\n    second = api_client.post(\\\"/beneficiaries\\\", json=payload, headers=headers)\\n    assert seco"
+  }
+}

@@ -1,0 +1,182 @@
+{
+  "req": {
+    "id": "R-HLT-096",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Break-glass access (audit)",
+    "statement": "A clinician shall invoke break-glass access for an emergent patient; break-glass use shall be audited and trigger a post-event review. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician asserts emergency"
+    ],
+    "expected_outcomes": [
+      "access granted",
+      "audit event emitted"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/BreakGlass"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-096",
+    "reasoning": "The requirement mandates break-glass access for clinicians in emergencies, with mandatory audit event emission and post-event review task creation. I derive: (1) a positive EP/STC test confirming full happy-path state transition from normal\u2192break-glass\u2192audited; (2) a NEG test where a non-clinician role is denied access; (3) a BVA test exercising the exact boundary of a zero-length reason string (empty justification) which sits at the minimum valid input edge; (4) a DT test covering the decision matrix where patient does not exist; (5) a STC test verifying the post-event review task is created as a downstream side-effect. Each test POSTs to /BreakGlass, inspects HTTP status, then queries the audit log endpoint to assert AuditEvent presence.",
+    "tests": [
+      {
+        "name": "test_break_glass_grants_access_and_emits_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role:clinician with valid JWT",
+          "Patient with id=PAT-001 exists in the system",
+          "Audit log is queryable via /AuditEvent"
+        ],
+        "actions": [
+          "POST /BreakGlass with payload {\"patientId\": \"PAT-001\", \"reason\": \"cardiac arrest\"}",
+          "Assert HTTP 200 and response body contains accessGranted=true",
+          "GET /AuditEvent?entity=PAT-001&type=break-glass",
+          "Assert at least one AuditEvent record is returned"
+        ],
+        "expected": [
+          "HTTP 200 from /BreakGlass",
+          "Response JSON field accessGranted is true",
+          "At least one AuditEvent with type break-glass for PAT-001 exists"
+        ],
+        "trace": [
+          "R-HLT-096: access granted",
+          "R-HLT-096: audit event emitted"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_grants_access_and_emits_audit_event(clinician_auth_headers, base_url, existing_patient_id):\n    payload = {\"patientId\": existing_patient_id, \"reason\": \"cardiac arrest\"}\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body.get(\"accessGranted\") is True\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": existing_patient_id, \"type\": \"break-glass\"},\n        headers=clinician_auth_headers,\n    )\n    assert audit_resp.status_code == 200\n    events = audit_resp.json().get(\"entry\", [])\n    assert len(events) >= 1, \"Expected at least one AuditEvent for break-glass access\"\n"
+      },
+      {
+        "name": "test_non_clinician_break_glass_is_denied",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:receptionist (not clinician) with valid JWT",
+          "Patient with id=PAT-001 exists in the system"
+        ],
+        "actions": [
+          "POST /BreakGlass with payload {\"patientId\": \"PAT-001\", \"reason\": \"emergency\"} using receptionist credentials",
+          "Assert HTTP 403 Forbidden",
+          "GET /AuditEvent?entity=PAT-001&type=break-glass and assert no new event was emitted for this attempt"
+        ],
+        "expected": [
+          "HTTP 403 from /BreakGlass",
+          "Response body indicates insufficient privileges",
+          "No AuditEvent of type break-glass created for this denied attempt"
+        ],
+        "trace": [
+          "R-HLT-096: precondition role:clinician enforced",
+          "R-HLT-096: access denied for unauthorized role"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_non_clinician_break_glass_is_denied(receptionist_auth_headers, clinician_auth_headers, base_url, existing_patient_id):\n    before_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": existing_patient_id, \"type\": \"break-glass\"},\n        headers=clinician_auth_headers,\n    )\n    before_count = len(before_resp.json().get(\"entry\", []))\n\n    payload = {\"patientId\": existing_patient_id, \"reason\": \"emergency\"}\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=receptionist_auth_headers)\n    assert resp.status_code == 403\n\n    after_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": existing_patient_id, \"type\": \"break-glass\"},\n        headers=clinician_auth_headers,\n    )\n    after_count = len(after_resp.json().get(\"entry\", []))\n    assert after_count == before_count, \"Denied request must not create a break-glass AuditEvent\"\n"
+      },
+      {
+        "name": "test_break_glass_with_empty_reason_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:clinician with valid JWT",
+          "Patient with id=PAT-001 exists in the system",
+          "System requires a non-empty reason string for break-glass invocation"
+        ],
+        "actions": [
+          "POST /BreakGlass with payload {\"patientId\": \"PAT-001\", \"reason\": \"\"} (empty string at lower boundary)",
+          "Assert HTTP 422 or 400 Unprocessable Entity",
+          "Assert response body contains a validation error referencing the reason field"
+        ],
+        "expected": [
+          "HTTP 400 or 422 from /BreakGlass",
+          "Response body contains field-level error for reason being empty",
+          "No AuditEvent emitted for this invalid request"
+        ],
+        "trace": [
+          "R-HLT-096: break-glass reason is mandatory; empty reason is at the minimum invalid boundary"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_with_empty_reason_is_rejected(clinician_auth_headers, base_url, existing_patient_id):\n    payload = {\"patientId\": existing_patient_id, \"reason\": \"\"}\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code in (400, 422), f\"Expected 400/422, got {resp.status_code}\"\n    body = resp.json()\n    errors = body.get(\"errors\") or body.get(\"issue\") or []\n    reason_error = any(\n        \"reason\" in str(e).lower() for e in errors\n    )\n    assert reason_error, \"Validation error must reference the empty reason field\"\n"
+      },
+      {
+        "name": "test_break_glass_for_nonexistent_patient_returns_error",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller has role:clinician with valid JWT",
+          "Patient with id=PAT-GHOST does not exist in the system"
+        ],
+        "actions": [
+          "POST /BreakGlass with payload {\"patientId\": \"PAT-GHOST\", \"reason\": \"trauma\"}",
+          "Assert HTTP 404 Not Found",
+          "Assert response error message indicates unknown patient"
+        ],
+        "expected": [
+          "HTTP 404 from /BreakGlass",
+          "Response body indicates patient PAT-GHOST not found",
+          "No AuditEvent emitted for nonexistent patient"
+        ],
+        "trace": [
+          "R-HLT-096: precondition patient exists; decision table row where patient is absent"
+        ],
+        "executable": "import pytest\nimport requests\n\nNONEXISTENT_PATIENT_ID = \"PAT-GHOST-99999\"\n\ndef test_break_glass_for_nonexistent_patient_returns_error(clinician_auth_headers, base_url):\n    payload = {\"patientId\": NONEXISTENT_PATIENT_ID, \"reason\": \"trauma\"}\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 404, f\"Expected 404, got {resp.status_code}\"\n    body = resp.json()\n    detail = str(body).lower()\n    assert \"patient\" in detail or \"not found\" in detail, \"Error must reference missing patient\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": NONEXISTENT_PATIENT_ID, \"type\": \"break-glass\"},\n        headers=clinician_auth_headers,\n    )\n    events = audit_resp.json().get(\"entry\", [])\n    assert len(events) == 0, \"No AuditEvent should exist for a nonexistent patient\"\n"
+      },
+      {
+        "name": "test_break_glass_triggers_post_event_review_task",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:clinician with valid JWT",
+          "Patient with id=PAT-002 exists in the system",
+          "System is in normal state (no prior break-glass for PAT-002 in current session)"
+        ],
+        "actions": [
+          "POST /BreakGlass with payload {\"patientId\": \"PAT-002\", \"reason\": \"respiratory failure\"}",
+          "Assert HTTP 200 and accessGranted=true (state transition: normal -> break-glass)",
+          "GET /Task?focus=PAT-002&code=break-glass-review",
+          "Assert at least one Task resource exists in status draft or requested"
+        ],
+        "expected": [
+          "HTTP 200 from /BreakGlass",
+          "accessGranted is true in response body",
+          "At least one Task with code break-glass-review exists for PAT-002",
+          "Task status is draft or requested indicating pending post-event review"
+        ],
+        "trace": [
+          "R-HLT-096: break-glass use shall trigger a post-event review",
+          "R-HLT-096: error pathway review task created confirmed as side-effect"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_triggers_post_event_review_task(clinician_auth_headers, base_url):\n    patient_id = \"PAT-002\"\n    payload = {\"patientId\": patient_id, \"reason\": \"respiratory failure\"}\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 200\n    assert resp.json().get(\"accessGranted\") is True\n\n    task_resp = requests.get(\n        f\"{base_url}/Task\",\n        params={\"focus\": patient_id, \"code\": \"break-glass-review\"},\n        headers=clinician_auth_headers,\n    )\n    assert task_resp.status_code == 200\n    tasks = task_resp.json().get(\"entry\", [])\n    assert len(tasks) >= 1, \"A post-event review Task must be created after break-glass\"\n    statuses = {t.get(\"resource\", {}).get(\"status\") for t in tasks}\n    assert statuses & {\"draft\", \"requested\"}, f\"Task must be in draft/requested, got {statuses}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-096",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 3211,
+    "latency_ms": 39614,
+    "wall_ms": 39614,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-096\",\n  \"reasoning\": \"The requirement mandates break-glass access for clinicians in emergencies, with mandatory audit event emission and post-event review task creation. I derive: (1) a positive EP/STC test confirming full happy-path state transition from normal\u2192break-glass\u2192audited; (2) a NEG test where a non-clinician role is denied access; (3) a BVA test exercising the exact boundary of a zero-length reason string (empty justification) which sits at the minimum valid input edge; (4) a DT test covering the decision matrix where patient does not exist; (5) a STC test verifying the post-event review task is created as a downstream side-effect. Each test POSTs to /BreakGlass, inspects HTTP status, then queries the audit log endpoint to assert AuditEvent presence.\",\n  \"tests\": [\n    {\n      \"name\": \"test_break_glass_grants_access_and_emits_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role:clinician with valid JWT\",\n        \"Patient with id=PAT-001 exists in the system\",\n        \"Audit log is queryable via /AuditEvent\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with payload {\\\"patientId\\\": \\\"PAT-001\\\", \\\"reason\\\": \\\"cardiac arrest\\\"}\",\n        \"Assert HTTP 200 and response body contains accessGranted=true\",\n        \"GET /AuditEvent?entity=PAT-001&type=break-glass\",\n        \"Assert at least one AuditEvent record is returned\"\n      ],\n      \"expected\": [\n        \"HTTP 200 from /BreakGlass\",\n        \"Response JSON field accessGranted is true\",\n        \"At least one AuditEvent with type break-glass for PAT-001 exists\"\n      ],\n      \"trace\": [\n        \"R-HLT-096: access granted\",\n        \"R-HLT-096: audit event emitted\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_break_glass_grants_access_and_emits_audit_event(clinician_auth_headers, base_url, existing_patient_id):\\n    payload = {\\\"patientId\\\": existing_patient_id, \\\"reason\\\": \\\"cardiac arrest\\\"}\\n    resp = requests.post(f\\\"{base_url}/BreakGlass\\\", json=payload, headers=clinician_auth_headers)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body.get(\\\"accessGranted\\\") is True\\n\\n    audit_resp = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": existing_patient_id, \\\"type\\\": \\\"break-glass\\\"},\\n        headers=clinician_auth_headers,\\n    )\\n    assert audit_resp.status_code == 200\\n    events = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(events) >= 1, \\\"Expected at least one AuditEvent for break-glass access\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_clinician_break_glass_is_denied\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:receptionist (not clinician) with valid JWT\",\n        \"Patient with id=PAT-001 exists in the system\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with payload {\\\"patientId\\\": \\\"PAT-001\\\", \\\"reason\\\": \\\"emergency\\\"} using receptionist credentials\",\n        \"Assert HTTP 403 Forbidden\",\n        \"GET /AuditEvent?entity=PAT-001&type=break-glass and assert no new event was emitted for this attempt\"\n      ],\n      \"expected\": [\n        \"HTTP 403 from /BreakGlass\",\n        \"Response body indicates insufficient privileges\",\n        \"No AuditEvent of type break-glass created for this denied attempt\"\n      ],\n      \"trace\": [\n        \"R-HLT-096: precondition role:clinician enforced\",\n        \"R-HLT-096: access denied for unauthorized role\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_non_clinician_break_glass_is_denied(receptionist_auth_headers, clinician_auth_headers, base_url, existing_patient_id):\\n    before_resp = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": existing_patient_id, \\\"type\\\": \\\"break-glass\\\"},\\n        headers=clinician_auth_headers,\\n    )\\n    before_count = len(before_resp.json().get(\\\"entry\\\", []))\\n\\n    payload = {\\\"pat"
+  }
+}

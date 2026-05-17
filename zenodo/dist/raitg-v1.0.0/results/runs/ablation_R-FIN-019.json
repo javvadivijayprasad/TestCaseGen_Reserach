@@ -1,0 +1,223 @@
+{
+  "req": {
+    "id": "R-FIN-019",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Cheque deposit by mobile",
+    "statement": "A customer shall deposit a cheque via mobile image; cheques above $5,000 shall require manual verification.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "image uploaded"
+    ],
+    "expected_outcomes": [
+      "deposit pending",
+      "decisioning queued"
+    ],
+    "error_pathways": [
+      "422 when image fails MICR decode"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/deposits/mobile-cheque"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-019",
+    "reasoning": "The requirement defines three distinct decision paths: (1) a standard deposit below $5,000 that auto-approves to 'pending', (2) a deposit at or above $5,000 that queues manual verification, and (3) an image that fails MICR decode and returns 422. BVA targets the $5,000 threshold with amounts of $4,999.99, $5,000.00, and $5,000.01. EP partitions the input space into valid-low, valid-high, and invalid-image classes. NEG covers the MICR decode failure. DT captures the compound rule: amount \u00d7 image-quality \u2192 routing decision. STC traces the deposit lifecycle from 'uploaded' through 'pending' or 'queued-for-review'.",
+    "tests": [
+      {
+        "name": "test_mobile_cheque_deposit_below_threshold_returns_pending",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated and holds a valid session token",
+          "A well-formed cheque image with readable MICR line is available",
+          "Cheque amount is $1,000.00 (representative of the valid-low equivalence class below $5,000)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image payload and amount=1000.00",
+          "Assert HTTP 202 Accepted is returned",
+          "Assert response body contains status='pending'",
+          "Assert response body contains a non-null deposit_id"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "JSON body: { \"status\": \"pending\", \"manual_review\": false }",
+          "deposit_id is present and non-empty",
+          "No manual verification queue entry created"
+        ],
+        "trace": [
+          "R-FIN-019: cheque deposit via mobile image",
+          "R-FIN-019: deposit pending outcome",
+          "R-FIN-019: cheques above $5,000 require manual verification (inverse: below threshold does not)"
+        ],
+        "executable": "def test_mobile_cheque_deposit_below_threshold_returns_pending(auth_session, valid_cheque_image):\n    payload = {\n        \"image\": valid_cheque_image,\n        \"amount\": 1000.00,\n        \"currency\": \"USD\"\n    }\n    resp = auth_session.post(\"/deposits/mobile-cheque\", json=payload)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is False\n    assert body.get(\"deposit_id\"), \"deposit_id must be present\""
+      },
+      {
+        "name": "test_mobile_cheque_deposit_above_threshold_queues_manual_review",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated and holds a valid session token",
+          "A well-formed cheque image with readable MICR line is available",
+          "Cheque amount is $10,000.00 (representative of valid-high equivalence class above $5,000)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image payload and amount=10000.00",
+          "Assert HTTP 202 Accepted is returned",
+          "Assert response body contains status='pending'",
+          "Assert response body contains manual_review=true",
+          "Assert decisioning queue entry is created via GET /deposits/{deposit_id}"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "JSON body: { \"status\": \"pending\", \"manual_review\": true }",
+          "deposit_id is present and non-empty",
+          "GET /deposits/{deposit_id} shows review_status='queued'"
+        ],
+        "trace": [
+          "R-FIN-019: cheque deposit via mobile image",
+          "R-FIN-019: cheques above $5,000 shall require manual verification",
+          "R-FIN-019: decisioning queued expected outcome"
+        ],
+        "executable": "def test_mobile_cheque_deposit_above_threshold_queues_manual_review(auth_session, valid_cheque_image):\n    payload = {\n        \"image\": valid_cheque_image,\n        \"amount\": 10000.00,\n        \"currency\": \"USD\"\n    }\n    resp = auth_session.post(\"/deposits/mobile-cheque\", json=payload)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is True\n    deposit_id = body.get(\"deposit_id\")\n    assert deposit_id, \"deposit_id must be present\"\n    review_resp = auth_session.get(f\"/deposits/{deposit_id}\")\n    assert review_resp.status_code == 200\n    assert review_resp.json().get(\"review_status\") == \"queued\""
+      },
+      {
+        "name": "test_mobile_cheque_deposit_invalid_image_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated and holds a valid session token",
+          "A corrupted or unreadable image that will fail MICR decode is prepared"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with corrupt/unreadable image payload",
+          "Assert HTTP 422 Unprocessable Entity is returned",
+          "Assert error code in response body identifies MICR decode failure"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "JSON body error_code = 'MICR_DECODE_FAILURE' or equivalent",
+          "No deposit_id created",
+          "No queue entry created"
+        ],
+        "trace": [
+          "R-FIN-019: 422 when image fails MICR decode (error pathway)",
+          "R-FIN-019: image uploaded trigger with invalid image"
+        ],
+        "executable": "def test_mobile_cheque_deposit_invalid_image_returns_422(auth_session, invalid_micr_image):\n    payload = {\n        \"image\": invalid_micr_image,\n        \"amount\": 500.00,\n        \"currency\": \"USD\"\n    }\n    resp = auth_session.post(\"/deposits/mobile-cheque\", json=payload)\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}\"\n    body = resp.json()\n    assert \"error_code\" in body\n    assert body[\"error_code\"] == \"MICR_DECODE_FAILURE\"\n    assert body.get(\"deposit_id\") is None"
+      },
+      {
+        "name": "test_mobile_cheque_deposit_at_exact_threshold_requires_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated and holds a valid session token",
+          "A well-formed cheque image with readable MICR line is available",
+          "Cheque amount is exactly $5,000.00 (on-boundary value)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image payload and amount=5000.00",
+          "Assert HTTP 202 Accepted is returned",
+          "Assert response body contains manual_review=true",
+          "Assert deposit_id is present"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "JSON body: { \"status\": \"pending\", \"manual_review\": true }",
+          "deposit_id is present and non-empty",
+          "Boundary rule: amount >= $5,000 triggers manual verification"
+        ],
+        "trace": [
+          "R-FIN-019: cheques ABOVE $5,000 require manual verification \u2014 boundary at exactly $5,000.00",
+          "R-FIN-019: deposit pending expected outcome",
+          "R-FIN-019: decisioning queued expected outcome"
+        ],
+        "executable": "def test_mobile_cheque_deposit_at_exact_threshold_requires_manual_review(auth_session, valid_cheque_image):\n    payload = {\n        \"image\": valid_cheque_image,\n        \"amount\": 5000.00,\n        \"currency\": \"USD\"\n    }\n    resp = auth_session.post(\"/deposits/mobile-cheque\", json=payload)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is True, \"Exactly $5000 must trigger manual review\"\n    assert body.get(\"deposit_id\"), \"deposit_id must be present\""
+      },
+      {
+        "name": "test_mobile_cheque_deposit_one_cent_below_threshold_no_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated and holds a valid session token",
+          "A well-formed cheque image with readable MICR line is available",
+          "Cheque amount is $4,999.99 (one unit below boundary)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image payload and amount=4999.99",
+          "Assert HTTP 202 Accepted is returned",
+          "Assert response body contains manual_review=false",
+          "Assert deposit_id is present"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "JSON body: { \"status\": \"pending\", \"manual_review\": false }",
+          "deposit_id is present and non-empty",
+          "Boundary rule: $4,999.99 does NOT trigger manual verification"
+        ],
+        "trace": [
+          "R-FIN-019: cheques above $5,000 require manual verification \u2014 off-boundary at $4,999.99",
+          "R-FIN-019: deposit pending expected outcome",
+          "R-FIN-019: below threshold should not queue decisioning"
+        ],
+        "executable": "def test_mobile_cheque_deposit_one_cent_below_threshold_no_manual_review(auth_session, valid_cheque_image):\n    payload = {\n        \"image\": valid_cheque_image,\n        \"amount\": 4999.99,\n        \"currency\": \"USD\"\n    }\n    resp = auth_session.post(\"/deposits/mobile-cheque\", json=payload)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is False, \"$4999.99 must NOT trigger manual review\"\n    assert body.get(\"deposit_id\"), \"deposit_id must be present\""
+      },
+      {
+        "name": "test_mobile_cheque_deposit_state_transition_pending_to_queued",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated and holds a valid session token",
+          "A well-formed cheque image with readable MICR line is available",
+          "Cheque amount is $7,500.00 to trigger manual review path",
+          "Deposit has been successfully submitted and deposit_id obtained"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image and amount=7500.00",
+          "Capture deposit_id from 202 response",
+          "GET /deposits/{deposit_id} to read initial state",
+          "Assert state transitions from 'uploaded' through 'pending' to 'queued'"
+        ],
+        "expected": [
+          "Initial POST returns HTTP 202 with status='pending'",
+          "GET /deposits/{deposit_id} returns review_status='queued'",
+          "State machine: uploaded -> pending -> queued (no skipped states)"
+        ],
+        "trace": [
+          "R-FIN-019: triggers = image uploaded",
+          "R-FIN-019: expected outcomes = deposit pending; decisioning queued",
+          "R-FIN-019: cheques above $5,000 require manual verification \u2014 lifecycle state coverage"
+        ],
+        "executable": "def test_mobile_cheque_deposit_state_transition_pending_to_queued(auth_session, valid_cheque_image):\n    payload = {\n        \"image\": valid_cheque_image,\n        \"amount\": 7500.00,\n        \"currency\": \"USD\"\n    }\n    post_resp = auth_session.post(\"/deposits/mobile-cheque\", json=payload)\n    assert post_resp.status_code == 202\n    body = post_resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is True\n    deposit_id = body.get(\"deposit_id\")\n    assert deposit_id, \"deposit_id must be present\"\n    get_resp = auth_session.get(f\"/deposits/{deposit_id}\")\n    assert get_resp.status_code == 200\n    detail = get_resp.json()\n    assert detail.get(\"review_status\") == \"queued\"\n    assert detail.get(\"status\") == \"pending\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-019",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 983,
+    "output_tokens": 3544,
+    "latency_ms": 33745,
+    "wall_ms": 33745,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-019\",\n  \"reasoning\": \"The requirement defines three distinct decision paths: (1) a standard deposit below $5,000 that auto-approves to 'pending', (2) a deposit at or above $5,000 that queues manual verification, and (3) an image that fails MICR decode and returns 422. BVA targets the $5,000 threshold with amounts of $4,999.99, $5,000.00, and $5,000.01. EP partitions the input space into valid-low, valid-high, and invalid-image classes. NEG covers the MICR decode failure. DT captures the compound rule: amount \u00d7 image-quality \u2192 routing decision. STC traces the deposit lifecycle from 'uploaded' through 'pending' or 'queued-for-review'.\",\n  \"tests\": [\n    {\n      \"name\": \"test_mobile_cheque_deposit_below_threshold_returns_pending\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid session token\",\n        \"A well-formed cheque image with readable MICR line is available\",\n        \"Cheque amount is $1,000.00 (representative of the valid-low equivalence class below $5,000)\"\n      ],\n      \"actions\": [\n        \"POST /deposits/mobile-cheque with valid image payload and amount=1000.00\",\n        \"Assert HTTP 202 Accepted is returned\",\n        \"Assert response body contains status='pending'\",\n        \"Assert response body contains a non-null deposit_id\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"JSON body: { \\\"status\\\": \\\"pending\\\", \\\"manual_review\\\": false }\",\n        \"deposit_id is present and non-empty\",\n        \"No manual verification queue entry created\"\n      ],\n      \"trace\": [\n        \"R-FIN-019: cheque deposit via mobile image\",\n        \"R-FIN-019: deposit pending outcome\",\n        \"R-FIN-019: cheques above $5,000 require manual verification (inverse: below threshold does not)\"\n      ],\n      \"executable\": \"def test_mobile_cheque_deposit_below_threshold_returns_pending(auth_session, valid_cheque_image):\\n    payload = {\\n        \\\"image\\\": valid_cheque_image,\\n        \\\"amount\\\": 1000.00,\\n        \\\"currency\\\": \\\"USD\\\"\\n    }\\n    resp = auth_session.post(\\\"/deposits/mobile-cheque\\\", json=payload)\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert body.get(\\\"manual_review\\\") is False\\n    assert body.get(\\\"deposit_id\\\"), \\\"deposit_id must be present\\\"\"\n    },\n    {\n      \"name\": \"test_mobile_cheque_deposit_above_threshold_queues_manual_review\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid session token\",\n        \"A well-formed cheque image with readable MICR line is available\",\n        \"Cheque amount is $10,000.00 (representative of valid-high equivalence class above $5,000)\"\n      ],\n      \"actions\": [\n        \"POST /deposits/mobile-cheque with valid image payload and amount=10000.00\",\n        \"Assert HTTP 202 Accepted is returned\",\n        \"Assert response body contains status='pending'\",\n        \"Assert response body contains manual_review=true\",\n        \"Assert decisioning queue entry is created via GET /deposits/{deposit_id}\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"JSON body: { \\\"status\\\": \\\"pending\\\", \\\"manual_review\\\": true }\",\n        \"deposit_id is present and non-empty\",\n        \"GET /deposits/{deposit_id} shows review_status='queued'\"\n      ],\n      \"trace\": [\n        \"R-FIN-019: cheque deposit via mobile image\",\n        \"R-FIN-019: cheques above $5,000 shall require manual verification\",\n        \"R-FIN-019: decisioning queued expected outcome\"\n      ],\n      \"executable\": \"def test_mobile_cheque_deposit_above_threshold_queues_manual_review(auth_session, valid_cheque_image):\\n    payload = {\\n        \\\"image\\\": valid_cheque_image,\\n        \\\"amount\\\": 10000.00,\\n        \\\"currency\\\": \\\"USD\\\"\\n    }\\n    resp = auth_session.post(\\\"/deposits/mobile-cheque\\\", json=payloa"
+  }
+}

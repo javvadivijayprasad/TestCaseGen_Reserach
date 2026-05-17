@@ -1,0 +1,179 @@
+{
+  "req": {
+    "id": "R-WEB-084",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Export employee directory \u2014 variant 3",
+    "statement": "An hr-admin shall export the employee directory as CSV with PII redacted for employees who opted out of public directory. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin requests export"
+    ],
+    "expected_outcomes": [
+      "CSV streamed",
+      "PII redacted per opt-out",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if not hr-admin",
+      "429 if rate-limited"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/employees/export.csv"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-084",
+    "reasoning": "The requirement covers three concerns: (1) correct CSV export with PII redaction for opted-out employees, (2) webhook emission on export, and (3) access-control and rate-limit error paths. I selected EP for the happy-path (valid hr-admin gets correct CSV + webhook), NEG for the 403 unauthorised path, NEG for the 429 rate-limit path, BVA for the edge of exactly one opted-out vs zero opted-out employees, and DT for the decision matrix combining opt-out flag with expected field redaction. This gives five tests (well above the minimum three) covering all stated error pathways and the variant-3 semantics.",
+    "tests": [
+      {
+        "name": "test_hr_admin_export_csv_pii_redacted_and_webhook_emitted",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role hr-admin",
+          "At least one employee has opted out of public directory",
+          "At least one employee has not opted out",
+          "Webhook receiver is reachable and recorded"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with hr-admin bearer token",
+          "Capture response body as CSV text",
+          "Poll webhook receiver for emitted event"
+        ],
+        "expected": [
+          "HTTP 200 with Content-Type text/csv or application/octet-stream",
+          "CSV contains a row for every employee",
+          "Opted-out employees have PII fields (email, phone, address) replaced with REDACTED",
+          "Non-opted-out employees have full PII present",
+          "Webhook receiver recorded exactly one event with type employee_directory_exported"
+        ],
+        "trace": [
+          "R-WEB-084: hr-admin can export; PII redacted per opt-out; webhook emitted"
+        ],
+        "executable": "import pytest\nimport csv, io\nfrom <fixture> import hr_admin_client, webhook_receiver, seed_employees\n\ndef test_hr_admin_export_csv_pii_redacted_and_webhook_emitted(\n    hr_admin_client, webhook_receiver, seed_employees\n):\n    opted_out_id, active_id = seed_employees(opted_out=1, active=1)\n    resp = hr_admin_client.get(\"/api/employees/export.csv\")\n    assert resp.status_code == 200\n    assert \"csv\" in resp.headers.get(\"Content-Type\", \"\").lower() or \\\n           \"octet\" in resp.headers.get(\"Content-Type\", \"\").lower()\n\n    reader = csv.DictReader(io.StringIO(resp.text))\n    rows = {r[\"id\"]: r for r in reader}\n\n    assert opted_out_id in rows\n    for pii_field in (\"email\", \"phone\", \"address\"):\n        assert rows[opted_out_id][pii_field] == \"REDACTED\", \\\n            f\"{pii_field} must be REDACTED for opted-out employee\"\n\n    assert active_id in rows\n    for pii_field in (\"email\", \"phone\", \"address\"):\n        assert rows[active_id][pii_field] != \"REDACTED\", \\\n            f\"{pii_field} must not be REDACTED for non-opted-out employee\"\n\n    events = webhook_receiver.get_events(event_type=\"employee_directory_exported\")\n    assert len(events) == 1, \"Exactly one webhook event must be emitted\"\n"
+      },
+      {
+        "name": "test_non_admin_export_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role employee (not hr-admin)",
+          "Employee directory has at least one record"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with employee-role bearer token"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an error indicating insufficient permissions",
+          "No CSV data is returned",
+          "No webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-084 error pathway: 403 if not hr-admin"
+        ],
+        "executable": "import pytest\nfrom <fixture> import employee_client, webhook_receiver\n\ndef test_non_admin_export_returns_403(employee_client, webhook_receiver):\n    resp = employee_client.get(\"/api/employees/export.csv\")\n    assert resp.status_code == 403\n\n    body = resp.json() if resp.headers.get(\"Content-Type\", \"\").startswith(\"application/json\") \\\n           else {}\n    assert body.get(\"error\") or body.get(\"message\"), \\\n        \"Error body must describe the permission failure\"\n\n    assert \"id,\" not in resp.text, \"CSV data must not be present in 403 response\"\n\n    events = webhook_receiver.get_events(event_type=\"employee_directory_exported\")\n    assert len(events) == 0, \"No webhook must fire on a rejected request\"\n"
+      },
+      {
+        "name": "test_rate_limited_export_returns_429",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role hr-admin",
+          "Rate-limit threshold for /api/employees/export.csv is known (N requests per window)",
+          "Request counter has been exhausted via <helper_fn> exhaust_rate_limit"
+        ],
+        "actions": [
+          "Exhaust the rate-limit allowance for the hr-admin token",
+          "Immediately issue one additional GET /api/employees/export.csv"
+        ],
+        "expected": [
+          "HTTP 429 Too Many Requests",
+          "Response includes Retry-After header",
+          "No CSV payload returned",
+          "No webhook event emitted for the rejected call"
+        ],
+        "trace": [
+          "R-WEB-084 error pathway: 429 if rate-limited"
+        ],
+        "executable": "import pytest\nfrom <fixture> import hr_admin_client, webhook_receiver\nfrom <helper_fn> import exhaust_rate_limit\n\nRATE_LIMIT_ENDPOINT = \"/api/employees/export.csv\"\n\ndef test_rate_limited_export_returns_429(hr_admin_client, webhook_receiver):\n    exhaust_rate_limit(hr_admin_client, RATE_LIMIT_ENDPOINT)\n\n    resp = hr_admin_client.get(RATE_LIMIT_ENDPOINT)\n    assert resp.status_code == 429\n\n    assert \"Retry-After\" in resp.headers, \\\n        \"429 response must include Retry-After header\"\n\n    assert \"id,\" not in resp.text, \"No CSV data must leak on 429 response\"\n\n    events = webhook_receiver.get_events(event_type=\"employee_directory_exported\")\n    rate_limited_events = [\n        e for e in events if e.get(\"status\") != \"rejected\"\n    ]\n    assert len(rate_limited_events) == 0, \\\n        \"Webhook must not fire for a rate-limited request\"\n"
+      },
+      {
+        "name": "test_export_with_exactly_one_opted_out_employee",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated session exists for a user with role hr-admin",
+          "Directory seeded with exactly one opted-out employee and zero non-opted-out employees"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with hr-admin bearer token",
+          "Parse response CSV"
+        ],
+        "expected": [
+          "HTTP 200",
+          "CSV contains exactly one data row",
+          "All PII fields for that row are REDACTED",
+          "Non-PII fields (id, department, job_title) are present and non-empty",
+          "Webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-084: BVA on minimum opted-out population (boundary = 1); PII redacted"
+        ],
+        "executable": "import pytest\nimport csv, io\nfrom <fixture> import hr_admin_client, webhook_receiver, seed_employees\n\nPII_FIELDS = (\"email\", \"phone\", \"address\")\nNON_PII_FIELDS = (\"id\", \"department\", \"job_title\")\n\ndef test_export_with_exactly_one_opted_out_employee(\n    hr_admin_client, webhook_receiver, seed_employees\n):\n    (opted_out_id,) = seed_employees(opted_out=1, active=0)\n\n    resp = hr_admin_client.get(\"/api/employees/export.csv\")\n    assert resp.status_code == 200\n\n    rows = list(csv.DictReader(io.StringIO(resp.text)))\n    assert len(rows) == 1, \"Exactly one data row expected\"\n\n    row = rows[0]\n    assert row[\"id\"] == opted_out_id\n\n    for field in PII_FIELDS:\n        assert row[field] == \"REDACTED\", f\"{field} must be REDACTED\"\n\n    for field in NON_PII_FIELDS:\n        assert row.get(field), f\"{field} must be present and non-empty\"\n\n    events = webhook_receiver.get_events(event_type=\"employee_directory_exported\")\n    assert len(events) == 1\n"
+      },
+      {
+        "name": "test_opt_out_flag_determines_pii_redaction_decision_table",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated session exists for a user with role hr-admin",
+          "Directory seeded with multiple employees covering all combinations: opted-out=true, opted-out=false"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with hr-admin bearer token",
+          "Parse CSV and map each row to its opted-out status"
+        ],
+        "expected": [
+          "opted_out=true  => all PII fields equal REDACTED",
+          "opted_out=false => all PII fields are non-empty real values",
+          "Non-PII fields are populated regardless of opt-out status",
+          "HTTP 200 returned"
+        ],
+        "trace": [
+          "R-WEB-084: DT covering opt-out=true/false vs PII present/redacted"
+        ],
+        "executable": "import pytest\nimport csv, io\nfrom <fixture> import hr_admin_client, seed_employees_with_ids\n\nPII_FIELDS = (\"email\", \"phone\", \"address\")\n\ndef test_opt_out_flag_determines_pii_redaction_decision_table(\n    hr_admin_client, seed_employees_with_ids\n):\n    opted_out_ids, active_ids = seed_employees_with_ids(\n        opted_out=3, active=3\n    )\n\n    resp = hr_admin_client.get(\"/api/employees/export.csv\")\n    assert resp.status_code == 200\n\n    rows = {r[\"id\"]: r for r in csv.DictReader(io.StringIO(resp.text))}\n\n    for eid in opted_out_ids:\n        row = rows[eid]\n        for field in PII_FIELDS:\n            assert row[field] == \"REDACTED\", \\\n                f\"opted-out emp {eid}: {field} must be REDACTED\"\n\n    for eid in active_ids:\n        row = rows[eid]\n        for field in PII_FIELDS:\n            assert row[field] not in (\"\", \"REDACTED\"), \\\n                f\"active emp {eid}: {field} must be real value\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-084",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1024,
+    "output_tokens": 3150,
+    "latency_ms": 42497,
+    "wall_ms": 42497,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-084\",\n  \"reasoning\": \"The requirement covers three concerns: (1) correct CSV export with PII redaction for opted-out employees, (2) webhook emission on export, and (3) access-control and rate-limit error paths. I selected EP for the happy-path (valid hr-admin gets correct CSV + webhook), NEG for the 403 unauthorised path, NEG for the 429 rate-limit path, BVA for the edge of exactly one opted-out vs zero opted-out employees, and DT for the decision matrix combining opt-out flag with expected field redaction. This gives five tests (well above the minimum three) covering all stated error pathways and the variant-3 semantics.\",\n  \"tests\": [\n    {\n      \"name\": \"test_hr_admin_export_csv_pii_redacted_and_webhook_emitted\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role hr-admin\",\n        \"At least one employee has opted out of public directory\",\n        \"At least one employee has not opted out\",\n        \"Webhook receiver is reachable and recorded\"\n      ],\n      \"actions\": [\n        \"GET /api/employees/export.csv with hr-admin bearer token\",\n        \"Capture response body as CSV text\",\n        \"Poll webhook receiver for emitted event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with Content-Type text/csv or application/octet-stream\",\n        \"CSV contains a row for every employee\",\n        \"Opted-out employees have PII fields (email, phone, address) replaced with REDACTED\",\n        \"Non-opted-out employees have full PII present\",\n        \"Webhook receiver recorded exactly one event with type employee_directory_exported\"\n      ],\n      \"trace\": [\n        \"R-WEB-084: hr-admin can export; PII redacted per opt-out; webhook emitted\"\n      ],\n      \"executable\": \"import pytest\\nimport csv, io\\nfrom <fixture> import hr_admin_client, webhook_receiver, seed_employees\\n\\ndef test_hr_admin_export_csv_pii_redacted_and_webhook_emitted(\\n    hr_admin_client, webhook_receiver, seed_employees\\n):\\n    opted_out_id, active_id = seed_employees(opted_out=1, active=1)\\n    resp = hr_admin_client.get(\\\"/api/employees/export.csv\\\")\\n    assert resp.status_code == 200\\n    assert \\\"csv\\\" in resp.headers.get(\\\"Content-Type\\\", \\\"\\\").lower() or \\\\\\n           \\\"octet\\\" in resp.headers.get(\\\"Content-Type\\\", \\\"\\\").lower()\\n\\n    reader = csv.DictReader(io.StringIO(resp.text))\\n    rows = {r[\\\"id\\\"]: r for r in reader}\\n\\n    assert opted_out_id in rows\\n    for pii_field in (\\\"email\\\", \\\"phone\\\", \\\"address\\\"):\\n        assert rows[opted_out_id][pii_field] == \\\"REDACTED\\\", \\\\\\n            f\\\"{pii_field} must be REDACTED for opted-out employee\\\"\\n\\n    assert active_id in rows\\n    for pii_field in (\\\"email\\\", \\\"phone\\\", \\\"address\\\"):\\n        assert rows[active_id][pii_field] != \\\"REDACTED\\\", \\\\\\n            f\\\"{pii_field} must not be REDACTED for non-opted-out employee\\\"\\n\\n    events = webhook_receiver.get_events(event_type=\\\"employee_directory_exported\\\")\\n    assert len(events) == 1, \\\"Exactly one webhook event must be emitted\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_export_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role employee (not hr-admin)\",\n        \"Employee directory has at least one record\"\n      ],\n      \"actions\": [\n        \"GET /api/employees/export.csv with employee-role bearer token\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an error indicating insufficient permissions\",\n        \"No CSV data is returned\",\n        \"No webhook event is emitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-084 error pathway: 403 if not hr-admin\"\n      ],\n      \"executable\": \"import pytest\\nfrom <fixture> import employee_client, webhook_receiver\\n\\ndef test_non_admin_export_returns_403(employee_client, webhook_receiver):\\n    resp = employee_client.get(\\\"/api/employees/export.csv\\\")\\n    a"
+  }
+}

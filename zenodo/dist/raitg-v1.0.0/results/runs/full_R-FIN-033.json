@@ -1,0 +1,219 @@
+{
+  "req": {
+    "id": "R-FIN-033",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Account statement generation (boundary variant)",
+    "statement": "A customer shall request monthly statements as PDF; statements older than 7 years shall be fetched from cold storage. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer requests statement"
+    ],
+    "expected_outcomes": [
+      "PDF delivered",
+      "retrieval logged"
+    ],
+    "error_pathways": [
+      "404 if no activity in period",
+      "503 if cold storage unavailable"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/statements/{month}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-033",
+    "reasoning": "R-FIN-033 defines four key test dimensions: (1) normal in-range statement retrieval (EP positive), (2) statement exactly at the 7-year boundary switching from hot to cold storage (BVA boundary), (3) the exact month just inside the 7-year window remaining in hot storage (BVA boundary), (4) a period with no activity returning 404 (NEG), (5) cold storage unavailability returning 503 (DT/NEG). The 7-year boundary is the primary risk axis: < 7 years uses hot storage, >= 7 years uses cold storage. Equivalence classes are: valid recent month, valid cold-storage month, month with no activity, and cold-storage-unavailable state. All tests use a fixed calendar anchor to remain deterministic and idempotent.",
+    "tests": [
+      {
+        "name": "test_recent_statement_returns_pdf",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer token available via <auth_fixture>",
+          "Account has activity in the target month (within last 7 years)",
+          "Hot storage is available"
+        ],
+        "actions": [
+          "GET /statements/2024-06 with valid Bearer token",
+          "Assert HTTP 200",
+          "Assert Content-Type is application/pdf",
+          "Assert response body is non-empty",
+          "Assert X-Storage-Tier header equals 'hot'",
+          "Assert retrieval event is present in audit log via <audit_helper>"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type: application/pdf",
+          "Non-empty PDF body",
+          "X-Storage-Tier: hot",
+          "Audit log contains retrieval record for account and month"
+        ],
+        "trace": [
+          "R-FIN-033: PDF delivered for valid month",
+          "R-FIN-033: retrieval logged",
+          "EP: valid recent month partition"
+        ],
+        "executable": "def test_recent_statement_returns_pdf(auth_fixture, audit_helper, base_url):\n    token = auth_fixture.get_customer_token()\n    month = \"2024-06\"\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    resp = <http_client>.get(f\"{base_url}/statements/{month}\", headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers[\"Content-Type\"] == \"application/pdf\"\n    assert len(resp.content) > 0\n    assert resp.headers.get(\"X-Storage-Tier\") == \"hot\"\n    assert audit_helper.has_retrieval_log(\n        account_id=auth_fixture.account_id, month=month\n    )"
+      },
+      {
+        "name": "test_statement_exactly_7_years_old_uses_cold_storage",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer token available via <auth_fixture>",
+          "Account has activity in the month exactly 84 months (7 years) before fixed anchor 2024-07",
+          "Cold storage is available and seeded with that month's data"
+        ],
+        "actions": [
+          "Compute target month as anchor_year - 7 years = 2017-07",
+          "GET /statements/2017-07 with valid Bearer token",
+          "Assert HTTP 200",
+          "Assert Content-Type is application/pdf",
+          "Assert X-Storage-Tier header equals 'cold'",
+          "Assert retrieval event logged via <audit_helper>"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type: application/pdf",
+          "X-Storage-Tier: cold",
+          "Audit log contains retrieval record for cold-storage fetch"
+        ],
+        "trace": [
+          "R-FIN-033: statements older than 7 years fetched from cold storage",
+          "BVA: exact lower boundary of cold-storage threshold (84 months)"
+        ],
+        "executable": "def test_statement_exactly_7_years_old_uses_cold_storage(auth_fixture, audit_helper, base_url):\n    token = auth_fixture.get_customer_token()\n    month = \"2017-07\"  # exactly 7 years before anchor 2024-07\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    resp = <http_client>.get(f\"{base_url}/statements/{month}\", headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers[\"Content-Type\"] == \"application/pdf\"\n    assert resp.headers.get(\"X-Storage-Tier\") == \"cold\"\n    assert len(resp.content) > 0\n    assert audit_helper.has_retrieval_log(\n        account_id=auth_fixture.account_id, month=month, tier=\"cold\"\n    )"
+      },
+      {
+        "name": "test_statement_one_month_inside_7_year_boundary_uses_hot_storage",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer token available via <auth_fixture>",
+          "Account has activity in the month 83 months before anchor 2024-07 (i.e. 2017-08)",
+          "Hot storage is available"
+        ],
+        "actions": [
+          "Compute target month as one month newer than the 7-year boundary = 2017-08",
+          "GET /statements/2017-08 with valid Bearer token",
+          "Assert HTTP 200",
+          "Assert X-Storage-Tier header equals 'hot'"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Content-Type: application/pdf",
+          "X-Storage-Tier: hot (not yet crossed into cold storage)"
+        ],
+        "trace": [
+          "R-FIN-033: boundary \u2014 month just inside the 7-year window stays in hot storage",
+          "BVA: upper boundary minus 1 month (83 months ago)"
+        ],
+        "executable": "def test_statement_one_month_inside_7_year_boundary_uses_hot_storage(auth_fixture, base_url):\n    token = auth_fixture.get_customer_token()\n    month = \"2017-08\"  # 83 months before anchor 2024-07, still hot\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    resp = <http_client>.get(f\"{base_url}/statements/{month}\", headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers[\"Content-Type\"] == \"application/pdf\"\n    assert resp.headers.get(\"X-Storage-Tier\") == \"hot\""
+      },
+      {
+        "name": "test_statement_for_month_with_no_activity_returns_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer token available via <auth_fixture>",
+          "Account has zero transactions in target month 2023-02",
+          "Target month is within the 7-year window"
+        ],
+        "actions": [
+          "GET /statements/2023-02 with valid Bearer token",
+          "Assert HTTP 404",
+          "Assert response body contains error code NO_ACTIVITY"
+        ],
+        "expected": [
+          "HTTP 404 Not Found",
+          "Error payload with code NO_ACTIVITY or equivalent",
+          "No PDF body returned"
+        ],
+        "trace": [
+          "R-FIN-033: 404 if no activity in period",
+          "NEG: inactive month equivalence class"
+        ],
+        "executable": "def test_statement_for_month_with_no_activity_returns_404(auth_fixture, base_url):\n    token = auth_fixture.get_customer_token()\n    month = \"2023-02\"  # seeded with zero transactions\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    resp = <http_client>.get(f\"{base_url}/statements/{month}\", headers=headers)\n\n    assert resp.status_code == 404\n    body = resp.json()\n    assert body.get(\"error_code\") == \"NO_ACTIVITY\"\n    assert resp.headers.get(\"Content-Type\", \"\").startswith(\"application/json\")"
+      },
+      {
+        "name": "test_cold_storage_unavailable_returns_503",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer token available via <auth_fixture>",
+          "Account has activity in target month 2016-01 (older than 7 years)",
+          "Cold storage is configured to be unavailable via <fault_injection_fixture>"
+        ],
+        "actions": [
+          "Inject cold-storage fault via <fault_injection_fixture>",
+          "GET /statements/2016-01 with valid Bearer token",
+          "Assert HTTP 503",
+          "Assert response body contains error code COLD_STORAGE_UNAVAILABLE",
+          "Restore cold-storage availability via <fault_injection_fixture>"
+        ],
+        "expected": [
+          "HTTP 503 Service Unavailable",
+          "Error payload with code COLD_STORAGE_UNAVAILABLE",
+          "No PDF body returned"
+        ],
+        "trace": [
+          "R-FIN-033: 503 if cold storage unavailable",
+          "DT: decision \u2014 age > 7 years AND cold storage down => 503"
+        ],
+        "executable": "def test_cold_storage_unavailable_returns_503(auth_fixture, fault_injection_fixture, base_url):\n    token = auth_fixture.get_customer_token()\n    month = \"2016-01\"  # older than 7 years; requires cold storage\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    fault_injection_fixture.disable_cold_storage()\n    try:\n        resp = <http_client>.get(f\"{base_url}/statements/{month}\", headers=headers)\n    finally:\n        fault_injection_fixture.restore_cold_storage()\n\n    assert resp.status_code == 503\n    body = resp.json()\n    assert body.get(\"error_code\") == \"COLD_STORAGE_UNAVAILABLE\""
+      },
+      {
+        "name": "test_unauthorized_request_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No valid authentication token (missing or expired)",
+          "Account exists and has activity in target month"
+        ],
+        "actions": [
+          "GET /statements/2024-06 with no Authorization header",
+          "Assert HTTP 401",
+          "Assert no PDF content is returned"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "No PDF body in response"
+        ],
+        "trace": [
+          "R-FIN-033: precondition account.owner == caller \u2014 unauthenticated caller must be rejected",
+          "NEG: missing authentication credential"
+        ],
+        "executable": "def test_unauthorized_request_returns_401(base_url):\n    month = \"2024-06\"\n\n    resp = <http_client>.get(f\"{base_url}/statements/{month}\")\n\n    assert resp.status_code == 401\n    assert resp.headers.get(\"Content-Type\", \"\").startswith(\"application/json\")\n    assert \"pdf\" not in resp.headers.get(\"Content-Type\", \"\")"
+      }
+    ]
+  },
+  "req_id": "R-FIN-033",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1008,
+    "output_tokens": 3018,
+    "latency_ms": 30429,
+    "wall_ms": 30429,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-033\",\n  \"reasoning\": \"R-FIN-033 defines four key test dimensions: (1) normal in-range statement retrieval (EP positive), (2) statement exactly at the 7-year boundary switching from hot to cold storage (BVA boundary), (3) the exact month just inside the 7-year window remaining in hot storage (BVA boundary), (4) a period with no activity returning 404 (NEG), (5) cold storage unavailability returning 503 (DT/NEG). The 7-year boundary is the primary risk axis: < 7 years uses hot storage, >= 7 years uses cold storage. Equivalence classes are: valid recent month, valid cold-storage month, month with no activity, and cold-storage-unavailable state. All tests use a fixed calendar anchor to remain deterministic and idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_recent_statement_returns_pdf\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer token available via <auth_fixture>\",\n        \"Account has activity in the target month (within last 7 years)\",\n        \"Hot storage is available\"\n      ],\n      \"actions\": [\n        \"GET /statements/2024-06 with valid Bearer token\",\n        \"Assert HTTP 200\",\n        \"Assert Content-Type is application/pdf\",\n        \"Assert response body is non-empty\",\n        \"Assert X-Storage-Tier header equals 'hot'\",\n        \"Assert retrieval event is present in audit log via <audit_helper>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Content-Type: application/pdf\",\n        \"Non-empty PDF body\",\n        \"X-Storage-Tier: hot\",\n        \"Audit log contains retrieval record for account and month\"\n      ],\n      \"trace\": [\n        \"R-FIN-033: PDF delivered for valid month\",\n        \"R-FIN-033: retrieval logged\",\n        \"EP: valid recent month partition\"\n      ],\n      \"executable\": \"def test_recent_statement_returns_pdf(auth_fixture, audit_helper, base_url):\\n    token = auth_fixture.get_customer_token()\\n    month = \\\"2024-06\\\"\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n\\n    resp = <http_client>.get(f\\\"{base_url}/statements/{month}\\\", headers=headers)\\n\\n    assert resp.status_code == 200\\n    assert resp.headers[\\\"Content-Type\\\"] == \\\"application/pdf\\\"\\n    assert len(resp.content) > 0\\n    assert resp.headers.get(\\\"X-Storage-Tier\\\") == \\\"hot\\\"\\n    assert audit_helper.has_retrieval_log(\\n        account_id=auth_fixture.account_id, month=month\\n    )\"\n    },\n    {\n      \"name\": \"test_statement_exactly_7_years_old_uses_cold_storage\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer token available via <auth_fixture>\",\n        \"Account has activity in the month exactly 84 months (7 years) before fixed anchor 2024-07\",\n        \"Cold storage is available and seeded with that month's data\"\n      ],\n      \"actions\": [\n        \"Compute target month as anchor_year - 7 years = 2017-07\",\n        \"GET /statements/2017-07 with valid Bearer token\",\n        \"Assert HTTP 200\",\n        \"Assert Content-Type is application/pdf\",\n        \"Assert X-Storage-Tier header equals 'cold'\",\n        \"Assert retrieval event logged via <audit_helper>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Content-Type: application/pdf\",\n        \"X-Storage-Tier: cold\",\n        \"Audit log contains retrieval record for cold-storage fetch\"\n      ],\n      \"trace\": [\n        \"R-FIN-033: statements older than 7 years fetched from cold storage\",\n        \"BVA: exact lower boundary of cold-storage threshold (84 months)\"\n      ],\n      \"executable\": \"def test_statement_exactly_7_years_old_uses_cold_storage(auth_fixture, audit_helper, base_url):\\n    token = auth_fixture.get_customer_token()\\n    month = \\\"2017-07\\\"  # exactly 7 years before anchor 2024-07\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n\\n    resp = <http_client>.get(f\\\"{base_url}/statements/{month}\\\", headers=headers)\\n\\n    assert resp.status_code == 200\\n    assert resp.headers[\\\"C"
+  }
+}

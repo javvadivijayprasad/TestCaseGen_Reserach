@@ -1,0 +1,190 @@
+{
+  "req": {
+    "id": "R-HLT-034",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "integration",
+    "title": "Allergy intolerance (boundary)",
+    "statement": "A clinician shall record an AllergyIntolerance linked to the patient; subsequent MedicationRequests shall warn on conflict. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records allergy"
+    ],
+    "expected_outcomes": [
+      "allergy stored",
+      "alerts regenerated"
+    ],
+    "error_pathways": [
+      "409 when exact duplicate"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AllergyIntolerance"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-034",
+    "reasoning": "R-HLT-034 covers three distinct concern areas: (1) happy-path allergy creation and downstream conflict alert generation (EP/STC), (2) duplicate prevention via 409 (NEG/DT), and (3) boundary values on the recordedDate timestamp and numeric severity/criticality fields (BVA). Each test is self-contained by using a unique patient fixture per run and cleaning up via a teardown DELETE. The state-transition test additionally posts a MedicationRequest referencing the same substance to verify alert regeneration, exercising the STC arc from 'allergy-absent' to 'allergy-active' to 'conflict-detected'.",
+    "tests": [
+      {
+        "name": "test_create_allergy_intolerance_happy_path",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <auth_token fixture>",
+          "Patient resource exists via <patient_id fixture>",
+          "No prior AllergyIntolerance for that patient/substance combination"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with valid payload referencing patient and substance penicillin",
+          "Assert HTTP 201 and Location header present",
+          "GET the returned Location URL",
+          "Assert resource round-trips with correct patient reference and clinicalStatus active"
+        ],
+        "expected": [
+          "HTTP 201 on creation",
+          "Location header points to new resource",
+          "GET returns 200 with clinicalStatus.coding[0].code == 'active'",
+          "patient reference matches fixture patient ID"
+        ],
+        "trace": [
+          "R-HLT-034: allergy stored",
+          "R-HLT-034: clinician records allergy"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_allergy_intolerance_happy_path(auth_token, patient_id, base_url, cleanup_resource):\n    headers = {\"Authorization\": f\"Bearer {auth_token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\", \"code\": \"7980\", \"display\": \"Penicillin\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"recordedDate\": \"2024-01-15T10:00:00Z\"\n    }\n    resp = requests.post(f\"{base_url}/AllergyIntolerance\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    location = resp.headers.get(\"Location\", \"\")\n    assert location, \"Location header must be present\"\n    resource_id = location.rstrip(\"/\").split(\"/\")[-1].split(\"/_history\")[0]\n    cleanup_resource(\"AllergyIntolerance\", resource_id)\n    get_resp = requests.get(f\"{base_url}/AllergyIntolerance/{resource_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    body = get_resp.json()\n    assert body[\"clinicalStatus\"][\"coding\"][0][\"code\"] == \"active\"\n    assert patient_id in body[\"patient\"][\"reference\"]\n"
+      },
+      {
+        "name": "test_duplicate_allergy_intolerance_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token available via <auth_token fixture>",
+          "Patient resource exists via <patient_id fixture>",
+          "An identical AllergyIntolerance (same patient + substance + recordedDate) already exists via <existing_allergy fixture>"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with payload identical to the pre-seeded resource (same patient, substance, recordedDate)",
+          "Assert HTTP 409 Conflict is returned",
+          "Assert response body contains OperationOutcome with issue.code 'duplicate'"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response Content-Type is application/fhir+json",
+          "OperationOutcome.issue[0].code equals 'duplicate' or 'conflict'"
+        ],
+        "trace": [
+          "R-HLT-034: 409 when exact duplicate"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_duplicate_allergy_intolerance_returns_409(auth_token, patient_id, base_url, existing_allergy):\n    headers = {\"Authorization\": f\"Bearer {auth_token}\", \"Content-Type\": \"application/fhir+json\"}\n    duplicate_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\", \"code\": \"7980\", \"display\": \"Penicillin\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"recordedDate\": existing_allergy[\"recordedDate\"]\n    }\n    resp = requests.post(f\"{base_url}/AllergyIntolerance\", json=duplicate_payload, headers=headers)\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\", \"Response must be OperationOutcome\"\n    codes = [issue.get(\"code\") for issue in body.get(\"issue\", [])]\n    assert any(c in (\"duplicate\", \"conflict\") for c in codes), f\"No duplicate/conflict code found in {codes}\"\n"
+      },
+      {
+        "name": "test_allergy_recorded_date_boundary_max_precision",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <auth_token fixture>",
+          "Patient resource exists via <patient_id fixture>"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with recordedDate at maximum FHIR dateTime precision including milliseconds and explicit UTC offset",
+          "Assert HTTP 201",
+          "GET resource and assert recordedDate is preserved or normalised without data loss",
+          "POST second AllergyIntolerance with recordedDate as date-only string (minimum precision boundary)",
+          "Assert HTTP 201 for date-only variant"
+        ],
+        "expected": [
+          "HTTP 201 for full-precision timestamp '2024-12-31T23:59:59.999+00:00'",
+          "Stored recordedDate contains the same date portion '2024-12-31'",
+          "HTTP 201 for date-only value '2024-12-31'",
+          "No 400/422 validation error for either boundary value"
+        ],
+        "trace": [
+          "R-HLT-034: Boundary cases on timestamps",
+          "R-HLT-034: allergy stored"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_allergy_recorded_date_boundary_max_precision(auth_token, patient_id, base_url, cleanup_resource):\n    headers = {\"Authorization\": f\"Bearer {auth_token}\", \"Content-Type\": \"application/fhir+json\"}\n    base_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\", \"code\": \"3498\", \"display\": \"Aspirin\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    full_ts_payload = {**base_payload, \"recordedDate\": \"2024-12-31T23:59:59.999+00:00\"}\n    r1 = requests.post(f\"{base_url}/AllergyIntolerance\", json=full_ts_payload, headers=headers)\n    assert r1.status_code == 201, f\"Full-precision timestamp rejected: {r1.status_code} {r1.text}\"\n    rid1 = r1.headers[\"Location\"].rstrip(\"/\").split(\"/\")[-1].split(\"/_history\")[0]\n    cleanup_resource(\"AllergyIntolerance\", rid1)\n    stored = requests.get(f\"{base_url}/AllergyIntolerance/{rid1}\", headers=headers).json()\n    assert \"2024-12-31\" in stored.get(\"recordedDate\", \"\"), \"Date portion must be preserved\"\n    date_only_payload = {**base_payload, \"recordedDate\": \"2024-12-31\"}\n    r2 = requests.post(f\"{base_url}/AllergyIntolerance\", json=date_only_payload, headers=headers)\n    assert r2.status_code == 201, f\"Date-only timestamp rejected: {r2.status_code} {r2.text}\"\n    rid2 = r2.headers[\"Location\"].rstrip(\"/\").split(\"/\")[-1].split(\"/_history\")[0]\n    cleanup_resource(\"AllergyIntolerance\", rid2)\n"
+      },
+      {
+        "name": "test_medication_request_conflict_alert_after_allergy_creation",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician token available via <auth_token fixture>",
+          "Patient resource exists via <patient_id fixture>",
+          "No existing AllergyIntolerance for patient/penicillin"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance for patient with penicillin allergy (state: allergy-absent -> allergy-active)",
+          "Assert HTTP 201",
+          "POST /MedicationRequest referencing same patient and penicillin medication (state: allergy-active -> conflict-detected)",
+          "Assert response contains detectedIssue or extension indicating allergy conflict warning"
+        ],
+        "expected": [
+          "HTTP 201 for AllergyIntolerance",
+          "MedicationRequest POST returns 201 or 200 with a conflict warning element",
+          "Response body includes detectedIssue reference or operationOutcome warning with code 'drug-allergy-alert' or equivalent",
+          "No silent suppression of the alert"
+        ],
+        "trace": [
+          "R-HLT-034: subsequent MedicationRequests shall warn on conflict",
+          "R-HLT-034: alerts regenerated"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_medication_request_conflict_alert_after_allergy_creation(auth_token, patient_id, base_url, cleanup_resource):\n    headers = {\"Authorization\": f\"Bearer {auth_token}\", \"Content-Type\": \"application/fhir+json\"}\n    allergy_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n        \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n        \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\", \"code\": \"7980\", \"display\": \"Penicillin\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"recordedDate\": \"2024-06-01T08:00:00Z\"\n    }\n    ar = requests.post(f\"{base_url}/AllergyIntolerance\", json=allergy_payload, headers=headers)\n    assert ar.status_code == 201, f\"Allergy creation failed: {ar.status_code}\"\n    aid = ar.headers[\"Location\"].rstrip(\"/\").split(\"/\")[-1].split(\"/_history\")[0]\n    cleanup_resource(\"AllergyIntolerance\", aid)\n    med_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"medicationCodeableConcept\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\", \"code\": \"7980\", \"display\": \"Penicillin\"}]},\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"authoredOn\": \"2024-06-01T09:00:00Z\"\n    }\n    mr = requests.post(f\"{base_url}/MedicationRequest\", json=med_payload, headers=headers)\n    assert mr.status_code in (200, 201), f\"MedicationRequest failed: {mr.status_code} {mr.text}\"\n    body = mr.json()\n    has_alert = <check_conflict_alert>(body)\n    assert has_alert, f\"Expected allergy conflict alert in response but none found: {body}\"\n"
+      },
+      {
+        "name": "test_allergy_numeric_criticality_boundary_values",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <auth_token fixture>",
+          "Patient resource exists via <patient_id fixture>"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with criticality set to 'low' (minimum valid FHIR value)",
+          "Assert HTTP 201",
+          "POST /AllergyIntolerance with criticality set to 'high' (maximum valid FHIR value)",
+          "Assert HTTP 201",
+          "POST /AllergyIntolerance with criticality set to 'INVALID_VALUE' (out-of-bound value)",
+          "Assert HTTP 400 or 422 with OperationOutcome"
+        ],
+        "expected": [
+          "HTTP 201 for criticality='low'",
+          "HTTP 201 for criticality='high'",
+          "HTTP 400 or 422 for criticality='INVALID_VALUE'",
+          "OperationOutcome returned for invalid criticality"
+        ],
+        "trace": [
+          "R-HLT-034: Boundary cases on numeric elements",
+          "R-HLT-034: allergy stored"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_allergy_numeric_criticality_boundary_values(auth_token, patient_id, base_url, cleanup_resource):\n    headers = {\"Authorization\": f\"Bearer {auth_token}\", \"Content-Type\": \"application/fhir+json\"}\n    def build(criticality):\n        return {\n            \"resourceType\": \"AllergyIntolerance\",\n            \"clinicalStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\", \"code\": \"active\"}]},\n            \"verificationStatus\": {\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\", \"code\": \"confirmed\"}]},\n            \"criticality\": criticality,\n            \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls/rxnorm\", \"code\": \"1191\", \"display\": \"Aspirin\"}]},\n            \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n            \"recordedDate\": \"2024-03-01T00:00:00Z\"\n        }\n    for crit in (\"low\", \"high\"):\n        r = requests.post(f\"{base_url}/AllergyIntolerance\", json=build(crit), headers=headers)\n        assert r.status_code == 201, f\"criticality={crit} rejected: {r.status_code} {r.text}\"\n        rid = r.headers[\"Location\"].rstrip(\"/\").split(\"/\")[-1].split(\"/_history\")[0]\n        cleanup_resource(\"AllergyIntolerance\", rid)\n    bad = requests.post(f\"{base_url}/AllergyIntolerance\", json=build(\"INVALID_VALUE\"), headers=headers)\n    assert bad.status_code in (400, 422), f\"Expected 400/422 for invalid criticality, got {bad.status_code}\"\n    assert bad.json().get(\"resourceType\") == \"OperationOutcome\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-034",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 4814,
+    "latency_ms": 48372,
+    "wall_ms": 48372,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-034\",\n  \"reasoning\": \"R-HLT-034 covers three distinct concern areas: (1) happy-path allergy creation and downstream conflict alert generation (EP/STC), (2) duplicate prevention via 409 (NEG/DT), and (3) boundary values on the recordedDate timestamp and numeric severity/criticality fields (BVA). Each test is self-contained by using a unique patient fixture per run and cleaning up via a teardown DELETE. The state-transition test additionally posts a MedicationRequest referencing the same substance to verify alert regeneration, exercising the STC arc from 'allergy-absent' to 'allergy-active' to 'conflict-detected'.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_allergy_intolerance_happy_path\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <auth_token fixture>\",\n        \"Patient resource exists via <patient_id fixture>\",\n        \"No prior AllergyIntolerance for that patient/substance combination\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with valid payload referencing patient and substance penicillin\",\n        \"Assert HTTP 201 and Location header present\",\n        \"GET the returned Location URL\",\n        \"Assert resource round-trips with correct patient reference and clinicalStatus active\"\n      ],\n      \"expected\": [\n        \"HTTP 201 on creation\",\n        \"Location header points to new resource\",\n        \"GET returns 200 with clinicalStatus.coding[0].code == 'active'\",\n        \"patient reference matches fixture patient ID\"\n      ],\n      \"trace\": [\n        \"R-HLT-034: allergy stored\",\n        \"R-HLT-034: clinician records allergy\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_allergy_intolerance_happy_path(auth_token, patient_id, base_url, cleanup_resource):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\", \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    payload = {\\n        \\\"resourceType\\\": \\\"AllergyIntolerance\\\",\\n        \\\"clinicalStatus\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical\\\", \\\"code\\\": \\\"active\\\"}]},\\n        \\\"verificationStatus\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/allergyintolerance-verification\\\", \\\"code\\\": \\\"confirmed\\\"}]},\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://www.nlm.nih.gov/research/umls/rxnorm\\\", \\\"code\\\": \\\"7980\\\", \\\"display\\\": \\\"Penicillin\\\"}]},\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"recordedDate\\\": \\\"2024-01-15T10:00:00Z\\\"\\n    }\\n    resp = requests.post(f\\\"{base_url}/AllergyIntolerance\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    location = resp.headers.get(\\\"Location\\\", \\\"\\\")\\n    assert location, \\\"Location header must be present\\\"\\n    resource_id = location.rstrip(\\\"/\\\").split(\\\"/\\\")[-1].split(\\\"/_history\\\")[0]\\n    cleanup_resource(\\\"AllergyIntolerance\\\", resource_id)\\n    get_resp = requests.get(f\\\"{base_url}/AllergyIntolerance/{resource_id}\\\", headers=headers)\\n    assert get_resp.status_code == 200\\n    body = get_resp.json()\\n    assert body[\\\"clinicalStatus\\\"][\\\"coding\\\"][0][\\\"code\\\"] == \\\"active\\\"\\n    assert patient_id in body[\\\"patient\\\"][\\\"reference\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_allergy_intolerance_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <auth_token fixture>\",\n        \"Patient resource exists via <patient_id fixture>\",\n        \"An identical AllergyIntolerance (same patient + substance + recordedDate) already exists via <existing_allergy fixture>\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with payload identical to the pre-seeded resource (same patient, substance, recordedDate)\",\n        \"Assert HTTP 409 Conflict is returned\",\n        \"Assert r"
+  }
+}

@@ -1,0 +1,193 @@
+{
+  "req": {
+    "id": "R-WEB-059",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Submit leave request \u2014 variant 3",
+    "statement": "A full-time employee shall be able to submit a leave request for between 1 and 30 business days; requests spanning more than 30 days require hr-admin approval. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated",
+      "employment_type:full_time"
+    ],
+    "triggers": [
+      "employee submits form"
+    ],
+    "expected_outcomes": [
+      "request created",
+      "manager notified",
+      "notification email sent",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "400 when start_date > end_date",
+      "409 when overlapping existing leave",
+      "422 when request exceeds 30 days without hr-admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-059",
+    "reasoning": "The requirement defines five distinct test-worthy dimensions: (1) valid leave submission within 1-30 days (EP positive path), (2) the exact 30-day boundary (BVA), (3) exceeding 30 days without hr-admin role (NEG/DT 422 path), (4) start_date > end_date (NEG 400 path), (5) overlapping leave (NEG 409 path), and (6) webhook emission on success (STC side-effect). I selected five tests to cover all mandated error pathways plus one strong positive and one boundary, satisfying the minimum three while achieving meaningful decision-table coverage. Each test is scoped to the UI layer via Playwright but validates backend state through a lightweight API assertion helper to remain deterministic.",
+    "tests": [
+      {
+        "name": "test_submit_leave_request_valid_15_days",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlapping the target date range",
+          "Webhook listener is primed via <fixture: webhook_sink>"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with a Monday 4 weeks from today",
+          "Fill end_date with start_date + 14 business days (15-day request)",
+          "Submit the form",
+          "Capture the created leave request ID from the confirmation banner"
+        ],
+        "expected": [
+          "HTTP 201 / success banner visible on screen",
+          "Leave record exists in backend with status='pending'",
+          "Manager receives notification (email stub asserted)",
+          "Webhook event 'leave_request.created' fired with correct payload"
+        ],
+        "trace": [
+          "R-WEB-059: valid submission 1-30 days",
+          "R-WEB-059: manager notified",
+          "R-WEB-059: webhook emitted"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_submit_leave_request_valid_15_days(\n    page: Page,\n    auth_full_time_employee,\n    webhook_sink,\n    api_client,\n    business_date_range,\n    email_stub,\n):\n    start, end = business_date_range(days=15)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n\n    banner = page.locator(\"[data-testid='success-banner']\")\n    banner.wait_for(state=\"visible\", timeout=5000)\n    leave_id = banner.get_attribute(\"data-leave-id\")\n\n    record = api_client.get(f\"/api/leave-requests/{leave_id}\").json()\n    assert record[\"status\"] == \"pending\"\n    assert record[\"duration_days\"] == 15\n\n    assert email_stub.received_for(auth_full_time_employee.manager_email)\n    event = webhook_sink.latest_event(\"leave_request.created\")\n    assert event is not None\n    assert event[\"payload\"][\"leave_id\"] == leave_id\n"
+      },
+      {
+        "name": "test_submit_leave_request_exactly_30_days_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "No existing leave overlapping the target date range",
+          "Webhook listener is primed via <fixture: webhook_sink>"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date such that the span equals exactly 30 business days",
+          "Submit the form"
+        ],
+        "expected": [
+          "Request created successfully (no 422 raised)",
+          "No hr-admin approval step shown in UI",
+          "Leave record status='pending' with duration_days==30",
+          "Webhook event fired"
+        ],
+        "trace": [
+          "R-WEB-059: upper boundary \u2014 30 days requires NO hr-admin approval",
+          "R-WEB-059: webhook emitted"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_submit_leave_request_exactly_30_days_boundary(\n    page: Page,\n    auth_full_time_employee,\n    webhook_sink,\n    api_client,\n    business_date_range,\n):\n    start, end = business_date_range(days=30)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n\n    banner = page.locator(\"[data-testid='success-banner']\")\n    banner.wait_for(state=\"visible\", timeout=5000)\n    leave_id = banner.get_attribute(\"data-leave-id\")\n\n    assert page.locator(\"[data-testid='hradmin-approval-notice']\").count() == 0\n\n    record = api_client.get(f\"/api/leave-requests/{leave_id}\").json()\n    assert record[\"duration_days\"] == 30\n    assert record[\"status\"] == \"pending\"\n\n    event = webhook_sink.latest_event(\"leave_request.created\")\n    assert event is not None\n"
+      },
+      {
+        "name": "test_submit_leave_request_31_days_without_hradmin_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as a full-time employee (NOT hr-admin)",
+          "No existing leave overlapping the target date range"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date spanning exactly 31 business days",
+          "Submit the form"
+        ],
+        "expected": [
+          "Form submission rejected \u2014 error banner visible",
+          "Error message references hr-admin approval requirement",
+          "No leave record created in backend (404 on lookup)",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-059: 422 when request exceeds 30 days without hr-admin",
+          "R-WEB-059: webhook must NOT fire on rejected request"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_submit_leave_request_31_days_without_hradmin_returns_422(\n    page: Page,\n    auth_full_time_employee,\n    webhook_sink,\n    api_client,\n    business_date_range,\n):\n    start, end = business_date_range(days=31)\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n\n    error_banner = page.locator(\"[data-testid='error-banner']\")\n    error_banner.wait_for(state=\"visible\", timeout=5000)\n    assert \"hr-admin\" in error_banner.inner_text().lower()\n\n    resp = api_client.get(\n        \"/api/leave-requests\",\n        params={\"start_date\": start, \"end_date\": end,\n                \"employee_id\": auth_full_time_employee.id}\n    )\n    assert resp.json()[\"total\"] == 0\n\n    assert webhook_sink.count_events(\"leave_request.created\") == 0\n"
+      },
+      {
+        "name": "test_submit_leave_request_start_after_end_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a full-time employee"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date with today + 10 business days",
+          "Fill end_date with today + 5 business days (end < start)",
+          "Submit the form"
+        ],
+        "expected": [
+          "Inline validation error shown on end_date field",
+          "Form does not submit (no network request to /api/leave-requests)",
+          "Error text indicates end date must be after start date"
+        ],
+        "trace": [
+          "R-WEB-059: 400 when start_date > end_date"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_submit_leave_request_start_after_end_returns_400(\n    page: Page,\n    auth_full_time_employee,\n    future_business_date,\n):\n    start = future_business_date(offset_days=10)\n    end = future_business_date(offset_days=5)\n\n    requests_made = []\n    page.on(\"request\", lambda r: requests_made.append(r.url)\n            if \"leave-requests\" in r.url and r.method == \"POST\" else None)\n\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", start)\n    page.fill(\"[data-testid='end-date']\", end)\n    page.click(\"[data-testid='submit-btn']\")\n\n    field_error = page.locator(\"[data-testid='end-date-error']\")\n    field_error.wait_for(state=\"visible\", timeout=3000)\n    assert \"after\" in field_error.inner_text().lower()\n\n    assert len(requests_made) == 0, \"No POST should be issued for invalid dates\"\n"
+      },
+      {
+        "name": "test_submit_leave_request_overlapping_existing_returns_409",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as a full-time employee",
+          "An approved leave record already exists for the employee spanning 2 weeks from next Monday",
+          "<fixture: existing_leave> seeds this record via API before the test"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/new",
+          "Fill start_date and end_date overlapping the pre-existing leave record",
+          "Submit the form"
+        ],
+        "expected": [
+          "Error banner visible with 409 conflict message",
+          "Message references 'overlapping' or 'conflict'",
+          "No new leave record created in backend",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-059: 409 when overlapping existing leave",
+          "R-WEB-059: state transition \u2014 employee already in APPROVED_LEAVE state for range"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_submit_leave_request_overlapping_existing_returns_409(\n    page: Page,\n    auth_full_time_employee,\n    existing_leave,\n    webhook_sink,\n    api_client,\n):\n    overlap_start = existing_leave[\"start_date\"]\n    overlap_end = existing_leave[\"end_date\"]\n\n    page.goto(\"/leave-requests/new\")\n    page.fill(\"[data-testid='start-date']\", overlap_start)\n    page.fill(\"[data-testid='end-date']\", overlap_end)\n    page.click(\"[data-testid='submit-btn']\")\n\n    error_banner = page.locator(\"[data-testid='error-banner']\")\n    error_banner.wait_for(state=\"visible\", timeout=5000)\n    text = error_banner.inner_text().lower()\n    assert \"overlap\" in text or \"conflict\" in text\n\n    resp = api_client.get(\n        \"/api/leave-requests\",\n        params={\"start_date\": overlap_start, \"end_date\": overlap_end,\n                \"employee_id\": auth_full_time_employee.id}\n    )\n    assert resp.json()[\"total\"] == 1, \"Only the pre-seeded record should exist\"\n\n    assert webhook_sink.count_events(\"leave_request.created\") == 0\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-059",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1057,
+    "output_tokens": 3341,
+    "latency_ms": 42912,
+    "wall_ms": 42912,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-059\",\n  \"reasoning\": \"The requirement defines five distinct test-worthy dimensions: (1) valid leave submission within 1-30 days (EP positive path), (2) the exact 30-day boundary (BVA), (3) exceeding 30 days without hr-admin role (NEG/DT 422 path), (4) start_date > end_date (NEG 400 path), (5) overlapping leave (NEG 409 path), and (6) webhook emission on success (STC side-effect). I selected five tests to cover all mandated error pathways plus one strong positive and one boundary, satisfying the minimum three while achieving meaningful decision-table coverage. Each test is scoped to the UI layer via Playwright but validates backend state through a lightweight API assertion helper to remain deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_leave_request_valid_15_days\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"No existing leave overlapping the target date range\",\n        \"Webhook listener is primed via <fixture: webhook_sink>\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date with a Monday 4 weeks from today\",\n        \"Fill end_date with start_date + 14 business days (15-day request)\",\n        \"Submit the form\",\n        \"Capture the created leave request ID from the confirmation banner\"\n      ],\n      \"expected\": [\n        \"HTTP 201 / success banner visible on screen\",\n        \"Leave record exists in backend with status='pending'\",\n        \"Manager receives notification (email stub asserted)\",\n        \"Webhook event 'leave_request.created' fired with correct payload\"\n      ],\n      \"trace\": [\n        \"R-WEB-059: valid submission 1-30 days\",\n        \"R-WEB-059: manager notified\",\n        \"R-WEB-059: webhook emitted\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import Page\\n\\ndef test_submit_leave_request_valid_15_days(\\n    page: Page,\\n    auth_full_time_employee,\\n    webhook_sink,\\n    api_client,\\n    business_date_range,\\n    email_stub,\\n):\\n    start, end = business_date_range(days=15)\\n    page.goto(\\\"/leave-requests/new\\\")\\n    page.fill(\\\"[data-testid='start-date']\\\", start)\\n    page.fill(\\\"[data-testid='end-date']\\\", end)\\n    page.click(\\\"[data-testid='submit-btn']\\\")\\n\\n    banner = page.locator(\\\"[data-testid='success-banner']\\\")\\n    banner.wait_for(state=\\\"visible\\\", timeout=5000)\\n    leave_id = banner.get_attribute(\\\"data-leave-id\\\")\\n\\n    record = api_client.get(f\\\"/api/leave-requests/{leave_id}\\\").json()\\n    assert record[\\\"status\\\"] == \\\"pending\\\"\\n    assert record[\\\"duration_days\\\"] == 15\\n\\n    assert email_stub.received_for(auth_full_time_employee.manager_email)\\n    event = webhook_sink.latest_event(\\\"leave_request.created\\\")\\n    assert event is not None\\n    assert event[\\\"payload\\\"][\\\"leave_id\\\"] == leave_id\\n\"\n    },\n    {\n      \"name\": \"test_submit_leave_request_exactly_30_days_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated as a full-time employee\",\n        \"No existing leave overlapping the target date range\",\n        \"Webhook listener is primed via <fixture: webhook_sink>\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/new\",\n        \"Fill start_date and end_date such that the span equals exactly 30 business days\",\n        \"Submit the form\"\n      ],\n      \"expected\": [\n        \"Request created successfully (no 422 raised)\",\n        \"No hr-admin approval step shown in UI\",\n        \"Leave record status='pending' with duration_days==30\",\n        \"Webhook event fired\"\n      ],\n      \"trace\": [\n        \"R-WEB-059: upper boundary \u2014 30 days requires NO hr-admin approval\",\n        \"R-WEB-059: webhook emitted\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import Page\\n\\ndef test_submit_leave_request_exactly_30_days_boundary(\\n    page: Page,\\n    auth_full_time_employee,\\n   "
+  }
+}

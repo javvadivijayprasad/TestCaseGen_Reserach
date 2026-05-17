@@ -1,0 +1,179 @@
+{
+  "req": {
+    "id": "R-FIN-072",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Card PIN change (negative variant)",
+    "statement": "A customer shall change their card PIN at most 5 times per 24-hour window. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer changes PIN"
+    ],
+    "expected_outcomes": [
+      "PIN updated"
+    ],
+    "error_pathways": [
+      "429 when rate limit exceeded"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/pin"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-072",
+    "reasoning": "The requirement mandates a 5-per-24h rate limit on card PIN changes. Test coverage requires: (1) a positive EP case confirming a single valid PIN change succeeds (HTTP 200), (2) a NEG case confirming an unauthorised caller is rejected (HTTP 401/403), (3) a BVA boundary case at exactly the 5th attempt succeeding and the 6th returning 429, and (4) an STC case walking the state machine from zero attempts through the limit transition. A DT case covers the cross-product of ownership vs. rate-limit conditions. Each test resets state via a dedicated fixture that rewinds the attempt counter, making tests idempotent.",
+    "tests": [
+      {
+        "name": "test_pin_change_single_valid_request_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card ID belongs to the authenticated customer",
+          "PIN change attempt counter is reset to 0 for this card in the last 24h"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with a valid new PIN and valid auth token",
+          "Assert HTTP 200 is returned",
+          "Assert response body confirms PIN updated"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response JSON contains status='updated' or equivalent success indicator"
+        ],
+        "trace": [
+          "R-FIN-072: PIN updated (expected outcome)",
+          "EP: valid partition \u2014 authenticated owner, counter < limit"
+        ],
+        "executable": "def test_pin_change_single_valid_request_succeeds(api_client, card_with_reset_counter):\n    card_id = card_with_reset_counter[\"id\"]\n    new_pin = <generate_valid_pin>()\n    response = api_client.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"new_pin\": new_pin},\n        headers=<auth_header>(card_with_reset_counter[\"owner_token\"]),\n    )\n    assert response.status_code == 200\n    body = response.json()\n    assert body.get(\"status\") == \"updated\""
+      },
+      {
+        "name": "test_pin_change_unauthenticated_caller_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No valid auth token is supplied (missing or expired)",
+          "Card ID is valid and exists in the system"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with no Authorization header",
+          "Assert HTTP 401 or 403 is returned",
+          "Assert response body contains an error message"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized or 403 Forbidden",
+          "Response body contains error field indicating auth failure"
+        ],
+        "trace": [
+          "R-FIN-072: error pathway \u2014 unauthorised",
+          "NEG: invalid partition \u2014 missing/invalid auth token"
+        ],
+        "executable": "def test_pin_change_unauthenticated_caller_rejected(api_client, existing_card_id):\n    response = api_client.patch(\n        f\"/cards/{existing_card_id}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n    )\n    assert response.status_code in (401, 403)\n    body = response.json()\n    assert \"error\" in body or \"message\" in body"
+      },
+      {
+        "name": "test_pin_change_fifth_attempt_succeeds_sixth_returns_429",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card ID belongs to the authenticated customer",
+          "PIN change attempt counter is reset to 0 for this card in the last 24h"
+        ],
+        "actions": [
+          "Issue 4 successful PATCH /cards/{id}/pin requests to advance counter to 4",
+          "Issue 5th PATCH /cards/{id}/pin and assert HTTP 200",
+          "Issue 6th PATCH /cards/{id}/pin and assert HTTP 429"
+        ],
+        "expected": [
+          "Attempts 1-5: HTTP 200 OK",
+          "Attempt 6: HTTP 429 Too Many Requests",
+          "Response on 429 includes Retry-After header or error body"
+        ],
+        "trace": [
+          "R-FIN-072: at most 5 times per 24-hour window",
+          "BVA: boundary values N=5 (last valid) and N+1=6 (first invalid)"
+        ],
+        "executable": "def test_pin_change_fifth_attempt_succeeds_sixth_returns_429(\n    api_client, card_with_reset_counter\n):\n    card_id = card_with_reset_counter[\"id\"]\n    headers = <auth_header>(card_with_reset_counter[\"owner_token\"])\n    for i in range(4):\n        r = api_client.patch(\n            f\"/cards/{card_id}/pin\",\n            json={\"new_pin\": <generate_valid_pin>()},\n            headers=headers,\n        )\n        assert r.status_code == 200, f\"Attempt {i+1} failed unexpectedly\"\n    fifth = api_client.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n        headers=headers,\n    )\n    assert fifth.status_code == 200\n    sixth = api_client.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n        headers=headers,\n    )\n    assert sixth.status_code == 429\n    assert \"Retry-After\" in sixth.headers or \"error\" in sixth.json()"
+      },
+      {
+        "name": "test_pin_change_state_transition_zero_to_limit_to_locked",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card PIN change counter is in state ZERO (0 attempts in last 24h)"
+        ],
+        "actions": [
+          "Verify counter state is ZERO via <get_pin_change_count> helper",
+          "Issue 5 successful PIN change requests, verifying counter increments each time",
+          "Verify counter state is AT_LIMIT (5)",
+          "Issue one more PIN change request",
+          "Verify response is 429 and counter state is LOCKED (>= 5)"
+        ],
+        "expected": [
+          "State progresses: ZERO -> 1 -> 2 -> 3 -> 4 -> AT_LIMIT(5) -> LOCKED",
+          "HTTP 200 for each of the first 5 transitions",
+          "HTTP 429 on LOCKED transition"
+        ],
+        "trace": [
+          "R-FIN-072: at most 5 times per 24-hour window",
+          "STC: covers all state transitions in the PIN change rate-limit FSM"
+        ],
+        "executable": "def test_pin_change_state_transition_zero_to_limit_to_locked(\n    api_client, card_with_reset_counter\n):\n    card_id = card_with_reset_counter[\"id\"]\n    headers = <auth_header>(card_with_reset_counter[\"owner_token\"])\n    assert <get_pin_change_count>(card_id) == 0\n    for expected_count in range(1, 6):\n        r = api_client.patch(\n            f\"/cards/{card_id}/pin\",\n            json={\"new_pin\": <generate_valid_pin>()},\n            headers=headers,\n        )\n        assert r.status_code == 200\n        assert <get_pin_change_count>(card_id) == expected_count\n    assert <get_pin_change_count>(card_id) == 5\n    locked_r = api_client.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n        headers=headers,\n    )\n    assert locked_r.status_code == 429\n    assert <get_pin_change_count>(card_id) >= 5"
+      },
+      {
+        "name": "test_pin_change_decision_table_ownership_vs_rate_limit",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Two customer tokens: owner_token (card owner) and other_token (different customer)",
+          "Card belongs only to owner_token customer",
+          "PIN change counter for owner is AT_LIMIT (5 attempts in last 24h)"
+        ],
+        "actions": [
+          "Case A: other_token requests PIN change on card -> expect 401 or 403 (ownership fails regardless of limit)",
+          "Case B: owner_token requests PIN change when counter == 5 -> expect 429 (ownership OK, limit exceeded)",
+          "Case C: owner_token requests PIN change when counter == 0 -> expect 200 (ownership OK, limit OK)"
+        ],
+        "expected": [
+          "Case A: HTTP 401 or 403",
+          "Case B: HTTP 429",
+          "Case C: HTTP 200"
+        ],
+        "trace": [
+          "R-FIN-072: error pathways \u2014 unauthorised and exceeded limits",
+          "DT: cross-product of {ownership valid/invalid} x {rate limit ok/exceeded}"
+        ],
+        "executable": "def test_pin_change_decision_table_ownership_vs_rate_limit(\n    api_client, card_at_limit, fresh_card\n):\n    other_headers = <auth_header>(<other_customer_token>())\n    owner_headers_limited = <auth_header>(card_at_limit[\"owner_token\"])\n    owner_headers_fresh = <auth_header>(fresh_card[\"owner_token\"])\n    case_a = api_client.patch(\n        f\"/cards/{card_at_limit['id']}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n        headers=other_headers,\n    )\n    assert case_a.status_code in (401, 403), \"Case A: non-owner must be rejected\"\n    case_b = api_client.patch(\n        f\"/cards/{card_at_limit['id']}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n        headers=owner_headers_limited,\n    )\n    assert case_b.status_code == 429, \"Case B: owner at limit must get 429\"\n    case_c = api_client.patch(\n        f\"/cards/{fresh_card['id']}/pin\",\n        json={\"new_pin\": <generate_valid_pin>()},\n        headers=owner_headers_fresh,\n    )\n    assert case_c.status_code == 200, \"Case C: owner under limit must succeed\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-072",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 2912,
+    "latency_ms": 38148,
+    "wall_ms": 38148,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-072\",\n  \"reasoning\": \"The requirement mandates a 5-per-24h rate limit on card PIN changes. Test coverage requires: (1) a positive EP case confirming a single valid PIN change succeeds (HTTP 200), (2) a NEG case confirming an unauthorised caller is rejected (HTTP 401/403), (3) a BVA boundary case at exactly the 5th attempt succeeding and the 6th returning 429, and (4) an STC case walking the state machine from zero attempts through the limit transition. A DT case covers the cross-product of ownership vs. rate-limit conditions. Each test resets state via a dedicated fixture that rewinds the attempt counter, making tests idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_pin_change_single_valid_request_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer token is available\",\n        \"Card ID belongs to the authenticated customer\",\n        \"PIN change attempt counter is reset to 0 for this card in the last 24h\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/pin with a valid new PIN and valid auth token\",\n        \"Assert HTTP 200 is returned\",\n        \"Assert response body confirms PIN updated\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response JSON contains status='updated' or equivalent success indicator\"\n      ],\n      \"trace\": [\n        \"R-FIN-072: PIN updated (expected outcome)\",\n        \"EP: valid partition \u2014 authenticated owner, counter < limit\"\n      ],\n      \"executable\": \"def test_pin_change_single_valid_request_succeeds(api_client, card_with_reset_counter):\\n    card_id = card_with_reset_counter[\\\"id\\\"]\\n    new_pin = <generate_valid_pin>()\\n    response = api_client.patch(\\n        f\\\"/cards/{card_id}/pin\\\",\\n        json={\\\"new_pin\\\": new_pin},\\n        headers=<auth_header>(card_with_reset_counter[\\\"owner_token\\\"]),\\n    )\\n    assert response.status_code == 200\\n    body = response.json()\\n    assert body.get(\\\"status\\\") == \\\"updated\\\"\"\n    },\n    {\n      \"name\": \"test_pin_change_unauthenticated_caller_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"No valid auth token is supplied (missing or expired)\",\n        \"Card ID is valid and exists in the system\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/pin with no Authorization header\",\n        \"Assert HTTP 401 or 403 is returned\",\n        \"Assert response body contains an error message\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized or 403 Forbidden\",\n        \"Response body contains error field indicating auth failure\"\n      ],\n      \"trace\": [\n        \"R-FIN-072: error pathway \u2014 unauthorised\",\n        \"NEG: invalid partition \u2014 missing/invalid auth token\"\n      ],\n      \"executable\": \"def test_pin_change_unauthenticated_caller_rejected(api_client, existing_card_id):\\n    response = api_client.patch(\\n        f\\\"/cards/{existing_card_id}/pin\\\",\\n        json={\\\"new_pin\\\": <generate_valid_pin>()},\\n    )\\n    assert response.status_code in (401, 403)\\n    body = response.json()\\n    assert \\\"error\\\" in body or \\\"message\\\" in body\"\n    },\n    {\n      \"name\": \"test_pin_change_fifth_attempt_succeeds_sixth_returns_429\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer token is available\",\n        \"Card ID belongs to the authenticated customer\",\n        \"PIN change attempt counter is reset to 0 for this card in the last 24h\"\n      ],\n      \"actions\": [\n        \"Issue 4 successful PATCH /cards/{id}/pin requests to advance counter to 4\",\n        \"Issue 5th PATCH /cards/{id}/pin and assert HTTP 200\",\n        \"Issue 6th PATCH /cards/{id}/pin and assert HTTP 429\"\n      ],\n      \"expected\": [\n        \"Attempts 1-5: HTTP 200 OK\",\n        \"Attempt 6: HTTP 429 Too Many Requests\",\n        \"Response on 429 includes Retry-After header or error body\"\n      ],\n      \"trace\": [\n        \"R-FIN-072: at most 5 times per 24-hour window\""
+  }
+}

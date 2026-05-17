@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-018",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Lab order routing",
+    "statement": "A clinician shall order a lab test; orders shall route to the patient's preferred lab when available.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician orders lab"
+    ],
+    "expected_outcomes": [
+      "order routed",
+      "status tracked"
+    ],
+    "error_pathways": [
+      "fallback to default lab when preferred unavailable"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ServiceRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-018",
+    "reasoning": "The requirement covers three distinct routing scenarios: (1) preferred lab is available \u2192 route to preferred lab (positive/EP); (2) preferred lab is unavailable \u2192 fallback to default lab (negative/NEG/DT); (3) boundary state where a lab transitions from available to unavailable mid-order cycle (STC). A fourth BVA case covers a patient with exactly one lab preference (the minimum non-zero preference count). Together these provide EP, NEG, DT, STC, and BVA coverage of R-HLT-018.",
+    "tests": [
+      {
+        "name": "test_order_routes_to_preferred_lab_when_available",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician session token available via <clinician_auth_fixture>",
+          "Patient record exists with preferred lab set to 'lab-preferred-001'",
+          "Lab 'lab-preferred-001' is marked active/available in the system"
+        ],
+        "actions": [
+          "POST /ServiceRequest with subject referencing patient, code for CBC, and performer hint omitted (system should resolve preferred lab)",
+          "Capture the HTTP response and the created ServiceRequest resource"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "ServiceRequest.status == 'active'",
+          "ServiceRequest.performer[0].reference contains 'lab-preferred-001'",
+          "ServiceRequest.id is present (routing confirmed)"
+        ],
+        "trace": [
+          "R-HLT-018: order routed to preferred lab when available",
+          "R-HLT-018: status tracked"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_routes_to_preferred_lab_when_available(\n    clinician_auth_fixture,\n    patient_with_preferred_lab_fixture,\n    ensure_lab_available_fixture,\n):\n    token = clinician_auth_fixture\n    patient_id = patient_with_preferred_lab_fixture[\"patient_id\"]\n    preferred_lab = patient_with_preferred_lab_fixture[\"preferred_lab_ref\"]\n    ensure_lab_available_fixture(preferred_lab, available=True)\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"58410-2\"}]},\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    resp = requests.post(f\"{BASE_URL}/ServiceRequest\", json=payload, headers=headers)\n\n    assert resp.status_code == 201\n    resource = resp.json()\n    assert resource.get(\"status\") == \"active\"\n    assert resource.get(\"id\") is not None\n    performers = resource.get(\"performer\", [])\n    assert any(preferred_lab in p.get(\"reference\", \"\") for p in performers), \\\n        f\"Expected performer {preferred_lab}, got {performers}\"\n"
+      },
+      {
+        "name": "test_order_falls_back_to_default_lab_when_preferred_unavailable",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician session token available via <clinician_auth_fixture>",
+          "Patient record exists with preferred lab 'lab-preferred-001'",
+          "Lab 'lab-preferred-001' is marked inactive/unavailable in the system",
+          "A default lab 'lab-default-001' is configured as system fallback"
+        ],
+        "actions": [
+          "Mark preferred lab as unavailable via <ensure_lab_available_fixture>",
+          "POST /ServiceRequest with the same patient and CBC code",
+          "Capture response and resource"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "ServiceRequest.status == 'active'",
+          "ServiceRequest.performer[0].reference contains 'lab-default-001' (fallback)",
+          "ServiceRequest.performer[0].reference does NOT contain 'lab-preferred-001'"
+        ],
+        "trace": [
+          "R-HLT-018: fallback to default lab when preferred unavailable"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_falls_back_to_default_lab_when_preferred_unavailable(\n    clinician_auth_fixture,\n    patient_with_preferred_lab_fixture,\n    ensure_lab_available_fixture,\n    default_lab_ref_fixture,\n):\n    token = clinician_auth_fixture\n    patient_id = patient_with_preferred_lab_fixture[\"patient_id\"]\n    preferred_lab = patient_with_preferred_lab_fixture[\"preferred_lab_ref\"]\n    default_lab = default_lab_ref_fixture\n    ensure_lab_available_fixture(preferred_lab, available=False)\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"58410-2\"}]},\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    resp = requests.post(f\"{BASE_URL}/ServiceRequest\", json=payload, headers=headers)\n\n    assert resp.status_code == 201\n    resource = resp.json()\n    assert resource.get(\"status\") == \"active\"\n    performers = resource.get(\"performer\", [])\n    refs = [p.get(\"reference\", \"\") for p in performers]\n    assert any(default_lab in r for r in refs), f\"Expected fallback {default_lab}, got {refs}\"\n    assert not any(preferred_lab in r for r in refs), f\"Preferred lab should not appear: {refs}\"\n"
+      },
+      {
+        "name": "test_order_status_transitions_from_draft_to_active_on_submission",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician session token available",
+          "Patient record exists with preferred lab available",
+          "A draft ServiceRequest exists for the patient (status=draft)"
+        ],
+        "actions": [
+          "PUT /ServiceRequest/{id} updating status from 'draft' to 'active' to simulate clinician finalising the order",
+          "GET /ServiceRequest/{id} to confirm persisted status"
+        ],
+        "expected": [
+          "PUT returns HTTP 200",
+          "GET confirms ServiceRequest.status == 'active'",
+          "ServiceRequest.performer is populated (routing applied on activation)"
+        ],
+        "trace": [
+          "R-HLT-018: order routed (state: draft -> active)",
+          "R-HLT-018: status tracked across transitions"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_status_transitions_from_draft_to_active_on_submission(\n    clinician_auth_fixture,\n    draft_service_request_fixture,\n    patient_with_preferred_lab_fixture,\n    ensure_lab_available_fixture,\n):\n    token = clinician_auth_fixture\n    preferred_lab = patient_with_preferred_lab_fixture[\"preferred_lab_ref\"]\n    ensure_lab_available_fixture(preferred_lab, available=True)\n    sr_id = draft_service_request_fixture[\"id\"]\n    draft_resource = draft_service_request_fixture.copy()\n    draft_resource[\"status\"] = \"active\"\n\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    put_resp = requests.put(f\"{BASE_URL}/ServiceRequest/{sr_id}\", json=draft_resource, headers=headers)\n    assert put_resp.status_code == 200\n\n    get_resp = requests.get(f\"{BASE_URL}/ServiceRequest/{sr_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    resource = get_resp.json()\n    assert resource.get(\"status\") == \"active\", f\"Expected active, got {resource.get('status')}\"\n    assert len(resource.get(\"performer\", [])) >= 1, \"Performer must be set after activation\"\n"
+      },
+      {
+        "name": "test_order_routing_with_exactly_one_lab_preference",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician session token available",
+          "Patient record exists with exactly ONE preferred lab entry (minimum valid preference list)",
+          "That single preferred lab is available"
+        ],
+        "actions": [
+          "POST /ServiceRequest for the patient with exactly one lab preference",
+          "Inspect performer in response"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "ServiceRequest.performer list has exactly 1 entry",
+          "The single performer reference matches the one configured preferred lab",
+          "No duplicate or extra performers appended"
+        ],
+        "trace": [
+          "R-HLT-018: order routed to preferred lab (BVA: exactly one preference, lower boundary of non-empty preference set)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_routing_with_exactly_one_lab_preference(\n    clinician_auth_fixture,\n    patient_with_single_lab_preference_fixture,\n    ensure_lab_available_fixture,\n):\n    token = clinician_auth_fixture\n    patient_id = patient_with_single_lab_preference_fixture[\"patient_id\"]\n    sole_lab = patient_with_single_lab_preference_fixture[\"preferred_lab_ref\"]\n    ensure_lab_available_fixture(sole_lab, available=True)\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"58410-2\"}]},\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    resp = requests.post(f\"{BASE_URL}/ServiceRequest\", json=payload, headers=headers)\n\n    assert resp.status_code == 201\n    resource = resp.json()\n    performers = resource.get(\"performer\", [])\n    assert len(performers) == 1, f\"Expected exactly 1 performer, got {len(performers)}\"\n    assert sole_lab in performers[0].get(\"reference\", \"\"), \\\n        f\"Expected {sole_lab} as sole performer, got {performers[0]}\"\n"
+      },
+      {
+        "name": "test_order_routing_decision_table_no_preferred_lab_configured",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician session token available",
+          "Patient record exists with NO preferred lab configured",
+          "Default lab 'lab-default-001' is configured as system fallback"
+        ],
+        "actions": [
+          "POST /ServiceRequest for a patient who has no preferred lab",
+          "Inspect performer in response"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "ServiceRequest.status == 'active'",
+          "ServiceRequest.performer[0].reference contains 'lab-default-001'",
+          "No error or 5xx response"
+        ],
+        "trace": [
+          "R-HLT-018: DT rule \u2014 no preference configured \u2192 always route to default lab",
+          "R-HLT-018: error pathway: fallback to default lab"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080/fhir\"\n\ndef test_order_routing_decision_table_no_preferred_lab_configured(\n    clinician_auth_fixture,\n    patient_without_lab_preference_fixture,\n    default_lab_ref_fixture,\n):\n    token = clinician_auth_fixture\n    patient_id = patient_without_lab_preference_fixture[\"patient_id\"]\n    default_lab = default_lab_ref_fixture\n\n    payload = {\n        \"resourceType\": \"ServiceRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"58410-2\"}]},\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"}\n    }\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    resp = requests.post(f\"{BASE_URL}/ServiceRequest\", json=payload, headers=headers)\n\n    assert resp.status_code == 201, f\"Unexpected status {resp.status_code}: {resp.text}\"\n    resource = resp.json()\n    assert resource.get(\"status\") == \"active\"\n    performers = resource.get(\"performer\", [])\n    refs = [p.get(\"reference\", \"\") for p in performers]\n    assert any(default_lab in r for r in refs), \\\n        f\"Expected default lab {default_lab} as performer, got {refs}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-018",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 979,
+    "output_tokens": 3731,
+    "latency_ms": 36472,
+    "wall_ms": 36472,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-018\",\n  \"reasoning\": \"The requirement covers three distinct routing scenarios: (1) preferred lab is available \u2192 route to preferred lab (positive/EP); (2) preferred lab is unavailable \u2192 fallback to default lab (negative/NEG/DT); (3) boundary state where a lab transitions from available to unavailable mid-order cycle (STC). A fourth BVA case covers a patient with exactly one lab preference (the minimum non-zero preference count). Together these provide EP, NEG, DT, STC, and BVA coverage of R-HLT-018.\",\n  \"tests\": [\n    {\n      \"name\": \"test_order_routes_to_preferred_lab_when_available\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician session token available via <clinician_auth_fixture>\",\n        \"Patient record exists with preferred lab set to 'lab-preferred-001'\",\n        \"Lab 'lab-preferred-001' is marked active/available in the system\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with subject referencing patient, code for CBC, and performer hint omitted (system should resolve preferred lab)\",\n        \"Capture the HTTP response and the created ServiceRequest resource\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"ServiceRequest.status == 'active'\",\n        \"ServiceRequest.performer[0].reference contains 'lab-preferred-001'\",\n        \"ServiceRequest.id is present (routing confirmed)\"\n      ],\n      \"trace\": [\n        \"R-HLT-018: order routed to preferred lab when available\",\n        \"R-HLT-018: status tracked\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://localhost:8080/fhir\\\"\\n\\ndef test_order_routes_to_preferred_lab_when_available(\\n    clinician_auth_fixture,\\n    patient_with_preferred_lab_fixture,\\n    ensure_lab_available_fixture,\\n):\\n    token = clinician_auth_fixture\\n    patient_id = patient_with_preferred_lab_fixture[\\\"patient_id\\\"]\\n    preferred_lab = patient_with_preferred_lab_fixture[\\\"preferred_lab_ref\\\"]\\n    ensure_lab_available_fixture(preferred_lab, available=True)\\n\\n    payload = {\\n        \\\"resourceType\\\": \\\"ServiceRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"58410-2\\\"}]},\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"}\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\", \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    resp = requests.post(f\\\"{BASE_URL}/ServiceRequest\\\", json=payload, headers=headers)\\n\\n    assert resp.status_code == 201\\n    resource = resp.json()\\n    assert resource.get(\\\"status\\\") == \\\"active\\\"\\n    assert resource.get(\\\"id\\\") is not None\\n    performers = resource.get(\\\"performer\\\", [])\\n    assert any(preferred_lab in p.get(\\\"reference\\\", \\\"\\\") for p in performers), \\\\\\n        f\\\"Expected performer {preferred_lab}, got {performers}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_order_falls_back_to_default_lab_when_preferred_unavailable\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician session token available via <clinician_auth_fixture>\",\n        \"Patient record exists with preferred lab 'lab-preferred-001'\",\n        \"Lab 'lab-preferred-001' is marked inactive/unavailable in the system\",\n        \"A default lab 'lab-default-001' is configured as system fallback\"\n      ],\n      \"actions\": [\n        \"Mark preferred lab as unavailable via <ensure_lab_available_fixture>\",\n        \"POST /ServiceRequest with the same patient and CBC code\",\n        \"Capture response and resource\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"ServiceRequest.status == 'active'\",\n        \"ServiceRequest.performer[0].reference contains 'lab-default-001' (fallback)\",\n        \"ServiceRequest.performer[0].reference does NOT contain 'lab-preferred-001'\"\n      ],\n      \"trace\": [\n        \"R-HLT-018: fallback to default lab when preferred "
+  }
+}

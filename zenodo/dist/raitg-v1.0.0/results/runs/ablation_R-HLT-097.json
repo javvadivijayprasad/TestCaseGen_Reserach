@@ -1,0 +1,200 @@
+{
+  "req": {
+    "id": "R-HLT-097",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Device data ingest (audit)",
+    "statement": "A registered device shall push Observations via FHIR ingest; unregistered devices shall be rejected. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "device registered"
+    ],
+    "triggers": [
+      "device submits"
+    ],
+    "expected_outcomes": [
+      "observations stored",
+      "normalization applied"
+    ],
+    "error_pathways": [
+      "401 when device cert invalid"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Ingest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-097",
+    "reasoning": "R-HLT-097 mandates three orthogonal concerns: (1) registered devices can ingest FHIR Observations and have them stored with normalization, (2) unregistered/invalid-cert devices receive 401 and are rejected, and (3) an AuditEvent is emitted for every ingest operation regardless of outcome. Test selection uses EP to partition registered vs unregistered device space, NEG for the invalid-certificate rejection path, BVA for the minimal-valid single-Observation payload boundary, STC for the state transition from device-registered to observation-stored with audit emitted, and DT to cover the decision table row where cert is valid AND device is registered AND payload is well-formed. Each test is self-contained via fixtures that register/deregister devices and roll back state, making them idempotent.",
+    "tests": [
+      {
+        "name": "test_registered_device_ingest_stores_observation_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running and reachable at FHIR_BASE_URL",
+          "Device 'dev-001' is registered in the device registry with a valid TLS certificate",
+          "No prior Observation with identifier 'obs-ep-001' exists"
+        ],
+        "actions": [
+          "POST a well-formed FHIR Observation resource to /Ingest using the registered device certificate",
+          "Query /Observation?identifier=obs-ep-001 to verify storage",
+          "Query /AuditEvent?entity=obs-ep-001 to verify audit emission"
+        ],
+        "expected": [
+          "POST /Ingest returns HTTP 201",
+          "Response body contains a FHIR Observation with id set by the server",
+          "GET /Observation?identifier=obs-ep-001 returns at least one resource",
+          "The stored Observation has normalization applied (valueQuantity unit is canonical)",
+          "GET /AuditEvent?entity=obs-ep-001 returns at least one AuditEvent with outcome='0'"
+        ],
+        "trace": [
+          "R-HLT-097: registered device pushes Observations via FHIR ingest",
+          "R-HLT-097: observations stored; normalization applied",
+          "R-HLT-097: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_registered_device_ingest_stores_observation_and_emits_audit(\n    registered_device_session,  # <fixture>: requests.Session with valid cert\n    fhir_base_url,              # <fixture>: str base URL\n    cleanup_observation,        # <fixture>: deletes obs by identifier on teardown\n):\n    identifier = \"obs-ep-001\"\n    cleanup_observation(identifier)\n\n    payload = <build_observation_payload>(identifier, value=98.6, unit=\"degF\")\n\n    resp = registered_device_session.post(\n        f\"{fhir_base_url}/Ingest\",\n        json=payload,\n        timeout=10,\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    assert body.get(\"id\"), \"Server must assign an id\"\n\n    search = requests.get(\n        f\"{fhir_base_url}/Observation\",\n        params={\"identifier\": identifier},\n        timeout=10,\n    )\n    assert search.status_code == 200\n    bundle = search.json()\n    assert bundle.get(\"total\", 0) >= 1, \"Observation must be stored\"\n\n    stored = bundle[\"entry\"][0][\"resource\"]\n    unit = stored[\"valueQuantity\"][\"code\"]\n    assert unit == \"Cel\", f\"Normalization expected Cel, got {unit}\"\n\n    audit = requests.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": identifier},\n        timeout=10,\n    )\n    assert audit.status_code == 200\n    events = audit.json()\n    assert events.get(\"total\", 0) >= 1, \"AuditEvent must be emitted\"\n    assert events[\"entry\"][0][\"resource\"][\"outcome\"] == \"0\"\n"
+      },
+      {
+        "name": "test_unregistered_device_ingest_returns_401_and_emits_audit",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running and reachable at FHIR_BASE_URL",
+          "Device 'dev-unregistered' holds an invalid or self-signed certificate not trusted by fhir-lite",
+          "Device 'dev-unregistered' is NOT present in the device registry"
+        ],
+        "actions": [
+          "POST a well-formed FHIR Observation resource to /Ingest using the unregistered device certificate",
+          "Query /AuditEvent for the rejected request to verify audit emission"
+        ],
+        "expected": [
+          "POST /Ingest returns HTTP 401",
+          "Response body contains an OperationOutcome with issue.severity='error'",
+          "No Observation is created for identifier 'obs-neg-001'",
+          "GET /AuditEvent for the rejected request returns at least one AuditEvent with outcome != '0'"
+        ],
+        "trace": [
+          "R-HLT-097: unregistered devices shall be rejected",
+          "R-HLT-097: 401 when device cert invalid",
+          "R-HLT-097: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unregistered_device_ingest_returns_401_and_emits_audit(\n    unregistered_device_session,  # <fixture>: requests.Session with invalid cert\n    fhir_base_url,                # <fixture>: str base URL\n):\n    identifier = \"obs-neg-001\"\n    payload = <build_observation_payload>(identifier, value=37.0, unit=\"Cel\")\n\n    resp = unregistered_device_session.post(\n        f\"{fhir_base_url}/Ingest\",\n        json=payload,\n        timeout=10,\n    )\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i[\"severity\"] == \"error\" for i in issues)\n\n    search = requests.get(\n        f\"{fhir_base_url}/Observation\",\n        params={\"identifier\": identifier},\n        timeout=10,\n    )\n    bundle = search.json()\n    assert bundle.get(\"total\", 0) == 0, \"No Observation must be stored for rejected device\"\n\n    audit = requests.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": identifier},\n        timeout=10,\n    )\n    assert audit.status_code == 200\n    events = audit.json()\n    assert events.get(\"total\", 0) >= 1, \"AuditEvent must be emitted even for rejected requests\"\n    outcomes = [e[\"resource\"][\"outcome\"] for e in events[\"entry\"]]\n    assert any(o != \"0\" for o in outcomes), \"AuditEvent outcome must indicate failure\"\n"
+      },
+      {
+        "name": "test_minimal_single_observation_boundary_payload_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running and reachable at FHIR_BASE_URL",
+          "Device 'dev-001' is registered with a valid TLS certificate",
+          "Payload contains exactly the minimum required FHIR Observation fields (resourceType, status, code, subject)"
+        ],
+        "actions": [
+          "POST the minimum-field FHIR Observation payload to /Ingest using the registered device certificate",
+          "Query /Observation?identifier=obs-bva-001 to verify storage",
+          "Query /AuditEvent?entity=obs-bva-001 to verify audit emission"
+        ],
+        "expected": [
+          "POST /Ingest returns HTTP 201",
+          "Server accepts the minimal payload without rejecting for missing optional fields",
+          "GET /Observation?identifier=obs-bva-001 returns the stored resource",
+          "GET /AuditEvent?entity=obs-bva-001 returns at least one AuditEvent with outcome='0'"
+        ],
+        "trace": [
+          "R-HLT-097: registered device pushes Observations via FHIR ingest",
+          "R-HLT-097: observations stored",
+          "R-HLT-097: AuditEvent must be emitted for every operation",
+          "BVA lower boundary: exactly the minimum fields required by FHIR Observation profile"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_minimal_single_observation_boundary_payload_accepted(\n    registered_device_session,  # <fixture>: requests.Session with valid cert\n    fhir_base_url,              # <fixture>: str base URL\n    cleanup_observation,        # <fixture>: deletes obs by identifier on teardown\n):\n    identifier = \"obs-bva-001\"\n    cleanup_observation(identifier)\n\n    minimal_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\n            \"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8310-5\"}]\n        },\n        \"subject\": {\"reference\": \"Patient/pat-001\"},\n        \"identifier\": [{\"value\": identifier}]\n    }\n\n    resp = registered_device_session.post(\n        f\"{fhir_base_url}/Ingest\",\n        json=minimal_payload,\n        timeout=10,\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    assert resp.json().get(\"resourceType\") == \"Observation\"\n\n    search = requests.get(\n        f\"{fhir_base_url}/Observation\",\n        params={\"identifier\": identifier},\n        timeout=10,\n    )\n    assert search.status_code == 200\n    assert search.json().get(\"total\", 0) >= 1, \"Minimal Observation must be stored\"\n\n    audit = requests.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": identifier},\n        timeout=10,\n    )\n    assert audit.status_code == 200\n    events = audit.json()\n    assert events.get(\"total\", 0) >= 1, \"AuditEvent must be emitted for minimal payload\"\n    assert events[\"entry\"][0][\"resource\"][\"outcome\"] == \"0\"\n"
+      },
+      {
+        "name": "test_device_state_transition_registered_to_observation_stored_with_audit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running and reachable at FHIR_BASE_URL",
+          "Device 'dev-stc-001' starts in state UNREGISTERED",
+          "A device registration API is available at /Device"
+        ],
+        "actions": [
+          "Register device 'dev-stc-001' via POST /Device (transition: UNREGISTERED -> REGISTERED)",
+          "POST a FHIR Observation to /Ingest with 'dev-stc-001' credentials (transition: REGISTERED -> OBSERVATION_STORED)",
+          "Verify Observation is stored and AuditEvent emitted",
+          "Deregister device 'dev-stc-001' via DELETE /Device/dev-stc-001 (cleanup)"
+        ],
+        "expected": [
+          "POST /Device returns 201 confirming registration",
+          "POST /Ingest returns 201 confirming Observation stored",
+          "GET /Observation?identifier=obs-stc-001 returns the resource",
+          "GET /AuditEvent?entity=obs-stc-001 returns AuditEvent with outcome='0'",
+          "DELETE /Device/dev-stc-001 returns 200 or 204 confirming cleanup"
+        ],
+        "trace": [
+          "R-HLT-097: registered device pushes Observations via FHIR ingest",
+          "R-HLT-097: preconditions - device registered",
+          "R-HLT-097: triggers - device submits",
+          "R-HLT-097: AuditEvent must be emitted for every operation",
+          "STC: covers UNREGISTERED -> REGISTERED -> OBSERVATION_STORED state path"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_device_state_transition_registered_to_observation_stored_with_audit(\n    fhir_base_url,           # <fixture>: str base URL\n    admin_session,           # <fixture>: requests.Session with admin privileges\n    device_cert_for,         # <fixture>: fn(device_id) -> (cert, key) tuple\n):\n    device_id = \"dev-stc-001\"\n    identifier = \"obs-stc-001\"\n\n    reg_resp = admin_session.post(\n        f\"{fhir_base_url}/Device\",\n        json=<build_device_payload>(device_id),\n        timeout=10,\n    )\n    assert reg_resp.status_code == 201, f\"Registration failed: {reg_resp.text}\"\n\n    try:\n        cert, key = device_cert_for(device_id)\n        session = <make_mtls_session>(cert, key)\n        payload = <build_observation_payload>(identifier, value=36.6, unit=\"Cel\")\n\n        ingest_resp = session.post(\n            f\"{fhir_base_url}/Ingest\",\n            json=payload,\n            timeout=10,\n        )\n        assert ingest_resp.status_code == 201, f\"Ingest failed: {ingest_resp.text}\"\n\n        search = requests.get(\n            f\"{fhir_base_url}/Observation\",\n            params={\"identifier\": identifier}, timeout=10,\n        )\n        assert search.json().get(\"total\", 0) >= 1\n\n        audit = requests.get(\n            f\"{fhir_base_url}/AuditEvent\",\n            params={\"entity\": identifier}, timeout=10,\n        )\n        assert audit.json().get(\"total\", 0) >= 1\n        assert audit.json()[\"entry\"][0][\"resource\"][\"outcome\"] == \"0\"\n    finally:\n        admin_session.delete(f\"{fhir_base_url}/Device/{device_id}\", timeout=10)\n"
+      },
+      {
+        "name": "test_decision_table_valid_cert_registered_device_well_formed_payload",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite service is running and reachable at FHIR_BASE_URL",
+          "Device 'dev-001' is registered with a valid TLS certificate",
+          "Observation payload is well-formed and includes all mandatory FHIR fields",
+          "Device certificate is valid (not expired, correct CA chain)"
+        ],
+        "actions": [
+          "POST a complete FHIR Observation (all decision table conditions TRUE) to /Ingest",
+          "Assert HTTP 201 response",
+          "Assert Observation stored with normalization",
+          "Assert AuditEvent outcome success"
+        ],
+        "expected": [
+          "POST /Ingest returns HTTP 201 (DT row: cert=valid, registered=true, payload=valid -> accept)",
+          "Observation is persisted and retrievable",
+          "Normalization is applied to valueQuantity",
+          "AuditEvent emitted with outcome='0' and action='C' (create)"
+        ],
+        "trace": [
+          "R-HLT-097: registered device pushes Observations via FHIR ingest",
+          "R-HLT-097: observations stored; normalization applied",
+          "R-HLT-097: AuditEvent emitted for every operation",
+          "DT row: cert_valid=T, device_registered=T, payload_valid=T -> HTTP 201 + stored + audit success"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_decision_table_valid_cert_registered_device_well_formed_payload(\n    registered_device_session,  # <fixture>: requests.Session with valid cert\n    fhir_base_url,              # <fixture>: str base URL\n    cleanup_observation,        # <fixture>: deletes obs by identifier on teardown\n):\n    identifier = \"obs-dt-001\"\n    cleanup_observation(identifier)\n\n    payload = <build_full_observation_payload>(\n        identifier=identifier,\n        value=37.2,\n        unit=\"degF\",\n        device_ref=\"Device/dev-001\",\n        category=\"vital-signs\",\n    )\n\n    resp = registered_device_session.post(\n        f\"{fhir_base_url}/Ingest\",\n        json=payload,\n        timeout=10,\n    )\n    assert resp.status_code == 201, f\"DT all-true row must yield 201: {resp.text}\"\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Observation\"\n    assert body.get(\"id\"), \"Server id must be present\"\n\n    search = requests.get(\n        f\"{fhir_base_url}/Observation\",\n        params={\"identifier\": identifier}, timeout=10,\n    )\n    assert search.json().get(\"total\", 0) >= 1\n    stored = search.json()[\"entry\"][0][\"resource\"]\n    assert stored[\"valueQuantity\"][\"code\"] == \"Cel\", \"Normalization to SI unit required\"\n\n    audit = requests.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": identifier}, timeout=10,\n    )\n    events = audit.json()\n    assert events.get(\"total\", 0) >= 1\n    event = events[\"entry\"][0][\"resource\"]\n    assert event[\"outcome\"] == \"0\"\n    assert event[\"action\"] == \"C\", \"AuditEvent action must be Create\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-097",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 5026,
+    "latency_ms": 60656,
+    "wall_ms": 60656,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-097\",\n  \"reasoning\": \"R-HLT-097 mandates three orthogonal concerns: (1) registered devices can ingest FHIR Observations and have them stored with normalization, (2) unregistered/invalid-cert devices receive 401 and are rejected, and (3) an AuditEvent is emitted for every ingest operation regardless of outcome. Test selection uses EP to partition registered vs unregistered device space, NEG for the invalid-certificate rejection path, BVA for the minimal-valid single-Observation payload boundary, STC for the state transition from device-registered to observation-stored with audit emitted, and DT to cover the decision table row where cert is valid AND device is registered AND payload is well-formed. Each test is self-contained via fixtures that register/deregister devices and roll back state, making them idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_registered_device_ingest_stores_observation_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable at FHIR_BASE_URL\",\n        \"Device 'dev-001' is registered in the device registry with a valid TLS certificate\",\n        \"No prior Observation with identifier 'obs-ep-001' exists\"\n      ],\n      \"actions\": [\n        \"POST a well-formed FHIR Observation resource to /Ingest using the registered device certificate\",\n        \"Query /Observation?identifier=obs-ep-001 to verify storage\",\n        \"Query /AuditEvent?entity=obs-ep-001 to verify audit emission\"\n      ],\n      \"expected\": [\n        \"POST /Ingest returns HTTP 201\",\n        \"Response body contains a FHIR Observation with id set by the server\",\n        \"GET /Observation?identifier=obs-ep-001 returns at least one resource\",\n        \"The stored Observation has normalization applied (valueQuantity unit is canonical)\",\n        \"GET /AuditEvent?entity=obs-ep-001 returns at least one AuditEvent with outcome='0'\"\n      ],\n      \"trace\": [\n        \"R-HLT-097: registered device pushes Observations via FHIR ingest\",\n        \"R-HLT-097: observations stored; normalization applied\",\n        \"R-HLT-097: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_registered_device_ingest_stores_observation_and_emits_audit(\\n    registered_device_session,  # <fixture>: requests.Session with valid cert\\n    fhir_base_url,              # <fixture>: str base URL\\n    cleanup_observation,        # <fixture>: deletes obs by identifier on teardown\\n):\\n    identifier = \\\"obs-ep-001\\\"\\n    cleanup_observation(identifier)\\n\\n    payload = <build_observation_payload>(identifier, value=98.6, unit=\\\"degF\\\")\\n\\n    resp = registered_device_session.post(\\n        f\\\"{fhir_base_url}/Ingest\\\",\\n        json=payload,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Observation\\\"\\n    assert body.get(\\\"id\\\"), \\\"Server must assign an id\\\"\\n\\n    search = requests.get(\\n        f\\\"{fhir_base_url}/Observation\\\",\\n        params={\\\"identifier\\\": identifier},\\n        timeout=10,\\n    )\\n    assert search.status_code == 200\\n    bundle = search.json()\\n    assert bundle.get(\\\"total\\\", 0) >= 1, \\\"Observation must be stored\\\"\\n\\n    stored = bundle[\\\"entry\\\"][0][\\\"resource\\\"]\\n    unit = stored[\\\"valueQuantity\\\"][\\\"code\\\"]\\n    assert unit == \\\"Cel\\\", f\\\"Normalization expected Cel, got {unit}\\\"\\n\\n    audit = requests.get(\\n        f\\\"{fhir_base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": identifier},\\n        timeout=10,\\n    )\\n    assert audit.status_code == 200\\n    events = audit.json()\\n    assert events.get(\\\"total\\\", 0) >= 1, \\\"AuditEvent must be emitted\\\"\\n    assert events[\\\"entry\\\"][0][\\\"resource\\\"][\\\"outcome\\\"] == \\\"0\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unregistered_device_ingest_returns_401_and_emits_audit\",\n      \"kind\": \"n"
+  }
+}

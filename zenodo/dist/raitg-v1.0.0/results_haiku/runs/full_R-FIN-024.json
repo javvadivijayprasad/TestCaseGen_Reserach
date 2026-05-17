@@ -1,0 +1,217 @@
+{
+  "req": {
+    "id": "R-FIN-024",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "integration",
+    "title": "Rate limiting",
+    "statement": "The API shall enforce 60 requests per minute per user; overages shall return 429 with retry-after.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "any endpoint"
+    ],
+    "triggers": [
+      "burst requests"
+    ],
+    "expected_outcomes": [
+      "429 with retry-after"
+    ],
+    "error_pathways": [
+      "request tail rejected"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/*"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-024",
+    "reasoning": "Rate limiting is a critical security and fairness control in financial APIs. The requirement specifies a hard limit of 60 requests/minute per user with explicit 429 status and retry-after header on overage. Test suite applies EP (partition by request count ranges), BVA (test at 59, 60, 61 requests), NEG (rejection scenarios), and STC (state transitions from allowed to throttled). All tests are deterministic, self-contained, and idempotent through use of unique user tokens and isolated request sequences.",
+    "tests": [
+      {
+        "name": "test_rate_limit_under_threshold_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "API endpoint is reachable",
+          "User has valid authentication token",
+          "Rate limit counter is reset for user"
+        ],
+        "actions": [
+          "Send 30 requests within 60 seconds to any endpoint",
+          "Use same user token for all requests",
+          "Assert each response status"
+        ],
+        "expected": [
+          "All 30 requests return 2xx status code",
+          "No 429 response received",
+          "No retry-after header present"
+        ],
+        "trace": [
+          "R-FIN-024: verify requests below 60/min threshold are allowed",
+          "Equivalence partition: request_count in [1..59]"
+        ],
+        "executable": "import requests\nimport pytest\nimport time\n\n@pytest.mark.usefixtures('reset_rate_limit')\ndef test_rate_limit_under_threshold_succeeds(api_base_url, auth_token):\n    endpoint = f\"{api_base_url}/accounts\"\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    for i in range(30):\n        resp = requests.get(endpoint, headers=headers, timeout=5)\n        assert resp.status_code in [200, 201], (\n            f\"Request {i+1} failed with {resp.status_code}\"\n        )\n        assert \"retry-after\" not in resp.headers\n        time.sleep(0.1)\n    \n    assert True, \"All 30 requests succeeded\""
+      },
+      {
+        "name": "test_rate_limit_at_boundary_60_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "API endpoint is reachable",
+          "User has valid authentication token",
+          "Rate limit window is exactly 60 seconds",
+          "Rate limit counter is reset for user"
+        ],
+        "actions": [
+          "Send exactly 60 requests within 60 seconds",
+          "Use same user token for all requests",
+          "Measure response times and status codes"
+        ],
+        "expected": [
+          "All 60 requests return 2xx status code",
+          "No 429 response received",
+          "Last request arrives within 60-second window",
+          "No retry-after header present"
+        ],
+        "trace": [
+          "R-FIN-024: verify boundary case at exactly 60 requests/minute",
+          "Boundary value analysis: request_count = 60 (upper limit)"
+        ],
+        "executable": "import requests\nimport pytest\nimport time\n\n@pytest.mark.usefixtures('reset_rate_limit')\ndef test_rate_limit_at_boundary_60_succeeds(api_base_url, auth_token):\n    endpoint = f\"{api_base_url}/accounts\"\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    start_time = time.time()\n    \n    for i in range(60):\n        resp = requests.get(endpoint, headers=headers, timeout=5)\n        assert resp.status_code in [200, 201]\n        assert \"retry-after\" not in resp.headers\n        time.sleep(0.95)  # ~57 sec total for 60 requests\n    \n    elapsed = time.time() - start_time\n    assert elapsed < 65, f\"All 60 requests completed in {elapsed}s\""
+      },
+      {
+        "name": "test_rate_limit_exceeded_returns_429_with_retry_after",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "API endpoint is reachable",
+          "User has valid authentication token",
+          "User has already consumed 60 requests in current minute",
+          "Rate limit counter is reset for user"
+        ],
+        "actions": [
+          "Send 61 requests within 60 seconds",
+          "Use same user token for all requests",
+          "Inspect response status and headers on 61st request"
+        ],
+        "expected": [
+          "First 60 requests return 2xx status code",
+          "61st request returns 429 Too Many Requests",
+          "61st response includes retry-after header",
+          "retry-after value is numeric and > 0"
+        ],
+        "trace": [
+          "R-FIN-024: verify overage rejection with 429 and retry-after",
+          "Negative path: request_count = 61 (exceeds 60/min limit)"
+        ],
+        "executable": "import requests\nimport pytest\nimport time\n\n@pytest.mark.usefixtures('reset_rate_limit')\ndef test_rate_limit_exceeded_returns_429_with_retry_after(api_base_url, auth_token):\n    endpoint = f\"{api_base_url}/accounts\"\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    for i in range(60):\n        resp = requests.get(endpoint, headers=headers, timeout=5)\n        assert resp.status_code in [200, 201]\n        time.sleep(0.9)\n    \n    resp_61 = requests.get(endpoint, headers=headers, timeout=5)\n    assert resp_61.status_code == 429\n    assert \"retry-after\" in resp_61.headers\n    retry_after = int(resp_61.headers[\"retry-after\"])\n    assert retry_after > 0, f\"retry-after={retry_after} must be positive\""
+      },
+      {
+        "name": "test_rate_limit_burst_rejection_immediate",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "API endpoint is reachable",
+          "User has valid authentication token",
+          "Rate limit counter is reset for user",
+          "No throttling delay between requests"
+        ],
+        "actions": [
+          "Send 80 requests as fast as possible (minimal delay)",
+          "Use same user token for all requests",
+          "Record status code of each request"
+        ],
+        "expected": [
+          "Requests 1-60 return 2xx status code",
+          "Requests 61-80 return 429 status code",
+          "All 429 responses include retry-after header",
+          "No 5xx errors occur"
+        ],
+        "trace": [
+          "R-FIN-024: verify burst attack is rejected at threshold",
+          "Negative path: rapid sequential requests exceed limit"
+        ],
+        "executable": "import requests\nimport pytest\n\n@pytest.mark.usefixtures('reset_rate_limit')\ndef test_rate_limit_burst_rejection_immediate(api_base_url, auth_token):\n    endpoint = f\"{api_base_url}/accounts\"\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    status_codes = []\n    \n    for i in range(80):\n        resp = requests.get(endpoint, headers=headers, timeout=5)\n        status_codes.append(resp.status_code)\n        if resp.status_code == 429:\n            assert \"retry-after\" in resp.headers\n    \n    success_count = sum(1 for s in status_codes if s in [200, 201])\n    throttled_count = sum(1 for s in status_codes if s == 429)\n    \n    assert success_count == 60\n    assert throttled_count == 20\n    assert not any(s >= 500 for s in status_codes)"
+      },
+      {
+        "name": "test_rate_limit_reset_after_window_expires",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "API endpoint is reachable",
+          "User has valid authentication token",
+          "User has exhausted rate limit in current window"
+        ],
+        "actions": [
+          "Send 60 requests to exhaust limit",
+          "Wait 61 seconds for window to reset",
+          "Send 1 additional request after window expiry",
+          "Verify response status"
+        ],
+        "expected": [
+          "Requests 1-60 return 2xx status code",
+          "Request at 61+ seconds returns 2xx status code",
+          "No 429 response after window reset",
+          "Counter transitions from throttled to allowed state"
+        ],
+        "trace": [
+          "R-FIN-024: verify rate limit window reset allows new requests",
+          "State transition: throttled -> allowed after 60-second window"
+        ],
+        "executable": "import requests\nimport pytest\nimport time\n\n@pytest.mark.usefixtures('reset_rate_limit')\ndef test_rate_limit_reset_after_window_expires(api_base_url, auth_token):\n    endpoint = f\"{api_base_url}/accounts\"\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    for i in range(60):\n        resp = requests.get(endpoint, headers=headers, timeout=5)\n        assert resp.status_code in [200, 201]\n        time.sleep(0.9)\n    \n    time.sleep(2)\n    \n    resp_after = requests.get(endpoint, headers=headers, timeout=5)\n    assert resp_after.status_code in [200, 201]\n    assert \"retry-after\" not in resp_after.headers"
+      },
+      {
+        "name": "test_rate_limit_per_user_isolation",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "API endpoint is reachable",
+          "Two distinct users with separate auth tokens exist",
+          "Both users have fresh rate limit counters"
+        ],
+        "actions": [
+          "User A sends 50 requests",
+          "User B sends 50 requests concurrently",
+          "Both users send additional requests",
+          "Verify each user's limit is independent"
+        ],
+        "expected": [
+          "User A: 50 requests succeed with 2xx",
+          "User B: 50 requests succeed with 2xx",
+          "User A: request 51 succeeds (within their limit)",
+          "User B: request 51 succeeds (within their limit)",
+          "Rate limits do not cross-user boundaries"
+        ],
+        "trace": [
+          "R-FIN-024: verify rate limiting is per-user, not global",
+          "Equivalence partition: requests partitioned by user identity"
+        ],
+        "executable": "import requests\nimport pytest\nimport concurrent.futures\n\ndef send_requests(endpoint, token, count):\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    results = []\n    for _ in range(count):\n        resp = requests.get(endpoint, headers=headers, timeout=5)\n        results.append(resp.status_code)\n    return results\n\n@pytest.mark.usefixtures('reset_rate_limit')\ndef test_rate_limit_per_user_isolation(api_base_url, auth_token_a, auth_token_b):\n    endpoint = f\"{api_base_url}/accounts\"\n    \n    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:\n        fut_a = ex.submit(send_requests, endpoint, auth_token_a, 51)\n        fut_b = ex.submit(send_requests, endpoint, auth_token_b, 51)\n        results_a = fut_a.result(timeout=60)\n        results_b = fut_b.result(timeout=60)\n    \n    assert all(s in [200, 201] for s in results_a)\n    assert all(s in [200, 201] for s in results_b)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-024",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1011,
+    "output_tokens": 3193,
+    "latency_ms": 18351,
+    "wall_ms": 18351,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-024\",\n  \"reasoning\": \"Rate limiting is a critical security and fairness control in financial APIs. The requirement specifies a hard limit of 60 requests/minute per user with explicit 429 status and retry-after header on overage. Test suite applies EP (partition by request count ranges), BVA (test at 59, 60, 61 requests), NEG (rejection scenarios), and STC (state transitions from allowed to throttled). All tests are deterministic, self-contained, and idempotent through use of unique user tokens and isolated request sequences.\",\n  \"tests\": [\n    {\n      \"name\": \"test_rate_limit_under_threshold_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"API endpoint is reachable\",\n        \"User has valid authentication token\",\n        \"Rate limit counter is reset for user\"\n      ],\n      \"actions\": [\n        \"Send 30 requests within 60 seconds to any endpoint\",\n        \"Use same user token for all requests\",\n        \"Assert each response status\"\n      ],\n      \"expected\": [\n        \"All 30 requests return 2xx status code\",\n        \"No 429 response received\",\n        \"No retry-after header present\"\n      ],\n      \"trace\": [\n        \"R-FIN-024: verify requests below 60/min threshold are allowed\",\n        \"Equivalence partition: request_count in [1..59]\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\nimport time\\n\\n@pytest.mark.usefixtures('reset_rate_limit')\\ndef test_rate_limit_under_threshold_succeeds(api_base_url, auth_token):\\n    endpoint = f\\\"{api_base_url}/accounts\\\"\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"}\\n    \\n    for i in range(30):\\n        resp = requests.get(endpoint, headers=headers, timeout=5)\\n        assert resp.status_code in [200, 201], (\\n            f\\\"Request {i+1} failed with {resp.status_code}\\\"\\n        )\\n        assert \\\"retry-after\\\" not in resp.headers\\n        time.sleep(0.1)\\n    \\n    assert True, \\\"All 30 requests succeeded\\\"\"\n    },\n    {\n      \"name\": \"test_rate_limit_at_boundary_60_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"API endpoint is reachable\",\n        \"User has valid authentication token\",\n        \"Rate limit window is exactly 60 seconds\",\n        \"Rate limit counter is reset for user\"\n      ],\n      \"actions\": [\n        \"Send exactly 60 requests within 60 seconds\",\n        \"Use same user token for all requests\",\n        \"Measure response times and status codes\"\n      ],\n      \"expected\": [\n        \"All 60 requests return 2xx status code\",\n        \"No 429 response received\",\n        \"Last request arrives within 60-second window\",\n        \"No retry-after header present\"\n      ],\n      \"trace\": [\n        \"R-FIN-024: verify boundary case at exactly 60 requests/minute\",\n        \"Boundary value analysis: request_count = 60 (upper limit)\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\nimport time\\n\\n@pytest.mark.usefixtures('reset_rate_limit')\\ndef test_rate_limit_at_boundary_60_succeeds(api_base_url, auth_token):\\n    endpoint = f\\\"{api_base_url}/accounts\\\"\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"}\\n    start_time = time.time()\\n    \\n    for i in range(60):\\n        resp = requests.get(endpoint, headers=headers, timeout=5)\\n        assert resp.status_code in [200, 201]\\n        assert \\\"retry-after\\\" not in resp.headers\\n        time.sleep(0.95)  # ~57 sec total for 60 requests\\n    \\n    elapsed = time.time() - start_time\\n    assert elapsed < 65, f\\\"All 60 requests completed in {elapsed}s\\\"\"\n    },\n    {\n      \"name\": \"test_rate_limit_exceeded_returns_429_with_retry_after\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"API endpoint is reachable\",\n        \"User has valid authentication token\",\n        \"User has already consumed 60 requests in current minute\",\n        \"Rate limit counter is reset for user\"\n      ],\n      \"actions\": [\n        \"Send 61 requests"
+  }
+}

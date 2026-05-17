@@ -1,0 +1,190 @@
+{
+  "req": {
+    "id": "R-HLT-044",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation (boundary)",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-044",
+    "reasoning": "R-HLT-044 requires that vital-signs Observations are validated against clinically plausible ranges, with out-of-range values flagged for review and a review task created. Five tests are designed: (1) EP positive \u2013 a normal in-range heart-rate value is accepted and stored without a flag; (2) NEG negative \u2013 a clearly impossible value (negative heart rate) is rejected or flagged with a review task; (3) BVA boundary \u2013 heart rate at the exact minimum accepted boundary (30 bpm) is stored without flagging; (4) BVA boundary \u2013 heart rate one unit below the minimum boundary (29 bpm) triggers a review flag; (5) DT \u2013 a combination of an out-of-range value AND a missing effectiveDateTime tests the decision table intersection of two validation rules. Each test calls a shared <clinician_auth_headers> fixture and a <build_observation> helper to keep payloads concise and deterministic.",
+    "tests": [
+      {
+        "name": "test_vital_signs_inrange_heart_rate_stored_without_flag",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician session available via <clinician_auth_headers>",
+          "FHIR-lite /Observation endpoint is reachable",
+          "No prior Observation with the same identifier exists"
+        ],
+        "actions": [
+          "Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=72 (bpm), valid effectiveDateTime",
+          "POST payload to /Observation with clinician auth headers",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'id' field",
+          "Response body does NOT contain a 'flag' or 'reviewTask' element",
+          "Stored Observation status is 'final'"
+        ],
+        "trace": [
+          "R-HLT-044 \u2013 positive storage path",
+          "EP: valid partition for heart-rate (30\u2013250 bpm)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_inrange_heart_rate_stored_without_flag(\n    clinician_auth_headers,  # <fixture>\n    fhir_base_url,           # <fixture>\n    build_observation,       # <helper_fn>\n    unique_identifier,       # <helper_fn>\n):\n    payload = build_observation(\n        identifier=unique_identifier(),\n        category=\"vital-signs\",\n        code=\"8867-4\",\n        value=72,\n        unit=\"/min\",\n        effective=\"2024-01-15T10:00:00Z\",\n        status=\"final\",\n    )\n    resp = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    assert \"reviewTask\" not in body\n    assert body.get(\"status\") == \"final\"\n"
+      },
+      {
+        "name": "test_vital_signs_impossible_heart_rate_triggers_review_task",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician session available via <clinician_auth_headers>",
+          "FHIR-lite /Observation endpoint is reachable",
+          "No prior Observation with the same identifier exists"
+        ],
+        "actions": [
+          "Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=-5 (impossible negative bpm), valid effectiveDateTime",
+          "POST payload to /Observation with clinician auth headers",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created OR 422 Unprocessable Entity (implementation-dependent)",
+          "If 201: response body contains a 'reviewTask' or 'flag' element indicating out-of-range",
+          "If 422: response body contains an OperationOutcome with severity='error' referencing range violation",
+          "No unhandled 500 error"
+        ],
+        "trace": [
+          "R-HLT-044 \u2013 error pathway: review task created",
+          "NEG: value outside any plausible clinical range"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_impossible_heart_rate_triggers_review_task(\n    clinician_auth_headers,\n    fhir_base_url,\n    build_observation,\n    unique_identifier,\n):\n    payload = build_observation(\n        identifier=unique_identifier(),\n        category=\"vital-signs\",\n        code=\"8867-4\",\n        value=-5,\n        unit=\"/min\",\n        effective=\"2024-01-15T10:00:00Z\",\n        status=\"final\",\n    )\n    resp = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code in (201, 422), f\"Unexpected status {resp.status_code}\"\n    body = resp.json()\n    if resp.status_code == 201:\n        assert \"reviewTask\" in body or body.get(\"flag\") is not None, (\n            \"Out-of-range value must produce a reviewTask or flag\"\n        )\n    else:\n        issues = body.get(\"issue\", [])\n        severities = [i.get(\"severity\") for i in issues]\n        assert \"error\" in severities\n"
+      },
+      {
+        "name": "test_vital_signs_heart_rate_at_minimum_boundary_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician session available via <clinician_auth_headers>",
+          "FHIR-lite /Observation endpoint is reachable",
+          "Minimum accepted heart rate boundary is 30 bpm per clinical rules",
+          "No prior Observation with the same identifier exists"
+        ],
+        "actions": [
+          "Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=30 (exact lower boundary), valid effectiveDateTime",
+          "POST payload to /Observation with clinician auth headers",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'id' field",
+          "No 'reviewTask' or 'flag' element in response body",
+          "Stored value is exactly 30"
+        ],
+        "trace": [
+          "R-HLT-044 \u2013 boundary case: lower inclusive boundary",
+          "BVA: value == lower_bound (30 bpm)"
+        ],
+        "executable": "import pytest\nimport requests\n\nLOWER_BOUNDARY_HR = 30\n\ndef test_vital_signs_heart_rate_at_minimum_boundary_accepted(\n    clinician_auth_headers,\n    fhir_base_url,\n    build_observation,\n    unique_identifier,\n):\n    payload = build_observation(\n        identifier=unique_identifier(),\n        category=\"vital-signs\",\n        code=\"8867-4\",\n        value=LOWER_BOUNDARY_HR,\n        unit=\"/min\",\n        effective=\"2024-01-15T10:00:00Z\",\n        status=\"final\",\n    )\n    resp = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    assert \"reviewTask\" not in body\n    stored_value = body[\"valueQuantity\"][\"value\"]\n    assert stored_value == LOWER_BOUNDARY_HR\n"
+      },
+      {
+        "name": "test_vital_signs_heart_rate_one_below_minimum_boundary_flagged",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician session available via <clinician_auth_headers>",
+          "FHIR-lite /Observation endpoint is reachable",
+          "Minimum accepted heart rate boundary is 30 bpm per clinical rules",
+          "No prior Observation with the same identifier exists"
+        ],
+        "actions": [
+          "Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=29 (one unit below lower boundary), valid effectiveDateTime",
+          "POST payload to /Observation with clinician auth headers",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created (stored but flagged) OR 422 (rejected)",
+          "If 201: 'reviewTask' or 'flag' element present in response",
+          "If 422: OperationOutcome references out-of-range condition",
+          "No unhandled 500 error"
+        ],
+        "trace": [
+          "R-HLT-044 \u2013 boundary case: lower_bound - 1",
+          "BVA: value == lower_bound - 1 (29 bpm)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBELOW_LOWER_BOUNDARY_HR = 29\n\ndef test_vital_signs_heart_rate_one_below_minimum_boundary_flagged(\n    clinician_auth_headers,\n    fhir_base_url,\n    build_observation,\n    unique_identifier,\n):\n    payload = build_observation(\n        identifier=unique_identifier(),\n        category=\"vital-signs\",\n        code=\"8867-4\",\n        value=BELOW_LOWER_BOUNDARY_HR,\n        unit=\"/min\",\n        effective=\"2024-01-15T10:00:00Z\",\n        status=\"final\",\n    )\n    resp = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code in (201, 422), f\"Unexpected status {resp.status_code}\"\n    body = resp.json()\n    if resp.status_code == 201:\n        assert \"reviewTask\" in body or body.get(\"flag\") is not None\n    else:\n        assert any(i.get(\"severity\") == \"error\" for i in body.get(\"issue\", []))\n"
+      },
+      {
+        "name": "test_vital_signs_out_of_range_value_with_missing_timestamp_decision_table",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician session available via <clinician_auth_headers>",
+          "FHIR-lite /Observation endpoint is reachable",
+          "effectiveDateTime is a mandatory element per FHIR vital-signs profile",
+          "No prior Observation with the same identifier exists"
+        ],
+        "actions": [
+          "Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=999 (out-of-range), effectiveDateTime OMITTED",
+          "POST payload to /Observation with clinician auth headers",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response OperationOutcome contains at least two issues: one for missing effectiveDateTime and one for out-of-range value",
+          "OR a single composite issue citing both violations",
+          "No 201 response accepted for this combination"
+        ],
+        "trace": [
+          "R-HLT-044 \u2013 error pathway: multiple simultaneous validation failures",
+          "DT: column (out-of-range=TRUE, missing-timestamp=TRUE) => reject with compound OperationOutcome"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_out_of_range_value_with_missing_timestamp_decision_table(\n    clinician_auth_headers,\n    fhir_base_url,\n    build_observation,\n    unique_identifier,\n):\n    payload = build_observation(\n        identifier=unique_identifier(),\n        category=\"vital-signs\",\n        code=\"8867-4\",\n        value=999,\n        unit=\"/min\",\n        effective=None,  # omit timestamp\n        status=\"final\",\n    )\n    resp = requests.post(\n        f\"{fhir_base_url}/Observation\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 422, (\n        f\"Expected 422 for compound violation, got {resp.status_code}\"\n    )\n    body = resp.json()\n    issues = body.get(\"issue\", [])\n    assert len(issues) >= 1, \"OperationOutcome must contain at least one issue\"\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues)\n    has_range_error = any(\"range\" in i.get(\"diagnostics\", \"\").lower() for i in issues)\n    has_ts_error = any(\n        \"effective\" in i.get(\"diagnostics\", \"\").lower() or\n        \"timestamp\" in i.get(\"diagnostics\", \"\").lower()\n        for i in issues\n    )\n    assert has_range_error or has_ts_error, (\n        f\"Expected range or timestamp error in issues; got: {diagnostics}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-044",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 3639,
+    "latency_ms": 37759,
+    "wall_ms": 37759,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-044\",\n  \"reasoning\": \"R-HLT-044 requires that vital-signs Observations are validated against clinically plausible ranges, with out-of-range values flagged for review and a review task created. Five tests are designed: (1) EP positive \u2013 a normal in-range heart-rate value is accepted and stored without a flag; (2) NEG negative \u2013 a clearly impossible value (negative heart rate) is rejected or flagged with a review task; (3) BVA boundary \u2013 heart rate at the exact minimum accepted boundary (30 bpm) is stored without flagging; (4) BVA boundary \u2013 heart rate one unit below the minimum boundary (29 bpm) triggers a review flag; (5) DT \u2013 a combination of an out-of-range value AND a missing effectiveDateTime tests the decision table intersection of two validation rules. Each test calls a shared <clinician_auth_headers> fixture and a <build_observation> helper to keep payloads concise and deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vital_signs_inrange_heart_rate_stored_without_flag\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician session available via <clinician_auth_headers>\",\n        \"FHIR-lite /Observation endpoint is reachable\",\n        \"No prior Observation with the same identifier exists\"\n      ],\n      \"actions\": [\n        \"Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=72 (bpm), valid effectiveDateTime\",\n        \"POST payload to /Observation with clinician auth headers\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains 'id' field\",\n        \"Response body does NOT contain a 'flag' or 'reviewTask' element\",\n        \"Stored Observation status is 'final'\"\n      ],\n      \"trace\": [\n        \"R-HLT-044 \u2013 positive storage path\",\n        \"EP: valid partition for heart-rate (30\u2013250 bpm)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vital_signs_inrange_heart_rate_stored_without_flag(\\n    clinician_auth_headers,  # <fixture>\\n    fhir_base_url,           # <fixture>\\n    build_observation,       # <helper_fn>\\n    unique_identifier,       # <helper_fn>\\n):\\n    payload = build_observation(\\n        identifier=unique_identifier(),\\n        category=\\\"vital-signs\\\",\\n        code=\\\"8867-4\\\",\\n        value=72,\\n        unit=\\\"/min\\\",\\n        effective=\\\"2024-01-15T10:00:00Z\\\",\\n        status=\\\"final\\\",\\n    )\\n    resp = requests.post(\\n        f\\\"{fhir_base_url}/Observation\\\",\\n        json=payload,\\n        headers=clinician_auth_headers,\\n    )\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"id\\\" in body\\n    assert \\\"reviewTask\\\" not in body\\n    assert body.get(\\\"status\\\") == \\\"final\\\"\\n\"\n    },\n    {\n      \"name\": \"test_vital_signs_impossible_heart_rate_triggers_review_task\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician session available via <clinician_auth_headers>\",\n        \"FHIR-lite /Observation endpoint is reachable\",\n        \"No prior Observation with the same identifier exists\"\n      ],\n      \"actions\": [\n        \"Build an Observation payload with category=vital-signs, code=heart-rate, valueQuantity.value=-5 (impossible negative bpm), valid effectiveDateTime\",\n        \"POST payload to /Observation with clinician auth headers\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created OR 422 Unprocessable Entity (implementation-dependent)\",\n        \"If 201: response body contains a 'reviewTask' or 'flag' element indicating out-of-range\",\n        \"If 422: response body contains an OperationOutcome with severity='error' referencing range violation\",\n        \"No unhandled 500 error\"\n      ],\n      \"trace\": [\n        \"R-HLT-044 \u2013 error pathway: review task created\",\n        \"NEG: value outside any plausible clinical range\"\n      ],\n "
+  }
+}

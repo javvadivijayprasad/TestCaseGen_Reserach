@@ -1,0 +1,215 @@
+{
+  "req": {
+    "id": "R-FIN-079",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "External ACH transfer (idempotency variant)",
+    "statement": "A customer shall transfer funds to an external ACH-linked account up to $10,000 per transfer; transfers above this shall require step-up verification. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "ach_link verified"
+    ],
+    "triggers": [
+      "customer submits transfer"
+    ],
+    "expected_outcomes": [
+      "ACH batch queued",
+      "confirmation sent"
+    ],
+    "error_pathways": [
+      "422 when amount > 10000 without step-up",
+      "409 on insufficient funds"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/ach"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-079",
+    "reasoning": "The requirement defines five distinct test-worthy behaviours: (1) a valid ACH transfer within the $10,000 limit queues successfully (EP positive partition); (2) a transfer exceeding $10,000 without step-up is rejected with 422 (NEG / DT); (3) the exact $10,000 boundary is accepted (BVA upper-on-boundary); (4) $10,001 is rejected \u2013 the first value above the boundary (BVA off-boundary); (5) a duplicate submission with the same Idempotency-Key returns the original response without creating a second transfer (STC idempotency state). Insufficient-funds (409) adds a sixth negative DT cell. All tests are self-contained via fixtures that create and teardown isolated test accounts, and each uses a unique UUID idempotency key so repeated pytest runs stay deterministic.",
+    "tests": [
+      {
+        "name": "test_ach_transfer_valid_amount_queued",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $500)",
+          "ACH link is verified for the destination account",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key UUID",
+          "POST /transfers/ach with amount=500.00, valid ach_link_id, and Idempotency-Key header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains transfer_id",
+          "Response body status field equals 'queued'",
+          "Confirmation event recorded (response contains confirmation_reference)"
+        ],
+        "trace": [
+          "R-FIN-079: transfers up to $10,000 shall be accepted and ACH batch queued",
+          "R-FIN-079: confirmation sent on successful submission"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_ach_transfer_valid_amount_queued(api_client, verified_ach_customer):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"ach_link_id\": verified_ach_customer[\"ach_link_id\"],\n        \"amount\": \"500.00\",\n        \"currency\": \"USD\",\n        \"memo\": \"EP positive test\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {verified_ach_customer['token']}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"transfer_id\" in body, \"Missing transfer_id in response\"\n    assert body.get(\"status\") == \"queued\", f\"Expected status=queued, got {body.get('status')}\"\n    assert \"confirmation_reference\" in body, \"Missing confirmation_reference\"\n"
+      },
+      {
+        "name": "test_ach_transfer_above_limit_without_stepup_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $15,000)",
+          "ACH link is verified",
+          "No step-up verification token provided",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key UUID",
+          "POST /transfers/ach with amount=10001.00 and NO step-up header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response error code indicates step-up required",
+          "No transfer_id created in the system"
+        ],
+        "trace": [
+          "R-FIN-079: transfers above $10,000 require step-up verification",
+          "R-FIN-079: error pathway 422 when amount > 10000 without step-up"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_ach_transfer_above_limit_without_stepup_rejected(api_client, verified_ach_customer):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"ach_link_id\": verified_ach_customer[\"ach_link_id\"],\n        \"amount\": \"10001.00\",\n        \"currency\": \"USD\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {verified_ach_customer['token']}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_code = body.get(\"error\", {}).get(\"code\", \"\")\n    assert \"step_up\" in error_code.lower() or \"limit\" in error_code.lower(), \\\n        f\"Unexpected error code: {error_code}\"\n    assert \"transfer_id\" not in body, \"transfer_id must not be present on rejection\"\n"
+      },
+      {
+        "name": "test_ach_transfer_exact_limit_boundary_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $10,000)",
+          "ACH link is verified",
+          "No step-up token required (amount is exactly at the limit)",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key UUID",
+          "POST /transfers/ach with amount=10000.00 (exact boundary)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains transfer_id",
+          "Response body status field equals 'queued'"
+        ],
+        "trace": [
+          "R-FIN-079: transfers UP TO $10,000 shall be accepted",
+          "BVA: on-boundary value 10000.00 must be in the valid partition"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_ach_transfer_exact_limit_boundary_accepted(api_client, verified_ach_customer):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"ach_link_id\": verified_ach_customer[\"ach_link_id\"],\n        \"amount\": \"10000.00\",\n        \"currency\": \"USD\",\n        \"memo\": \"BVA on-boundary test\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {verified_ach_customer['token']}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp.status_code == 202, f\"Expected 202 at boundary, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"transfer_id\" in body\n    assert body.get(\"status\") == \"queued\"\n"
+      },
+      {
+        "name": "test_ach_transfer_one_cent_above_limit_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $10,001)",
+          "ACH link is verified",
+          "No step-up token provided",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key UUID",
+          "POST /transfers/ach with amount=10000.01 (one cent above boundary)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response error references the transfer limit or step-up requirement"
+        ],
+        "trace": [
+          "R-FIN-079: amount > 10000 without step-up must return 422",
+          "BVA: off-boundary value 10000.01 must be in the invalid partition"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_ach_transfer_one_cent_above_limit_rejected(api_client, verified_ach_customer):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"ach_link_id\": verified_ach_customer[\"ach_link_id\"],\n        \"amount\": \"10000.01\",\n        \"currency\": \"USD\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {verified_ach_customer['token']}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp.status_code == 422, f\"Expected 422 off-boundary, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"error\" in body, \"Response must contain error details\"\n"
+      },
+      {
+        "name": "test_ach_transfer_idempotent_duplicate_returns_original",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with sufficient balance (>= $200)",
+          "ACH link is verified",
+          "Authentication token is valid",
+          "A specific Idempotency-Key has not been used before this test run"
+        ],
+        "actions": [
+          "Generate a single Idempotency-Key UUID shared across both calls",
+          "POST /transfers/ach (first submission) with amount=200.00 and the key",
+          "Capture first response transfer_id and status",
+          "POST /transfers/ach (duplicate submission) with identical payload and same key",
+          "Capture second response and compare to first"
+        ],
+        "expected": [
+          "First call returns HTTP 202 with transfer_id and status=queued",
+          "Second call returns HTTP 200 or 202 (idempotent replay)",
+          "Second call transfer_id equals first call transfer_id",
+          "Second call status equals first call status",
+          "No duplicate transfer created in the system"
+        ],
+        "trace": [
+          "R-FIN-079: duplicate submission with same Idempotency-Key must return original result",
+          "STC: state transitions from initial -> queued must not repeat on replay"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_ach_transfer_idempotent_duplicate_returns_original(api_client, verified_ach_customer):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"ach_link_id\": verified_ach_customer[\"ach_link_id\"],\n        \"amount\": \"200.00\",\n        \"currency\": \"USD\",\n        \"memo\": \"STC idempotency test\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {verified_ach_customer['token']}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp1 = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp1.status_code == 202, f\"First call failed: {resp1.status_code} {resp1.text}\"\n    body1 = resp1.json()\n    assert \"transfer_id\" in body1\n\n    resp2 = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp2.status_code in (200, 202), f\"Duplicate call unexpected status: {resp2.status_code}\"\n    body2 = resp2.json()\n    assert body2.get(\"transfer_id\") == body1[\"transfer_id\"], \\\n        \"Idempotency violation: duplicate returned different transfer_id\"\n    assert body2.get(\"status\") == body1.get(\"status\"), \\\n        \"Idempotency violation: status differs on replay\"\n"
+      },
+      {
+        "name": "test_ach_transfer_insufficient_funds_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with balance LESS THAN the transfer amount (e.g. balance=$10.00)",
+          "ACH link is verified",
+          "Authentication token is valid"
+        ],
+        "actions": [
+          "Generate a unique Idempotency-Key UUID",
+          "POST /transfers/ach with amount=500.00 (exceeds available balance)",
+          "Capture HTTP response status and error body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response error code indicates insufficient_funds",
+          "No transfer_id returned"
+        ],
+        "trace": [
+          "R-FIN-079: error pathway 409 on insufficient funds"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_ach_transfer_insufficient_funds_returns_409(api_client, low_balance_ach_customer):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"ach_link_id\": low_balance_ach_customer[\"ach_link_id\"],\n        \"amount\": \"500.00\",\n        \"currency\": \"USD\"\n    }\n    headers = {\n        \"Authorization\": f\"Bearer {low_balance_ach_customer['token']}\",\n        \"Idempotency-Key\": idempotency_key\n    }\n    resp = api_client.post(\"/transfers/ach\", json=payload, headers=headers)\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_code = body.get(\"error\", {}).get(\"code\", \"\")\n    assert \"insufficient\" in error_code.lower() or \"funds\" in error_code.lower(), \\\n        f\"Unexpected error code: {error_code}\"\n    assert \"transfer_id\" not in body\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-079",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1040,
+    "output_tokens": 3853,
+    "latency_ms": 37325,
+    "wall_ms": 37325,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-079\",\n  \"reasoning\": \"The requirement defines five distinct test-worthy behaviours: (1) a valid ACH transfer within the $10,000 limit queues successfully (EP positive partition); (2) a transfer exceeding $10,000 without step-up is rejected with 422 (NEG / DT); (3) the exact $10,000 boundary is accepted (BVA upper-on-boundary); (4) $10,001 is rejected \u2013 the first value above the boundary (BVA off-boundary); (5) a duplicate submission with the same Idempotency-Key returns the original response without creating a second transfer (STC idempotency state). Insufficient-funds (409) adds a sixth negative DT cell. All tests are self-contained via fixtures that create and teardown isolated test accounts, and each uses a unique UUID idempotency key so repeated pytest runs stay deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_ach_transfer_valid_amount_queued\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance (>= $500)\",\n        \"ACH link is verified for the destination account\",\n        \"Authentication token is valid\"\n      ],\n      \"actions\": [\n        \"Generate a unique Idempotency-Key UUID\",\n        \"POST /transfers/ach with amount=500.00, valid ach_link_id, and Idempotency-Key header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains transfer_id\",\n        \"Response body status field equals 'queued'\",\n        \"Confirmation event recorded (response contains confirmation_reference)\"\n      ],\n      \"trace\": [\n        \"R-FIN-079: transfers up to $10,000 shall be accepted and ACH batch queued\",\n        \"R-FIN-079: confirmation sent on successful submission\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_ach_transfer_valid_amount_queued(api_client, verified_ach_customer):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"ach_link_id\\\": verified_ach_customer[\\\"ach_link_id\\\"],\\n        \\\"amount\\\": \\\"500.00\\\",\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"memo\\\": \\\"EP positive test\\\"\\n    }\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {verified_ach_customer['token']}\\\",\\n        \\\"Idempotency-Key\\\": idempotency_key\\n    }\\n    resp = api_client.post(\\\"/transfers/ach\\\", json=payload, headers=headers)\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"transfer_id\\\" in body, \\\"Missing transfer_id in response\\\"\\n    assert body.get(\\\"status\\\") == \\\"queued\\\", f\\\"Expected status=queued, got {body.get('status')}\\\"\\n    assert \\\"confirmation_reference\\\" in body, \\\"Missing confirmation_reference\\\"\\n\"\n    },\n    {\n      \"name\": \"test_ach_transfer_above_limit_without_stepup_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance (>= $15,000)\",\n        \"ACH link is verified\",\n        \"No step-up verification token provided\",\n        \"Authentication token is valid\"\n      ],\n      \"actions\": [\n        \"Generate a unique Idempotency-Key UUID\",\n        \"POST /transfers/ach with amount=10001.00 and NO step-up header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response error code indicates step-up required\",\n        \"No transfer_id created in the system\"\n      ],\n      \"trace\": [\n        \"R-FIN-079: transfers above $10,000 require step-up verification\",\n        \"R-FIN-079: error pathway 422 when amount > 10000 without step-up\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_ach_transfer_above_limit_without_stepup_rejected(api_client, verified_ach_customer):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"ach_link_id\\\": verified_ach_customer[\\\"ach_link_id\\\"],\\n        \\\"amount\\\": \\\"10001.00\\\",\\n        \\\"currency\\\""
+  }
+}

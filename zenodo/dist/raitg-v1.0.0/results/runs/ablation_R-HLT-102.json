@@ -1,0 +1,164 @@
+{
+  "req": {
+    "id": "R-HLT-102",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient (consent)",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied. Consent state at the time of the operation must be tested, including post-revocation timing windows.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-102",
+    "reasoning": "R-HLT-102 mandates three distinct test axes: (1) a clinician assigned to a patient can read that patient (EP positive partition), (2) a clinician NOT assigned is denied with 403 (NEG / DT), and (3) consent revocation timing \u2014 specifically reading immediately after revocation vs. after a grace window \u2014 exercises a state transition boundary (STC + BVA). An audit record must exist after every permitted read. Tests are structured around a lightweight requests-based fixture that injects a Bearer token; patient IDs and assignment states are seeded via helper fixtures so each test is idempotent.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_reads_patient_returns_200_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists with known id",
+          "Clinician is assigned to the patient in the care-team roster",
+          "Patient consent is active"
+        ],
+        "actions": [
+          "Obtain a valid Bearer token for the assigned clinician via <get_token>",
+          "HTTP GET /Patient/{patient_id} with Authorization header",
+          "HTTP GET /AuditEvent?entity={patient_id}&agent={clinician_id} to verify audit"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body resourceType == 'Patient'",
+          "Response body id matches requested patient_id",
+          "At least one AuditEvent record exists for this read operation"
+        ],
+        "trace": [
+          "R-HLT-102: clinician shall read a patient resource for patients in their care",
+          "R-HLT-102: access audit written"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\n    assigned_clinician_token,  # <fixture>\n    assigned_patient_id,       # <fixture>\n    assigned_clinician_id,     # <fixture>\n    fhir_base_url,             # <fixture>\n):\n    headers = {\"Authorization\": f\"Bearer {assigned_clinician_token}\"}\n\n    resp = requests.get(\n        f\"{fhir_base_url}/Patient/{assigned_patient_id}\",\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Patient\"\n    assert body.get(\"id\") == assigned_patient_id\n\n    audit_resp = requests.get(\n        f\"{fhir_base_url}/AuditEvent\",\n        params={\"entity\": assigned_patient_id, \"agent\": assigned_clinician_id},\n        headers=headers,\n        timeout=10,\n    )\n    assert audit_resp.status_code == 200\n    audit_body = audit_resp.json()\n    assert audit_body.get(\"total\", 0) >= 1, \"Audit record missing after permitted read\"\n"
+      },
+      {
+        "name": "test_unassigned_clinician_reads_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists with known id",
+          "Clinician is NOT assigned to the patient in the care-team roster",
+          "Patient consent is active"
+        ],
+        "actions": [
+          "Obtain a valid Bearer token for the unassigned clinician via <get_token>",
+          "HTTP GET /Patient/{patient_id} with Authorization header"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an OperationOutcome or equivalent error payload",
+          "No patient resource data exposed in the response body"
+        ],
+        "trace": [
+          "R-HLT-102: reading outside their assignment shall be denied",
+          "R-HLT-102: 403 when clinician not assigned"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unassigned_clinician_reads_patient_returns_403(\n    unassigned_clinician_token,  # <fixture>\n    unassigned_patient_id,       # <fixture>\n    fhir_base_url,               # <fixture>\n):\n    headers = {\"Authorization\": f\"Bearer {unassigned_clinician_token}\"}\n\n    resp = requests.get(\n        f\"{fhir_base_url}/Patient/{unassigned_patient_id}\",\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 403\n\n    body = resp.json()\n    # Must not leak patient data; resourceType should not be 'Patient'\n    assert body.get(\"resourceType\") != \"Patient\", (\n        \"Patient data must not be returned on 403\"\n    )\n    # FHIR servers return OperationOutcome for errors\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n"
+      },
+      {
+        "name": "test_read_patient_immediately_after_consent_revocation_is_denied",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists with known id",
+          "Clinician is assigned to the patient in the care-team roster",
+          "Patient consent is currently ACTIVE (pre-condition state)"
+        ],
+        "actions": [
+          "Obtain a valid Bearer token for the assigned clinician via <get_token>",
+          "Confirm read succeeds while consent is active (HTTP GET /Patient/{id})",
+          "Revoke patient consent via <revoke_consent> helper (transitions consent to INACTIVE)",
+          "Immediately (within the same second) retry HTTP GET /Patient/{id} with same token",
+          "Verify consent state recorded as INACTIVE via <get_consent_state>"
+        ],
+        "expected": [
+          "First read (consent ACTIVE) returns HTTP 200",
+          "Second read (consent INACTIVE, T+0s) returns HTTP 403",
+          "Consent state reported as INACTIVE confirms the transition occurred before the second request"
+        ],
+        "trace": [
+          "R-HLT-102: consent state at the time of the operation must be tested",
+          "R-HLT-102: post-revocation timing windows",
+          "STC: covers ACTIVE->INACTIVE consent state transition boundary"
+        ],
+        "executable": "import pytest\nimport requests\nimport time\n\ndef test_read_patient_immediately_after_consent_revocation_is_denied(\n    assigned_clinician_token,   # <fixture>\n    consented_patient_id,       # <fixture> patient starts with active consent\n    fhir_base_url,              # <fixture>\n    revoke_consent,             # <helper_fn>(patient_id) -> None\n    get_consent_state,          # <helper_fn>(patient_id) -> str\n):\n    headers = {\"Authorization\": f\"Bearer {assigned_clinician_token}\"}\n    url = f\"{fhir_base_url}/Patient/{consented_patient_id}\"\n\n    # State: ACTIVE \u2014 read must succeed\n    pre_resp = requests.get(url, headers=headers, timeout=10)\n    assert pre_resp.status_code == 200, \"Baseline read with active consent failed\"\n\n    # Transition consent to INACTIVE\n    revoke_consent(consented_patient_id)\n    assert get_consent_state(consented_patient_id) == \"INACTIVE\"\n\n    # Boundary: read at T+0 after revocation must be denied\n    post_resp = requests.get(url, headers=headers, timeout=10)\n    assert post_resp.status_code == 403, (\n        \"Read must be denied immediately after consent revocation (T+0 boundary)\"\n    )\n    body = post_resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n"
+      },
+      {
+        "name": "test_decision_table_role_and_assignment_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Multiple accounts exist: admin (role:admin), nurse (role:nurse), assigned clinician (role:clinician, assigned), unassigned clinician (role:clinician, not assigned)",
+          "Patient resource exists with known id",
+          "Patient consent is active"
+        ],
+        "actions": [
+          "For each (token, expected_status) pair in the decision table, HTTP GET /Patient/{id}",
+          "Collect all response statuses"
+        ],
+        "expected": [
+          "Assigned clinician (role:clinician, assigned) -> 200",
+          "Unassigned clinician (role:clinician, not assigned) -> 403",
+          "Admin account (role:admin, not clinician) -> 403",
+          "Nurse account (role:nurse, assigned) -> 403"
+        ],
+        "trace": [
+          "R-HLT-102: A clinician shall read; implies non-clinician roles are denied",
+          "R-HLT-102: reading outside their assignment shall be denied",
+          "DT: exhausts role x assignment decision conditions"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_decision_table_role_and_assignment_combinations(\n    assigned_clinician_token,    # <fixture>\n    unassigned_clinician_token,  # <fixture>\n    admin_token,                 # <fixture>\n    nurse_token,                 # <fixture>\n    shared_patient_id,           # <fixture> patient assigned only to clinician\n    fhir_base_url,               # <fixture>\n):\n    url = f\"{fhir_base_url}/Patient/{shared_patient_id}\"\n\n    decision_table = [\n        (\"assigned_clinician\",   assigned_clinician_token,   200),\n        (\"unassigned_clinician\", unassigned_clinician_token, 403),\n        (\"admin\",               admin_token,                403),\n        (\"nurse\",               nurse_token,                403),\n    ]\n\n    failures = []\n    for label, token, expected_status in decision_table:\n        resp = requests.get(\n            url,\n            headers={\"Authorization\": f\"Bearer {token}\"},\n            timeout=10,\n        )\n        if resp.status_code != expected_status:\n            failures.append(\n                f\"{label}: expected {expected_status}, got {resp.status_code}\"\n            )\n\n    assert not failures, \"Decision table violations: \" + \"; \".join(failures)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-102",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 2821,
+    "latency_ms": 32713,
+    "wall_ms": 32713,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-102\",\n  \"reasoning\": \"R-HLT-102 mandates three distinct test axes: (1) a clinician assigned to a patient can read that patient (EP positive partition), (2) a clinician NOT assigned is denied with 403 (NEG / DT), and (3) consent revocation timing \u2014 specifically reading immediately after revocation vs. after a grace window \u2014 exercises a state transition boundary (STC + BVA). An audit record must exist after every permitted read. Tests are structured around a lightweight requests-based fixture that injects a Bearer token; patient IDs and assignment states are seeded via helper fixtures so each test is idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_returns_200_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician account exists with role:clinician\",\n        \"Patient resource exists with known id\",\n        \"Clinician is assigned to the patient in the care-team roster\",\n        \"Patient consent is active\"\n      ],\n      \"actions\": [\n        \"Obtain a valid Bearer token for the assigned clinician via <get_token>\",\n        \"HTTP GET /Patient/{patient_id} with Authorization header\",\n        \"HTTP GET /AuditEvent?entity={patient_id}&agent={clinician_id} to verify audit\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body resourceType == 'Patient'\",\n        \"Response body id matches requested patient_id\",\n        \"At least one AuditEvent record exists for this read operation\"\n      ],\n      \"trace\": [\n        \"R-HLT-102: clinician shall read a patient resource for patients in their care\",\n        \"R-HLT-102: access audit written\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\\n    assigned_clinician_token,  # <fixture>\\n    assigned_patient_id,       # <fixture>\\n    assigned_clinician_id,     # <fixture>\\n    fhir_base_url,             # <fixture>\\n):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {assigned_clinician_token}\\\"}\\n\\n    resp = requests.get(\\n        f\\\"{fhir_base_url}/Patient/{assigned_patient_id}\\\",\\n        headers=headers,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Patient\\\"\\n    assert body.get(\\\"id\\\") == assigned_patient_id\\n\\n    audit_resp = requests.get(\\n        f\\\"{fhir_base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": assigned_patient_id, \\\"agent\\\": assigned_clinician_id},\\n        headers=headers,\\n        timeout=10,\\n    )\\n    assert audit_resp.status_code == 200\\n    audit_body = audit_resp.json()\\n    assert audit_body.get(\\\"total\\\", 0) >= 1, \\\"Audit record missing after permitted read\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_reads_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician account exists with role:clinician\",\n        \"Patient resource exists with known id\",\n        \"Clinician is NOT assigned to the patient in the care-team roster\",\n        \"Patient consent is active\"\n      ],\n      \"actions\": [\n        \"Obtain a valid Bearer token for the unassigned clinician via <get_token>\",\n        \"HTTP GET /Patient/{patient_id} with Authorization header\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an OperationOutcome or equivalent error payload\",\n        \"No patient resource data exposed in the response body\"\n      ],\n      \"trace\": [\n        \"R-HLT-102: reading outside their assignment shall be denied\",\n        \"R-HLT-102: 403 when clinician not assigned\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_unassigned_clinician_reads_patient_returns_403(\\n    unassigned_clinician_token,  # <fixture>\\n    unassigned_patient_id,       # <fixture>\\n    fhir_base_url,               # <fixture>\\n):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {un"
+  }
+}

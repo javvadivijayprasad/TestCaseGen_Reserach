@@ -1,0 +1,201 @@
+{
+  "req": {
+    "id": "R-HLT-094",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation (audit)",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-094",
+    "reasoning": "The requirement mandates three concerns: (1) valid vital-signs Observations are stored, (2) out-of-range values are flagged and a review task is created, and (3) an AuditEvent is emitted for every operation. Test design covers: EP for a normal in-range heart-rate (positive), NEG for a physiologically impossible value (negative), BVA for the exact upper boundary of the plausible range (boundary). A fourth DT test covers the AuditEvent emission rule orthogonally, and a fifth STC test walks the full state machine from Observation creation through flag-raised to review-task-created, satisfying end-to-end audit traceability. All tests are self-contained via fixtures that create and clean up their own resources.",
+    "tests": [
+      {
+        "name": "test_inrange_vitalsigns_observation_stored",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running",
+          "caller has role:clinician JWT",
+          "heart-rate plausible range is 40-200 bpm"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity=72 bpm",
+          "Assert HTTP 201 and Location header returned",
+          "GET the returned Location",
+          "Assert no review flag present on the resource"
+        ],
+        "expected": [
+          "HTTP 201 on POST",
+          "Observation.status = 'final'",
+          "No flag or review extension on the resource",
+          "AuditEvent with action='C' emitted for this Observation id"
+        ],
+        "trace": [
+          "R-HLT-094: vital-signs shall have value in clinically plausible range",
+          "R-HLT-094: observation stored",
+          "R-HLT-094: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_inrange_vitalsigns_observation_stored(clinician_auth_headers, base_url, cleanup_resource, assert_audit_event):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    obs_id = resp.json()[\"id\"]\n    cleanup_resource(\"Observation\", obs_id)\n\n    get_resp = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_auth_headers)\n    assert get_resp.status_code == 200\n    body = get_resp.json()\n    assert body[\"status\"] == \"final\"\n    extensions = body.get(\"extension\", [])\n    flag_urls = [e[\"url\"] for e in extensions]\n    assert not any(\"review\" in u or \"flag\" in u for u in flag_urls), \"Unexpected review flag on in-range observation\"\n\n    assert_audit_event(entity_id=obs_id, action=\"C\")\n"
+      },
+      {
+        "name": "test_outofrange_vitalsigns_creates_review_flag",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running",
+          "caller has role:clinician JWT",
+          "heart-rate plausible range is 40-200 bpm",
+          "value 999 bpm is outside any plausible range"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity=999 bpm",
+          "Assert HTTP 201 or 422 depending on server policy",
+          "If 201: GET Observation and assert review flag extension is present",
+          "Assert a Task resource flagging the Observation for review exists",
+          "Assert AuditEvent emitted with action='C' and outcome indicating flag"
+        ],
+        "expected": [
+          "Server accepts or rejects with documented status code",
+          "If stored: Observation carries a review-flag extension",
+          "A Task with intent=order referencing the Observation id is created",
+          "AuditEvent emitted for the operation"
+        ],
+        "trace": [
+          "R-HLT-094: out-of-range shall be flagged for review",
+          "R-HLT-094: error pathway - review task created",
+          "R-HLT-094: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_outofrange_vitalsigns_creates_review_flag(clinician_auth_headers, base_url, cleanup_resource, assert_audit_event, search_resources):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 999, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code in (201, 422), f\"Unexpected status {resp.status_code}\"\n    if resp.status_code == 422:\n        pytest.skip(\"Server rejects out-of-range at ingestion; review flag pathway not applicable\")\n\n    obs_id = resp.json()[\"id\"]\n    cleanup_resource(\"Observation\", obs_id)\n\n    body = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_auth_headers).json()\n    ext_urls = [e[\"url\"] for e in body.get(\"extension\", [])]\n    assert any(\"review\" in u or \"flag\" in u for u in ext_urls), \"Review flag extension missing for out-of-range value\"\n\n    tasks = search_resources(\"Task\", {\"focus\": f\"Observation/{obs_id}\"})\n    assert len(tasks) >= 1, \"No review Task created for out-of-range Observation\"\n    assert tasks[0][\"intent\"] == \"order\"\n\n    assert_audit_event(entity_id=obs_id, action=\"C\")\n"
+      },
+      {
+        "name": "test_boundary_max_heartrate_200bpm_accepted_without_flag",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running",
+          "caller has role:clinician JWT",
+          "heart-rate upper boundary of plausible range is exactly 200 bpm (inclusive)"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity=200 bpm",
+          "Assert HTTP 201",
+          "GET Observation and assert no review flag",
+          "Assert AuditEvent emitted"
+        ],
+        "expected": [
+          "HTTP 201",
+          "Observation stored with status=final",
+          "No review flag extension present",
+          "AuditEvent with action='C' recorded"
+        ],
+        "trace": [
+          "R-HLT-094: value in clinically plausible range",
+          "R-HLT-094: observation stored",
+          "R-HLT-094: AuditEvent must be emitted for every operation",
+          "BVA: upper boundary value is included in the valid partition"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_boundary_max_heartrate_200bpm_accepted_without_flag(clinician_auth_headers, base_url, cleanup_resource, assert_audit_event):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 200, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201, f\"Expected 201 at upper boundary, got {resp.status_code}: {resp.text}\"\n    obs_id = resp.json()[\"id\"]\n    cleanup_resource(\"Observation\", obs_id)\n\n    body = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_auth_headers).json()\n    assert body[\"status\"] == \"final\"\n    ext_urls = [e[\"url\"] for e in body.get(\"extension\", [])]\n    assert not any(\"review\" in u or \"flag\" in u for u in ext_urls), \"Boundary value 200 bpm should NOT trigger review flag\"\n\n    assert_audit_event(entity_id=obs_id, action=\"C\")\n"
+      },
+      {
+        "name": "test_auditevent_emitted_for_read_operation",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite service is running",
+          "caller has role:clinician JWT",
+          "an existing Observation with id known to the test via fixture"
+        ],
+        "actions": [
+          "GET /Observation/{id} to perform a read operation",
+          "Assert HTTP 200",
+          "Query AuditEvent search endpoint filtering on entity.what=Observation/{id} and action=R",
+          "Assert at least one AuditEvent record exists for the read"
+        ],
+        "expected": [
+          "HTTP 200 on GET",
+          "AuditEvent with action='R' and entity referencing the Observation id is present",
+          "AuditEvent.agent references the clinician actor"
+        ],
+        "trace": [
+          "R-HLT-094: AuditEvent must be emitted for every operation and tested end-to-end",
+          "DT: every operation type (C/R/U/D) must appear in AuditEvent log"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_auditevent_emitted_for_read_operation(clinician_auth_headers, base_url, existing_observation_id, assert_audit_event):\n    # existing_observation_id fixture creates a known Observation and yields its id\n    obs_id = existing_observation_id\n\n    read_resp = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=clinician_auth_headers)\n    assert read_resp.status_code == 200, f\"GET failed: {read_resp.status_code}\"\n\n    # Allow eventual-consistency propagation\n    import time; time.sleep(1)\n\n    assert_audit_event(entity_id=obs_id, action=\"R\")\n\n    audit_search = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Observation/{obs_id}\", \"action\": \"R\"},\n        headers=clinician_auth_headers\n    )\n    assert audit_search.status_code == 200\n    bundle = audit_search.json()\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) >= 1, \"No AuditEvent found for READ operation\"\n    agent_names = [a.get(\"who\", {}).get(\"display\", \"\") for e in entries for a in e[\"resource\"].get(\"agent\", [])]\n    assert any(agent_names), \"AuditEvent agent not populated\"\n"
+      },
+      {
+        "name": "test_state_transition_observation_to_reviewed",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running",
+          "caller has role:clinician JWT",
+          "heart-rate value 250 bpm is out of plausible range",
+          "system auto-creates a review Task on out-of-range detection"
+        ],
+        "actions": [
+          "POST /Observation with valueQuantity=250 bpm to trigger flag (state: flagged)",
+          "Assert review Task exists with status=requested",
+          "PUT /Task/{task_id} with status=completed to mark reviewed (state: reviewed)",
+          "GET /Observation/{obs_id} and assert review extension is resolved or status updated",
+          "Assert AuditEvent emitted for each state-changing operation"
+        ],
+        "expected": [
+          "Observation transitions from preliminary/flagged to reviewed state",
+          "Task transitions from requested to completed",
+          "AuditEvent recorded for Observation POST and Task PUT",
+          "No orphaned flag remains after Task completion"
+        ],
+        "trace": [
+          "R-HLT-094: out-of-range shall be flagged for review",
+          "R-HLT-094: error pathway - review task created",
+          "R-HLT-094: AuditEvent must be emitted for every operation and tested end-to-end",
+          "STC: covers flagged -> under-review -> reviewed state transitions"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_state_transition_observation_to_reviewed(clinician_auth_headers, base_url, cleanup_resource, assert_audit_event, search_resources):\n    obs_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 250, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    post_resp = requests.post(f\"{base_url}/Observation\", json=obs_payload, headers=clinician_auth_headers)\n    assert post_resp.status_code == 201\n    obs_id = post_resp.json()[\"id\"]\n    cleanup_resource(\"Observation\", obs_id)\n\n    tasks = search_resources(\"Task\", {\"focus\": f\"Observation/{obs_id}\", \"status\": \"requested\"})\n    assert len(tasks) >= 1, \"Review Task not created for out-of-range Observation\"\n    task = tasks[0]\n    task_id = task[\"id\"]\n    cleanup_resource(\"Task\", task_id)\n\n    task[\"status\"] = \"completed\"\n    put_resp = requests.put(f\"{base_url}/Task/{task_id}\", json=task, headers=clinician_auth_headers)\n    assert put_resp.status_code in (200, 201), f\"Task update failed: {put_resp.status_code}\"\n\n    assert_audit_event(entity_id=obs_id, action=\"C\")\n    assert_audit_event(entity_id=task_id, action=\"U\")\n\n    final_task = requests.get(f\"{base_url}/Task/{task_id}\", headers=clinician_auth_headers).json()\n    assert final_task[\"status\"] == \"completed\", \"Task did not reach completed state\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-094",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 4425,
+    "latency_ms": 55673,
+    "wall_ms": 55673,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-094\",\n  \"reasoning\": \"The requirement mandates three concerns: (1) valid vital-signs Observations are stored, (2) out-of-range values are flagged and a review task is created, and (3) an AuditEvent is emitted for every operation. Test design covers: EP for a normal in-range heart-rate (positive), NEG for a physiologically impossible value (negative), BVA for the exact upper boundary of the plausible range (boundary). A fourth DT test covers the AuditEvent emission rule orthogonally, and a fifth STC test walks the full state machine from Observation creation through flag-raised to review-task-created, satisfying end-to-end audit traceability. All tests are self-contained via fixtures that create and clean up their own resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_inrange_vitalsigns_observation_stored\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"caller has role:clinician JWT\",\n        \"heart-rate plausible range is 40-200 bpm\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category=vital-signs, code=heart-rate, valueQuantity=72 bpm\",\n        \"Assert HTTP 201 and Location header returned\",\n        \"GET the returned Location\",\n        \"Assert no review flag present on the resource\"\n      ],\n      \"expected\": [\n        \"HTTP 201 on POST\",\n        \"Observation.status = 'final'\",\n        \"No flag or review extension on the resource\",\n        \"AuditEvent with action='C' emitted for this Observation id\"\n      ],\n      \"trace\": [\n        \"R-HLT-094: vital-signs shall have value in clinically plausible range\",\n        \"R-HLT-094: observation stored\",\n        \"R-HLT-094: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_inrange_vitalsigns_observation_stored(clinician_auth_headers, base_url, cleanup_resource, assert_audit_event):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_url}/Observation\\\", json=payload, headers=clinician_auth_headers)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    obs_id = resp.json()[\\\"id\\\"]\\n    cleanup_resource(\\\"Observation\\\", obs_id)\\n\\n    get_resp = requests.get(f\\\"{base_url}/Observation/{obs_id}\\\", headers=clinician_auth_headers)\\n    assert get_resp.status_code == 200\\n    body = get_resp.json()\\n    assert body[\\\"status\\\"] == \\\"final\\\"\\n    extensions = body.get(\\\"extension\\\", [])\\n    flag_urls = [e[\\\"url\\\"] for e in extensions]\\n    assert not any(\\\"review\\\" in u or \\\"flag\\\" in u for u in flag_urls), \\\"Unexpected review flag on in-range observation\\\"\\n\\n    assert_audit_event(entity_id=obs_id, action=\\\"C\\\")\\n\"\n    },\n    {\n      \"name\": \"test_outofrange_vitalsigns_creates_review_flag\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"caller has role:clinician JWT\",\n        \"heart-rate plausible range is 40-200 bpm\",\n        \"value 999 bpm is outside any plausible range\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category=vital-signs, code=heart-rate, valueQuantity=999 bpm\",\n        \"Assert HTTP 201 or 422 depending on server policy\",\n        \"If 201: GET Observation and assert review flag extension is present\",\n        \"Assert a Task resource flagging the Observation for review exists\",\n        \"Assert AuditEvent emitted with action='C' and outcome indicating flag\"\n      ],\n      \"expec"
+  }
+}

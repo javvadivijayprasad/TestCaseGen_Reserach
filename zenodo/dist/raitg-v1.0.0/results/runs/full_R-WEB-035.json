@@ -1,0 +1,183 @@
+{
+  "req": {
+    "id": "R-WEB-035",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Manager deletes benefit",
+    "statement": "An authenticated manager shall be able to delete a benefit through the UI form. Mandatory fields must be validated and an audit record must be written on success.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "authenticated",
+      "role:manager",
+      "benefit module is enabled"
+    ],
+    "triggers": [
+      "manager deletes a benefit"
+    ],
+    "expected_outcomes": [
+      "benefit is deleted",
+      "audit record written",
+      "response 200 or 201 with entity id"
+    ],
+    "error_pathways": [
+      "400 on validation error",
+      "401 if unauthenticated",
+      "403 if role forbidden"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/benefits"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-035",
+    "reasoning": "The requirement covers UI-driven benefit deletion by an authenticated manager. I derived: (1) a positive EP/STC test confirming happy-path deletion, audit record creation, and 200/201 response; (2) a NEG/DT test for unauthenticated access expecting 401; (3) a NEG/DT test for a forbidden role (employee) expecting 403; (4) a BVA boundary test targeting the minimum valid benefit_id (1), verifying the delete still succeeds; (5) a NEG/NEG test supplying an invalid/missing benefit_id (0 or empty) to trigger a 400 validation error. The violation in test[4] was that kind=negative but heuristic=BVA, which is contradictory - BVA applies to boundary tests. The fix changes test[4] heuristic from BVA to NEG to match the negative kind, since supplying an out-of-range/invalid id is a negative equivalence partition test, not a boundary value test.",
+    "tests": [
+      {
+        "name": "test_manager_deletes_benefit_happy_path",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as manager",
+          "Benefit module is enabled",
+          "A benefit record exists in the system"
+        ],
+        "actions": [
+          "Obtain manager auth token via <get_auth_token> fixture",
+          "Create a transient benefit via <create_benefit_fixture>",
+          "Navigate to /benefits and submit delete form for the created benefit"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains the deleted entity id",
+          "Benefit no longer appears in /benefits list",
+          "Audit record for the deletion exists via <get_audit_record>"
+        ],
+        "trace": [
+          "R-WEB-035: positive outcome - benefit deleted",
+          "R-WEB-035: audit record written on success",
+          "R-WEB-035: response 200 or 201 with entity id"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_manager_deletes_benefit_happy_path(\n    manager_page,        # <fixture>: authenticated Playwright Page as manager\n    create_benefit,      # <fixture>: creates benefit, yields benefit_id, deletes on teardown if still exists\n    api_client,          # <fixture>: authenticated requests.Session\n    benefits_url,        # <fixture>: base URL + '/benefits'\n):\n    benefit_id = create_benefit(name=\"Health Plan Beta\")\n    page = manager_page\n    page.goto(benefits_url)\n    row = page.locator(f\"[data-benefit-id='{benefit_id}']\")\n    row.locator(\"button[data-action='delete']\").click()\n    page.locator(\"button[data-testid='confirm-delete']\").click()\n    expect(page.locator(\"[data-testid='toast-success']\")).to_be_visible()\n    resp = api_client.get(f\"{benefits_url}/{benefit_id}\")\n    assert resp.status_code == 404, \"Benefit should no longer exist\"\n    audit = <get_audit_record>(api_client, entity=\"benefit\", entity_id=benefit_id, action=\"delete\")\n    assert audit is not None, \"Audit record must be written\"\n    assert audit[\"entity_id\"] == str(benefit_id)\n"
+      },
+      {
+        "name": "test_unauthenticated_user_cannot_delete_benefit",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No auth token is present (unauthenticated session)",
+          "A benefit record exists in the system"
+        ],
+        "actions": [
+          "Attempt DELETE request to /benefits/{id} without Authorization header"
+        ],
+        "expected": [
+          "HTTP response status is 401",
+          "Response body indicates authentication required",
+          "Benefit record remains intact",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-035: error pathway - 401 if unauthenticated"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unauthenticated_user_cannot_delete_benefit(\n    create_benefit,      # <fixture>: creates benefit, yields benefit_id\n    benefits_url,        # <fixture>: base URL + '/benefits'\n    api_client,          # <fixture>: authenticated requests.Session (for verification only)\n):\n    benefit_id = create_benefit(name=\"Dental Plan Anon\")\n    anon_session = requests.Session()\n    resp = anon_session.delete(f\"{benefits_url}/{benefit_id}\")\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}\"\n    verify = api_client.get(f\"{benefits_url}/{benefit_id}\")\n    assert verify.status_code == 200, \"Benefit must still exist after rejected delete\"\n    audit = <get_audit_record>(api_client, entity=\"benefit\", entity_id=benefit_id, action=\"delete\")\n    assert audit is None, \"No audit record should exist for rejected delete\"\n"
+      },
+      {
+        "name": "test_forbidden_role_cannot_delete_benefit",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated but has role 'employee' (not manager)",
+          "Benefit module is enabled",
+          "A benefit record exists in the system"
+        ],
+        "actions": [
+          "Obtain employee auth token via <get_auth_token> with role=employee",
+          "Attempt DELETE request to /benefits/{id} with employee token"
+        ],
+        "expected": [
+          "HTTP response status is 403",
+          "Response body indicates insufficient permissions",
+          "Benefit record remains intact",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-035: error pathway - 403 if role forbidden",
+          "R-WEB-035: precondition - role:manager required"
+        ],
+        "executable": "import pytest\n\ndef test_forbidden_role_cannot_delete_benefit(\n    employee_api_client, # <fixture>: requests.Session authenticated as role=employee\n    create_benefit,      # <fixture>: creates benefit, yields benefit_id\n    api_client,          # <fixture>: manager requests.Session for verification\n    benefits_url,        # <fixture>: base URL + '/benefits'\n):\n    benefit_id = create_benefit(name=\"Vision Plan Forbidden\")\n    resp = employee_api_client.delete(f\"{benefits_url}/{benefit_id}\")\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n    body = resp.json()\n    assert \"forbidden\" in body.get(\"message\", \"\").lower() or \"permission\" in body.get(\"message\", \"\").lower()\n    verify = api_client.get(f\"{benefits_url}/{benefit_id}\")\n    assert verify.status_code == 200, \"Benefit must still exist after 403\"\n    audit = <get_audit_record>(api_client, entity=\"benefit\", entity_id=benefit_id, action=\"delete\")\n    assert audit is None, \"No audit record should exist for a forbidden delete attempt\"\n"
+      },
+      {
+        "name": "test_manager_deletes_benefit_with_minimum_valid_id",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as manager",
+          "Benefit module is enabled",
+          "A benefit exists whose ID is the minimum allowed positive integer (1)"
+        ],
+        "actions": [
+          "Seed or locate the benefit with id=1 via <ensure_benefit_with_id_fixture>",
+          "Submit DELETE request for benefit_id=1 using manager credentials"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains entity id equal to 1",
+          "Benefit id=1 no longer retrievable (404)",
+          "Audit record written for entity_id=1"
+        ],
+        "trace": [
+          "R-WEB-035: boundary - minimum valid benefit_id (BVA lower bound)",
+          "R-WEB-035: positive outcome on boundary input"
+        ],
+        "executable": "import pytest\n\nMIN_BENEFIT_ID = 1\n\ndef test_manager_deletes_benefit_with_minimum_valid_id(\n    api_client,          # <fixture>: authenticated requests.Session as manager\n    ensure_benefit_id,   # <fixture>: ensures benefit with given id exists, cleans up on teardown\n    benefits_url,        # <fixture>: base URL + '/benefits'\n):\n    ensure_benefit_id(MIN_BENEFIT_ID, name=\"Min ID Benefit\")\n    resp = api_client.delete(f\"{benefits_url}/{MIN_BENEFIT_ID}\")\n    assert resp.status_code in (200, 201), f\"Expected 200/201, got {resp.status_code}\"\n    body = resp.json()\n    assert str(body.get(\"id\") or body.get(\"entity_id\")) == str(MIN_BENEFIT_ID)\n    verify = api_client.get(f\"{benefits_url}/{MIN_BENEFIT_ID}\")\n    assert verify.status_code == 404, \"Benefit id=1 must be gone after deletion\"\n    audit = <get_audit_record>(api_client, entity=\"benefit\", entity_id=MIN_BENEFIT_ID, action=\"delete\")\n    assert audit is not None\n    assert str(audit[\"entity_id\"]) == str(MIN_BENEFIT_ID)\n"
+      },
+      {
+        "name": "test_delete_benefit_with_invalid_id_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as manager",
+          "Benefit module is enabled"
+        ],
+        "actions": [
+          "Submit DELETE request using benefit_id=0 (invalid, below minimum valid boundary)"
+        ],
+        "expected": [
+          "HTTP response status is 400",
+          "Response body contains a validation error message",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-035: error pathway - 400 on validation error",
+          "R-WEB-035: negative test - invalid benefit_id value rejected by server"
+        ],
+        "executable": "import pytest\n\nINVALID_BENEFIT_ID = 0\n\ndef test_delete_benefit_with_invalid_id_returns_400(\n    api_client,          # <fixture>: authenticated requests.Session as manager\n    benefits_url,        # <fixture>: base URL + '/benefits'\n):\n    resp = api_client.delete(f\"{benefits_url}/{INVALID_BENEFIT_ID}\")\n    assert resp.status_code == 400, f\"Expected 400 for invalid id=0, got {resp.status_code}\"\n    body = resp.json()\n    msg = body.get(\"message\", \"\").lower()\n    assert \"invalid\" in msg or \"validation\" in msg or \"error\" in msg, (\n        f\"Expected validation error message, got: {body}\"\n    )\n    audit = <get_audit_record>(api_client, entity=\"benefit\", entity_id=INVALID_BENEFIT_ID, action=\"delete\")\n    assert audit is None, \"No audit record should exist for an invalid delete request\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-035",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 2944,
+    "latency_ms": 32585,
+    "wall_ms": 32585,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-035\",\n  \"reasoning\": \"The requirement covers UI-driven benefit deletion by an authenticated manager. I derived: (1) a positive EP/STC test confirming happy-path deletion, audit record creation, and 200/201 response; (2) a NEG/DT test for unauthenticated access expecting 401; (3) a NEG/DT test for a forbidden role (employee) expecting 403; (4) a BVA test targeting the boundary where a benefit_id is at the minimum valid integer (1), verifying the delete still succeeds; (5) a NEG test supplying an invalid/missing benefit_id (0 or empty) to trigger a 400 validation error. Each test is self-contained via fixtures that create and clean up data.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_deletes_benefit_happy_path\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as manager\",\n        \"Benefit module is enabled\",\n        \"A benefit record exists in the system\"\n      ],\n      \"actions\": [\n        \"Obtain manager auth token via <get_auth_token> fixture\",\n        \"Create a transient benefit via <create_benefit_fixture>\",\n        \"Navigate to /benefits and submit delete form for the created benefit\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 200 or 201\",\n        \"Response body contains the deleted entity id\",\n        \"Benefit no longer appears in /benefits list\",\n        \"Audit record for the deletion exists via <get_audit_record>\"\n      ],\n      \"trace\": [\n        \"R-WEB-035: positive outcome - benefit deleted\",\n        \"R-WEB-035: audit record written on success\",\n        \"R-WEB-035: response 200 or 201 with entity id\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_manager_deletes_benefit_happy_path(\\n    manager_page,        # <fixture>: authenticated Playwright Page as manager\\n    create_benefit,      # <fixture>: creates benefit, yields benefit_id, deletes on teardown if still exists\\n    api_client,          # <fixture>: authenticated requests.Session\\n    benefits_url,        # <fixture>: base URL + '/benefits'\\n):\\n    benefit_id = create_benefit(name=\\\"Health Plan Beta\\\")\\n    page = manager_page\\n    page.goto(benefits_url)\\n    row = page.locator(f\\\"[data-benefit-id='{benefit_id}']\\\")\\n    row.locator(\\\"button[data-action='delete']\\\").click()\\n    page.locator(\\\"button[data-testid='confirm-delete']\\\").click()\\n    expect(page.locator(\\\"[data-testid='toast-success']\\\")).to_be_visible()\\n    resp = api_client.get(f\\\"{benefits_url}/{benefit_id}\\\")\\n    assert resp.status_code == 404, \\\"Benefit should no longer exist\\\"\\n    audit = <get_audit_record>(api_client, entity=\\\"benefit\\\", entity_id=benefit_id, action=\\\"delete\\\")\\n    assert audit is not None, \\\"Audit record must be written\\\"\\n    assert audit[\\\"entity_id\\\"] == str(benefit_id)\\n\"\n    },\n    {\n      \"name\": \"test_unauthenticated_user_cannot_delete_benefit\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"No auth token is present (unauthenticated session)\",\n        \"A benefit record exists in the system\"\n      ],\n      \"actions\": [\n        \"Attempt DELETE request to /benefits/{id} without Authorization header\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 401\",\n        \"Response body indicates authentication required\",\n        \"Benefit record remains intact\",\n        \"No audit record is written\"\n      ],\n      \"trace\": [\n        \"R-WEB-035: error pathway - 401 if unauthenticated\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_unauthenticated_user_cannot_delete_benefit(\\n    create_benefit,      # <fixture>: creates benefit, yields benefit_id\\n    benefits_url,        # <fixture>: base URL + '/benefits'\\n    api_client,          # <fixture>: authenticated requests.Session (for verification only)\\n):\\n    benefit_id = create_benefit(name=\\\"Dental Plan Anon\\\")\\n    anon_session = requests.Session()\\n    resp = anon_session.delete(f"
+  }
+}

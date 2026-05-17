@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-HLT-076",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create patient (audit)",
+    "statement": "A registered clinician shall create a patient resource with validated demographics; creation with missing mandatory elements shall be rejected. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician creates patient"
+    ],
+    "expected_outcomes": [
+      "patient resource stored"
+    ],
+    "error_pathways": [
+      "422 when mandatory element missing"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-076",
+    "reasoning": "The requirement mandates: (1) a clinician can create a valid patient resource, (2) creation with missing mandatory elements is rejected with HTTP 422, and (3) an AuditEvent is emitted for every operation. I apply EP for the happy-path (valid demographics partition), NEG for the missing-mandatory-field partition, BVA for a patient name at the minimum acceptable length (1-character family name boundary), DT for multiple missing-field combinations, and STC to verify the state transition from 'no patient' through 'patient created' to 'audit recorded'. Tests are self-contained via the <clinician_auth_headers> fixture and <assert_audit_event> helper.",
+    "tests": [
+      {
+        "name": "test_create_patient_valid_demographics_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "fhir-lite /Patient endpoint is reachable",
+          "AuditEvent store is accessible"
+        ],
+        "actions": [
+          "POST /Patient with all mandatory FHIR R4 demographics (resourceType, name[family], birthDate, gender)",
+          "Capture HTTP response",
+          "Query AuditEvent store for the returned patient ID"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType=Patient",
+          "Response body contains a server-assigned id",
+          "AuditEvent exists referencing the new patient id with outcome=0 (success)"
+        ],
+        "trace": [
+          "R-HLT-076: patient resource stored",
+          "R-HLT-076: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_patient_valid_demographics_emits_audit(\n    clinician_auth_headers, base_url, assert_audit_event\n):\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"use\": \"official\", \"family\": \"Smith\", \"given\": [\"Alice\"]}],\n        \"gender\": \"female\",\n        \"birthDate\": \"1990-06-15\"\n    }\n    resp = requests.post(\n        f\"{base_url}/Patient\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Patient\"\n    patient_id = body.get(\"id\")\n    assert patient_id, \"Expected server-assigned id in response\"\n    assert_audit_event(\n        entity_id=patient_id,\n        expected_outcome=\"0\",\n        headers=clinician_auth_headers\n    )\n"
+      },
+      {
+        "name": "test_create_patient_missing_mandatory_name_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "fhir-lite /Patient endpoint is reachable",
+          "AuditEvent store is accessible"
+        ],
+        "actions": [
+          "POST /Patient with mandatory 'name' element omitted",
+          "Capture HTTP response",
+          "Query AuditEvent store for a failure audit tied to this request"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains OperationOutcome with issue describing missing 'name'",
+          "AuditEvent exists for the failed attempt with outcome != 0"
+        ],
+        "trace": [
+          "R-HLT-076: 422 when mandatory element missing",
+          "R-HLT-076: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_patient_missing_mandatory_name_returns_422(\n    clinician_auth_headers, base_url, assert_audit_event_failure\n):\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"gender\": \"male\",\n        \"birthDate\": \"1985-03-20\"\n    }\n    resp = requests.post(\n        f\"{base_url}/Patient\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\"name\" in str(i).lower() for i in issues), (\n        \"Expected OperationOutcome issue referencing missing 'name'\"\n    )\n    assert_audit_event_failure(\n        operation=\"create\",\n        headers=clinician_auth_headers\n    )\n"
+      },
+      {
+        "name": "test_create_patient_minimum_length_family_name_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "fhir-lite /Patient endpoint is reachable",
+          "AuditEvent store is accessible",
+          "System minimum for family name length is 1 character per FHIR spec"
+        ],
+        "actions": [
+          "POST /Patient with family name of exactly 1 character (boundary minimum)",
+          "Capture HTTP response",
+          "Query AuditEvent store for the returned patient ID"
+        ],
+        "expected": [
+          "HTTP 201 Created (1-char family name is valid boundary)",
+          "Response body contains resourceType=Patient with a server-assigned id",
+          "AuditEvent exists referencing the new patient id with outcome=0"
+        ],
+        "trace": [
+          "R-HLT-076: patient resource stored",
+          "R-HLT-076: AuditEvent emitted for every operation",
+          "BVA: minimum-length mandatory string field"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_patient_minimum_length_family_name_boundary(\n    clinician_auth_headers, base_url, assert_audit_event\n):\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"name\": [{\"use\": \"official\", \"family\": \"A\"}],\n        \"gender\": \"unknown\",\n        \"birthDate\": \"2000-01-01\"\n    }\n    resp = requests.post(\n        f\"{base_url}/Patient\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 201, (\n        f\"1-char family name should be accepted; got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Patient\"\n    patient_id = body.get(\"id\")\n    assert patient_id\n    assert_audit_event(\n        entity_id=patient_id,\n        expected_outcome=\"0\",\n        headers=clinician_auth_headers\n    )\n"
+      },
+      {
+        "name": "test_create_patient_multiple_missing_fields_decision_table",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "fhir-lite /Patient endpoint is reachable"
+        ],
+        "actions": [
+          "Iterate over decision-table rows: each row omits a different combination of mandatory fields",
+          "POST /Patient for each row",
+          "Assert HTTP 422 for every row where at least one mandatory field is absent"
+        ],
+        "expected": [
+          "HTTP 422 for payload missing only 'gender'",
+          "HTTP 422 for payload missing only 'birthDate'",
+          "HTTP 422 for payload missing both 'name' and 'birthDate'",
+          "HTTP 422 for completely empty resourceType=Patient payload"
+        ],
+        "trace": [
+          "R-HLT-076: 422 when mandatory element missing",
+          "DT: all combinations of absent mandatory fields"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"payload,label\", [\n    ({\"resourceType\": \"Patient\", \"name\": [{\"family\": \"Doe\"}], \"birthDate\": \"1970-01-01\"}, \"missing gender\"),\n    ({\"resourceType\": \"Patient\", \"name\": [{\"family\": \"Doe\"}], \"gender\": \"male\"}, \"missing birthDate\"),\n    ({\"resourceType\": \"Patient\", \"gender\": \"female\"}, \"missing name and birthDate\"),\n    ({\"resourceType\": \"Patient\"}, \"missing all mandatory fields\"),\n])\ndef test_create_patient_multiple_missing_fields_decision_table(\n    payload, label, clinician_auth_headers, base_url\n):\n    resp = requests.post(\n        f\"{base_url}/Patient\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 422, (\n        f\"[{label}] Expected 422, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\", (\n        f\"[{label}] Expected OperationOutcome\"\n    )\n"
+      },
+      {
+        "name": "test_create_patient_state_transition_no_patient_to_stored_to_audited",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated as role:clinician",
+          "fhir-lite /Patient endpoint is reachable",
+          "AuditEvent store is accessible",
+          "Patient with the test identifier does NOT exist prior to test run"
+        ],
+        "actions": [
+          "Confirm patient does not exist (GET /Patient?identifier=TEST-STC-076 returns empty bundle)",
+          "POST /Patient with valid demographics and identifier TEST-STC-076",
+          "Confirm patient now exists (GET /Patient/{id} returns 200)",
+          "Confirm AuditEvent is present for the patient id"
+        ],
+        "expected": [
+          "Pre-state: GET returns empty bundle (total=0)",
+          "Transition: POST returns HTTP 201 with new patient id",
+          "Post-state: GET /Patient/{id} returns 200 with matching resourceType=Patient",
+          "Audit-state: AuditEvent with outcome=0 references the new patient id"
+        ],
+        "trace": [
+          "R-HLT-076: patient resource stored",
+          "R-HLT-076: AuditEvent emitted for every operation",
+          "STC: states = [NonExistent -> Created -> Audited]"
+        ],
+        "executable": "import pytest\nimport requests\n\nIDENTIFIER = \"TEST-STC-076\"\n\ndef test_create_patient_state_transition_no_patient_to_stored_to_audited(\n    clinician_auth_headers, base_url, assert_audit_event, cleanup_patient\n):\n    pre = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"identifier\": IDENTIFIER},\n        headers=clinician_auth_headers\n    )\n    assert pre.status_code == 200\n    assert pre.json().get(\"total\", 0) == 0, \"Pre-condition: patient must not exist\"\n\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"identifier\": [{\"value\": IDENTIFIER}],\n        \"name\": [{\"family\": \"Transition\", \"given\": [\"State\"]}],\n        \"gender\": \"other\",\n        \"birthDate\": \"1975-12-31\"\n    }\n    create_resp = requests.post(\n        f\"{base_url}/Patient\", json=payload, headers=clinician_auth_headers\n    )\n    assert create_resp.status_code == 201\n    patient_id = create_resp.json().get(\"id\")\n    assert patient_id\n    cleanup_patient(patient_id)\n\n    get_resp = requests.get(\n        f\"{base_url}/Patient/{patient_id}\", headers=clinician_auth_headers\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json().get(\"resourceType\") == \"Patient\"\n    assert_audit_event(entity_id=patient_id, expected_outcome=\"0\", headers=clinician_auth_headers)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-076",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 995,
+    "output_tokens": 3349,
+    "latency_ms": 42360,
+    "wall_ms": 42360,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-076\",\n  \"reasoning\": \"The requirement mandates: (1) a clinician can create a valid patient resource, (2) creation with missing mandatory elements is rejected with HTTP 422, and (3) an AuditEvent is emitted for every operation. I apply EP for the happy-path (valid demographics partition), NEG for the missing-mandatory-field partition, BVA for a patient name at the minimum acceptable length (1-character family name boundary), DT for multiple missing-field combinations, and STC to verify the state transition from 'no patient' through 'patient created' to 'audit recorded'. Tests are self-contained via the <clinician_auth_headers> fixture and <assert_audit_event> helper.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_patient_valid_demographics_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as role:clinician\",\n        \"fhir-lite /Patient endpoint is reachable\",\n        \"AuditEvent store is accessible\"\n      ],\n      \"actions\": [\n        \"POST /Patient with all mandatory FHIR R4 demographics (resourceType, name[family], birthDate, gender)\",\n        \"Capture HTTP response\",\n        \"Query AuditEvent store for the returned patient ID\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType=Patient\",\n        \"Response body contains a server-assigned id\",\n        \"AuditEvent exists referencing the new patient id with outcome=0 (success)\"\n      ],\n      \"trace\": [\n        \"R-HLT-076: patient resource stored\",\n        \"R-HLT-076: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_patient_valid_demographics_emits_audit(\\n    clinician_auth_headers, base_url, assert_audit_event\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"name\\\": [{\\\"use\\\": \\\"official\\\", \\\"family\\\": \\\"Smith\\\", \\\"given\\\": [\\\"Alice\\\"]}],\\n        \\\"gender\\\": \\\"female\\\",\\n        \\\"birthDate\\\": \\\"1990-06-15\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Patient\\\",\\n        json=payload,\\n        headers=clinician_auth_headers\\n    )\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Patient\\\"\\n    patient_id = body.get(\\\"id\\\")\\n    assert patient_id, \\\"Expected server-assigned id in response\\\"\\n    assert_audit_event(\\n        entity_id=patient_id,\\n        expected_outcome=\\\"0\\\",\\n        headers=clinician_auth_headers\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_create_patient_missing_mandatory_name_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller is authenticated as role:clinician\",\n        \"fhir-lite /Patient endpoint is reachable\",\n        \"AuditEvent store is accessible\"\n      ],\n      \"actions\": [\n        \"POST /Patient with mandatory 'name' element omitted\",\n        \"Capture HTTP response\",\n        \"Query AuditEvent store for a failure audit tied to this request\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains OperationOutcome with issue describing missing 'name'\",\n        \"AuditEvent exists for the failed attempt with outcome != 0\"\n      ],\n      \"trace\": [\n        \"R-HLT-076: 422 when mandatory element missing\",\n        \"R-HLT-076: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_patient_missing_mandatory_name_returns_422(\\n    clinician_auth_headers, base_url, assert_audit_event_failure\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"gender\\\": \\\"male\\\",\\n        \\\"birthDate\\\": \\\"1985-03-20\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Patient\\\",\\n        json=payload,\\n        headers=clinician_auth_headers\\n    )\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\"\\n  "
+  }
+}

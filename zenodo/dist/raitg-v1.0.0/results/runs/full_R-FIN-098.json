@@ -1,0 +1,174 @@
+{
+  "req": {
+    "id": "R-FIN-098",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration (idempotency variant)",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-098",
+    "reasoning": "R-FIN-098 has four testable behaviours: (1) a valid new biller lands in 'hold' state (EP/STC positive path); (2) a duplicate submission with the same Idempotency-Key returns the original response without creating a second record (EP idempotency positive path); (3) a duplicate biller submitted WITHOUT an Idempotency-Key returns 409 Conflict (NEG/DT negative path); (4) the 24-hour hold boundary \u2014 a withdrawal attempted exactly at T+24h-1s must still be deferred, while one at T+24h should be allowed (BVA boundary). Together these five cases cover all stated outcomes and error pathways. Each test is self-contained via a unique idempotency key and a fresh authenticated session fixture, keeping them deterministic and idempotent.",
+    "tests": [
+      {
+        "name": "test_register_biller_creates_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_fixture>)",
+          "Biller with the given account number does not already exist for this customer"
+        ],
+        "actions": [
+          "Generate a unique idempotency key via <unique_key_fn>",
+          "POST /billers with valid biller payload and Idempotency-Key header"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status == 'hold'",
+          "Response body contains a biller_id",
+          "Response body contains hold_expires_at timestamp approximately 24 hours from now"
+        ],
+        "trace": [
+          "R-FIN-098: biller in hold state after registration",
+          "R-FIN-098: 24-hour hold precondition"
+        ],
+        "executable": "def test_register_biller_creates_hold_state(auth_headers, unique_key_fn, api_client):\n    key = unique_key_fn()\n    payload = {\n        \"biller_name\": \"Acme Electric\",\n        \"account_number\": \"ACC-\" + key[-8:],\n        \"routing_number\": \"021000021\"\n    }\n    headers = {**auth_headers, \"Idempotency-Key\": key}\n    resp = api_client.post(\"/billers\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"hold\"\n    assert \"biller_id\" in body\n    assert \"hold_expires_at\" in body"
+      },
+      {
+        "name": "test_duplicate_idempotency_key_returns_original_response",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_fixture>)",
+          "A biller has been successfully registered with a known Idempotency-Key"
+        ],
+        "actions": [
+          "POST /billers with the same payload and the same Idempotency-Key a second time",
+          "Compare second response to first response"
+        ],
+        "expected": [
+          "HTTP 201 Created on second call (idempotent replay)",
+          "Second response body is identical to first response body",
+          "No new biller_id is created"
+        ],
+        "trace": [
+          "R-FIN-098: operation must be idempotent",
+          "R-FIN-098: duplicate submission with same Idempotency-Key returns original result"
+        ],
+        "executable": "def test_duplicate_idempotency_key_returns_original_response(auth_headers, unique_key_fn, api_client):\n    key = unique_key_fn()\n    payload = {\n        \"biller_name\": \"Idempotent Corp\",\n        \"account_number\": \"ACC-IDEM-\" + key[-6:],\n        \"routing_number\": \"021000021\"\n    }\n    headers = {**auth_headers, \"Idempotency-Key\": key}\n    resp1 = api_client.post(\"/billers\", json=payload, headers=headers)\n    assert resp1.status_code == 201\n    body1 = resp1.json()\n    resp2 = api_client.post(\"/billers\", json=payload, headers=headers)\n    assert resp2.status_code == 201\n    body2 = resp2.json()\n    assert body2[\"biller_id\"] == body1[\"biller_id\"]\n    assert body2[\"status\"] == body1[\"status\"]\n    assert body2[\"hold_expires_at\"] == body1[\"hold_expires_at\"]"
+      },
+      {
+        "name": "test_duplicate_biller_without_idempotency_key_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_fixture>)",
+          "A biller with the target account number already exists for this customer"
+        ],
+        "actions": [
+          "POST /billers with the same account_number but a different (or absent) Idempotency-Key",
+          "Inspect HTTP status code and error body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body error code indicates duplicate biller"
+        ],
+        "trace": [
+          "R-FIN-098: error pathway \u2014 409 if duplicate biller",
+          "R-FIN-098: idempotency only applies when same Idempotency-Key is reused"
+        ],
+        "executable": "def test_duplicate_biller_without_idempotency_key_returns_409(auth_headers, unique_key_fn, api_client):\n    first_key = unique_key_fn()\n    account_no = \"ACC-DUP-\" + first_key[-6:]\n    payload = {\n        \"biller_name\": \"Duplicate Biller Inc\",\n        \"account_number\": account_no,\n        \"routing_number\": \"021000021\"\n    }\n    resp1 = api_client.post(\"/billers\", json=payload,\n                             headers={**auth_headers, \"Idempotency-Key\": first_key})\n    assert resp1.status_code == 201\n    second_key = unique_key_fn()\n    resp2 = api_client.post(\"/billers\", json=payload,\n                             headers={**auth_headers, \"Idempotency-Key\": second_key})\n    assert resp2.status_code == 409\n    body = resp2.json()\n    assert \"duplicate\" in body.get(\"error\", \"\").lower() or body.get(\"code\") == \"DUPLICATE_BILLER\""
+      },
+      {
+        "name": "test_withdrawal_deferred_while_biller_in_hold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_fixture>)",
+          "Biller just registered (hold_expires_at is in the future \u2014 boundary: T+24h-1 second from now)"
+        ],
+        "actions": [
+          "Register a new biller and capture biller_id",
+          "Immediately attempt POST /withdrawals targeting the new biller_id",
+          "Assert the withdrawal is deferred (not processed)"
+        ],
+        "expected": [
+          "HTTP 202 Accepted with status == 'deferred' OR HTTP 403 with code BILLER_ON_HOLD",
+          "No funds movement occurs \u2014 withdrawal is queued/deferred",
+          "Biller status remains 'hold'"
+        ],
+        "trace": [
+          "R-FIN-098: withdrawals to new billers shall be deferred",
+          "R-FIN-098: 24-hour hold boundary \u2014 withdrawal attempted before hold expires must be deferred"
+        ],
+        "executable": "def test_withdrawal_deferred_while_biller_in_hold(auth_headers, unique_key_fn, api_client):\n    reg_key = unique_key_fn()\n    biller_payload = {\n        \"biller_name\": \"Hold Boundary Biller\",\n        \"account_number\": \"ACC-BVA-\" + reg_key[-6:],\n        \"routing_number\": \"021000021\"\n    }\n    reg_resp = api_client.post(\"/billers\", json=biller_payload,\n                                headers={**auth_headers, \"Idempotency-Key\": reg_key})\n    assert reg_resp.status_code == 201\n    biller_id = reg_resp.json()[\"biller_id\"]\n    assert reg_resp.json()[\"status\"] == \"hold\"\n    w_payload = {\"biller_id\": biller_id, \"amount\": \"50.00\", \"currency\": \"USD\"}\n    w_resp = api_client.post(\"/withdrawals\", json=w_payload, headers=auth_headers)\n    assert w_resp.status_code in (202, 403)\n    if w_resp.status_code == 202:\n        assert w_resp.json().get(\"status\") == \"deferred\"\n    else:\n        assert w_resp.json().get(\"code\") in (\"BILLER_ON_HOLD\", \"HOLD_PERIOD_ACTIVE\")"
+      },
+      {
+        "name": "test_biller_state_transitions_hold_to_active_after_hold_period",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated (valid Bearer token available via <auth_fixture>)",
+          "Test environment supports time-travel or fast-forward via <advance_time_fn> (e.g. mock clock or admin API)"
+        ],
+        "actions": [
+          "Register a new biller \u2014 assert state is 'hold'",
+          "Advance system clock by exactly 24 hours via <advance_time_fn>",
+          "GET /billers/{biller_id} \u2014 assert state transitions to 'active'",
+          "Attempt a withdrawal \u2014 assert it is now processed (not deferred)"
+        ],
+        "expected": [
+          "Biller status is 'hold' immediately after registration",
+          "Biller status is 'active' after 24-hour hold elapses",
+          "Withdrawal after hold period succeeds with HTTP 200/201 and status != 'deferred'"
+        ],
+        "trace": [
+          "R-FIN-098: 24-hour hold \u2014 state transition hold -> active",
+          "R-FIN-098: withdrawals to new billers shall be deferred (negated post-hold)"
+        ],
+        "executable": "def test_biller_state_transitions_hold_to_active_after_hold_period(\n        auth_headers, unique_key_fn, api_client, advance_time_fn):\n    reg_key = unique_key_fn()\n    payload = {\n        \"biller_name\": \"STC Transition Biller\",\n        \"account_number\": \"ACC-STC-\" + reg_key[-6:],\n        \"routing_number\": \"021000021\"\n    }\n    reg = api_client.post(\"/billers\", json=payload,\n                           headers={**auth_headers, \"Idempotency-Key\": reg_key})\n    assert reg.status_code == 201\n    biller_id = reg.json()[\"biller_id\"]\n    assert reg.json()[\"status\"] == \"hold\"\n    advance_time_fn(hours=24)\n    get_resp = api_client.get(f\"/billers/{biller_id}\", headers=auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\"\n    w_payload = {\"biller_id\": biller_id, \"amount\": \"100.00\", \"currency\": \"USD\"}\n    w_resp = api_client.post(\"/withdrawals\", json=w_payload, headers=auth_headers)\n    assert w_resp.status_code in (200, 201)\n    assert w_resp.json().get(\"status\") != \"deferred\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-098",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1011,
+    "output_tokens": 3207,
+    "latency_ms": 40359,
+    "wall_ms": 40359,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-098\",\n  \"reasoning\": \"R-FIN-098 has four testable behaviours: (1) a valid new biller lands in 'hold' state (EP/STC positive path); (2) a duplicate submission with the same Idempotency-Key returns the original response without creating a second record (EP idempotency positive path); (3) a duplicate biller submitted WITHOUT an Idempotency-Key returns 409 Conflict (NEG/DT negative path); (4) the 24-hour hold boundary \u2014 a withdrawal attempted exactly at T+24h-1s must still be deferred, while one at T+24h should be allowed (BVA boundary). Together these five cases cover all stated outcomes and error pathways. Each test is self-contained via a unique idempotency key and a fresh authenticated session fixture, keeping them deterministic and idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_register_biller_creates_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid Bearer token available via <auth_fixture>)\",\n        \"Biller with the given account number does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"Generate a unique idempotency key via <unique_key_fn>\",\n        \"POST /billers with valid biller payload and Idempotency-Key header\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status == 'hold'\",\n        \"Response body contains a biller_id\",\n        \"Response body contains hold_expires_at timestamp approximately 24 hours from now\"\n      ],\n      \"trace\": [\n        \"R-FIN-098: biller in hold state after registration\",\n        \"R-FIN-098: 24-hour hold precondition\"\n      ],\n      \"executable\": \"def test_register_biller_creates_hold_state(auth_headers, unique_key_fn, api_client):\\n    key = unique_key_fn()\\n    payload = {\\n        \\\"biller_name\\\": \\\"Acme Electric\\\",\\n        \\\"account_number\\\": \\\"ACC-\\\" + key[-8:],\\n        \\\"routing_number\\\": \\\"021000021\\\"\\n    }\\n    headers = {**auth_headers, \\\"Idempotency-Key\\\": key}\\n    resp = api_client.post(\\\"/billers\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"hold\\\"\\n    assert \\\"biller_id\\\" in body\\n    assert \\\"hold_expires_at\\\" in body\"\n    },\n    {\n      \"name\": \"test_duplicate_idempotency_key_returns_original_response\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid Bearer token available via <auth_fixture>)\",\n        \"A biller has been successfully registered with a known Idempotency-Key\"\n      ],\n      \"actions\": [\n        \"POST /billers with the same payload and the same Idempotency-Key a second time\",\n        \"Compare second response to first response\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created on second call (idempotent replay)\",\n        \"Second response body is identical to first response body\",\n        \"No new biller_id is created\"\n      ],\n      \"trace\": [\n        \"R-FIN-098: operation must be idempotent\",\n        \"R-FIN-098: duplicate submission with same Idempotency-Key returns original result\"\n      ],\n      \"executable\": \"def test_duplicate_idempotency_key_returns_original_response(auth_headers, unique_key_fn, api_client):\\n    key = unique_key_fn()\\n    payload = {\\n        \\\"biller_name\\\": \\\"Idempotent Corp\\\",\\n        \\\"account_number\\\": \\\"ACC-IDEM-\\\" + key[-6:],\\n        \\\"routing_number\\\": \\\"021000021\\\"\\n    }\\n    headers = {**auth_headers, \\\"Idempotency-Key\\\": key}\\n    resp1 = api_client.post(\\\"/billers\\\", json=payload, headers=headers)\\n    assert resp1.status_code == 201\\n    body1 = resp1.json()\\n    resp2 = api_client.post(\\\"/billers\\\", json=payload, headers=headers)\\n    assert resp2.status_code == 201\\n    body2 = resp2.json()\\n    assert body2[\\\"biller_id\\\"] == body1[\\\"biller_id\\\"]\\n    assert body2[\\\"status\\\"] == body1[\\\"status\\\"]\\n    assert body2[\\\"hold_expires_at\\\"] == body1[\\\"hold_expires_at\\\"]\"\n    },\n   "
+  }
+}

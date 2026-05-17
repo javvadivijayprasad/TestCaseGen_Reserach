@@ -1,0 +1,132 @@
+{
+  "req": {
+    "id": "R-FIN-024",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "integration",
+    "title": "Rate limiting",
+    "statement": "The API shall enforce 60 requests per minute per user; overages shall return 429 with retry-after.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "any endpoint"
+    ],
+    "triggers": [
+      "burst requests"
+    ],
+    "expected_outcomes": [
+      "429 with retry-after"
+    ],
+    "error_pathways": [
+      "request tail rejected"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/*"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-024",
+    "reasoning": "R-FIN-024 mandates 60 req/min per-user rate limiting with HTTP 429 + Retry-After on overage. Three orthogonal cases are needed: (1) EP/positive \u2013 59 requests within a minute all succeed (inside the allowed partition); (2) BVA/boundary \u2013 the 60th request succeeds and the 61st is the first rejected request, probing both edges of the limit; (3) NEG/negative \u2013 a burst well above 60 immediately triggers 429 with a valid Retry-After header, verifying the error pathway. Each test resets state via a unique per-test user token so they remain independent and idempotent. A <reset_rate_limit> fixture provides an admin call to flush counters before each test, ensuring determinism.",
+    "tests": [
+      {
+        "name": "test_requests_within_limit_all_succeed",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is reachable",
+          "Valid bearer token for a test user is available",
+          "Rate-limit counter for this user has been reset to 0"
+        ],
+        "actions": [
+          "Send 59 GET /health requests sequentially under the same user token within a 60-second window",
+          "Collect all HTTP response status codes"
+        ],
+        "expected": [
+          "All 59 responses return HTTP 200",
+          "No response returns HTTP 429"
+        ],
+        "trace": [
+          "R-FIN-024: requests within the 60 req/min quota must succeed",
+          "EP: 59 requests belong to the valid partition (1-60 inclusive)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\n\n@pytest.fixture(autouse=True)\ndef reset_rate_limit(unique_user_token):\n    <reset_rate_limit>(unique_user_token)\n    yield\n\n@pytest.fixture()\ndef unique_user_token():\n    return <generate_unique_user_token>()\n\ndef test_requests_within_limit_all_succeed(unique_user_token, reset_rate_limit):\n    headers = {\"Authorization\": f\"Bearer {unique_user_token}\"}\n    statuses = []\n    for _ in range(59):\n        resp = requests.get(f\"{BASE_URL}/health\", headers=headers, timeout=5)\n        statuses.append(resp.status_code)\n    assert all(s == 200 for s in statuses), (\n        f\"Expected all 200, got: {set(statuses)}\"\n    )\n    assert 429 not in statuses"
+      },
+      {
+        "name": "test_60th_request_succeeds_and_61st_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "Valid bearer token for a test user is available",
+          "Rate-limit counter for this user has been reset to 0"
+        ],
+        "actions": [
+          "Send exactly 60 GET /health requests under the same user token",
+          "Assert all 60 return HTTP 200",
+          "Send one additional (61st) GET /health request immediately",
+          "Inspect response status code and Retry-After header"
+        ],
+        "expected": [
+          "Requests 1-60 all return HTTP 200",
+          "Request 61 returns HTTP 429",
+          "Response 61 contains a Retry-After header with a positive integer value"
+        ],
+        "trace": [
+          "R-FIN-024: the 60th request is the last allowed; 61st is first overage",
+          "BVA: tests the boundary at exactly N=60 (max) and N=61 (min overage)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\n\n@pytest.fixture()\ndef unique_user_token():\n    return <generate_unique_user_token>()\n\n@pytest.fixture(autouse=True)\ndef reset_rate_limit(unique_user_token):\n    <reset_rate_limit>(unique_user_token)\n    yield\n\ndef test_60th_request_succeeds_and_61st_is_rejected(unique_user_token, reset_rate_limit):\n    headers = {\"Authorization\": f\"Bearer {unique_user_token}\"}\n    for i in range(1, 61):\n        r = requests.get(f\"{BASE_URL}/health\", headers=headers, timeout=5)\n        assert r.status_code == 200, f\"Request {i} failed with {r.status_code}\"\n    overage = requests.get(f\"{BASE_URL}/health\", headers=headers, timeout=5)\n    assert overage.status_code == 429, f\"Expected 429, got {overage.status_code}\"\n    retry_after = overage.headers.get(\"Retry-After\")\n    assert retry_after is not None, \"Retry-After header missing\"\n    assert int(retry_after) > 0, f\"Retry-After must be positive, got {retry_after}\""
+      },
+      {
+        "name": "test_burst_above_limit_returns_429_with_retry_after",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "Valid bearer token for a test user is available",
+          "Rate-limit counter for this user has been reset to 0"
+        ],
+        "actions": [
+          "Send 80 GET /health requests in rapid succession under the same user token",
+          "Collect all responses",
+          "Identify the first response with status 429",
+          "Verify Retry-After header on all 429 responses"
+        ],
+        "expected": [
+          "At least requests 61-80 return HTTP 429",
+          "Every 429 response includes a Retry-After header",
+          "Retry-After header value is a positive integer (seconds until window resets)"
+        ],
+        "trace": [
+          "R-FIN-024: overages shall return 429 with retry-after",
+          "NEG: exercises the error/rejection pathway when requests exceed the quota",
+          "R-FIN-024: request tail rejected error pathway"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\n\n@pytest.fixture()\ndef unique_user_token():\n    return <generate_unique_user_token>()\n\n@pytest.fixture(autouse=True)\ndef reset_rate_limit(unique_user_token):\n    <reset_rate_limit>(unique_user_token)\n    yield\n\ndef test_burst_above_limit_returns_429_with_retry_after(unique_user_token, reset_rate_limit):\n    headers = {\"Authorization\": f\"Bearer {unique_user_token}\"}\n    responses = [\n        requests.get(f\"{BASE_URL}/health\", headers=headers, timeout=5)\n        for _ in range(80)\n    ]\n    statuses = [r.status_code for r in responses]\n    rejected = [r for r in responses if r.status_code == 429]\n    assert len(rejected) >= 20, f\"Expected >=20 rejections, got {len(rejected)}\"\n    for r in rejected:\n        retry_after = r.headers.get(\"Retry-After\")\n        assert retry_after is not None, \"Retry-After header missing on 429\"\n        assert int(retry_after) > 0, f\"Invalid Retry-After: {retry_after}\"\n    first_429_idx = next(i for i, s in enumerate(statuses) if s == 429)\n    assert first_429_idx >= 60, f\"429 appeared too early at index {first_429_idx}\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-024",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 968,
+    "output_tokens": 2065,
+    "latency_ms": 23988,
+    "wall_ms": 23988,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-024\",\n  \"reasoning\": \"R-FIN-024 mandates 60 req/min per-user rate limiting with HTTP 429 + Retry-After on overage. Three orthogonal cases are needed: (1) EP/positive \u2013 59 requests within a minute all succeed (inside the allowed partition); (2) BVA/boundary \u2013 the 60th request succeeds and the 61st is the first rejected request, probing both edges of the limit; (3) NEG/negative \u2013 a burst well above 60 immediately triggers 429 with a valid Retry-After header, verifying the error pathway. Each test resets state via a unique per-test user token so they remain independent and idempotent. A <reset_rate_limit> fixture provides an admin call to flush counters before each test, ensuring determinism.\",\n  \"tests\": [\n    {\n      \"name\": \"test_requests_within_limit_all_succeed\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Valid bearer token for a test user is available\",\n        \"Rate-limit counter for this user has been reset to 0\"\n      ],\n      \"actions\": [\n        \"Send 59 GET /health requests sequentially under the same user token within a 60-second window\",\n        \"Collect all HTTP response status codes\"\n      ],\n      \"expected\": [\n        \"All 59 responses return HTTP 200\",\n        \"No response returns HTTP 429\"\n      ],\n      \"trace\": [\n        \"R-FIN-024: requests within the 60 req/min quota must succeed\",\n        \"EP: 59 requests belong to the valid partition (1-60 inclusive)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\n\\n@pytest.fixture(autouse=True)\\ndef reset_rate_limit(unique_user_token):\\n    <reset_rate_limit>(unique_user_token)\\n    yield\\n\\n@pytest.fixture()\\ndef unique_user_token():\\n    return <generate_unique_user_token>()\\n\\ndef test_requests_within_limit_all_succeed(unique_user_token, reset_rate_limit):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {unique_user_token}\\\"}\\n    statuses = []\\n    for _ in range(59):\\n        resp = requests.get(f\\\"{BASE_URL}/health\\\", headers=headers, timeout=5)\\n        statuses.append(resp.status_code)\\n    assert all(s == 200 for s in statuses), (\\n        f\\\"Expected all 200, got: {set(statuses)}\\\"\\n    )\\n    assert 429 not in statuses\"\n    },\n    {\n      \"name\": \"test_60th_request_succeeds_and_61st_is_rejected\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Valid bearer token for a test user is available\",\n        \"Rate-limit counter for this user has been reset to 0\"\n      ],\n      \"actions\": [\n        \"Send exactly 60 GET /health requests under the same user token\",\n        \"Assert all 60 return HTTP 200\",\n        \"Send one additional (61st) GET /health request immediately\",\n        \"Inspect response status code and Retry-After header\"\n      ],\n      \"expected\": [\n        \"Requests 1-60 all return HTTP 200\",\n        \"Request 61 returns HTTP 429\",\n        \"Response 61 contains a Retry-After header with a positive integer value\"\n      ],\n      \"trace\": [\n        \"R-FIN-024: the 60th request is the last allowed; 61st is first overage\",\n        \"BVA: tests the boundary at exactly N=60 (max) and N=61 (min overage)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\n\\n@pytest.fixture()\\ndef unique_user_token():\\n    return <generate_unique_user_token>()\\n\\n@pytest.fixture(autouse=True)\\ndef reset_rate_limit(unique_user_token):\\n    <reset_rate_limit>(unique_user_token)\\n    yield\\n\\ndef test_60th_request_succeeds_and_61st_is_rejected(unique_user_token, reset_rate_limit):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {unique_user_token}\\\"}\\n    for i in range(1, 61):\\n        r = requests.get(f\\\"{BASE_URL}/health\\\", headers=headers, timeout=5)\\n        assert r.status_code == 200, f\\\"Request {i} failed with {r.status_code}\\\"\\n    overage = requests.get(f\\\"{BASE_URL}/health\\\", headers=headers, timeo"
+  }
+}

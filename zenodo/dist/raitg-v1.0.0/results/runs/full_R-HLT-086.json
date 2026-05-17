@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-086",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Procedure record (audit)",
+    "statement": "A clinician shall record a Procedure tied to an Encounter. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "encounter open or referenced"
+    ],
+    "triggers": [
+      "clinician records procedure"
+    ],
+    "expected_outcomes": [
+      "procedure stored"
+    ],
+    "error_pathways": [
+      "422 when encounter missing"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Procedure"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-086",
+    "reasoning": "R-HLT-086 mandates three orthogonal concerns: (1) a Procedure resource is persisted when a valid open Encounter exists, (2) a 422 is returned when the Encounter reference is absent or invalid, and (3) an AuditEvent is emitted for every operation. Test design covers: EP for the happy-path partition (valid encounter \u2192 201 + AuditEvent), NEG for the missing-encounter error pathway (422), BVA for the boundary where the Encounter reference field is present but contains an empty string (degenerate boundary between 'provided' and 'missing'), STC for the state transition open-Encounter \u2192 Procedure-recorded \u2192 audit-trail-complete, and DT for the combined decision of encounter-present \u00d7 subject-present to confirm the full success path. This yields five tests, exceeding the minimum of three.",
+    "tests": [
+      {
+        "name": "test_create_procedure_valid_encounter_returns_201_and_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A valid open Encounter resource exists with known encounterID",
+          "Clinician auth token is available via <auth_fixture>"
+        ],
+        "actions": [
+          "POST /Procedure with resourceType=Procedure, status=completed, subject reference, and encounter reference pointing to the existing Encounter",
+          "Capture the response status and body",
+          "GET /AuditEvent?entity=Procedure/<new_id> to retrieve emitted audit record"
+        ],
+        "expected": [
+          "POST /Procedure returns HTTP 201",
+          "Response body contains id field",
+          "Response body encounter.reference matches submitted encounter ID",
+          "GET /AuditEvent returns at least one AuditEvent record whose entity reference matches the new Procedure ID"
+        ],
+        "trace": [
+          "R-HLT-086: procedure stored when encounter open",
+          "R-HLT-086: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_procedure_valid_encounter_returns_201_and_audit_event(\n    base_url, auth_headers, open_encounter_id\n):\n    payload = {\n        \"resourceType\": \"Procedure\",\n        \"status\": \"completed\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"encounter\": {\"reference\": f\"Encounter/{open_encounter_id}\"},\n        \"code\": {\"text\": \"Blood pressure measurement\"}\n    }\n    resp = requests.post(\n        f\"{base_url}/Procedure\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    proc_id = body.get(\"id\")\n    assert proc_id, \"Response body missing 'id'\"\n    assert body[\"encounter\"][\"reference\"] == f\"Encounter/{open_encounter_id}\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Procedure/{proc_id}\"},\n        headers=auth_headers\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"No AuditEvent emitted for Procedure creation\"\n"
+      },
+      {
+        "name": "test_create_procedure_missing_encounter_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "No encounter reference is included in the request body",
+          "Clinician auth token is available via <auth_fixture>"
+        ],
+        "actions": [
+          "POST /Procedure with resourceType=Procedure and status=completed but omit the encounter field entirely",
+          "Capture the response status and OperationOutcome body"
+        ],
+        "expected": [
+          "POST /Procedure returns HTTP 422",
+          "Response body contains OperationOutcome resourceType",
+          "OperationOutcome issue severity is 'error' and diagnostics mention encounter"
+        ],
+        "trace": [
+          "R-HLT-086: error pathway 422 when encounter missing"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_procedure_missing_encounter_returns_422(\n    base_url, auth_headers\n):\n    payload = {\n        \"resourceType\": \"Procedure\",\n        \"status\": \"completed\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"code\": {\"text\": \"Blood pressure measurement\"}\n        # 'encounter' field deliberately omitted\n    }\n    resp = requests.post(\n        f\"{base_url}/Procedure\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\n        i.get(\"severity\") == \"error\" for i in issues\n    ), \"Expected at least one error-severity issue in OperationOutcome\"\n"
+      },
+      {
+        "name": "test_create_procedure_empty_string_encounter_reference_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "The encounter field is present in the payload but its reference value is an empty string (boundary between supplied and missing)",
+          "Clinician auth token is available via <auth_fixture>"
+        ],
+        "actions": [
+          "POST /Procedure with encounter field set to {\"reference\": \"\"} (empty string)",
+          "Capture response status and body"
+        ],
+        "expected": [
+          "POST /Procedure returns HTTP 422 or HTTP 400 (invalid reference boundary)",
+          "Response body is an OperationOutcome",
+          "Procedure is NOT persisted (no id returned)"
+        ],
+        "trace": [
+          "R-HLT-086: error pathway when encounter reference degenerate/empty",
+          "BVA: boundary between present-encounter and absent-encounter partitions"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_procedure_empty_string_encounter_reference_is_rejected(\n    base_url, auth_headers\n):\n    payload = {\n        \"resourceType\": \"Procedure\",\n        \"status\": \"completed\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"encounter\": {\"reference\": \"\"},\n        \"code\": {\"text\": \"Blood pressure measurement\"}\n    }\n    resp = requests.post(\n        f\"{base_url}/Procedure\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400 or 422 for empty encounter ref, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    assert \"id\" not in body, \"Procedure must not be persisted with empty encounter reference\"\n"
+      },
+      {
+        "name": "test_procedure_state_transition_open_encounter_to_recorded_with_audit_trail",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A valid Encounter in status=in-progress exists",
+          "Clinician auth token is available via <auth_fixture>"
+        ],
+        "actions": [
+          "GET /Encounter/<id> to confirm state is in-progress (pre-state)",
+          "POST /Procedure referencing that Encounter to trigger state transition",
+          "GET /Procedure/<new_id> to confirm procedure state is completed (post-state)",
+          "GET /AuditEvent?entity=Procedure/<new_id> to verify audit trail covers the transition"
+        ],
+        "expected": [
+          "Encounter pre-state is in-progress",
+          "POST /Procedure returns 201",
+          "GET /Procedure returns status=completed",
+          "AuditEvent entry exists with action=C (create) for the Procedure"
+        ],
+        "trace": [
+          "R-HLT-086: state transition open-Encounter \u2192 Procedure recorded",
+          "R-HLT-086: AuditEvent emitted end-to-end"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_procedure_state_transition_open_encounter_to_recorded_with_audit_trail(\n    base_url, auth_headers, open_encounter_id\n):\n    enc_resp = requests.get(f\"{base_url}/Encounter/{open_encounter_id}\", headers=auth_headers)\n    assert enc_resp.status_code == 200\n    assert enc_resp.json().get(\"status\") == \"in-progress\"\n\n    payload = {\n        \"resourceType\": \"Procedure\",\n        \"status\": \"completed\",\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"encounter\": {\"reference\": f\"Encounter/{open_encounter_id}\"},\n        \"code\": {\"text\": \"ECG\"}\n    }\n    post_resp = requests.post(f\"{base_url}/Procedure\", json=payload, headers=auth_headers)\n    assert post_resp.status_code == 201\n    proc_id = post_resp.json()[\"id\"]\n\n    get_resp = requests.get(f\"{base_url}/Procedure/{proc_id}\", headers=auth_headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"completed\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Procedure/{proc_id}\", \"action\": \"C\"},\n        headers=auth_headers\n    )\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json().get(\"entry\", [])) >= 1\n"
+      },
+      {
+        "name": "test_procedure_decision_table_encounter_present_and_subject_present_succeeds",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "Encounter exists and is open; Subject (Patient) exists",
+          "Decision table row: encounter=PRESENT, subject=PRESENT \u2192 expected outcome=201+AuditEvent"
+        ],
+        "actions": [
+          "POST /Procedure with both encounter reference and subject reference populated",
+          "Assert 201 and stored resource contains both references",
+          "Assert AuditEvent emitted"
+        ],
+        "expected": [
+          "HTTP 201 returned",
+          "Stored Procedure contains encounter.reference and subject.reference",
+          "AuditEvent entry count >= 1 for this Procedure"
+        ],
+        "trace": [
+          "R-HLT-086: decision table \u2013 encounter present AND subject present \u2192 procedure stored",
+          "R-HLT-086: AuditEvent for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_procedure_decision_table_encounter_present_and_subject_present_succeeds(\n    base_url, auth_headers, open_encounter_id\n):\n    subject_ref = \"Patient/test-patient-dt-1\"\n    encounter_ref = f\"Encounter/{open_encounter_id}\"\n    payload = {\n        \"resourceType\": \"Procedure\",\n        \"status\": \"completed\",\n        \"subject\": {\"reference\": subject_ref},\n        \"encounter\": {\"reference\": encounter_ref},\n        \"code\": {\"text\": \"Venepuncture\"}\n    }\n    resp = requests.post(f\"{base_url}/Procedure\", json=payload, headers=auth_headers)\n    assert resp.status_code == 201, f\"DT row failed: {resp.status_code} {resp.text}\"\n    body = resp.json()\n    assert body[\"subject\"][\"reference\"] == subject_ref\n    assert body[\"encounter\"][\"reference\"] == encounter_ref\n    proc_id = body[\"id\"]\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": f\"Procedure/{proc_id}\"},\n        headers=auth_headers\n    )\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json().get(\"entry\", [])) >= 1, \"AuditEvent missing for DT positive row\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-086",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 986,
+    "output_tokens": 3501,
+    "latency_ms": 37796,
+    "wall_ms": 37796,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-086\",\n  \"reasoning\": \"R-HLT-086 mandates three orthogonal concerns: (1) a Procedure resource is persisted when a valid open Encounter exists, (2) a 422 is returned when the Encounter reference is absent or invalid, and (3) an AuditEvent is emitted for every operation. Test design covers: EP for the happy-path partition (valid encounter \u2192 201 + AuditEvent), NEG for the missing-encounter error pathway (422), BVA for the boundary where the Encounter reference field is present but contains an empty string (degenerate boundary between 'provided' and 'missing'), STC for the state transition open-Encounter \u2192 Procedure-recorded \u2192 audit-trail-complete, and DT for the combined decision of encounter-present \u00d7 subject-present to confirm the full success path. This yields five tests, exceeding the minimum of three.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_procedure_valid_encounter_returns_201_and_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"A valid open Encounter resource exists with known encounterID\",\n        \"Clinician auth token is available via <auth_fixture>\"\n      ],\n      \"actions\": [\n        \"POST /Procedure with resourceType=Procedure, status=completed, subject reference, and encounter reference pointing to the existing Encounter\",\n        \"Capture the response status and body\",\n        \"GET /AuditEvent?entity=Procedure/<new_id> to retrieve emitted audit record\"\n      ],\n      \"expected\": [\n        \"POST /Procedure returns HTTP 201\",\n        \"Response body contains id field\",\n        \"Response body encounter.reference matches submitted encounter ID\",\n        \"GET /AuditEvent returns at least one AuditEvent record whose entity reference matches the new Procedure ID\"\n      ],\n      \"trace\": [\n        \"R-HLT-086: procedure stored when encounter open\",\n        \"R-HLT-086: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_procedure_valid_encounter_returns_201_and_audit_event(\\n    base_url, auth_headers, open_encounter_id\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Procedure\\\",\\n        \\\"status\\\": \\\"completed\\\",\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/test-patient-1\\\"},\\n        \\\"encounter\\\": {\\\"reference\\\": f\\\"Encounter/{open_encounter_id}\\\"},\\n        \\\"code\\\": {\\\"text\\\": \\\"Blood pressure measurement\\\"}\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Procedure\\\",\\n        json=payload,\\n        headers=auth_headers\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    proc_id = body.get(\\\"id\\\")\\n    assert proc_id, \\\"Response body missing 'id'\\\"\\n    assert body[\\\"encounter\\\"][\\\"reference\\\"] == f\\\"Encounter/{open_encounter_id}\\\"\\n\\n    audit_resp = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Procedure/{proc_id}\\\"},\\n        headers=auth_headers\\n    )\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"No AuditEvent emitted for Procedure creation\\\"\\n\"\n    },\n    {\n      \"name\": \"test_create_procedure_missing_encounter_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"No encounter reference is included in the request body\",\n        \"Clinician auth token is available via <auth_fixture>\"\n      ],\n      \"actions\": [\n        \"POST /Procedure with resourceType=Procedure and status=completed but omit the encounter field entirely\",\n        \"Capture the response status and OperationOutcome body\"\n      ],\n      \"expected\": [\n        \"POST /Procedure returns HTTP 422\",\n        \"Response body contains OperationOutcome resourceType\",\n        \"OperationOutcome issue severity is 'error' and diagnostics mention encounte"
+  }
+}

@@ -1,0 +1,187 @@
+{
+  "req": {
+    "id": "R-HLT-081",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create encounter (audit)",
+    "statement": "A clinician shall create an Encounter for a patient with start and end timestamps; end before start shall be rejected. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician opens encounter"
+    ],
+    "expected_outcomes": [
+      "encounter stored"
+    ],
+    "error_pathways": [
+      "422 when end < start"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-081",
+    "reasoning": "The requirement mandates: (1) successful Encounter creation with valid start < end timestamps, (2) rejection with HTTP 422 when end < start, (3) AuditEvent emission for every operation. I apply EP for the happy path (valid partition), NEG for the invalid timestamp ordering, BVA for the boundary where end equals start (zero-duration encounter), STC to verify the state transition from no-encounter to stored-encounter with audit, and DT for a combined decision covering both timestamp validity and audit presence. Tests are self-contained via fixtures that create and tear down resources deterministically.",
+    "tests": [
+      {
+        "name": "test_create_encounter_valid_timestamps_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_token> fixture",
+          "Patient exists with known ID via <existing_patient_id> fixture",
+          "AuditEvent log is queryable at /AuditEvent endpoint"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T09:00:00Z' using clinician token",
+          "Assert HTTP 201 and capture returned encounter ID",
+          "GET /AuditEvent?entity=Encounter/<id> to retrieve audit records"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Response body contains resourceType='Encounter'",
+          "Stored start and end timestamps match submitted values",
+          "At least one AuditEvent record references the created Encounter ID",
+          "AuditEvent action field equals 'C' (create)"
+        ],
+        "trace": [
+          "R-HLT-081: encounter stored",
+          "R-HLT-081: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "def test_create_encounter_valid_timestamps_emits_audit(clinician_auth_token, existing_patient_id, api_base_url):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-06-01T08:00:00Z\",\n            \"end\": \"2024-06-01T09:00:00Z\"\n        }\n    }\n    resp = <api_post>(f\"{api_base_url}/Encounter\", json=payload, token=clinician_auth_token)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Encounter\"\n    enc_id = body[\"id\"]\n    assert body[\"period\"][\"start\"] == \"2024-06-01T08:00:00Z\"\n    assert body[\"period\"][\"end\"] == \"2024-06-01T09:00:00Z\"\n\n    audit_resp = <api_get>(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"entity\": f\"Encounter/{enc_id}\"},\n        token=clinician_auth_token\n    )\n    assert audit_resp.status_code == 200\n    audit_entries = audit_resp.json().get(\"entry\", [])\n    assert len(audit_entries) >= 1\n    actions = [e[\"resource\"][\"action\"] for e in audit_entries]\n    assert \"C\" in actions\n\n    <cleanup_resource>(f\"{api_base_url}/Encounter/{enc_id}\", token=clinician_auth_token)"
+      },
+      {
+        "name": "test_create_encounter_end_before_start_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_token> fixture",
+          "Patient exists with known ID via <existing_patient_id> fixture"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T10:00:00Z' and end='2024-06-01T09:00:00Z' (end before start)",
+          "Assert HTTP 422 is returned",
+          "Assert error body describes timestamp validation failure"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity is returned",
+          "Response body contains an OperationOutcome or error message referencing period/end or timestamp ordering",
+          "No Encounter resource is persisted in the system"
+        ],
+        "trace": [
+          "R-HLT-081: 422 when end < start"
+        ],
+        "executable": "def test_create_encounter_end_before_start_returns_422(clinician_auth_token, existing_patient_id, api_base_url):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-06-01T10:00:00Z\",\n            \"end\": \"2024-06-01T09:00:00Z\"\n        }\n    }\n    resp = <api_post>(f\"{api_base_url}/Encounter\", json=payload, token=clinician_auth_token)\n    assert resp.status_code == 422\n    body = resp.json()\n    error_text = str(body).lower()\n    assert any(kw in error_text for kw in [\"period\", \"end\", \"start\", \"timestamp\", \"invalid\"])\n\n    search_resp = <api_get>(\n        f\"{api_base_url}/Encounter\",\n        params={\"subject\": existing_patient_id, \"date\": \"2024-06-01\"},\n        token=clinician_auth_token\n    )\n    entries = search_resp.json().get(\"entry\", [])\n    bad = [e for e in entries\n           if e[\"resource\"].get(\"period\", {}).get(\"end\") == \"2024-06-01T09:00:00Z\"\n           and e[\"resource\"].get(\"period\", {}).get(\"start\") == \"2024-06-01T10:00:00Z\"]\n    assert len(bad) == 0"
+      },
+      {
+        "name": "test_create_encounter_end_equals_start_accepted_and_audit_emitted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_token> fixture",
+          "Patient exists with known ID via <existing_patient_id> fixture",
+          "AuditEvent log is queryable at /AuditEvent endpoint"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T08:00:00Z' (zero-duration boundary)",
+          "Assert HTTP 201 is returned",
+          "GET /AuditEvent?entity=Encounter/<id> to confirm audit emission"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned (end == start is the exact boundary; not end < start)",
+          "Response body contains the Encounter with matching zero-duration period",
+          "At least one AuditEvent references the created Encounter"
+        ],
+        "trace": [
+          "R-HLT-081: end before start shall be rejected \u2014 boundary is end == start (not rejected)",
+          "R-HLT-081: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "def test_create_encounter_end_equals_start_accepted_and_audit_emitted(clinician_auth_token, existing_patient_id, api_base_url):\n    ts = \"2024-06-01T08:00:00Z\"\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": ts, \"end\": ts}\n    }\n    resp = <api_post>(f\"{api_base_url}/Encounter\", json=payload, token=clinician_auth_token)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Encounter\"\n    enc_id = body[\"id\"]\n    assert body[\"period\"][\"start\"] == ts\n    assert body[\"period\"][\"end\"] == ts\n\n    audit_resp = <api_get>(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"entity\": f\"Encounter/{enc_id}\"},\n        token=clinician_auth_token\n    )\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json().get(\"entry\", [])) >= 1\n\n    <cleanup_resource>(f\"{api_base_url}/Encounter/{enc_id}\", token=clinician_auth_token)"
+      },
+      {
+        "name": "test_encounter_state_transition_planned_to_finished_audit_captured",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_token> fixture",
+          "Patient exists with known ID via <existing_patient_id> fixture",
+          "System supports Encounter status values: 'planned' and 'finished'"
+        ],
+        "actions": [
+          "POST /Encounter with status='planned' and start='2024-07-01T07:00:00Z' (no end)",
+          "Assert HTTP 201 and capture encounter ID",
+          "PUT /Encounter/<id> updating status to 'finished' and adding end='2024-07-01T08:00:00Z'",
+          "Assert HTTP 200 on update",
+          "GET /AuditEvent?entity=Encounter/<id> and confirm two audit entries (create + update)"
+        ],
+        "expected": [
+          "Initial POST returns HTTP 201 with status='planned'",
+          "PUT returns HTTP 200 with status='finished' and valid period",
+          "AuditEvent log contains at least two entries: one for 'C' (create) and one for 'U' (update)",
+          "No 422 is raised since end > start in the final state"
+        ],
+        "trace": [
+          "R-HLT-081: encounter stored",
+          "R-HLT-081: AuditEvent must be emitted for every operation",
+          "R-HLT-081: clinician opens encounter (trigger maps to status transition)"
+        ],
+        "executable": "def test_encounter_state_transition_planned_to_finished_audit_captured(clinician_auth_token, existing_patient_id, api_base_url):\n    create_payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"planned\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-07-01T07:00:00Z\"}\n    }\n    create_resp = <api_post>(f\"{api_base_url}/Encounter\", json=create_payload, token=clinician_auth_token)\n    assert create_resp.status_code == 201\n    enc_id = create_resp.json()[\"id\"]\n\n    update_payload = {\n        \"resourceType\": \"Encounter\",\n        \"id\": enc_id,\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-07-01T07:00:00Z\", \"end\": \"2024-07-01T08:00:00Z\"}\n    }\n    update_resp = <api_put>(f\"{api_base_url}/Encounter/{enc_id}\", json=update_payload, token=clinician_auth_token)\n    assert update_resp.status_code == 200\n    assert update_resp.json()[\"status\"] == \"finished\"\n\n    audit_resp = <api_get>(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"entity\": f\"Encounter/{enc_id}\"},\n        token=clinician_auth_token\n    )\n    entries = audit_resp.json().get(\"entry\", [])\n    audit_actions = {e[\"resource\"][\"action\"] for e in entries}\n    assert \"C\" in audit_actions\n    assert \"U\" in audit_actions\n\n    <cleanup_resource>(f\"{api_base_url}/Encounter/{enc_id}\", token=clinician_auth_token)"
+      },
+      {
+        "name": "test_encounter_decision_table_timestamp_and_audit_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_token> fixture",
+          "Patient exists with known ID via <existing_patient_id> fixture",
+          "AuditEvent log is queryable at /AuditEvent endpoint"
+        ],
+        "actions": [
+          "Case A: POST with end > start \u2014 expect 201 and audit entry present",
+          "Case B: POST with end < start \u2014 expect 422 and no persisted resource",
+          "Case C: POST with missing end \u2014 expect 201 (open encounter) and audit entry present"
+        ],
+        "expected": [
+          "Case A: 201 + AuditEvent action='C'",
+          "Case B: 422 + no stored Encounter",
+          "Case C: 201 + AuditEvent action='C' with no end timestamp in period"
+        ],
+        "trace": [
+          "R-HLT-081: end before start shall be rejected",
+          "R-HLT-081: encounter stored",
+          "R-HLT-081: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_encounter_decision_table_timestamp_and_audit_combinations(clinician_auth_token, existing_patient_id, api_base_url):\n    created_ids = []\n\n    # Case A: valid end > start\n    payload_a = {\n        \"resourceType\": \"Encounter\", \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-08-01T08:00:00Z\", \"end\": \"2024-08-01T09:00:00Z\"}\n    }\n    resp_a = <api_post>(f\"{api_base_url}/Encounter\", json=payload_a, token=clinician_auth_token)\n    assert resp_a.status_code == 201\n    id_a = resp_a.json()[\"id\"]\n    created_ids.append(id_a)\n    audit_a = <api_get>(f\"{api_base_url}/AuditEvent\", params={\"entity\": f\"Encounter/{id_a}\"}, token=clinician_auth_token)\n    assert any(e[\"resource\"][\"action\"] == \"C\" for e in audit_a.json().get(\"entry\", []))\n\n    # Case B: invalid end < start\n    payload_b = {\n        \"resourceType\": \"Encounter\", \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-08-01T10:00:00Z\", \"end\": \"2024-08-01T09:00:00Z\"}\n    }\n    resp_b = <api_post>(f\"{api_base_url}/Encounter\", json=payload_b, token=clinician_auth_token)\n    assert resp_b.status_code == 422\n\n    # Case C: missing end (open encounter)\n    payload_c = {\n        \"resourceType\": \"Encounter\", \"status\": \"in-progress\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-08-01T11:00:00Z\"}\n    }\n    resp_c = <api_post>(f\"{api_base_url}/Encounter\", json=payload_c, token=clinician_auth_token)\n    assert resp_c.status_code == 201\n    id_c = resp_c.json()[\"id\"]\n    created_ids.append(id_c)\n    assert \"end\" not in resp_c.json().get(\"period\", {})\n    audit_c = <api_get>(f\"{api_base_url}/AuditEvent\", params={\"entity\": f\"Encounter/{id_c}\"}, token=clinician_auth_token)\n    assert any(e[\"resource\"][\"action\"] == \"C\" for e in audit_c.json().get(\"entry\", []))\n\n    for eid in created_ids:\n        <cleanup_resource>(f\"{api_base_url}/Encounter/{eid}\", token=clinician_auth_token)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-081",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 4567,
+    "latency_ms": 42245,
+    "wall_ms": 42245,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-081\",\n  \"reasoning\": \"The requirement mandates: (1) successful Encounter creation with valid start < end timestamps, (2) rejection with HTTP 422 when end < start, (3) AuditEvent emission for every operation. I apply EP for the happy path (valid partition), NEG for the invalid timestamp ordering, BVA for the boundary where end equals start (zero-duration encounter), STC to verify the state transition from no-encounter to stored-encounter with audit, and DT for a combined decision covering both timestamp validity and audit presence. Tests are self-contained via fixtures that create and tear down resources deterministically.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_encounter_valid_timestamps_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_token> fixture\",\n        \"Patient exists with known ID via <existing_patient_id> fixture\",\n        \"AuditEvent log is queryable at /AuditEvent endpoint\"\n      ],\n      \"actions\": [\n        \"POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T09:00:00Z' using clinician token\",\n        \"Assert HTTP 201 and capture returned encounter ID\",\n        \"GET /AuditEvent?entity=Encounter/<id> to retrieve audit records\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created is returned\",\n        \"Response body contains resourceType='Encounter'\",\n        \"Stored start and end timestamps match submitted values\",\n        \"At least one AuditEvent record references the created Encounter ID\",\n        \"AuditEvent action field equals 'C' (create)\"\n      ],\n      \"trace\": [\n        \"R-HLT-081: encounter stored\",\n        \"R-HLT-081: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"def test_create_encounter_valid_timestamps_emits_audit(clinician_auth_token, existing_patient_id, api_base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Encounter\\\",\\n        \\\"status\\\": \\\"finished\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{existing_patient_id}\\\"},\\n        \\\"period\\\": {\\n            \\\"start\\\": \\\"2024-06-01T08:00:00Z\\\",\\n            \\\"end\\\": \\\"2024-06-01T09:00:00Z\\\"\\n        }\\n    }\\n    resp = <api_post>(f\\\"{api_base_url}/Encounter\\\", json=payload, token=clinician_auth_token)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Encounter\\\"\\n    enc_id = body[\\\"id\\\"]\\n    assert body[\\\"period\\\"][\\\"start\\\"] == \\\"2024-06-01T08:00:00Z\\\"\\n    assert body[\\\"period\\\"][\\\"end\\\"] == \\\"2024-06-01T09:00:00Z\\\"\\n\\n    audit_resp = <api_get>(\\n        f\\\"{api_base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Encounter/{enc_id}\\\"},\\n        token=clinician_auth_token\\n    )\\n    assert audit_resp.status_code == 200\\n    audit_entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(audit_entries) >= 1\\n    actions = [e[\\\"resource\\\"][\\\"action\\\"] for e in audit_entries]\\n    assert \\\"C\\\" in actions\\n\\n    <cleanup_resource>(f\\\"{api_base_url}/Encounter/{enc_id}\\\", token=clinician_auth_token)\"\n    },\n    {\n      \"name\": \"test_create_encounter_end_before_start_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_token> fixture\",\n        \"Patient exists with known ID via <existing_patient_id> fixture\"\n      ],\n      \"actions\": [\n        \"POST /Encounter with start='2024-06-01T10:00:00Z' and end='2024-06-01T09:00:00Z' (end before start)\",\n        \"Assert HTTP 422 is returned\",\n        \"Assert error body describes timestamp validation failure\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity is returned\",\n        \"Response body contains an OperationOutcome or error message referencing period/end or timestamp ordering\",\n        \"No Encounter resource is persisted in the system\"\n      ],\n      \"trace\": [\n        \"R-HLT-081: 422 when end < start\"\n      "
+  }
+}

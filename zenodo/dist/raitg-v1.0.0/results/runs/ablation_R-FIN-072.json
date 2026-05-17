@@ -1,0 +1,201 @@
+{
+  "req": {
+    "id": "R-FIN-072",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Card PIN change (negative variant)",
+    "statement": "A customer shall change their card PIN at most 5 times per 24-hour window. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer changes PIN"
+    ],
+    "expected_outcomes": [
+      "PIN updated"
+    ],
+    "error_pathways": [
+      "429 when rate limit exceeded"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/pin"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-072",
+    "reasoning": "The requirement mandates a 5-per-24h PIN change rate limit on /cards/{id}/pin. Tests are derived using: EP for a valid single PIN change (happy path); NEG for an unauthorised caller (403); BVA for the exact 5th attempt (boundary-inclusive success) and the 6th attempt (boundary-exclusive, 429); STC to model the transition from under-limit -> at-limit -> over-limit; and DT for the combination of valid auth + exceeded limit producing 429. Each test resets state via <reset_pin_attempts_fixture> so it is idempotent.",
+    "tests": [
+      {
+        "name": "test_pin_change_single_valid_request_returns_200",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Card belongs to the authenticated customer",
+          "No prior PIN change attempts in the current 24-hour window"
+        ],
+        "actions": [
+          "Send PUT /cards/{id}/pin with valid new_pin payload",
+          "Assert HTTP 200 and confirmation body"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body contains 'pin_updated': true"
+        ],
+        "trace": [
+          "R-FIN-072 - PIN updated expected outcome",
+          "EP: representative member of valid-request equivalence class"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_pin_change_single_valid_request_returns_200(\n    auth_headers,          # <fixture>: returns {\"Authorization\": \"Bearer <token>\"}\n    owned_card_id,         # <fixture>: returns card id owned by caller\n    reset_pin_attempts,    # <fixture>: resets rate-limit counter before test\n    api_base_url,          # <fixture>: returns base URL string\n):\n    url = f\"{api_base_url}/cards/{owned_card_id}/pin\"\n    payload = {\"new_pin\": \"1234\", \"confirm_pin\": \"1234\"}\n\n    response = requests.put(url, json=payload, headers=auth_headers)\n\n    assert response.status_code == 200\n    body = response.json()\n    assert body.get(\"pin_updated\") is True\n"
+      },
+      {
+        "name": "test_pin_change_unauthenticated_request_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No valid bearer token is present in the request",
+          "Card exists in the system"
+        ],
+        "actions": [
+          "Send PUT /cards/{id}/pin with no Authorization header",
+          "Assert HTTP 401"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response body contains an error indicating missing or invalid credentials"
+        ],
+        "trace": [
+          "R-FIN-072 - Error pathway: unauthorised",
+          "NEG: caller lacks authentication credentials"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_pin_change_unauthenticated_request_returns_401(\n    owned_card_id,      # <fixture>: returns a valid card id\n    api_base_url,       # <fixture>: returns base URL string\n):\n    url = f\"{api_base_url}/cards/{owned_card_id}/pin\"\n    payload = {\"new_pin\": \"1234\", \"confirm_pin\": \"1234\"}\n\n    response = requests.put(url, json=payload)  # no auth header\n\n    assert response.status_code == 401\n    body = response.json()\n    assert \"error\" in body or \"message\" in body\n"
+      },
+      {
+        "name": "test_pin_change_fifth_attempt_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Card belongs to the authenticated customer",
+          "Exactly 4 PIN change attempts have been made in the current 24-hour window"
+        ],
+        "actions": [
+          "Pre-seed rate-limit counter to 4 via <seed_pin_attempts_fixture>",
+          "Send PUT /cards/{id}/pin (5th attempt)",
+          "Assert HTTP 200"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "5th PIN change in the window is accepted",
+          "Response body contains 'pin_updated': true"
+        ],
+        "trace": [
+          "R-FIN-072 - at most 5 times per 24-hour window",
+          "BVA: upper boundary inclusive (N=5)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_pin_change_fifth_attempt_succeeds(\n    auth_headers,              # <fixture>\n    owned_card_id,             # <fixture>\n    reset_pin_attempts,        # <fixture>: resets counter first\n    seed_pin_attempts,         # <fixture factory>: callable(card_id, count)\n    api_base_url,              # <fixture>\n):\n    seed_pin_attempts(owned_card_id, 4)  # place counter at 4\n\n    url = f\"{api_base_url}/cards/{owned_card_id}/pin\"\n    payload = {\"new_pin\": \"5678\", \"confirm_pin\": \"5678\"}\n\n    response = requests.put(url, json=payload, headers=auth_headers)\n\n    assert response.status_code == 200\n    assert response.json().get(\"pin_updated\") is True\n"
+      },
+      {
+        "name": "test_pin_change_sixth_attempt_returns_429",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Card belongs to the authenticated customer",
+          "Exactly 5 PIN change attempts have already been made in the current 24-hour window"
+        ],
+        "actions": [
+          "Pre-seed rate-limit counter to 5 via <seed_pin_attempts_fixture>",
+          "Send PUT /cards/{id}/pin (6th attempt)",
+          "Assert HTTP 429"
+        ],
+        "expected": [
+          "HTTP 429 Too Many Requests",
+          "Response contains Retry-After header or rate-limit error body"
+        ],
+        "trace": [
+          "R-FIN-072 - Error pathway: 429 when rate limit exceeded",
+          "BVA: one beyond upper boundary (N=6)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_pin_change_sixth_attempt_returns_429(\n    auth_headers,\n    owned_card_id,\n    reset_pin_attempts,\n    seed_pin_attempts,\n    api_base_url,\n):\n    seed_pin_attempts(owned_card_id, 5)  # counter already at limit\n\n    url = f\"{api_base_url}/cards/{owned_card_id}/pin\"\n    payload = {\"new_pin\": \"9999\", \"confirm_pin\": \"9999\"}\n\n    response = requests.put(url, json=payload, headers=auth_headers)\n\n    assert response.status_code == 429\n    # Retry-After or error body must be present\n    has_retry = \"Retry-After\" in response.headers\n    has_body_error = \"error\" in response.json() or \"message\" in response.json()\n    assert has_retry or has_body_error\n"
+      },
+      {
+        "name": "test_pin_change_state_transition_zero_to_over_limit",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Card belongs to the authenticated customer",
+          "PIN change counter is at 0 for the current 24-hour window"
+        ],
+        "actions": [
+          "Reset counter to 0",
+          "Make 5 sequential PUT /cards/{id}/pin requests (all expected 200)",
+          "Make a 6th PUT /cards/{id}/pin request",
+          "Assert the 6th response is HTTP 429"
+        ],
+        "expected": [
+          "Attempts 1-5 each return HTTP 200",
+          "Attempt 6 returns HTTP 429",
+          "State transitions: IDLE -> ATTEMPT_1 -> ... -> ATTEMPT_5 -> BLOCKED"
+        ],
+        "trace": [
+          "R-FIN-072 - at most 5 times per 24-hour window",
+          "STC: full state path from zero attempts through blocked state"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_pin_change_state_transition_zero_to_over_limit(\n    auth_headers,\n    owned_card_id,\n    reset_pin_attempts,\n    api_base_url,\n):\n    url = f\"{api_base_url}/cards/{owned_card_id}/pin\"\n\n    for attempt in range(1, 6):\n        pin = str(1000 + attempt).zfill(4)\n        resp = requests.put(url, json={\"new_pin\": pin, \"confirm_pin\": pin},\n                            headers=auth_headers)\n        assert resp.status_code == 200, f\"Attempt {attempt} expected 200\"\n\n    # 6th attempt must be blocked\n    resp6 = requests.put(url, json={\"new_pin\": \"0000\", \"confirm_pin\": \"0000\"},\n                         headers=auth_headers)\n    assert resp6.status_code == 429\n"
+      },
+      {
+        "name": "test_pin_change_foreign_card_returns_403",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer A is authenticated",
+          "Card ID belongs to Customer B, not Customer A",
+          "Rate limit counter is irrelevant (auth check fires first)"
+        ],
+        "actions": [
+          "Send PUT /cards/{foreign_id}/pin with Customer A credentials",
+          "Assert HTTP 403"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains ownership or permission error"
+        ],
+        "trace": [
+          "R-FIN-072 - Precondition: card belongs to caller",
+          "DT: decision combination of valid-auth + card-not-owned => 403"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_pin_change_foreign_card_returns_403(\n    auth_headers,         # <fixture>: Customer A token\n    foreign_card_id,      # <fixture>: card id owned by Customer B\n    api_base_url,\n):\n    url = f\"{api_base_url}/cards/{foreign_card_id}/pin\"\n    payload = {\"new_pin\": \"4321\", \"confirm_pin\": \"4321\"}\n\n    response = requests.put(url, json=payload, headers=auth_headers)\n\n    assert response.status_code == 403\n    body = response.json()\n    assert \"error\" in body or \"message\" in body\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-072",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 2960,
+    "latency_ms": 34129,
+    "wall_ms": 34129,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-072\",\n  \"reasoning\": \"The requirement mandates a 5-per-24h PIN change rate limit on /cards/{id}/pin. Tests are derived using: EP for a valid single PIN change (happy path); NEG for an unauthorised caller (403); BVA for the exact 5th attempt (boundary-inclusive success) and the 6th attempt (boundary-exclusive, 429); STC to model the transition from under-limit -> at-limit -> over-limit; and DT for the combination of valid auth + exceeded limit producing 429. Each test resets state via <reset_pin_attempts_fixture> so it is idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_pin_change_single_valid_request_returns_200\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"Card belongs to the authenticated customer\",\n        \"No prior PIN change attempts in the current 24-hour window\"\n      ],\n      \"actions\": [\n        \"Send PUT /cards/{id}/pin with valid new_pin payload\",\n        \"Assert HTTP 200 and confirmation body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body contains 'pin_updated': true\"\n      ],\n      \"trace\": [\n        \"R-FIN-072 - PIN updated expected outcome\",\n        \"EP: representative member of valid-request equivalence class\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_pin_change_single_valid_request_returns_200(\\n    auth_headers,          # <fixture>: returns {\\\"Authorization\\\": \\\"Bearer <token>\\\"}\\n    owned_card_id,         # <fixture>: returns card id owned by caller\\n    reset_pin_attempts,    # <fixture>: resets rate-limit counter before test\\n    api_base_url,          # <fixture>: returns base URL string\\n):\\n    url = f\\\"{api_base_url}/cards/{owned_card_id}/pin\\\"\\n    payload = {\\\"new_pin\\\": \\\"1234\\\", \\\"confirm_pin\\\": \\\"1234\\\"}\\n\\n    response = requests.put(url, json=payload, headers=auth_headers)\\n\\n    assert response.status_code == 200\\n    body = response.json()\\n    assert body.get(\\\"pin_updated\\\") is True\\n\"\n    },\n    {\n      \"name\": \"test_pin_change_unauthenticated_request_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"No valid bearer token is present in the request\",\n        \"Card exists in the system\"\n      ],\n      \"actions\": [\n        \"Send PUT /cards/{id}/pin with no Authorization header\",\n        \"Assert HTTP 401\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized\",\n        \"Response body contains an error indicating missing or invalid credentials\"\n      ],\n      \"trace\": [\n        \"R-FIN-072 - Error pathway: unauthorised\",\n        \"NEG: caller lacks authentication credentials\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_pin_change_unauthenticated_request_returns_401(\\n    owned_card_id,      # <fixture>: returns a valid card id\\n    api_base_url,       # <fixture>: returns base URL string\\n):\\n    url = f\\\"{api_base_url}/cards/{owned_card_id}/pin\\\"\\n    payload = {\\\"new_pin\\\": \\\"1234\\\", \\\"confirm_pin\\\": \\\"1234\\\"}\\n\\n    response = requests.put(url, json=payload)  # no auth header\\n\\n    assert response.status_code == 401\\n    body = response.json()\\n    assert \\\"error\\\" in body or \\\"message\\\" in body\\n\"\n    },\n    {\n      \"name\": \"test_pin_change_fifth_attempt_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"Card belongs to the authenticated customer\",\n        \"Exactly 4 PIN change attempts have been made in the current 24-hour window\"\n      ],\n      \"actions\": [\n        \"Pre-seed rate-limit counter to 4 via <seed_pin_attempts_fixture>\",\n        \"Send PUT /cards/{id}/pin (5th attempt)\",\n        \"Assert HTTP 200\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"5th PIN change in the window is accepted\",\n        \"Response body contains 'pin_updated': true\"\n      ],\n      \"trace\": [\n        \"R-F"
+  }
+}

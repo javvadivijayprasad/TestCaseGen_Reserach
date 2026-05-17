@@ -1,0 +1,206 @@
+{
+  "req": {
+    "id": "R-FIN-008",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Account statement generation",
+    "statement": "A customer shall request monthly statements as PDF; statements older than 7 years shall be fetched from cold storage.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer requests statement"
+    ],
+    "expected_outcomes": [
+      "PDF delivered",
+      "retrieval logged"
+    ],
+    "error_pathways": [
+      "404 if no activity in period",
+      "503 if cold storage unavailable"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/statements/{month}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-008",
+    "reasoning": "R-FIN-008 specifies generation of monthly PDF statements with ownership verification, retrieval from cold storage for statements >7 years old, and defined error handling (404 for no activity, 503 for storage unavailability). Test suite applies EP to partition valid/invalid months, BVA to test 7-year boundary, NEG to cover error pathways, and STC to validate state transitions in retrieval logic. Each test is deterministic and traces to specific requirement clauses.",
+    "tests": [
+      {
+        "name": "test_recent_statement_generation_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated customer with account ownership",
+          "statement period is within last 12 months",
+          "account has transaction activity in requested month"
+        ],
+        "actions": [
+          "GET /statements/{month} with valid month in recent range",
+          "verify response status and content-type"
+        ],
+        "expected": [
+          "HTTP 200 response",
+          "Content-Type: application/pdf header present",
+          "PDF body non-empty and valid",
+          "retrieval event logged in audit trail"
+        ],
+        "trace": [
+          "R-FIN-008: customer requests monthly statement",
+          "R-FIN-008: PDF delivered from hot storage",
+          "R-FIN-008: retrieval logged"
+        ],
+        "executable": "import requests\nimport pytest\nfrom datetime import datetime, timedelta\n\ndef test_recent_statement_generation_success():\n    base_url = '<api_base_url>'\n    customer_id = '<test_customer_id>'\n    recent_month = (datetime.now() - timedelta(days=30)).strftime('%Y-%m')\n    \n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\n    response = requests.get(\n        f'{base_url}/statements/{recent_month}',\n        headers=headers\n    )\n    \n    assert response.status_code == 200\n    assert response.headers['Content-Type'] == 'application/pdf'\n    assert len(response.content) > 0\n    assert response.content[:4] == b'%PDF'\n    \n    audit_response = requests.get(\n        f'{base_url}/audit/statements/{customer_id}',\n        headers=headers\n    )\n    assert audit_response.status_code == 200\n    audit_logs = audit_response.json()\n    assert any(log['action'] == 'statement_retrieved' for log in audit_logs)\n"
+      },
+      {
+        "name": "test_cold_storage_statement_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "authenticated customer with account ownership",
+          "statement period is exactly 7 years old",
+          "account has transaction activity in requested month",
+          "cold storage is operational"
+        ],
+        "actions": [
+          "GET /statements/{month} with month exactly 7 years prior",
+          "monitor retrieval latency and source"
+        ],
+        "expected": [
+          "HTTP 200 response",
+          "Content-Type: application/pdf header present",
+          "PDF retrieved from cold storage (not cached)",
+          "retrieval latency within SLA boundary (<5s)",
+          "retrieval event logged with cold_storage=true"
+        ],
+        "trace": [
+          "R-FIN-008: statements older than 7 years fetched from cold storage",
+          "R-FIN-008: PDF delivered",
+          "R-FIN-008: retrieval logged"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_cold_storage_statement_boundary():\n    base_url = '<api_base_url>'\n    customer_id = '<test_customer_id>'\n    seven_years_ago = (datetime.now() - timedelta(days=7*365)).strftime('%Y-%m')\n    \n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\n    import time\n    start = time.time()\n    response = requests.get(\n        f'{base_url}/statements/{seven_years_ago}',\n        headers=headers\n    )\n    elapsed = time.time() - start\n    \n    assert response.status_code == 200\n    assert response.headers['Content-Type'] == 'application/pdf'\n    assert response.headers.get('X-Storage-Source') == 'cold'\n    assert elapsed < 5.0\n    \n    audit_response = requests.get(\n        f'{base_url}/audit/statements/{customer_id}',\n        headers=headers\n    )\n    logs = audit_response.json()\n    assert any(\n        log['action'] == 'statement_retrieved' \n        and log.get('storage_source') == 'cold'\n        for log in logs[-1:]\n    )\n"
+      },
+      {
+        "name": "test_no_activity_in_period_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated customer with account ownership",
+          "requested month has zero transaction activity"
+        ],
+        "actions": [
+          "GET /statements/{month} for period with no activity",
+          "verify error response and code"
+        ],
+        "expected": [
+          "HTTP 404 response",
+          "error response body with code: NO_ACTIVITY_IN_PERIOD",
+          "no PDF attachment generated",
+          "error event logged"
+        ],
+        "trace": [
+          "R-FIN-008: error pathway - 404 if no activity in period"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_no_activity_in_period_404():\n    base_url = '<api_base_url>'\n    customer_id = '<test_customer_no_activity>'\n    target_month = (datetime.now() - timedelta(days=60)).strftime('%Y-%m')\n    \n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\n    response = requests.get(\n        f'{base_url}/statements/{target_month}',\n        headers=headers\n    )\n    \n    assert response.status_code == 404\n    error_body = response.json()\n    assert error_body['error_code'] == 'NO_ACTIVITY_IN_PERIOD'\n    assert 'application/pdf' not in response.headers.get('Content-Type', '')\n    \n    audit_response = requests.get(\n        f'{base_url}/audit/statements/{customer_id}',\n        headers=headers\n    )\n    logs = audit_response.json()\n    assert any(\n        log['action'] == 'statement_request_failed' \n        and log.get('reason') == 'NO_ACTIVITY_IN_PERIOD'\n        for log in logs[-1:]\n    )\n"
+      },
+      {
+        "name": "test_cold_storage_unavailable_503",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated customer with account ownership",
+          "statement period is older than 7 years",
+          "cold storage service is unavailable/degraded"
+        ],
+        "actions": [
+          "GET /statements/{month} for old month during cold storage outage",
+          "verify service unavailable response"
+        ],
+        "expected": [
+          "HTTP 503 Service Unavailable response",
+          "error response body with code: COLD_STORAGE_UNAVAILABLE",
+          "Retry-After header present",
+          "failure event logged"
+        ],
+        "trace": [
+          "R-FIN-008: error pathway - 503 if cold storage unavailable"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_cold_storage_unavailable_503():\n    base_url = '<api_base_url>'\n    customer_id = '<test_customer_id>'\n    old_month = (datetime.now() - timedelta(days=8*365)).strftime('%Y-%m')\n    \n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\n    response = requests.get(\n        f'{base_url}/statements/{old_month}',\n        headers=headers\n    )\n    \n    assert response.status_code == 503\n    error_body = response.json()\n    assert error_body['error_code'] == 'COLD_STORAGE_UNAVAILABLE'\n    assert 'Retry-After' in response.headers\n    assert int(response.headers['Retry-After']) >= 60\n    \n    audit_response = requests.get(\n        f'{base_url}/audit/statements/{customer_id}',\n        headers=headers\n    )\n    logs = audit_response.json()\n    assert any(\n        log['action'] == 'statement_request_failed'\n        and log.get('reason') == 'COLD_STORAGE_UNAVAILABLE'\n        for log in logs[-1:]\n    )\n"
+      },
+      {
+        "name": "test_unauthorized_access_ownership_check",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "authenticated customer without account ownership",
+          "target account is owned by different customer"
+        ],
+        "actions": [
+          "GET /statements/{month} for account not owned by caller",
+          "verify authorization failure"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden response",
+          "error response body with code: UNAUTHORIZED_ACCOUNT_ACCESS",
+          "no PDF delivered",
+          "security event logged"
+        ],
+        "trace": [
+          "R-FIN-008: precondition account.owner == caller violated"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_unauthorized_access_ownership_check():\n    base_url = '<api_base_url>'\n    other_account_id = '<test_other_customer_account>'\n    recent_month = (datetime.now() - timedelta(days=30)).strftime('%Y-%m')\n    \n    headers = {'Authorization': f'Bearer <valid_token_unauthorized_user>'}\n    response = requests.get(\n        f'{base_url}/statements/{other_account_id}/{recent_month}',\n        headers=headers\n    )\n    \n    assert response.status_code == 403\n    error_body = response.json()\n    assert error_body['error_code'] == 'UNAUTHORIZED_ACCOUNT_ACCESS'\n    assert 'application/pdf' not in response.headers.get('Content-Type', '')\n    \n    audit_response = requests.get(\n        f'{base_url}/audit/security',\n        headers=headers\n    )\n    logs = audit_response.json()\n    assert any(\n        log['event_type'] == 'unauthorized_access_attempt'\n        and log.get('resource_type') == 'statement'\n        for log in logs[-1:]\n    )\n"
+      },
+      {
+        "name": "test_invalid_month_format_bad_request",
+        "kind": "negative",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated customer",
+          "month parameter is malformed or invalid"
+        ],
+        "actions": [
+          "GET /statements/{month} with invalid month format",
+          "verify input validation error"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request response",
+          "error response body with code: INVALID_MONTH_FORMAT",
+          "error details specify expected format (YYYY-MM)"
+        ],
+        "trace": [
+          "R-FIN-008: input validation at API layer"
+        ],
+        "executable": "import requests\nimport pytest\n\n@pytest.mark.parametrize('invalid_month', [\n    'invalid',\n    '2024-13',\n    '202401',\n    '2024/01',\n    ''\n])\ndef test_invalid_month_format_bad_request(invalid_month):\n    base_url = '<api_base_url>'\n    customer_id = '<test_customer_id>'\n    \n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\n    response = requests.get(\n        f'{base_url}/statements/{invalid_month}',\n        headers=headers\n    )\n    \n    assert response.status_code == 400\n    error_body = response.json()\n    assert error_body['error_code'] == 'INVALID_MONTH_FORMAT'\n    assert 'YYYY-MM' in error_body.get('details', '')\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-008",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[5] negative kind but heuristic=EP"
+  ],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1032,
+    "output_tokens": 3300,
+    "latency_ms": 18443,
+    "wall_ms": 18443,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-008\",\n  \"reasoning\": \"R-FIN-008 specifies generation of monthly PDF statements with ownership verification, retrieval from cold storage for statements >7 years old, and defined error handling (404 for no activity, 503 for storage unavailability). Test suite applies EP to partition valid/invalid months, BVA to test 7-year boundary, NEG to cover error pathways, and STC to validate state transitions in retrieval logic. Each test is deterministic and traces to specific requirement clauses.\",\n  \"tests\": [\n    {\n      \"name\": \"test_recent_statement_generation_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"authenticated customer with account ownership\",\n        \"statement period is within last 12 months\",\n        \"account has transaction activity in requested month\"\n      ],\n      \"actions\": [\n        \"GET /statements/{month} with valid month in recent range\",\n        \"verify response status and content-type\"\n      ],\n      \"expected\": [\n        \"HTTP 200 response\",\n        \"Content-Type: application/pdf header present\",\n        \"PDF body non-empty and valid\",\n        \"retrieval event logged in audit trail\"\n      ],\n      \"trace\": [\n        \"R-FIN-008: customer requests monthly statement\",\n        \"R-FIN-008: PDF delivered from hot storage\",\n        \"R-FIN-008: retrieval logged\"\n      ],\n      \"executable\": \"import requests\\nimport pytest\\nfrom datetime import datetime, timedelta\\n\\ndef test_recent_statement_generation_success():\\n    base_url = '<api_base_url>'\\n    customer_id = '<test_customer_id>'\\n    recent_month = (datetime.now() - timedelta(days=30)).strftime('%Y-%m')\\n    \\n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\\n    response = requests.get(\\n        f'{base_url}/statements/{recent_month}',\\n        headers=headers\\n    )\\n    \\n    assert response.status_code == 200\\n    assert response.headers['Content-Type'] == 'application/pdf'\\n    assert len(response.content) > 0\\n    assert response.content[:4] == b'%PDF'\\n    \\n    audit_response = requests.get(\\n        f'{base_url}/audit/statements/{customer_id}',\\n        headers=headers\\n    )\\n    assert audit_response.status_code == 200\\n    audit_logs = audit_response.json()\\n    assert any(log['action'] == 'statement_retrieved' for log in audit_logs)\\n\"\n    },\n    {\n      \"name\": \"test_cold_storage_statement_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"authenticated customer with account ownership\",\n        \"statement period is exactly 7 years old\",\n        \"account has transaction activity in requested month\",\n        \"cold storage is operational\"\n      ],\n      \"actions\": [\n        \"GET /statements/{month} with month exactly 7 years prior\",\n        \"monitor retrieval latency and source\"\n      ],\n      \"expected\": [\n        \"HTTP 200 response\",\n        \"Content-Type: application/pdf header present\",\n        \"PDF retrieved from cold storage (not cached)\",\n        \"retrieval latency within SLA boundary (<5s)\",\n        \"retrieval event logged with cold_storage=true\"\n      ],\n      \"trace\": [\n        \"R-FIN-008: statements older than 7 years fetched from cold storage\",\n        \"R-FIN-008: PDF delivered\",\n        \"R-FIN-008: retrieval logged\"\n      ],\n      \"executable\": \"import requests\\nfrom datetime import datetime, timedelta\\n\\ndef test_cold_storage_statement_boundary():\\n    base_url = '<api_base_url>'\\n    customer_id = '<test_customer_id>'\\n    seven_years_ago = (datetime.now() - timedelta(days=7*365)).strftime('%Y-%m')\\n    \\n    headers = {'Authorization': f'Bearer <valid_token_{customer_id}>'}\\n    import time\\n    start = time.time()\\n    response = requests.get(\\n        f'{base_url}/statements/{seven_years_ago}',\\n        headers=headers\\n    )\\n    elapsed = time.time() - start\\n    \\n    assert response.status_code == 200\\n    assert response.headers['Content-Type'] == 'application/pdf'\\n    assert "
+  }
+}

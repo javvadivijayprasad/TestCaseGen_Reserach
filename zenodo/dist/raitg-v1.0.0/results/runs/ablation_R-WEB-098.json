@@ -1,0 +1,175 @@
+{
+  "req": {
+    "id": "R-WEB-098",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Bulk import employees \u2014 variant 2",
+    "statement": "An hr-admin shall bulk-import employees via CSV; the import shall validate each row and commit only rows that pass validation, reporting errors per row. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin uploads CSV"
+    ],
+    "expected_outcomes": [
+      "valid rows imported",
+      "error report generated",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "415 when file not CSV",
+      "422 when header missing required columns"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/employees/import"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-098",
+    "reasoning": "The requirement covers: (1) happy-path bulk import where valid rows are committed and invalid rows produce per-row errors (EP), (2) non-CSV upload rejected with 415 (NEG), (3) CSV with missing required header columns rejected with 422 (NEG/DT), (4) a single-valid-row boundary file to probe the minimum accepted payload (BVA), and (5) idempotent retry \u2014 uploading the same valid CSV twice must not duplicate records (STC). Together these cover the positive, negative, and boundary obligations and trace to all stated error pathways and idempotency semantics.",
+    "tests": [
+      {
+        "name": "test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role:hr-admin",
+          "Target endpoint /employees/import is reachable",
+          "No prior employees from this CSV exist in the system"
+        ],
+        "actions": [
+          "Build a CSV with 3 valid rows and 2 invalid rows (missing required field)",
+          "POST the CSV to /employees/import as multipart/form-data with Content-Type text/csv",
+          "Capture the JSON response"
+        ],
+        "expected": [
+          "HTTP 207 Multi-Status or 200 with partial-success body",
+          "Response body contains imported_count == 3",
+          "Response body contains errors list with exactly 2 entries",
+          "Each error entry references the originating row number"
+        ],
+        "trace": [
+          "R-WEB-098: valid rows imported",
+          "R-WEB-098: error report generated per row"
+        ],
+        "executable": "import pytest\nimport io\nfrom <fixture> import hr_admin_session  # provides requests.Session\n\nVALID_ROWS = [\n    \"emp001,Alice,Smith,alice@example.com,Engineering\",\n    \"emp002,Bob,Jones,bob@example.com,HR\",\n    \"emp003,Carol,White,carol@example.com,Finance\",\n]\nINVALID_ROWS = [\n    \"emp004,,Brown,,\",   # missing first_name and email\n    \"emp005,Dave,,\",     # missing last_name and department\n]\nHEADER = \"employee_id,first_name,last_name,email,department\"\n\n\ndef test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors(hr_admin_session):\n    csv_content = \"\\n\".join([HEADER] + VALID_ROWS + INVALID_ROWS)\n    files = {\"file\": (\"employees.csv\", io.BytesIO(csv_content.encode()), \"text/csv\")}\n    resp = hr_admin_session.post(\"/employees/import\", files=files)\n    assert resp.status_code in (200, 207)\n    body = resp.json()\n    assert body[\"imported_count\"] == 3\n    assert len(body[\"errors\"]) == 2\n    row_refs = {e[\"row\"] for e in body[\"errors\"]}\n    assert row_refs == {5, 6}  # 1-indexed: header=1, valid=2-4, invalid=5-6\n"
+      },
+      {
+        "name": "test_bulk_import_non_csv_file_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role:hr-admin",
+          "Target endpoint /employees/import is reachable"
+        ],
+        "actions": [
+          "Build a plain-text file with employee data but send with Content-Type application/json",
+          "POST the file to /employees/import"
+        ],
+        "expected": [
+          "HTTP 415 Unsupported Media Type",
+          "No rows are imported"
+        ],
+        "trace": [
+          "R-WEB-098 error pathway: 415 when file not CSV"
+        ],
+        "executable": "import pytest\nimport io\nfrom <fixture> import hr_admin_session\n\n\ndef test_bulk_import_non_csv_file_returns_415(hr_admin_session):\n    fake_json = b'{\"employees\": []}'\n    files = {\"file\": (\"employees.json\", io.BytesIO(fake_json), \"application/json\")}\n    resp = hr_admin_session.post(\"/employees/import\", files=files)\n    assert resp.status_code == 415\n"
+      },
+      {
+        "name": "test_bulk_import_csv_missing_required_header_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated session exists for a user with role:hr-admin",
+          "Target endpoint /employees/import is reachable"
+        ],
+        "actions": [
+          "Build a CSV whose header omits the required 'email' column",
+          "POST the CSV to /employees/import as multipart/form-data"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body identifies the missing column(s)"
+        ],
+        "trace": [
+          "R-WEB-098 error pathway: 422 when header missing required columns"
+        ],
+        "executable": "import pytest\nimport io\nfrom <fixture> import hr_admin_session\n\nBAD_HEADER = \"employee_id,first_name,last_name,department\"  # 'email' intentionally absent\n\n\ndef test_bulk_import_csv_missing_required_header_returns_422(hr_admin_session):\n    csv_content = \"\\n\".join([BAD_HEADER, \"emp001,Alice,Smith,Engineering\"])\n    files = {\"file\": (\"bad_header.csv\", io.BytesIO(csv_content.encode()), \"text/csv\")}\n    resp = hr_admin_session.post(\"/employees/import\", files=files)\n    assert resp.status_code == 422\n    body = resp.json()\n    missing = body.get(\"missing_columns\", body.get(\"detail\", \"\"))\n    assert \"email\" in str(missing).lower()\n"
+      },
+      {
+        "name": "test_bulk_import_single_valid_row_is_minimum_accepted_payload",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated session exists for a user with role:hr-admin",
+          "No employee with id 'bva001' exists in the system"
+        ],
+        "actions": [
+          "Build a CSV with exactly one data row (minimum non-empty payload)",
+          "POST the CSV to /employees/import",
+          "Verify the single row is imported"
+        ],
+        "expected": [
+          "HTTP 200 or 207",
+          "imported_count == 1",
+          "errors list is empty"
+        ],
+        "trace": [
+          "R-WEB-098: valid rows imported",
+          "BVA lower boundary: exactly 1 data row"
+        ],
+        "executable": "import pytest\nimport io\nfrom <fixture> import hr_admin_session\nfrom <helper_fn> import delete_employee_if_exists\n\nHEADER = \"employee_id,first_name,last_name,email,department\"\nSINGLE_ROW = \"bva001,Eve,Taylor,eve@example.com,Legal\"\n\n\ndef test_bulk_import_single_valid_row_is_minimum_accepted_payload(hr_admin_session):\n    delete_employee_if_exists(hr_admin_session, \"bva001\")  # ensure clean state\n    csv_content = \"\\n\".join([HEADER, SINGLE_ROW])\n    files = {\"file\": (\"single.csv\", io.BytesIO(csv_content.encode()), \"text/csv\")}\n    resp = hr_admin_session.post(\"/employees/import\", files=files)\n    assert resp.status_code in (200, 207)\n    body = resp.json()\n    assert body[\"imported_count\"] == 1\n    assert body.get(\"errors\", []) == []\n"
+      },
+      {
+        "name": "test_bulk_import_idempotent_on_retry",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated session exists for a user with role:hr-admin",
+          "No employees with ids 'idem001','idem002' exist in the system"
+        ],
+        "actions": [
+          "Build a CSV with 2 valid rows using deterministic employee ids",
+          "POST the CSV to /employees/import (first upload)",
+          "POST the identical CSV to /employees/import a second time (retry)",
+          "Query total count of employees matching those ids"
+        ],
+        "expected": [
+          "Both POSTs return 200 or 207",
+          "After second upload, exactly 2 employees exist with those ids (no duplicates)",
+          "Second response imported_count reflects upsert/skip \u2014 system total unchanged"
+        ],
+        "trace": [
+          "R-WEB-098: action must be idempotent under retry"
+        ],
+        "executable": "import pytest\nimport io\nfrom <fixture> import hr_admin_session\nfrom <helper_fn> import delete_employee_if_exists, get_employee\n\nHEADER = \"employee_id,first_name,last_name,email,department\"\nROWS = [\n    \"idem001,Frank,Brown,frank@example.com,Ops\",\n    \"idem002,Grace,Green,grace@example.com,Ops\",\n]\n\n\ndef test_bulk_import_idempotent_on_retry(hr_admin_session):\n    for eid in (\"idem001\", \"idem002\"):\n        delete_employee_if_exists(hr_admin_session, eid)\n\n    csv_bytes = \"\\n\".join([HEADER] + ROWS).encode()\n\n    def do_upload():\n        return hr_admin_session.post(\n            \"/employees/import\",\n            files={\"file\": (\"idempotent.csv\", io.BytesIO(csv_bytes), \"text/csv\")},\n        )\n\n    r1 = do_upload()\n    assert r1.status_code in (200, 207)\n    r2 = do_upload()\n    assert r2.status_code in (200, 207)\n\n    for eid in (\"idem001\", \"idem002\"):\n        emp = get_employee(hr_admin_session, eid)\n        assert emp is not None, f\"Employee {eid} should exist after idempotent import\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-098",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1022,
+    "output_tokens": 2858,
+    "latency_ms": 31633,
+    "wall_ms": 31633,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-098\",\n  \"reasoning\": \"The requirement covers: (1) happy-path bulk import where valid rows are committed and invalid rows produce per-row errors (EP), (2) non-CSV upload rejected with 415 (NEG), (3) CSV with missing required header columns rejected with 422 (NEG/DT), (4) a single-valid-row boundary file to probe the minimum accepted payload (BVA), and (5) idempotent retry \u2014 uploading the same valid CSV twice must not duplicate records (STC). Together these cover the positive, negative, and boundary obligations and trace to all stated error pathways and idempotency semantics.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:hr-admin\",\n        \"Target endpoint /employees/import is reachable\",\n        \"No prior employees from this CSV exist in the system\"\n      ],\n      \"actions\": [\n        \"Build a CSV with 3 valid rows and 2 invalid rows (missing required field)\",\n        \"POST the CSV to /employees/import as multipart/form-data with Content-Type text/csv\",\n        \"Capture the JSON response\"\n      ],\n      \"expected\": [\n        \"HTTP 207 Multi-Status or 200 with partial-success body\",\n        \"Response body contains imported_count == 3\",\n        \"Response body contains errors list with exactly 2 entries\",\n        \"Each error entry references the originating row number\"\n      ],\n      \"trace\": [\n        \"R-WEB-098: valid rows imported\",\n        \"R-WEB-098: error report generated per row\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\nfrom <fixture> import hr_admin_session  # provides requests.Session\\n\\nVALID_ROWS = [\\n    \\\"emp001,Alice,Smith,alice@example.com,Engineering\\\",\\n    \\\"emp002,Bob,Jones,bob@example.com,HR\\\",\\n    \\\"emp003,Carol,White,carol@example.com,Finance\\\",\\n]\\nINVALID_ROWS = [\\n    \\\"emp004,,Brown,,\\\",   # missing first_name and email\\n    \\\"emp005,Dave,,\\\",     # missing last_name and department\\n]\\nHEADER = \\\"employee_id,first_name,last_name,email,department\\\"\\n\\n\\ndef test_bulk_import_mixed_csv_commits_valid_rows_and_reports_errors(hr_admin_session):\\n    csv_content = \\\"\\\\n\\\".join([HEADER] + VALID_ROWS + INVALID_ROWS)\\n    files = {\\\"file\\\": (\\\"employees.csv\\\", io.BytesIO(csv_content.encode()), \\\"text/csv\\\")}\\n    resp = hr_admin_session.post(\\\"/employees/import\\\", files=files)\\n    assert resp.status_code in (200, 207)\\n    body = resp.json()\\n    assert body[\\\"imported_count\\\"] == 3\\n    assert len(body[\\\"errors\\\"]) == 2\\n    row_refs = {e[\\\"row\\\"] for e in body[\\\"errors\\\"]}\\n    assert row_refs == {5, 6}  # 1-indexed: header=1, valid=2-4, invalid=5-6\\n\"\n    },\n    {\n      \"name\": \"test_bulk_import_non_csv_file_returns_415\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:hr-admin\",\n        \"Target endpoint /employees/import is reachable\"\n      ],\n      \"actions\": [\n        \"Build a plain-text file with employee data but send with Content-Type application/json\",\n        \"POST the file to /employees/import\"\n      ],\n      \"expected\": [\n        \"HTTP 415 Unsupported Media Type\",\n        \"No rows are imported\"\n      ],\n      \"trace\": [\n        \"R-WEB-098 error pathway: 415 when file not CSV\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\nfrom <fixture> import hr_admin_session\\n\\n\\ndef test_bulk_import_non_csv_file_returns_415(hr_admin_session):\\n    fake_json = b'{\\\"employees\\\": []}'\\n    files = {\\\"file\\\": (\\\"employees.json\\\", io.BytesIO(fake_json), \\\"application/json\\\")}\\n    resp = hr_admin_session.post(\\\"/employees/import\\\", files=files)\\n    assert resp.status_code == 415\\n\"\n    },\n    {\n      \"name\": \"test_bulk_import_csv_missing_required_header_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Authenticated session exists for "
+  }
+}

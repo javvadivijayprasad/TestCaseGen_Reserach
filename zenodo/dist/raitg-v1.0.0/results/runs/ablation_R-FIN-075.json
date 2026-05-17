@@ -1,0 +1,274 @@
+{
+  "req": {
+    "id": "R-FIN-075",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Reconciliation report (negative variant)",
+    "statement": "The system shall produce a daily reconciliation report comparing internal ledger to correspondent bank; non-zero variance shall open an incident. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "EOD trigger"
+    ],
+    "expected_outcomes": [
+      "report stored",
+      "incidents opened on variance"
+    ],
+    "error_pathways": [
+      "incident severity based on variance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/reconcile"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-075",
+    "reasoning": "R-FIN-075 mandates a daily reconciliation job at /cron/reconcile that: (1) stores a report, (2) opens incidents when internal ledger vs correspondent bank shows non-zero variance, and (3) assigns severity based on variance magnitude. Negative paths explicitly named are insufficient funds, unauthorised access, and exceeded limits. Test design uses EP to partition zero/non-zero variance; BVA to probe the variance=0 boundary (no incident) vs variance=1 (incident opens); NEG for each named error pathway; DT to map multiple condition combinations to outcomes; STC to verify the state machine transition from 'job triggered' -> 'report stored' -> 'incident opened'. Each test calls POST /cron/reconcile with a seeded ledger state and inspects the HTTP response plus downstream incident store.",
+    "tests": [
+      {
+        "name": "test_reconcile_zero_variance_no_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Banking API is reachable",
+          "Internal ledger and correspondent bank balances are seeded to identical values",
+          "No open incidents exist for today's reconciliation run"
+        ],
+        "actions": [
+          "Seed ledger balance = correspondent balance via <seed_balanced_ledger> fixture",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Assert HTTP 200 response",
+          "Fetch today's reconciliation report via GET /reports/reconciliation/today",
+          "Fetch open incidents via GET /incidents?source=reconciliation&date=today"
+        ],
+        "expected": [
+          "HTTP 200 with body containing report_id",
+          "Report status is 'stored'",
+          "variance field equals 0",
+          "No incidents opened (incidents list is empty)"
+        ],
+        "trace": [
+          "R-FIN-075: report stored on EOD trigger",
+          "R-FIN-075: non-zero variance SHALL open incident (contrapositive: zero variance must NOT open incident)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef balanced_ledger():\n    <seed_balanced_ledger>(BASE_URL, internal=10000_00, correspondent=10000_00)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_zero_variance_no_incident():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert \"report_id\" in body\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"status\"] == \"stored\"\n    assert report[\"variance\"] == 0\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] == 0\n"
+      },
+      {
+        "name": "test_reconcile_nonzero_variance_opens_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Banking API is reachable",
+          "Internal ledger is seeded with a balance that differs from correspondent bank balance",
+          "No open incidents exist for today's reconciliation run"
+        ],
+        "actions": [
+          "Seed internal ledger = 10000.00, correspondent bank = 9500.00 (variance = 500.00) via <seed_mismatched_ledger>",
+          "POST /cron/reconcile with valid EOD trigger payload",
+          "Assert HTTP 200 response",
+          "Fetch today's reconciliation report",
+          "Fetch open incidents for source=reconciliation"
+        ],
+        "expected": [
+          "HTTP 200 with report_id",
+          "Report variance equals 500.00",
+          "Exactly one incident opened",
+          "Incident severity reflects the 500.00 variance magnitude"
+        ],
+        "trace": [
+          "R-FIN-075: non-zero variance shall open an incident",
+          "R-FIN-075: incident severity based on variance"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef mismatched_ledger():\n    <seed_mismatched_ledger>(BASE_URL, internal=10000_00, correspondent=9500_00)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_nonzero_variance_opens_incident():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"status\"] == \"stored\"\n    assert report[\"variance\"] == 500_00\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] == 1\n    assert incidents[\"items\"][0][\"severity\"] == <expected_severity>(500_00)\n"
+      },
+      {
+        "name": "test_reconcile_variance_exactly_zero_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Banking API is reachable",
+          "Internal ledger and correspondent bank balances differ by exactly 0 (boundary point)",
+          "No open incidents exist for today's reconciliation run"
+        ],
+        "actions": [
+          "Seed internal ledger = 0.01, correspondent = 0.01 (minimum non-empty balance, zero variance) via <seed_balanced_ledger>",
+          "POST /cron/reconcile",
+          "Assert HTTP 200",
+          "Confirm variance = 0 in report",
+          "Confirm no incident created"
+        ],
+        "expected": [
+          "HTTP 200",
+          "variance == 0 (boundary: no incident side)",
+          "Zero incidents opened"
+        ],
+        "trace": [
+          "R-FIN-075: boundary between zero-variance (no incident) and non-zero-variance (incident) partitions",
+          "BVA on variance threshold = 0"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef boundary_zero_variance():\n    <seed_balanced_ledger>(BASE_URL, internal=1, correspondent=1)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_variance_exactly_zero_boundary():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"variance\"] == 0\n    assert report[\"status\"] == \"stored\"\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] == 0\n"
+      },
+      {
+        "name": "test_reconcile_variance_one_cent_above_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Banking API is reachable",
+          "Internal ledger seeded 1 cent higher than correspondent bank (variance = 0.01, one unit above zero-boundary)",
+          "No open incidents exist for today's reconciliation run"
+        ],
+        "actions": [
+          "Seed internal ledger = 2, correspondent = 1 (variance = 1 cent) via <seed_mismatched_ledger>",
+          "POST /cron/reconcile",
+          "Assert HTTP 200",
+          "Confirm variance = 1 in report",
+          "Confirm exactly one incident opened"
+        ],
+        "expected": [
+          "HTTP 200",
+          "variance == 1 (one cent, first non-zero value)",
+          "Exactly one incident opened"
+        ],
+        "trace": [
+          "R-FIN-075: BVA upper boundary of zero-variance partition; variance=1 must trigger incident",
+          "R-FIN-075: report stored; incident opened on variance"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef boundary_one_cent_variance():\n    <seed_mismatched_ledger>(BASE_URL, internal=2, correspondent=1)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_variance_one_cent_above_boundary():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"variance\"] == 1\n    assert report[\"status\"] == \"stored\"\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] == 1\n"
+      },
+      {
+        "name": "test_reconcile_insufficient_funds_negative_path",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Banking API is reachable",
+          "Correspondent bank account is seeded with zero / insufficient balance",
+          "Internal ledger shows positive balance creating negative variance"
+        ],
+        "actions": [
+          "Seed internal=50000_00, correspondent=0 to represent insufficient funds state via <seed_insufficient_funds>",
+          "POST /cron/reconcile",
+          "Assert HTTP 200 (job completes despite error condition)",
+          "Confirm report is stored with negative variance",
+          "Confirm incident opened with severity = HIGH or CRITICAL per <expected_severity>"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Report stored with variance == -50000_00 (negative)",
+          "Incident opened",
+          "Incident severity is HIGH or CRITICAL"
+        ],
+        "trace": [
+          "R-FIN-075: negative path - insufficient funds",
+          "R-FIN-075: incident severity based on variance magnitude"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef insufficient_funds_state():\n    <seed_insufficient_funds>(BASE_URL, internal=50000_00, correspondent=0)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_insufficient_funds_negative_path():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"status\"] == \"stored\"\n    assert report[\"variance\"] < 0\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] >= 1\n    assert incidents[\"items\"][0][\"severity\"] in (\"HIGH\", \"CRITICAL\")\n"
+      },
+      {
+        "name": "test_reconcile_unauthorised_trigger_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Banking API is reachable",
+          "Caller has no authorisation token / uses an invalid token"
+        ],
+        "actions": [
+          "POST /cron/reconcile with missing or invalid Authorization header",
+          "Assert HTTP 401 or 403 response",
+          "Confirm no reconciliation report stored for today",
+          "Confirm no incidents opened"
+        ],
+        "expected": [
+          "HTTP 401 or 403",
+          "No report created",
+          "No incident created"
+        ],
+        "trace": [
+          "R-FIN-075: negative path - unauthorised caller must not execute reconciliation",
+          "R-FIN-075: precondition - system job with valid authority"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef clean_state():\n    <cleanup_reconciliation_data>(BASE_URL)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_unauthorised_trigger_rejected():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers={\"Authorization\": \"Bearer invalid_token_xyz\"}\n    )\n    assert resp.status_code in (401, 403)\n\n    report_resp = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    )\n    assert report_resp.status_code == 404 or report_resp.json().get(\"total\", 0) == 0\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] == 0\n"
+      },
+      {
+        "name": "test_reconcile_exceeded_limit_variance_severity",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Banking API is reachable",
+          "Variance is seeded to exceed the configured limit threshold (e.g. > 1000000.00)",
+          "No open incidents exist for today"
+        ],
+        "actions": [
+          "Seed internal=2000000_00, correspondent=0 to force variance above limit via <seed_exceeded_limit>",
+          "POST /cron/reconcile",
+          "Assert HTTP 200",
+          "Fetch report and assert variance > limit_threshold",
+          "Fetch incident and assert severity == CRITICAL"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Report stored with variance exceeding limit",
+          "Incident opened with severity CRITICAL"
+        ],
+        "trace": [
+          "R-FIN-075: negative path - exceeded limits",
+          "R-FIN-075: incident severity based on variance (DT: exceeded-limit row -> CRITICAL severity)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nLIMIT_THRESHOLD = 1000000_00\n\n@pytest.fixture(autouse=True)\ndef exceeded_limit_state():\n    <seed_exceeded_limit>(BASE_URL, internal=2000000_00, correspondent=0)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_exceeded_limit_variance_severity():\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"status\"] == \"stored\"\n    assert abs(report[\"variance\"]) > LIMIT_THRESHOLD\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"total\"] >= 1\n    assert incidents[\"items\"][0][\"severity\"] == \"CRITICAL\"\n"
+      },
+      {
+        "name": "test_reconcile_state_transition_triggered_to_stored_to_incident",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Banking API is reachable",
+          "Reconciliation job is in IDLE state (not yet triggered today)",
+          "Ledger variance is non-zero to force full state path"
+        ],
+        "actions": [
+          "Verify job status is IDLE via GET /cron/reconcile/status",
+          "Seed non-zero variance via <seed_mismatched_ledger>",
+          "POST /cron/reconcile (transition: IDLE -> RUNNING -> COMPLETED)",
+          "Assert HTTP 200 and job status transitions to COMPLETED",
+          "Assert report state == stored and incident state == OPEN"
+        ],
+        "expected": [
+          "Job transitions IDLE -> RUNNING -> COMPLETED",
+          "Report stored (state = stored)",
+          "Incident created with state = OPEN"
+        ],
+        "trace": [
+          "R-FIN-075: STC covering full lifecycle: EOD trigger fires job, job stores report, incident opened",
+          "R-FIN-075: triggers=EOD trigger; expected outcomes=report stored; incidents opened on variance"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\n\n@pytest.fixture(autouse=True)\ndef state_transition_setup():\n    <reset_job_state>(BASE_URL, job=\"reconcile\")\n    <seed_mismatched_ledger>(BASE_URL, internal=30000_00, correspondent=29000_00)\n    yield\n    <cleanup_reconciliation_data>(BASE_URL)\n\ndef test_reconcile_state_transition_triggered_to_stored_to_incident():\n    pre = requests.get(\n        f\"{BASE_URL}/cron/reconcile/status\",\n        headers=<auth_header>()\n    ).json()\n    assert pre[\"state\"] == \"IDLE\"\n\n    resp = requests.post(\n        f\"{BASE_URL}/cron/reconcile\",\n        json=<eod_trigger_payload>(),\n        headers=<auth_header>()\n    )\n    assert resp.status_code == 200\n\n    post = requests.get(\n        f\"{BASE_URL}/cron/reconcile/status\",\n        headers=<auth_header>()\n    ).json()\n    assert post[\"state\"] == \"COMPLETED\"\n\n    report = requests.get(\n        f\"{BASE_URL}/reports/reconciliation/today\",\n        headers=<auth_header>()\n    ).json()\n    assert report[\"status\"] == \"stored\"\n\n    incidents = requests.get(\n        f\"{BASE_URL}/incidents\",\n        params={\"source\": \"reconciliation\", \"date\": \"today\"},\n        headers=<auth_header>()\n    ).json()\n    assert incidents[\"items\"][0][\"state\"] == \"OPEN\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-075",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 5410,
+    "latency_ms": 53116,
+    "wall_ms": 53116,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-075\",\n  \"reasoning\": \"R-FIN-075 mandates a daily reconciliation job at /cron/reconcile that: (1) stores a report, (2) opens incidents when internal ledger vs correspondent bank shows non-zero variance, and (3) assigns severity based on variance magnitude. Negative paths explicitly named are insufficient funds, unauthorised access, and exceeded limits. Test design uses EP to partition zero/non-zero variance; BVA to probe the variance=0 boundary (no incident) vs variance=1 (incident opens); NEG for each named error pathway; DT to map multiple condition combinations to outcomes; STC to verify the state machine transition from 'job triggered' -> 'report stored' -> 'incident opened'. Each test calls POST /cron/reconcile with a seeded ledger state and inspects the HTTP response plus downstream incident store.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reconcile_zero_variance_no_incident\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Banking API is reachable\",\n        \"Internal ledger and correspondent bank balances are seeded to identical values\",\n        \"No open incidents exist for today's reconciliation run\"\n      ],\n      \"actions\": [\n        \"Seed ledger balance = correspondent balance via <seed_balanced_ledger> fixture\",\n        \"POST /cron/reconcile with valid EOD trigger payload\",\n        \"Assert HTTP 200 response\",\n        \"Fetch today's reconciliation report via GET /reports/reconciliation/today\",\n        \"Fetch open incidents via GET /incidents?source=reconciliation&date=today\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body containing report_id\",\n        \"Report status is 'stored'\",\n        \"variance field equals 0\",\n        \"No incidents opened (incidents list is empty)\"\n      ],\n      \"trace\": [\n        \"R-FIN-075: report stored on EOD trigger\",\n        \"R-FIN-075: non-zero variance SHALL open incident (contrapositive: zero variance must NOT open incident)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://localhost:8080\\\"\\n\\n@pytest.fixture(autouse=True)\\ndef balanced_ledger():\\n    <seed_balanced_ledger>(BASE_URL, internal=10000_00, correspondent=10000_00)\\n    yield\\n    <cleanup_reconciliation_data>(BASE_URL)\\n\\ndef test_reconcile_zero_variance_no_incident():\\n    resp = requests.post(\\n        f\\\"{BASE_URL}/cron/reconcile\\\",\\n        json=<eod_trigger_payload>(),\\n        headers=<auth_header>()\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert \\\"report_id\\\" in body\\n\\n    report = requests.get(\\n        f\\\"{BASE_URL}/reports/reconciliation/today\\\",\\n        headers=<auth_header>()\\n    ).json()\\n    assert report[\\\"status\\\"] == \\\"stored\\\"\\n    assert report[\\\"variance\\\"] == 0\\n\\n    incidents = requests.get(\\n        f\\\"{BASE_URL}/incidents\\\",\\n        params={\\\"source\\\": \\\"reconciliation\\\", \\\"date\\\": \\\"today\\\"},\\n        headers=<auth_header>()\\n    ).json()\\n    assert incidents[\\\"total\\\"] == 0\\n\"\n    },\n    {\n      \"name\": \"test_reconcile_nonzero_variance_opens_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Banking API is reachable\",\n        \"Internal ledger is seeded with a balance that differs from correspondent bank balance\",\n        \"No open incidents exist for today's reconciliation run\"\n      ],\n      \"actions\": [\n        \"Seed internal ledger = 10000.00, correspondent bank = 9500.00 (variance = 500.00) via <seed_mismatched_ledger>\",\n        \"POST /cron/reconcile with valid EOD trigger payload\",\n        \"Assert HTTP 200 response\",\n        \"Fetch today's reconciliation report\",\n        \"Fetch open incidents for source=reconciliation\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with report_id\",\n        \"Report variance equals 500.00\",\n        \"Exactly one incident opened\",\n        \"Incident severity reflects the 500.00 variance magnitude\"\n      ],\n      \"trace\": [\n        \"R-FIN-075: non-zero variance shall op"
+  }
+}

@@ -1,0 +1,173 @@
+{
+  "req": {
+    "id": "R-HLT-013",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-013",
+    "reasoning": "R-HLT-013 has three distinct testable behaviours: (1) a clinician receives only their own patients when searching by a valid parameter (EP positive), (2) a malformed query returns HTTP 400 (NEG negative), (3) a search term at the exact minimum accepted length (1 character) still produces a valid filtered response (BVA boundary). A fourth DT case covers the cross-product of search-parameter types to confirm each field (name/MRN/DOB) routes correctly and enforces care-team scoping. A fifth STC case validates that the audit log entry is written after a successful search, confirming the state transition from 'searched' to 'access-logged'.",
+    "tests": [
+      {
+        "name": "test_search_by_name_returns_only_assigned_patients",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "At least one patient assigned to the clinician with family name 'Smith'",
+          "At least one patient NOT assigned to the clinician also named 'Smith' exists in the system"
+        ],
+        "actions": [
+          "GET /Patient?search with query param name=Smith using clinician bearer token"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body is a FHIR Bundle",
+          "All entries in the bundle belong to the clinician's care list",
+          "No patient outside the clinician's care is included"
+        ],
+        "trace": [
+          "R-HLT-013: filtered bundle returned",
+          "R-HLT-013: only patients in their care shall be returned"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_by_name_returns_only_assigned_patients(\n    clinician_auth_fixture, assigned_patient_ids, base_url\n):\n    token = clinician_auth_fixture[\"token\"]\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"search\": \"name=Smith\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle.get(\"resourceType\") == \"Bundle\"\n    returned_ids = {\n        e[\"resource\"][\"id\"]\n        for e in bundle.get(\"entry\", [])\n    }\n    assert returned_ids, \"Bundle must contain at least one entry\"\n    for pid in returned_ids:\n        assert pid in assigned_patient_ids, (\n            f\"Patient {pid} not in clinician care list\"\n        )\n"
+      },
+      {
+        "name": "test_malformed_query_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>"
+        ],
+        "actions": [
+          "GET /Patient?search with an invalid query string (e.g. '%%bad%%') that violates the API contract"
+        ],
+        "expected": [
+          "HTTP 400 returned",
+          "Response body contains an OperationOutcome or error descriptor"
+        ],
+        "trace": [
+          "R-HLT-013: 400 when query malformed"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_malformed_query_returns_400(\n    clinician_auth_fixture, base_url\n):\n    token = clinician_auth_fixture[\"token\"]\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"search\": \"%%bad%%\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 400\n    body = resp.json()\n    has_error = (\n        body.get(\"resourceType\") == \"OperationOutcome\"\n        or \"error\" in body\n        or \"message\" in body\n    )\n    assert has_error, \"400 response must carry an error descriptor\"\n"
+      },
+      {
+        "name": "test_single_char_name_search_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "System accepts a minimum name search term of exactly 1 character"
+        ],
+        "actions": [
+          "GET /Patient?search with query param name=S (single character) using clinician bearer token"
+        ],
+        "expected": [
+          "HTTP 200 returned (not 400)",
+          "Response body is a FHIR Bundle (may have zero entries)",
+          "All returned patients belong to the clinician's care list"
+        ],
+        "trace": [
+          "R-HLT-013: filtered bundle returned",
+          "R-HLT-013: 400 when query malformed (boundary: minimum valid input must NOT trigger 400)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_single_char_name_search_is_accepted(\n    clinician_auth_fixture, assigned_patient_ids, base_url\n):\n    token = clinician_auth_fixture[\"token\"]\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"search\": \"name=S\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200, (\n        f\"Single-char query must not be rejected; got {resp.status_code}\"\n    )\n    bundle = resp.json()\n    assert bundle.get(\"resourceType\") == \"Bundle\"\n    for entry in bundle.get(\"entry\", []):\n        pid = entry[\"resource\"][\"id\"]\n        assert pid in assigned_patient_ids, (\n            f\"Patient {pid} outside care list returned\"\n        )\n"
+      },
+      {
+        "name": "test_search_by_mrn_and_dob_return_correct_patients",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "Assigned patient with known MRN '123456' exists in care list",
+          "Assigned patient with DOB '1980-01-15' exists in care list"
+        ],
+        "actions": [
+          "GET /Patient?search with query param mrn=123456",
+          "GET /Patient?search with query param dob=1980-01-15"
+        ],
+        "expected": [
+          "Both requests return HTTP 200",
+          "MRN search returns bundle containing the patient with MRN 123456",
+          "DOB search returns bundle containing the patient born on 1980-01-15",
+          "No out-of-care-list patients appear in either response"
+        ],
+        "trace": [
+          "R-HLT-013: search patients by name, MRN, or DOB",
+          "R-HLT-013: filtered bundle returned",
+          "R-HLT-013: only patients in their care shall be returned"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"param,value,field_path\", [\n    (\"mrn\", \"123456\", (\"identifier\", \"value\")),\n    (\"dob\", \"1980-01-15\", (\"birthDate\", None)),\n])\ndef test_search_by_mrn_and_dob_return_correct_patients(\n    clinician_auth_fixture, assigned_patient_ids, base_url,\n    param, value, field_path\n):\n    token = clinician_auth_fixture[\"token\"]\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"search\": f\"{param}={value}\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle.get(\"resourceType\") == \"Bundle\"\n    assert bundle.get(\"entry\"), \"Expected at least one match\"\n    for entry in bundle[\"entry\"]:\n        pid = entry[\"resource\"][\"id\"]\n        assert pid in assigned_patient_ids\n"
+      },
+      {
+        "name": "test_successful_search_creates_audit_log_entry",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "Audit log endpoint or fixture <audit_log_fixture> accessible",
+          "At least one patient assigned to clinician"
+        ],
+        "actions": [
+          "Record current audit log count or last entry timestamp",
+          "GET /Patient?search with query param name=Smith using clinician bearer token",
+          "Query audit log for entries generated after the search"
+        ],
+        "expected": [
+          "HTTP 200 returned for the search",
+          "A new audit log entry exists referencing the clinician's ID and the /Patient search action",
+          "State transitions from pre-search (no log entry) to post-search (log entry present)"
+        ],
+        "trace": [
+          "R-HLT-013: access logged",
+          "R-HLT-013: expected outcomes: filtered bundle returned; access logged"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_successful_search_creates_audit_log_entry(\n    clinician_auth_fixture, audit_log_fixture, base_url\n):\n    token = clinician_auth_fixture[\"token\"]\n    clinician_id = clinician_auth_fixture[\"user_id\"]\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    before_entries = audit_log_fixture.fetch_recent(clinician_id)\n    before_count = len(before_entries)\n\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"search\": \"name=Smith\"},\n        headers=headers,\n        timeout=10,\n    )\n    assert resp.status_code == 200\n\n    after_entries = audit_log_fixture.fetch_recent(clinician_id)\n    new_entries = [e for e in after_entries if e not in before_entries]\n    assert len(new_entries) >= 1, \"Audit log must record the search action\"\n    actions = [e.get(\"action\") for e in new_entries]\n    assert any(\"Patient\" in a for a in actions), (\n        \"Audit entry must reference the Patient search\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-013",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 980,
+    "output_tokens": 2879,
+    "latency_ms": 31374,
+    "wall_ms": 31374,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-013\",\n  \"reasoning\": \"R-HLT-013 has three distinct testable behaviours: (1) a clinician receives only their own patients when searching by a valid parameter (EP positive), (2) a malformed query returns HTTP 400 (NEG negative), (3) a search term at the exact minimum accepted length (1 character) still produces a valid filtered response (BVA boundary). A fourth DT case covers the cross-product of search-parameter types to confirm each field (name/MRN/DOB) routes correctly and enforces care-team scoping. A fifth STC case validates that the audit log entry is written after a successful search, confirming the state transition from 'searched' to 'access-logged'.\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_by_name_returns_only_assigned_patients\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\",\n        \"At least one patient assigned to the clinician with family name 'Smith'\",\n        \"At least one patient NOT assigned to the clinician also named 'Smith' exists in the system\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param name=Smith using clinician bearer token\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body is a FHIR Bundle\",\n        \"All entries in the bundle belong to the clinician's care list\",\n        \"No patient outside the clinician's care is included\"\n      ],\n      \"trace\": [\n        \"R-HLT-013: filtered bundle returned\",\n        \"R-HLT-013: only patients in their care shall be returned\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_search_by_name_returns_only_assigned_patients(\\n    clinician_auth_fixture, assigned_patient_ids, base_url\\n):\\n    token = clinician_auth_fixture[\\\"token\\\"]\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    resp = requests.get(\\n        f\\\"{base_url}/Patient\\\",\\n        params={\\\"search\\\": \\\"name=Smith\\\"},\\n        headers=headers,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle.get(\\\"resourceType\\\") == \\\"Bundle\\\"\\n    returned_ids = {\\n        e[\\\"resource\\\"][\\\"id\\\"]\\n        for e in bundle.get(\\\"entry\\\", [])\\n    }\\n    assert returned_ids, \\\"Bundle must contain at least one entry\\\"\\n    for pid in returned_ids:\\n        assert pid in assigned_patient_ids, (\\n            f\\\"Patient {pid} not in clinician care list\\\"\\n        )\\n\"\n    },\n    {\n      \"name\": \"test_malformed_query_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with an invalid query string (e.g. '%%bad%%') that violates the API contract\"\n      ],\n      \"expected\": [\n        \"HTTP 400 returned\",\n        \"Response body contains an OperationOutcome or error descriptor\"\n      ],\n      \"trace\": [\n        \"R-HLT-013: 400 when query malformed\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_malformed_query_returns_400(\\n    clinician_auth_fixture, base_url\\n):\\n    token = clinician_auth_fixture[\\\"token\\\"]\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    resp = requests.get(\\n        f\\\"{base_url}/Patient\\\",\\n        params={\\\"search\\\": \\\"%%bad%%\\\"},\\n        headers=headers,\\n        timeout=10,\\n    )\\n    assert resp.status_code == 400\\n    body = resp.json()\\n    has_error = (\\n        body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\"\\n        or \\\"error\\\" in body\\n        or \\\"message\\\" in body\\n    )\\n    assert has_error, \\\"400 response must carry an error descriptor\\\"\\n\"\n    },\n    {\n      \"name\": \"test_single_char_name_search_is_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\",\n        \"System acc"
+  }
+}

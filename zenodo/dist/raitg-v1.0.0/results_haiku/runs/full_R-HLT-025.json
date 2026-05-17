@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-HLT-025",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-025",
+    "reasoning": "R-HLT-025 requires that authenticated patients can send messages to providers, with automatic PHI exfiltration scanning on attachments. The requirement has three critical paths: (1) happy path\u2014message with safe attachment succeeds; (2) security path\u2014message with disallowed PHI pattern is blocked; (3) boundary path\u2014edge cases around attachment size, file type, and pattern detection. Equivalence partitioning separates safe vs. unsafe attachments. Boundary value analysis covers attachment size limits. Negative path testing validates rejection of PHI patterns. Decision table logic applies to attachment validation rules.",
+    "tests": [
+      {
+        "name": "test_message_to_provider_with_safe_attachment_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "patient authenticated with valid JWT token",
+          "provider exists in system",
+          "patient-provider relationship established"
+        ],
+        "actions": [
+          "POST /messages with text body and PDF attachment (clean content)",
+          "verify Content-Type is multipart/form-data",
+          "assert attachment size < 10MB"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "response.data.message_id returned",
+          "message.status == 'stored'",
+          "provider_notification event triggered",
+          "attachment.scan_result == 'clean'"
+        ],
+        "trace": [
+          "R-HLT-025: message stored",
+          "R-HLT-025: provider notified"
+        ],
+        "executable": "import requests\nimport json\n\ndef test_message_to_provider_with_safe_attachment_succeeds():\n    auth_token = '<jwt_token>'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'prov-001',\n        'subject': 'Test Message',\n        'body': 'Patient consultation notes.'\n    }\n    files = {'attachment': ('report.pdf', b'PDF_BINARY_DATA', 'application/pdf')}\n    resp = requests.post(\n        'http://localhost:8080/messages',\n        headers=headers,\n        data=payload,\n        files=files\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert 'message_id' in data\n    assert data['status'] == 'stored'\n    assert data['attachment']['scan_result'] == 'clean'\n    assert 'provider_notification' in data\n"
+      },
+      {
+        "name": "test_message_blocked_when_ssn_pattern_detected_in_attachment",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "patient authenticated with valid JWT token",
+          "provider exists in system",
+          "PHI pattern regex for SSN (\\d{3}-\\d{2}-\\d{4}) configured"
+        ],
+        "actions": [
+          "POST /messages with text body and TXT attachment containing SSN",
+          "attachment contains pattern: 'SSN: 123-45-6789'",
+          "attachment passes initial file type validation"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "error.code == 'PHI_EXFILTRATION_DETECTED'",
+          "error.detail contains 'SSN pattern'",
+          "message NOT stored",
+          "provider NOT notified",
+          "audit log records rejection"
+        ],
+        "trace": [
+          "R-HLT-025: blocked when disallowed attachment detected",
+          "Security: PHI pattern match on SSN"
+        ],
+        "executable": "import requests\n\ndef test_message_blocked_when_ssn_pattern_detected_in_attachment():\n    auth_token = '<jwt_token>'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'prov-001',\n        'subject': 'Test Message',\n        'body': 'Forwarding patient info.'\n    }\n    malicious_content = b'SSN: 123-45-6789\\nDOB: 1990-01-15'\n    files = {'attachment': ('data.txt', malicious_content, 'text/plain')}\n    resp = requests.post(\n        'http://localhost:8080/messages',\n        headers=headers,\n        data=payload,\n        files=files\n    )\n    assert resp.status_code == 422\n    data = resp.json()\n    assert data['error']['code'] == 'PHI_EXFILTRATION_DETECTED'\n    assert 'SSN' in data['error']['detail']\n"
+      },
+      {
+        "name": "test_message_boundary_max_attachment_size",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "patient authenticated with valid JWT token",
+          "provider exists in system",
+          "max attachment size configured as 10MB"
+        ],
+        "actions": [
+          "POST /messages with attachment exactly 10MB (boundary max)",
+          "attachment content is random binary (no PHI patterns)",
+          "Content-Type validation enabled"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "message.status == 'stored'",
+          "attachment.size == 10485760 bytes",
+          "provider notified"
+        ],
+        "trace": [
+          "R-HLT-025: message stored (boundary test)",
+          "Validation: max size boundary accepted"
+        ],
+        "executable": "import requests\nimport io\n\ndef test_message_boundary_max_attachment_size():\n    auth_token = '<jwt_token>'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    max_size = 10 * 1024 * 1024\n    binary_payload = b'X' * max_size\n    payload = {\n        'provider_id': 'prov-001',\n        'subject': 'Large File',\n        'body': 'Sending large attachment.'\n    }\n    files = {'attachment': ('large.bin', io.BytesIO(binary_payload), 'application/octet-stream')}\n    resp = requests.post(\n        'http://localhost:8080/messages',\n        headers=headers,\n        data=payload,\n        files=files\n    )\n    assert resp.status_code == 201\n    data = resp.json()\n    assert data['status'] == 'stored'\n    assert data['attachment']['size'] == max_size\n"
+      },
+      {
+        "name": "test_message_rejected_when_attachment_exceeds_max_size",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "patient authenticated with valid JWT token",
+          "provider exists in system",
+          "max attachment size configured as 10MB"
+        ],
+        "actions": [
+          "POST /messages with attachment 10.1MB (boundary exceeded)",
+          "attachment content is random binary (no PHI patterns)"
+        ],
+        "expected": [
+          "HTTP 413 Payload Too Large",
+          "error.code == 'ATTACHMENT_SIZE_EXCEEDED'",
+          "message NOT stored"
+        ],
+        "trace": [
+          "R-HLT-025: error pathway triggered",
+          "Validation: oversized attachment rejected"
+        ],
+        "executable": "import requests\nimport io\n\ndef test_message_rejected_when_attachment_exceeds_max_size():\n    auth_token = '<jwt_token>'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    max_size = 10 * 1024 * 1024 + 1\n    binary_payload = b'X' * max_size\n    payload = {\n        'provider_id': 'prov-001',\n        'subject': 'Large File',\n        'body': 'Oversized.'\n    }\n    files = {'attachment': ('large.bin', io.BytesIO(binary_payload), 'application/octet-stream')}\n    resp = requests.post(\n        'http://localhost:8080/messages',\n        headers=headers,\n        data=payload,\n        files=files\n    )\n    assert resp.status_code == 413\n    data = resp.json()\n    assert data['error']['code'] == 'ATTACHMENT_SIZE_EXCEEDED'\n"
+      },
+      {
+        "name": "test_message_blocked_when_medical_record_number_detected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "patient authenticated with valid JWT token",
+          "provider exists in system",
+          "PHI pattern regex for MRN configured"
+        ],
+        "actions": [
+          "POST /messages with attachment containing MRN pattern",
+          "attachment format: CSV file",
+          "MRN pattern: 'MRN#ABC123456' embedded in content"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "error.code == 'PHI_EXFILTRATION_DETECTED'",
+          "error.detail contains 'MRN'",
+          "message NOT stored"
+        ],
+        "trace": [
+          "R-HLT-025: blocked when disallowed attachment detected",
+          "Security: PHI pattern match on MRN"
+        ],
+        "executable": "import requests\n\ndef test_message_blocked_when_medical_record_number_detected():\n    auth_token = '<jwt_token>'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {\n        'provider_id': 'prov-001',\n        'subject': 'Patient Data',\n        'body': 'See attached.'\n    }\n    csv_content = b'patient_id,name,mrn\\n1,John Doe,MRN#ABC123456\\n'\n    files = {'attachment': ('patients.csv', csv_content, 'text/csv')}\n    resp = requests.post(\n        'http://localhost:8080/messages',\n        headers=headers,\n        data=payload,\n        files=files\n    )\n    assert resp.status_code == 422\n    data = resp.json()\n    assert data['error']['code'] == 'PHI_EXFILTRATION_DETECTED'\n    assert 'MRN' in data['error']['detail']\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-025",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1021,
+    "output_tokens": 2721,
+    "latency_ms": 15116,
+    "wall_ms": 15116,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-025\",\n  \"reasoning\": \"R-HLT-025 requires that authenticated patients can send messages to providers, with automatic PHI exfiltration scanning on attachments. The requirement has three critical paths: (1) happy path\u2014message with safe attachment succeeds; (2) security path\u2014message with disallowed PHI pattern is blocked; (3) boundary path\u2014edge cases around attachment size, file type, and pattern detection. Equivalence partitioning separates safe vs. unsafe attachments. Boundary value analysis covers attachment size limits. Negative path testing validates rejection of PHI patterns. Decision table logic applies to attachment validation rules.\",\n  \"tests\": [\n    {\n      \"name\": \"test_message_to_provider_with_safe_attachment_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"patient authenticated with valid JWT token\",\n        \"provider exists in system\",\n        \"patient-provider relationship established\"\n      ],\n      \"actions\": [\n        \"POST /messages with text body and PDF attachment (clean content)\",\n        \"verify Content-Type is multipart/form-data\",\n        \"assert attachment size < 10MB\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"response.data.message_id returned\",\n        \"message.status == 'stored'\",\n        \"provider_notification event triggered\",\n        \"attachment.scan_result == 'clean'\"\n      ],\n      \"trace\": [\n        \"R-HLT-025: message stored\",\n        \"R-HLT-025: provider notified\"\n      ],\n      \"executable\": \"import requests\\nimport json\\n\\ndef test_message_to_provider_with_safe_attachment_succeeds():\\n    auth_token = '<jwt_token>'\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {\\n        'provider_id': 'prov-001',\\n        'subject': 'Test Message',\\n        'body': 'Patient consultation notes.'\\n    }\\n    files = {'attachment': ('report.pdf', b'PDF_BINARY_DATA', 'application/pdf')}\\n    resp = requests.post(\\n        'http://localhost:8080/messages',\\n        headers=headers,\\n        data=payload,\\n        files=files\\n    )\\n    assert resp.status_code == 201\\n    data = resp.json()\\n    assert 'message_id' in data\\n    assert data['status'] == 'stored'\\n    assert data['attachment']['scan_result'] == 'clean'\\n    assert 'provider_notification' in data\\n\"\n    },\n    {\n      \"name\": \"test_message_blocked_when_ssn_pattern_detected_in_attachment\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"patient authenticated with valid JWT token\",\n        \"provider exists in system\",\n        \"PHI pattern regex for SSN (\\\\d{3}-\\\\d{2}-\\\\d{4}) configured\"\n      ],\n      \"actions\": [\n        \"POST /messages with text body and TXT attachment containing SSN\",\n        \"attachment contains pattern: 'SSN: 123-45-6789'\",\n        \"attachment passes initial file type validation\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"error.code == 'PHI_EXFILTRATION_DETECTED'\",\n        \"error.detail contains 'SSN pattern'\",\n        \"message NOT stored\",\n        \"provider NOT notified\",\n        \"audit log records rejection\"\n      ],\n      \"trace\": [\n        \"R-HLT-025: blocked when disallowed attachment detected\",\n        \"Security: PHI pattern match on SSN\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_message_blocked_when_ssn_pattern_detected_in_attachment():\\n    auth_token = '<jwt_token>'\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {\\n        'provider_id': 'prov-001',\\n        'subject': 'Test Message',\\n        'body': 'Forwarding patient info.'\\n    }\\n    malicious_content = b'SSN: 123-45-6789\\\\nDOB: 1990-01-15'\\n    files = {'attachment': ('data.txt', malicious_content, 'text/plain')}\\n    resp = requests.post(\\n        'http://localhost:8080/messages',\\n        headers=headers,\\n        data=payload,\\n        files=files\\n    )\\n    assert resp.status_code == 422\\n    data = resp.json()\\n  "
+  }
+}

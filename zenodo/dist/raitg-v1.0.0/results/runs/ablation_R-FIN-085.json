@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-FIN-085",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Card freeze / unfreeze (idempotency variant)",
+    "statement": "A customer shall freeze or unfreeze their card instantly; frozen cards must reject all authorization attempts. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer toggles freeze"
+    ],
+    "expected_outcomes": [
+      "card state updated",
+      "authorization network notified"
+    ],
+    "error_pathways": [
+      "404 when card does not exist"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/freeze"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-085",
+    "reasoning": "The requirement covers four orthogonal concerns: (1) nominal freeze/unfreeze state transitions, (2) idempotency of duplicate submissions with the same Idempotency-Key, (3) authorization rejection on a frozen card, and (4) 404 error when the card does not exist. I designed one test per concern, plus a boundary test for the idempotency key itself (empty string), totalling five tests. State Transition Coverage drives the freeze\u2192unfreeze round-trip; Equivalence Partitioning covers the valid-card happy path; Decision Table covers the authorization-rejection rule; Negative Path covers the missing card; Boundary Value Analysis targets the degenerate idempotency key edge.",
+    "tests": [
+      {
+        "name": "test_freeze_and_unfreeze_card_round_trip",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated with a valid bearer token",
+          "Card <CARD_ID_ACTIVE> exists and belongs to the caller",
+          "Card is in ACTIVE (unfrozen) state"
+        ],
+        "actions": [
+          "POST /cards/<CARD_ID_ACTIVE>/freeze with body {\"frozen\": true} and a unique Idempotency-Key",
+          "Assert card state is FROZEN",
+          "POST /cards/<CARD_ID_ACTIVE>/freeze with body {\"frozen\": false} and a new unique Idempotency-Key",
+          "Assert card state is ACTIVE"
+        ],
+        "expected": [
+          "First call returns HTTP 200 with {\"status\": \"FROZEN\"}",
+          "Second call returns HTTP 200 with {\"status\": \"ACTIVE\"}",
+          "Authorization network notified of each state change"
+        ],
+        "trace": [
+          "R-FIN-085: customer shall freeze or unfreeze their card instantly",
+          "R-FIN-085: card state updated; authorization network notified"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import api_client, ensure_card_active\n\ndef test_freeze_and_unfreeze_card_round_trip(<fixture_auth_headers>, <fixture_active_card>):\n    card_id = <fixture_active_card>[\"id\"]\n    client = api_client()\n\n    freeze_key = str(uuid.uuid4())\n    r = client.post(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n        headers={**<fixture_auth_headers>, \"Idempotency-Key\": freeze_key},\n    )\n    assert r.status_code == 200\n    assert r.json()[\"status\"] == \"FROZEN\"\n\n    unfreeze_key = str(uuid.uuid4())\n    r2 = client.post(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": False},\n        headers={**<fixture_auth_headers>, \"Idempotency-Key\": unfreeze_key},\n    )\n    assert r2.status_code == 200\n    assert r2.json()[\"status\"] == \"ACTIVE\"\n"
+      },
+      {
+        "name": "test_duplicate_freeze_request_is_idempotent",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated with a valid bearer token",
+          "Card <CARD_ID_ACTIVE> exists and belongs to the caller",
+          "Card is in ACTIVE state"
+        ],
+        "actions": [
+          "POST /cards/<CARD_ID_ACTIVE>/freeze with {\"frozen\": true} and Idempotency-Key X",
+          "Capture response body and status",
+          "POST /cards/<CARD_ID_ACTIVE>/freeze with {\"frozen\": true} and the same Idempotency-Key X",
+          "Compare second response to first"
+        ],
+        "expected": [
+          "Both calls return HTTP 200",
+          "Response bodies are identical (same status, same idempotency metadata)",
+          "Card remains FROZEN after both calls"
+        ],
+        "trace": [
+          "R-FIN-085: duplicate submission with the same Idempotency-Key must return the original result"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import api_client\n\ndef test_duplicate_freeze_request_is_idempotent(<fixture_auth_headers>, <fixture_active_card>):\n    card_id = <fixture_active_card>[\"id\"]\n    client = api_client()\n    idem_key = str(uuid.uuid4())\n    headers = {**<fixture_auth_headers>, \"Idempotency-Key\": idem_key}\n\n    r1 = client.post(f\"/cards/{card_id}/freeze\", json={\"frozen\": True}, headers=headers)\n    assert r1.status_code == 200\n\n    r2 = client.post(f\"/cards/{card_id}/freeze\", json={\"frozen\": True}, headers=headers)\n    assert r2.status_code == 200\n\n    body1 = r1.json()\n    body2 = r2.json()\n    assert body1[\"status\"] == body2[\"status\"] == \"FROZEN\"\n    assert body1.get(\"idempotency_key\") == body2.get(\"idempotency_key\") == idem_key\n"
+      },
+      {
+        "name": "test_authorization_rejected_when_card_is_frozen",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated with a valid bearer token",
+          "Card <CARD_ID_ACTIVE> exists, belongs to caller, and is ACTIVE",
+          "Authorization simulation endpoint is available"
+        ],
+        "actions": [
+          "POST /cards/<CARD_ID_ACTIVE>/freeze with {\"frozen\": true}",
+          "Attempt a simulated authorization via POST /cards/<CARD_ID_ACTIVE>/authorize with a valid amount"
+        ],
+        "expected": [
+          "Freeze call returns HTTP 200 with status FROZEN",
+          "Authorization attempt returns HTTP 402 or 403 with decline_reason CARD_FROZEN"
+        ],
+        "trace": [
+          "R-FIN-085: frozen cards must reject all authorization attempts"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import api_client\n\ndef test_authorization_rejected_when_card_is_frozen(<fixture_auth_headers>, <fixture_active_card>):\n    card_id = <fixture_active_card>[\"id\"]\n    client = api_client()\n\n    freeze_r = client.post(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n        headers={**<fixture_auth_headers>, \"Idempotency-Key\": str(uuid.uuid4())},\n    )\n    assert freeze_r.status_code == 200\n    assert freeze_r.json()[\"status\"] == \"FROZEN\"\n\n    auth_r = client.post(\n        f\"/cards/{card_id}/authorize\",\n        json={\"amount\": 10.00, \"currency\": \"USD\"},\n        headers=<fixture_auth_headers>,\n    )\n    assert auth_r.status_code in (402, 403)\n    assert auth_r.json().get(\"decline_reason\") == \"CARD_FROZEN\"\n"
+      },
+      {
+        "name": "test_freeze_nonexistent_card_returns_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated with a valid bearer token",
+          "Card ID <NONEXISTENT_CARD_ID> does not exist in the system"
+        ],
+        "actions": [
+          "POST /cards/<NONEXISTENT_CARD_ID>/freeze with {\"frozen\": true} and a unique Idempotency-Key"
+        ],
+        "expected": [
+          "Response status is HTTP 404",
+          "Response body contains error code CARD_NOT_FOUND"
+        ],
+        "trace": [
+          "R-FIN-085 error pathway: 404 when card does not exist"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import api_client\n\nNONEXISTENT_CARD_ID = \"00000000-0000-0000-0000-000000000000\"\n\ndef test_freeze_nonexistent_card_returns_404(<fixture_auth_headers>):\n    client = api_client()\n    r = client.post(\n        f\"/cards/{NONEXISTENT_CARD_ID}/freeze\",\n        json={\"frozen\": True},\n        headers={\n            **<fixture_auth_headers>,\n            \"Idempotency-Key\": str(uuid.uuid4()),\n        },\n    )\n    assert r.status_code == 404\n    body = r.json()\n    assert body.get(\"error_code\") == \"CARD_NOT_FOUND\"\n"
+      },
+      {
+        "name": "test_freeze_with_empty_idempotency_key_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated with a valid bearer token",
+          "Card <CARD_ID_ACTIVE> exists and belongs to the caller",
+          "Card is in ACTIVE state"
+        ],
+        "actions": [
+          "POST /cards/<CARD_ID_ACTIVE>/freeze with {\"frozen\": true} and Idempotency-Key header set to empty string \"\""
+        ],
+        "expected": [
+          "Response status is HTTP 400 or 422",
+          "Response body identifies Idempotency-Key as invalid or missing"
+        ],
+        "trace": [
+          "R-FIN-085: idempotency key boundary \u2014 zero-length key is degenerate and must be rejected",
+          "ISO/IEC 29119-4 BVA: boundary at minimum valid key length (1 character)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client\n\ndef test_freeze_with_empty_idempotency_key_is_rejected(<fixture_auth_headers>, <fixture_active_card>):\n    card_id = <fixture_active_card>[\"id\"]\n    client = api_client()\n\n    r = client.post(\n        f\"/cards/{card_id}/freeze\",\n        json={\"frozen\": True},\n        headers={**<fixture_auth_headers>, \"Idempotency-Key\": \"\"},\n    )\n    assert r.status_code in (400, 422)\n    body = r.json()\n    errors = str(body)\n    assert \"idempotency\" in errors.lower() or \"Idempotency-Key\" in errors\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-085",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1016,
+    "output_tokens": 2893,
+    "latency_ms": 33389,
+    "wall_ms": 33389,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-085\",\n  \"reasoning\": \"The requirement covers four orthogonal concerns: (1) nominal freeze/unfreeze state transitions, (2) idempotency of duplicate submissions with the same Idempotency-Key, (3) authorization rejection on a frozen card, and (4) 404 error when the card does not exist. I designed one test per concern, plus a boundary test for the idempotency key itself (empty string), totalling five tests. State Transition Coverage drives the freeze\u2192unfreeze round-trip; Equivalence Partitioning covers the valid-card happy path; Decision Table covers the authorization-rejection rule; Negative Path covers the missing card; Boundary Value Analysis targets the degenerate idempotency key edge.\",\n  \"tests\": [\n    {\n      \"name\": \"test_freeze_and_unfreeze_card_round_trip\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Caller is authenticated with a valid bearer token\",\n        \"Card <CARD_ID_ACTIVE> exists and belongs to the caller\",\n        \"Card is in ACTIVE (unfrozen) state\"\n      ],\n      \"actions\": [\n        \"POST /cards/<CARD_ID_ACTIVE>/freeze with body {\\\"frozen\\\": true} and a unique Idempotency-Key\",\n        \"Assert card state is FROZEN\",\n        \"POST /cards/<CARD_ID_ACTIVE>/freeze with body {\\\"frozen\\\": false} and a new unique Idempotency-Key\",\n        \"Assert card state is ACTIVE\"\n      ],\n      \"expected\": [\n        \"First call returns HTTP 200 with {\\\"status\\\": \\\"FROZEN\\\"}\",\n        \"Second call returns HTTP 200 with {\\\"status\\\": \\\"ACTIVE\\\"}\",\n        \"Authorization network notified of each state change\"\n      ],\n      \"trace\": [\n        \"R-FIN-085: customer shall freeze or unfreeze their card instantly\",\n        \"R-FIN-085: card state updated; authorization network notified\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom <helper_fn> import api_client, ensure_card_active\\n\\ndef test_freeze_and_unfreeze_card_round_trip(<fixture_auth_headers>, <fixture_active_card>):\\n    card_id = <fixture_active_card>[\\\"id\\\"]\\n    client = api_client()\\n\\n    freeze_key = str(uuid.uuid4())\\n    r = client.post(\\n        f\\\"/cards/{card_id}/freeze\\\",\\n        json={\\\"frozen\\\": True},\\n        headers={**<fixture_auth_headers>, \\\"Idempotency-Key\\\": freeze_key},\\n    )\\n    assert r.status_code == 200\\n    assert r.json()[\\\"status\\\"] == \\\"FROZEN\\\"\\n\\n    unfreeze_key = str(uuid.uuid4())\\n    r2 = client.post(\\n        f\\\"/cards/{card_id}/freeze\\\",\\n        json={\\\"frozen\\\": False},\\n        headers={**<fixture_auth_headers>, \\\"Idempotency-Key\\\": unfreeze_key},\\n    )\\n    assert r2.status_code == 200\\n    assert r2.json()[\\\"status\\\"] == \\\"ACTIVE\\\"\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_freeze_request_is_idempotent\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated with a valid bearer token\",\n        \"Card <CARD_ID_ACTIVE> exists and belongs to the caller\",\n        \"Card is in ACTIVE state\"\n      ],\n      \"actions\": [\n        \"POST /cards/<CARD_ID_ACTIVE>/freeze with {\\\"frozen\\\": true} and Idempotency-Key X\",\n        \"Capture response body and status\",\n        \"POST /cards/<CARD_ID_ACTIVE>/freeze with {\\\"frozen\\\": true} and the same Idempotency-Key X\",\n        \"Compare second response to first\"\n      ],\n      \"expected\": [\n        \"Both calls return HTTP 200\",\n        \"Response bodies are identical (same status, same idempotency metadata)\",\n        \"Card remains FROZEN after both calls\"\n      ],\n      \"trace\": [\n        \"R-FIN-085: duplicate submission with the same Idempotency-Key must return the original result\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom <helper_fn> import api_client\\n\\ndef test_duplicate_freeze_request_is_idempotent(<fixture_auth_headers>, <fixture_active_card>):\\n    card_id = <fixture_active_card>[\\\"id\\\"]\\n    client = api_client()\\n    idem_key = str(uuid.uuid4())\\n    headers = {**<fixture_auth_headers>, \\\"Idempotency-Key\\\": idem_key}\\n\\n    r1"
+  }
+}

@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-HLT-094",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation (audit)",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-094",
+    "reasoning": "R-HLT-094 requires three test dimensions: (1) valid vital-signs Observation accepted and stored, (2) out-of-range value flagged and a review task created, and (3) boundary values at the exact edge of plausible ranges treated correctly. An AuditEvent must be emitted for every operation. I chose heart-rate (HR) as the representative vital sign because its normal range (60-100 bpm) gives clean boundary values. EP covers the in-range partition; BVA covers the exact boundary (60 bpm); NEG covers the flagging path for an implausible value (300 bpm). A fourth DT test covers the cross-cutting AuditEvent emission rule for all three operation outcomes, and a fifth STC test exercises the state transition from 'stored' to 'flagged-for-review'. Each test authenticates as a clinician, performs idempotent resource creation via conditional-create or unique identifiers, then deletes created resources in teardown.",
+    "tests": [
+      {
+        "name": "test_vital_signs_in_range_stored_successfully",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician role credentials are available via <clinician_auth_fixture>",
+          "FHIR-lite server is reachable at BASE_URL",
+          "Heart-rate value 75 bpm is within the plausible range [60, 100]"
+        ],
+        "actions": [
+          "Authenticate as clinician",
+          "POST /Observation with category=vital-signs and HR=75 bpm",
+          "Assert HTTP 201 and resource id returned",
+          "GET /Observation/{id} and verify status=final and no flag extension",
+          "DELETE /Observation/{id} for cleanup"
+        ],
+        "expected": [
+          "HTTP 201 on creation",
+          "Observation.status == 'final'",
+          "No out-of-range flag present on resource",
+          "AuditEvent with action='C' emitted for the POST"
+        ],
+        "trace": [
+          "R-HLT-094"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import get_audit_events\n\ndef test_vital_signs_in_range_stored_successfully(<clinician_auth_fixture>, fhir_client):\n    obs_id = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": obs_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"valueQuantity\": {\"value\": 75, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = fhir_client.put(f\"/Observation/{obs_id}\", json=payload, headers=<clinician_auth_fixture>)\n    assert resp.status_code in (200, 201), f\"Expected 200/201, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"status\") == \"final\"\n    extensions = body.get(\"extension\", [])\n    flag_urls = [e[\"url\"] for e in extensions]\n    assert \"http://fhir-lite/StructureDefinition/out-of-range-flag\" not in flag_urls\n    audits = get_audit_events(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert any(a.get(\"action\") in (\"C\", \"U\") for a in audits)\n    fhir_client.delete(f\"/Observation/{obs_id}\", headers=<clinician_auth_fixture>)\n"
+      },
+      {
+        "name": "test_vital_signs_out_of_range_flagged_and_review_task_created",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician role credentials are available via <clinician_auth_fixture>",
+          "FHIR-lite server is reachable at BASE_URL",
+          "Heart-rate value 300 bpm is outside plausible range [60, 100]"
+        ],
+        "actions": [
+          "Authenticate as clinician",
+          "POST /Observation with category=vital-signs and HR=300 bpm",
+          "Assert HTTP 201 (resource stored)",
+          "GET /Observation/{id} and verify out-of-range flag extension present",
+          "GET /Task and verify a review task referencing the Observation exists",
+          "DELETE /Task/{task_id} and /Observation/{id} for cleanup"
+        ],
+        "expected": [
+          "HTTP 201 on creation",
+          "Observation stored with out-of-range flag extension set to true",
+          "A Task with intent='proposal' and focus referencing the Observation is created",
+          "AuditEvent emitted for both the Observation POST and the Task creation"
+        ],
+        "trace": [
+          "R-HLT-094"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import get_audit_events, poll_task_for_observation\n\ndef test_vital_signs_out_of_range_flagged_and_review_task_created(<clinician_auth_fixture>, fhir_client):\n    obs_id = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": obs_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"valueQuantity\": {\"value\": 300, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = fhir_client.put(f\"/Observation/{obs_id}\", json=payload, headers=<clinician_auth_fixture>)\n    assert resp.status_code in (200, 201)\n    body = resp.json()\n    extensions = {e[\"url\"]: e for e in body.get(\"extension\", [])}\n    flag_url = \"http://fhir-lite/StructureDefinition/out-of-range-flag\"\n    assert flag_url in extensions, \"Out-of-range flag extension missing\"\n    assert extensions[flag_url].get(\"valueBoolean\") is True\n    task = poll_task_for_observation(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert task is not None, \"Review Task not created for out-of-range observation\"\n    assert task.get(\"intent\") == \"proposal\"\n    audits = get_audit_events(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert len(audits) >= 1\n    fhir_client.delete(f\"/Task/{task['id']}\", headers=<clinician_auth_fixture>)\n    fhir_client.delete(f\"/Observation/{obs_id}\", headers=<clinician_auth_fixture>)\n"
+      },
+      {
+        "name": "test_vital_signs_boundary_value_minimum_accepted_no_flag",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician role credentials are available via <clinician_auth_fixture>",
+          "FHIR-lite server is reachable at BASE_URL",
+          "Heart-rate value 60 bpm is the exact lower boundary of plausible range [60, 100]"
+        ],
+        "actions": [
+          "Authenticate as clinician",
+          "POST /Observation with category=vital-signs and HR=60 bpm (exact lower bound)",
+          "Assert HTTP 201 and resource stored",
+          "Verify no out-of-range flag on returned resource",
+          "Verify no review Task created for this Observation",
+          "DELETE /Observation/{id} for cleanup"
+        ],
+        "expected": [
+          "HTTP 201 on creation",
+          "Observation.status == 'final' with no out-of-range flag",
+          "No review Task created",
+          "AuditEvent emitted for the POST"
+        ],
+        "trace": [
+          "R-HLT-094"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import get_audit_events, poll_task_for_observation\n\ndef test_vital_signs_boundary_value_minimum_accepted_no_flag(<clinician_auth_fixture>, fhir_client):\n    obs_id = str(uuid.uuid4())\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": obs_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"valueQuantity\": {\"value\": 60, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = fhir_client.put(f\"/Observation/{obs_id}\", json=payload, headers=<clinician_auth_fixture>)\n    assert resp.status_code in (200, 201), f\"Expected 200/201, got {resp.status_code}\"\n    body = resp.json()\n    flag_url = \"http://fhir-lite/StructureDefinition/out-of-range-flag\"\n    ext_urls = [e[\"url\"] for e in body.get(\"extension\", [])]\n    assert flag_url not in ext_urls, \"Boundary value 60 bpm incorrectly flagged\"\n    task = poll_task_for_observation(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert task is None, \"Review Task should not be created for boundary-valid value\"\n    audits = get_audit_events(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert len(audits) >= 1, \"AuditEvent missing for boundary-value observation\"\n    fhir_client.delete(f\"/Observation/{obs_id}\", headers=<clinician_auth_fixture>)\n"
+      },
+      {
+        "name": "test_audit_event_emitted_for_all_operation_types",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician role credentials are available via <clinician_auth_fixture>",
+          "FHIR-lite server is reachable at BASE_URL",
+          "AuditEvent endpoint /AuditEvent is queryable"
+        ],
+        "actions": [
+          "POST (create) a valid vital-signs Observation; assert AuditEvent action=C",
+          "GET (read) the Observation; assert AuditEvent action=R",
+          "PUT (update) the Observation; assert AuditEvent action=U",
+          "DELETE the Observation; assert AuditEvent action=D"
+        ],
+        "expected": [
+          "Distinct AuditEvents with actions C, R, U, D recorded for the same resource id",
+          "Each AuditEvent references the clinician as agent",
+          "All four operations succeed with appropriate HTTP status codes"
+        ],
+        "trace": [
+          "R-HLT-094"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import get_audit_events\n\ndef test_audit_event_emitted_for_all_operation_types(<clinician_auth_fixture>, fhir_client):\n    obs_id = str(uuid.uuid4())\n    base_payload = {\n        \"resourceType\": \"Observation\", \"id\": obs_id, \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    r_create = fhir_client.put(f\"/Observation/{obs_id}\", json=base_payload, headers=<clinician_auth_fixture>)\n    assert r_create.status_code in (200, 201)\n    r_read = fhir_client.get(f\"/Observation/{obs_id}\", headers=<clinician_auth_fixture>)\n    assert r_read.status_code == 200\n    base_payload[\"status\"] = \"amended\"\n    r_update = fhir_client.put(f\"/Observation/{obs_id}\", json=base_payload, headers=<clinician_auth_fixture>)\n    assert r_update.status_code in (200, 201)\n    r_delete = fhir_client.delete(f\"/Observation/{obs_id}\", headers=<clinician_auth_fixture>)\n    assert r_delete.status_code in (200, 204)\n    audits = get_audit_events(fhir_client, obs_id, <clinician_auth_fixture>)\n    recorded_actions = {a.get(\"action\") for a in audits}\n    assert recorded_actions >= {\"C\", \"R\", \"U\", \"D\"}, f\"Missing audit actions: {recorded_actions}\"\n"
+      },
+      {
+        "name": "test_vital_signs_state_transition_stored_to_flagged_on_update",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician role credentials are available via <clinician_auth_fixture>",
+          "FHIR-lite server is reachable at BASE_URL",
+          "An in-range Observation (HR=75) already exists and is in state 'stored/valid'"
+        ],
+        "actions": [
+          "Create Observation with HR=75 (in-range) \u2014 state: stored/valid",
+          "Assert no flag present on resource",
+          "Update the same Observation with HR=250 (out-of-range) \u2014 state should transition to flagged",
+          "Assert out-of-range flag extension is now true",
+          "Assert a review Task referencing the Observation is created",
+          "DELETE Task and Observation for cleanup"
+        ],
+        "expected": [
+          "Initial resource has no out-of-range flag (state: valid)",
+          "After update to out-of-range value, flag extension is present and true (state: flagged)",
+          "Review Task created upon state transition to flagged",
+          "AuditEvent emitted for both create and update operations"
+        ],
+        "trace": [
+          "R-HLT-094"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import get_audit_events, poll_task_for_observation\n\ndef test_vital_signs_state_transition_stored_to_flagged_on_update(<clinician_auth_fixture>, fhir_client):\n    obs_id = str(uuid.uuid4())\n    flag_url = \"http://fhir-lite/StructureDefinition/out-of-range-flag\"\n    def make_payload(hr_value):\n        return {\n            \"resourceType\": \"Observation\", \"id\": obs_id, \"status\": \"final\",\n            \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n            \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n            \"subject\": {\"reference\": \"Patient/test-patient-1\"},\n            \"valueQuantity\": {\"value\": hr_value, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n        }\n    r1 = fhir_client.put(f\"/Observation/{obs_id}\", json=make_payload(75), headers=<clinician_auth_fixture>)\n    assert r1.status_code in (200, 201)\n    ext_urls_v1 = [e[\"url\"] for e in r1.json().get(\"extension\", [])]\n    assert flag_url not in ext_urls_v1, \"In-range value should not be flagged\"\n    r2 = fhir_client.put(f\"/Observation/{obs_id}\", json=make_payload(250), headers=<clinician_auth_fixture>)\n    assert r2.status_code in (200, 201)\n    body_v2 = r2.json()\n    exts_v2 = {e[\"url\"]: e for e in body_v2.get(\"extension\", [])}\n    assert flag_url in exts_v2, \"Out-of-range flag missing after update to implausible value\"\n    assert exts_v2[flag_url].get(\"valueBoolean\") is True\n    task = poll_task_for_observation(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert task is not None, \"Review Task not created after state transition to flagged\"\n    audits = get_audit_events(fhir_client, obs_id, <clinician_auth_fixture>)\n    assert len(audits) >= 2, \"Expected AuditEvents for both create and update\"\n    fhir_client.delete(f\"/Task/{task['id']}\", headers=<clinician_auth_fixture>)\n    fhir_client.delete(f\"/Observation/{obs_id}\", headers=<clinician_auth_fixture>)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-094",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 4959,
+    "latency_ms": 52245,
+    "wall_ms": 52245,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-094\",\n  \"reasoning\": \"R-HLT-094 requires three test dimensions: (1) valid vital-signs Observation accepted and stored, (2) out-of-range value flagged and a review task created, and (3) boundary values at the exact edge of plausible ranges treated correctly. An AuditEvent must be emitted for every operation. I chose heart-rate (HR) as the representative vital sign because its normal range (60-100 bpm) gives clean boundary values. EP covers the in-range partition; BVA covers the exact boundary (60 bpm); NEG covers the flagging path for an implausible value (300 bpm). A fourth DT test covers the cross-cutting AuditEvent emission rule for all three operation outcomes, and a fifth STC test exercises the state transition from 'stored' to 'flagged-for-review'. Each test authenticates as a clinician, performs idempotent resource creation via conditional-create or unique identifiers, then deletes created resources in teardown.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vital_signs_in_range_stored_successfully\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician role credentials are available via <clinician_auth_fixture>\",\n        \"FHIR-lite server is reachable at BASE_URL\",\n        \"Heart-rate value 75 bpm is within the plausible range [60, 100]\"\n      ],\n      \"actions\": [\n        \"Authenticate as clinician\",\n        \"POST /Observation with category=vital-signs and HR=75 bpm\",\n        \"Assert HTTP 201 and resource id returned\",\n        \"GET /Observation/{id} and verify status=final and no flag extension\",\n        \"DELETE /Observation/{id} for cleanup\"\n      ],\n      \"expected\": [\n        \"HTTP 201 on creation\",\n        \"Observation.status == 'final'\",\n        \"No out-of-range flag present on resource\",\n        \"AuditEvent with action='C' emitted for the POST\"\n      ],\n      \"trace\": [\"R-HLT-094\"],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom <helper_fn> import get_audit_events\\n\\ndef test_vital_signs_in_range_stored_successfully(<clinician_auth_fixture>, fhir_client):\\n    obs_id = str(uuid.uuid4())\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"id\\\": obs_id,\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/test-patient-1\\\"},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 75, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = fhir_client.put(f\\\"/Observation/{obs_id}\\\", json=payload, headers=<clinician_auth_fixture>)\\n    assert resp.status_code in (200, 201), f\\\"Expected 200/201, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"status\\\") == \\\"final\\\"\\n    extensions = body.get(\\\"extension\\\", [])\\n    flag_urls = [e[\\\"url\\\"] for e in extensions]\\n    assert \\\"http://fhir-lite/StructureDefinition/out-of-range-flag\\\" not in flag_urls\\n    audits = get_audit_events(fhir_client, obs_id, <clinician_auth_fixture>)\\n    assert any(a.get(\\\"action\\\") in (\\\"C\\\", \\\"U\\\") for a in audits)\\n    fhir_client.delete(f\\\"/Observation/{obs_id}\\\", headers=<clinician_auth_fixture>)\\n\"\n    },\n    {\n      \"name\": \"test_vital_signs_out_of_range_flagged_and_review_task_created\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician role credentials are available via <clinician_auth_fixture>\",\n        \"FHIR-lite server is reachable at BASE_URL\",\n        \"Heart-rate value 300 bpm is outside plausible range [60, 100]\"\n      ],\n      \"actions\": [\n        \"Authenticate as clinician\",\n        \"POST /Observation with category=vital-signs and HR=300 bpm\",\n        \"Assert HTTP 201 (resource stored)\",\n        \"GET /Observation/{id} and verify out-of-range flag "
+  }
+}

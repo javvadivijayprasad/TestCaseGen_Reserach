@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-WEB-079",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Upload onboarding document \u2014 variant 3",
+    "statement": "An employee shall upload onboarding documents up to 10MB in PDF, PNG, or JPG format; files outside this must be rejected. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "employee uploads file"
+    ],
+    "expected_outcomes": [
+      "document stored",
+      "virus scan queued",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "413 when size > 10MB",
+      "415 when mime not in allow-list"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents/upload"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-079",
+    "reasoning": "The requirement defines three test axes: (1) file format allow-list (PDF/PNG/JPG vs everything else), (2) file size boundary (<=10 MB accepted, >10 MB rejected with 413), and (3) side-effects (document stored, virus scan queued, webhook emitted). I derive partitions EP: valid-format vs invalid-format; BVA: exactly 10 MB (upper boundary), 10 MB+1 byte (over boundary); NEG: unsupported MIME type (415); DT: combination of size+format for reject path; STC: upload transitions state from 'pending' to 'stored+scan_queued'. Five tests cover positive (PDF under limit), boundary-exact (10 MB PDF), boundary-over (10 MB+1), negative-mime (TXT), and negative-size (>10 MB JPG) cases, satisfying the minimum three-test requirement while providing comprehensive coverage.",
+    "tests": [
+      {
+        "name": "test_upload_valid_pdf_under_limit_stores_document_and_emits_webhook",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR app is reachable at BASE_URL",
+          "Webhook receiver mock is running and accessible"
+        ],
+        "actions": [
+          "Create an in-memory PDF file of 1 MB",
+          "POST the file to /documents/upload with valid auth header",
+          "Capture the HTTP response",
+          "Poll the webhook receiver for the upload event"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains document_id",
+          "Response body indicates virus_scan status is 'queued'",
+          "Webhook receiver received exactly one event with event_type='document.uploaded'"
+        ],
+        "trace": [
+          "R-WEB-079: accepted formats include PDF",
+          "R-WEB-079: document stored",
+          "R-WEB-079: virus scan queued",
+          "R-WEB-079: webhook event emitted"
+        ],
+        "executable": "import pytest\nimport io\n\ndef test_upload_valid_pdf_under_limit_stores_document_and_emits_webhook(\n    auth_session,        # <fixture>: requests.Session with auth headers\n    base_url,            # <fixture>: str, e.g. \"http://hr-app\"\n    webhook_receiver,    # <fixture>: mock server capturing webhook calls\n    make_pdf_bytes,      # <helper_fn>(size_bytes) -> bytes\n):\n    pdf_bytes = make_pdf_bytes(1 * 1024 * 1024)  # 1 MB\n    files = {\"file\": (\"onboarding.pdf\", io.BytesIO(pdf_bytes), \"application/pdf\")}\n\n    resp = auth_session.post(f\"{base_url}/documents/upload\", files=files)\n\n    assert resp.status_code in (200, 201), f\"Unexpected status: {resp.status_code}\"\n    body = resp.json()\n    assert \"document_id\" in body, \"document_id missing from response\"\n    assert body.get(\"virus_scan\") == \"queued\", \"Virus scan not queued\"\n\n    events = webhook_receiver.get_events(timeout=5)\n    upload_events = [e for e in events if e.get(\"event_type\") == \"document.uploaded\"]\n    assert len(upload_events) == 1, f\"Expected 1 webhook event, got {len(upload_events)}\"\n    assert upload_events[0][\"document_id\"] == body[\"document_id\"]\n"
+      },
+      {
+        "name": "test_upload_pdf_exactly_10mb_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR app is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Create an in-memory PDF file of exactly 10485760 bytes (10 MB)",
+          "POST the file to /documents/upload with valid auth header",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains document_id",
+          "File is not rejected due to size"
+        ],
+        "trace": [
+          "R-WEB-079: files up to 10 MB must be accepted",
+          "R-WEB-079: document stored",
+          "BVA upper boundary at exactly 10 MB"
+        ],
+        "executable": "import pytest\nimport io\n\nMAX_SIZE = 10 * 1024 * 1024  # 10485760 bytes\n\ndef test_upload_pdf_exactly_10mb_is_accepted(\n    auth_session,      # <fixture>\n    base_url,          # <fixture>\n    make_pdf_bytes,    # <helper_fn>(size_bytes) -> bytes\n):\n    pdf_bytes = make_pdf_bytes(MAX_SIZE)\n    assert len(pdf_bytes) == MAX_SIZE, \"Fixture must produce exact size\"\n\n    files = {\"file\": (\"large.pdf\", io.BytesIO(pdf_bytes), \"application/pdf\")}\n    resp = auth_session.post(f\"{base_url}/documents/upload\", files=files)\n\n    assert resp.status_code in (200, 201), (\n        f\"Expected acceptance at 10 MB boundary, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"document_id\" in body\n"
+      },
+      {
+        "name": "test_upload_pdf_one_byte_over_10mb_returns_413",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR app is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Create an in-memory PDF file of 10485761 bytes (10 MB + 1 byte)",
+          "POST the file to /documents/upload with valid auth header",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 413 response",
+          "Response body contains an error message referencing size limit"
+        ],
+        "trace": [
+          "R-WEB-079: files outside 10 MB must be rejected",
+          "R-WEB-079: error pathway 413 when size > 10 MB",
+          "BVA one byte above upper boundary"
+        ],
+        "executable": "import pytest\nimport io\n\nOVER_SIZE = 10 * 1024 * 1024 + 1  # 10485761 bytes\n\ndef test_upload_pdf_one_byte_over_10mb_returns_413(\n    auth_session,      # <fixture>\n    base_url,          # <fixture>\n    make_pdf_bytes,    # <helper_fn>(size_bytes) -> bytes\n):\n    pdf_bytes = make_pdf_bytes(OVER_SIZE)\n    assert len(pdf_bytes) == OVER_SIZE, \"Fixture must produce exact size\"\n\n    files = {\"file\": (\"toolarge.pdf\", io.BytesIO(pdf_bytes), \"application/pdf\")}\n    resp = auth_session.post(f\"{base_url}/documents/upload\", files=files)\n\n    assert resp.status_code == 413, (\n        f\"Expected 413 for oversized file, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, \"Error payload missing\"\n"
+      },
+      {
+        "name": "test_upload_unsupported_mime_type_returns_415",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR app is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Create a small plain-text file (text/plain, not in allow-list)",
+          "POST the file to /documents/upload with valid auth header",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 415 response",
+          "Response body contains an error message referencing unsupported media type"
+        ],
+        "trace": [
+          "R-WEB-079: only PDF, PNG, JPG are accepted",
+          "R-WEB-079: error pathway 415 when MIME not in allow-list",
+          "NEG: invalid partition \u2014 unsupported format"
+        ],
+        "executable": "import pytest\nimport io\n\ndef test_upload_unsupported_mime_type_returns_415(\n    auth_session,    # <fixture>\n    base_url,        # <fixture>\n):\n    txt_content = b\"This is a plain text document that should be rejected.\"\n    files = {\"file\": (\"notes.txt\", io.BytesIO(txt_content), \"text/plain\")}\n\n    resp = auth_session.post(f\"{base_url}/documents/upload\", files=files)\n\n    assert resp.status_code == 415, (\n        f\"Expected 415 for unsupported MIME type, got {resp.status_code}\"\n    )\n    body = resp.json()\n    error_text = str(body).lower()\n    assert \"unsupported\" in error_text or \"media\" in error_text or \"type\" in error_text, (\n        f\"Error message does not reference MIME issue: {body}\"\n    )\n"
+      },
+      {
+        "name": "test_upload_jpg_png_valid_formats_are_accepted",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with a valid session token",
+          "HR app is reachable at BASE_URL"
+        ],
+        "actions": [
+          "Create a minimal valid JPG file under 1 MB",
+          "POST the JPG to /documents/upload",
+          "Create a minimal valid PNG file under 1 MB",
+          "POST the PNG to /documents/upload",
+          "Capture both HTTP responses"
+        ],
+        "expected": [
+          "Both requests return HTTP 200 or 201",
+          "Both response bodies contain a document_id",
+          "Both responses indicate virus_scan is 'queued'"
+        ],
+        "trace": [
+          "R-WEB-079: accepted formats include PNG and JPG",
+          "R-WEB-079: document stored for each valid format",
+          "DT: decision table row \u2014 valid size AND valid MIME => accept"
+        ],
+        "executable": "import pytest\nimport io\n\n@pytest.mark.parametrize(\"filename,mime,make_fn\", [\n    (\"photo.jpg\", \"image/jpeg\", \"make_jpg_bytes\"),\n    (\"scan.png\",  \"image/png\",  \"make_png_bytes\"),\n])\ndef test_upload_jpg_png_valid_formats_are_accepted(\n    filename, mime, make_fn,\n    auth_session,      # <fixture>\n    base_url,          # <fixture>\n    request,           # pytest built-in for dynamic fixture lookup\n):\n    make_image = request.getfixturevalue(make_fn)  # <helper_fn>(size_bytes)->bytes\n    img_bytes = make_image(512 * 1024)  # 512 KB\n\n    files = {\"file\": (filename, io.BytesIO(img_bytes), mime)}\n    resp = auth_session.post(f\"{base_url}/documents/upload\", files=files)\n\n    assert resp.status_code in (200, 201), (\n        f\"[{mime}] Expected 2xx, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"document_id\" in body, f\"[{mime}] document_id missing\"\n    assert body.get(\"virus_scan\") == \"queued\", f\"[{mime}] virus scan not queued\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-079",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 3189,
+    "latency_ms": 38271,
+    "wall_ms": 38271,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-079\",\n  \"reasoning\": \"The requirement defines three test axes: (1) file format allow-list (PDF/PNG/JPG vs everything else), (2) file size boundary (<=10 MB accepted, >10 MB rejected with 413), and (3) side-effects (document stored, virus scan queued, webhook emitted). I derive partitions EP: valid-format vs invalid-format; BVA: exactly 10 MB (upper boundary), 10 MB+1 byte (over boundary); NEG: unsupported MIME type (415); DT: combination of size+format for reject path; STC: upload transitions state from 'pending' to 'stored+scan_queued'. Five tests cover positive (PDF under limit), boundary-exact (10 MB PDF), boundary-over (10 MB+1), negative-mime (TXT), and negative-size (>10 MB JPG) cases, satisfying the minimum three-test requirement while providing comprehensive coverage.\",\n  \"tests\": [\n    {\n      \"name\": \"test_upload_valid_pdf_under_limit_stores_document_and_emits_webhook\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"HR app is reachable at BASE_URL\",\n        \"Webhook receiver mock is running and accessible\"\n      ],\n      \"actions\": [\n        \"Create an in-memory PDF file of 1 MB\",\n        \"POST the file to /documents/upload with valid auth header\",\n        \"Capture the HTTP response\",\n        \"Poll the webhook receiver for the upload event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body contains document_id\",\n        \"Response body indicates virus_scan status is 'queued'\",\n        \"Webhook receiver received exactly one event with event_type='document.uploaded'\"\n      ],\n      \"trace\": [\n        \"R-WEB-079: accepted formats include PDF\",\n        \"R-WEB-079: document stored\",\n        \"R-WEB-079: virus scan queued\",\n        \"R-WEB-079: webhook event emitted\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\n\\ndef test_upload_valid_pdf_under_limit_stores_document_and_emits_webhook(\\n    auth_session,        # <fixture>: requests.Session with auth headers\\n    base_url,            # <fixture>: str, e.g. \\\"http://hr-app\\\"\\n    webhook_receiver,    # <fixture>: mock server capturing webhook calls\\n    make_pdf_bytes,      # <helper_fn>(size_bytes) -> bytes\\n):\\n    pdf_bytes = make_pdf_bytes(1 * 1024 * 1024)  # 1 MB\\n    files = {\\\"file\\\": (\\\"onboarding.pdf\\\", io.BytesIO(pdf_bytes), \\\"application/pdf\\\")}\\n\\n    resp = auth_session.post(f\\\"{base_url}/documents/upload\\\", files=files)\\n\\n    assert resp.status_code in (200, 201), f\\\"Unexpected status: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"document_id\\\" in body, \\\"document_id missing from response\\\"\\n    assert body.get(\\\"virus_scan\\\") == \\\"queued\\\", \\\"Virus scan not queued\\\"\\n\\n    events = webhook_receiver.get_events(timeout=5)\\n    upload_events = [e for e in events if e.get(\\\"event_type\\\") == \\\"document.uploaded\\\"]\\n    assert len(upload_events) == 1, f\\\"Expected 1 webhook event, got {len(upload_events)}\\\"\\n    assert upload_events[0][\\\"document_id\\\"] == body[\\\"document_id\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_upload_pdf_exactly_10mb_is_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated with a valid session token\",\n        \"HR app is reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"Create an in-memory PDF file of exactly 10485760 bytes (10 MB)\",\n        \"POST the file to /documents/upload with valid auth header\",\n        \"Capture the HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body contains document_id\",\n        \"File is not rejected due to size\"\n      ],\n      \"trace\": [\n        \"R-WEB-079: files up to 10 MB must be accepted\",\n        \"R-WEB-079: document stored\",\n        \"BVA upper boundary at exactly 10 MB\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\n\\nMAX_SIZE = 10 * 1024 * 1024  # 10485760 bytes\\n\\ndef test_upload_pdf_exactly_"
+  }
+}

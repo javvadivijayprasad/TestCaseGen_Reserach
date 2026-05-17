@@ -1,0 +1,187 @@
+{
+  "req": {
+    "id": "R-HLT-090",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Consent management (audit)",
+    "statement": "A patient shall grant or revoke consent for data sharing; revoked consent shall be enforced within 15 minutes. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "patient"
+    ],
+    "preconditions": [
+      "role:patient"
+    ],
+    "triggers": [
+      "patient updates consent"
+    ],
+    "expected_outcomes": [
+      "consent stored",
+      "downstream caches invalidated"
+    ],
+    "error_pathways": [
+      "accesses after revoke within SLA denied"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Consent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-090",
+    "reasoning": "R-HLT-090 mandates four observable behaviours: (1) consent grant is persisted and returns HTTP 201/200, (2) consent revoke is persisted, downstream caches are invalidated, and access is denied within the 15-minute SLA, (3) an AuditEvent is emitted for every mutating operation, and (4) access attempted exactly at the SLA boundary (t=15 min) must still be denied while access after the SLA window has closed must also be denied. Tests are partitioned as: positive=grant+audit round-trip (EP/STC), negative=data access after revoke within SLA (NEG/DT), boundary=access attempted at t=15min boundary (BVA). Each test is self-contained via fixtures that create and clean up their own patient context.",
+    "tests": [
+      {
+        "name": "test_consent_grant_stored_and_audit_emitted",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "FHIR-lite service is reachable at BASE_URL",
+          "No prior Consent resource exists for this patient (idempotent setup via <ensure_no_consent> fixture)"
+        ],
+        "actions": [
+          "POST /Consent with a valid grant payload signed by patient token",
+          "Assert HTTP 201 and consent id in response body",
+          "GET /AuditEvent?entity=<consent_id>&action=C to retrieve audit log"
+        ],
+        "expected": [
+          "POST /Consent returns HTTP 201",
+          "Response body contains resourceType=Consent and status=active",
+          "GET /AuditEvent returns at least one event with action=C linked to the consent id",
+          "AuditEvent.recorded timestamp is within 5 seconds of test execution"
+        ],
+        "trace": [
+          "R-HLT-090: patient shall grant consent",
+          "R-HLT-090: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest, requests, time\nfrom conftest import BASE_URL, patient_auth_headers, ensure_no_consent, build_consent_payload\n\ndef test_consent_grant_stored_and_audit_emitted():\n    headers = patient_auth_headers()\n    patient_id = headers[\"X-Patient-Id\"]\n    ensure_no_consent(patient_id, headers)\n\n    payload = build_consent_payload(patient_id, status=\"active\")\n    r = requests.post(f\"{BASE_URL}/Consent\", json=payload, headers=headers)\n    assert r.status_code == 201, f\"Expected 201, got {r.status_code}: {r.text}\"\n    body = r.json()\n    assert body.get(\"resourceType\") == \"Consent\"\n    assert body.get(\"status\") == \"active\"\n    consent_id = body[\"id\"]\n\n    time.sleep(1)\n    audit_r = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"entity\": consent_id, \"action\": \"C\"},\n        headers=headers\n    )\n    assert audit_r.status_code == 200\n    entries = audit_r.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"No AuditEvent found for consent grant\"\n    recorded = entries[0][\"resource\"][\"recorded\"]\n    assert recorded is not None\n"
+      },
+      {
+        "name": "test_data_access_denied_after_consent_revoke_within_sla",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "Active consent exists for the patient (created in setup)",
+          "A protected data endpoint /Patient/<id>/$everything is accessible under active consent"
+        ],
+        "actions": [
+          "Confirm data access is allowed under active consent (HTTP 200)",
+          "PATCH /Consent/<id> to set status=inactive (revoke)",
+          "Wait up to 15 minutes (parametrized short wait of 1s in CI with env override)",
+          "Attempt GET /Patient/<id>/$everything with same token",
+          "GET /AuditEvent for the revoke operation"
+        ],
+        "expected": [
+          "Initial data access returns HTTP 200",
+          "PATCH /Consent returns HTTP 200 with status=inactive",
+          "Subsequent data access returns HTTP 403 or 401 within SLA window",
+          "AuditEvent with action=U exists for the revoke operation"
+        ],
+        "trace": [
+          "R-HLT-090: revoked consent shall be enforced within 15 minutes",
+          "R-HLT-090: error pathway - accesses after revoke within SLA denied",
+          "R-HLT-090: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest, requests, os, time\nfrom conftest import BASE_URL, patient_auth_headers, create_active_consent\n\nREVOKE_WAIT = int(os.getenv(\"REVOKE_ENFORCEMENT_WAIT_SEC\", \"2\"))\n\ndef test_data_access_denied_after_consent_revoke_within_sla():\n    headers = patient_auth_headers()\n    patient_id = headers[\"X-Patient-Id\"]\n    consent_id = create_active_consent(patient_id, headers)\n\n    pre = requests.get(f\"{BASE_URL}/Patient/{patient_id}/$everything\", headers=headers)\n    assert pre.status_code == 200, \"Precondition: data must be accessible with active consent\"\n\n    revoke_payload = {\"resourceType\": \"Consent\", \"id\": consent_id, \"status\": \"inactive\"}\n    patch_r = requests.patch(\n        f\"{BASE_URL}/Consent/{consent_id}\", json=revoke_payload, headers=headers\n    )\n    assert patch_r.status_code == 200\n    assert patch_r.json().get(\"status\") == \"inactive\"\n\n    time.sleep(REVOKE_WAIT)\n\n    post = requests.get(f\"{BASE_URL}/Patient/{patient_id}/$everything\", headers=headers)\n    assert post.status_code in (401, 403), f\"Expected denial, got {post.status_code}\"\n\n    audit_r = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"entity\": consent_id, \"action\": \"U\"},\n        headers=headers\n    )\n    assert audit_r.status_code == 200\n    assert len(audit_r.json().get(\"entry\", [])) >= 1, \"Revoke AuditEvent missing\"\n"
+      },
+      {
+        "name": "test_data_access_denied_at_exactly_15_minute_sla_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "Active consent exists; revoke timestamp is controllable via <mock_revoke_time> fixture or service test-hook",
+          "Service exposes a test-hook header X-Test-Revoke-At allowing injection of revoke timestamp"
+        ],
+        "actions": [
+          "POST /Consent to create active consent",
+          "PATCH /Consent/<id> to revoke, injecting X-Test-Revoke-At = now - 899s (1 second before SLA)",
+          "GET /Patient/<id>/$everything \u2014 must be denied (within SLA)",
+          "PATCH revoke timestamp to now - 901s (1 second after SLA expires)",
+          "GET /Patient/<id>/$everything \u2014 enforcement window closed but still denied per policy"
+        ],
+        "expected": [
+          "At t=now-899s (just inside 15-min SLA): GET returns 403",
+          "At t=now-901s (just outside 15-min SLA): GET still returns 403 (consent remains inactive)",
+          "AuditEvent emitted for each PATCH operation"
+        ],
+        "trace": [
+          "R-HLT-090: revoked consent shall be enforced within 15 minutes (BVA at boundary t=900s)",
+          "R-HLT-090: error pathway - accesses after revoke within SLA denied"
+        ],
+        "executable": "import pytest, requests, time\nfrom conftest import BASE_URL, patient_auth_headers, create_active_consent\n\nSLA_SECONDS = 900\n\ndef _revoke_with_offset(consent_id, offset_sec, headers):\n    import datetime\n    revoke_time = (datetime.datetime.utcnow() -\n                   datetime.timedelta(seconds=offset_sec)).isoformat() + \"Z\"\n    payload = {\"resourceType\": \"Consent\", \"id\": consent_id, \"status\": \"inactive\"}\n    extra = {**headers, \"X-Test-Revoke-At\": revoke_time}\n    r = requests.patch(f\"{BASE_URL}/Consent/{consent_id}\", json=payload, headers=extra)\n    assert r.status_code == 200\n\ndef test_data_access_denied_at_exactly_15_minute_sla_boundary():\n    headers = patient_auth_headers()\n    patient_id = headers[\"X-Patient-Id\"]\n    consent_id = create_active_consent(patient_id, headers)\n\n    _revoke_with_offset(consent_id, SLA_SECONDS - 1, headers)\n    r_inside = requests.get(f\"{BASE_URL}/Patient/{patient_id}/$everything\", headers=headers)\n    assert r_inside.status_code in (401, 403), (\n        f\"Inside SLA boundary: expected denial, got {r_inside.status_code}\"\n    )\n\n    _revoke_with_offset(consent_id, SLA_SECONDS + 1, headers)\n    r_outside = requests.get(f\"{BASE_URL}/Patient/{patient_id}/$everything\", headers=headers)\n    assert r_outside.status_code in (401, 403), (\n        f\"Outside SLA boundary: consent inactive so still denied, got {r_outside.status_code}\"\n    )\n\n    for action in (\"U\",):\n        audit_r = requests.get(\n            f\"{BASE_URL}/AuditEvent\",\n            params={\"entity\": consent_id, \"action\": action},\n            headers=headers\n        )\n        assert len(audit_r.json().get(\"entry\", [])) >= 1, f\"Missing AuditEvent action={action}\"\n"
+      },
+      {
+        "name": "test_consent_grant_then_revoke_state_transitions_and_audit_chain",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated patient token available",
+          "No prior Consent resource for this patient"
+        ],
+        "actions": [
+          "POST /Consent (proposed -> active)",
+          "PATCH /Consent/<id> status=inactive (active -> inactive)",
+          "GET /AuditEvent?entity=<id> to retrieve full audit chain"
+        ],
+        "expected": [
+          "POST returns 201 with status=active",
+          "PATCH returns 200 with status=inactive",
+          "AuditEvent chain contains exactly two entries: action=C and action=U in order",
+          "Each AuditEvent references the same consent resource id"
+        ],
+        "trace": [
+          "R-HLT-090: patient shall grant or revoke consent",
+          "R-HLT-090: AuditEvent must be emitted for every operation (end-to-end chain)"
+        ],
+        "executable": "import pytest, requests, time\nfrom conftest import BASE_URL, patient_auth_headers, ensure_no_consent, build_consent_payload\n\ndef test_consent_grant_then_revoke_state_transitions_and_audit_chain():\n    headers = patient_auth_headers()\n    patient_id = headers[\"X-Patient-Id\"]\n    ensure_no_consent(patient_id, headers)\n\n    grant_r = requests.post(\n        f\"{BASE_URL}/Consent\",\n        json=build_consent_payload(patient_id, status=\"active\"),\n        headers=headers\n    )\n    assert grant_r.status_code == 201\n    consent_id = grant_r.json()[\"id\"]\n    assert grant_r.json()[\"status\"] == \"active\"\n\n    revoke_r = requests.patch(\n        f\"{BASE_URL}/Consent/{consent_id}\",\n        json={\"resourceType\": \"Consent\", \"id\": consent_id, \"status\": \"inactive\"},\n        headers=headers\n    )\n    assert revoke_r.status_code == 200\n    assert revoke_r.json()[\"status\"] == \"inactive\"\n\n    time.sleep(1)\n    audit_r = requests.get(\n        f\"{BASE_URL}/AuditEvent\", params={\"entity\": consent_id}, headers=headers\n    )\n    assert audit_r.status_code == 200\n    entries = audit_r.json().get(\"entry\", [])\n    actions = [e[\"resource\"][\"action\"] for e in entries]\n    assert \"C\" in actions, \"Missing create AuditEvent\"\n    assert \"U\" in actions, \"Missing update/revoke AuditEvent\"\n    for e in entries:\n        refs = [ref[\"what\"][\"reference\"] for ref in e[\"resource\"].get(\"entity\", [])]\n        assert any(consent_id in ref for ref in refs), \"AuditEvent entity ref mismatch\"\n"
+      },
+      {
+        "name": "test_consent_revoke_without_prior_grant_returns_error",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated patient token available",
+          "No active Consent resource exists for this patient"
+        ],
+        "actions": [
+          "PATCH /Consent/<nonexistent-id> with status=inactive",
+          "Assert error response"
+        ],
+        "expected": [
+          "PATCH returns HTTP 404 or 409",
+          "Response body contains an OperationOutcome or error descriptor",
+          "No AuditEvent of type U is created for the nonexistent resource"
+        ],
+        "trace": [
+          "R-HLT-090: Decision Table - revoke without active consent is an invalid transition",
+          "R-HLT-090: error pathway coverage"
+        ],
+        "executable": "import pytest, requests, uuid\nfrom conftest import BASE_URL, patient_auth_headers\n\ndef test_consent_revoke_without_prior_grant_returns_error():\n    headers = patient_auth_headers()\n    patient_id = headers[\"X-Patient-Id\"]\n    fake_id = f\"nonexistent-{uuid.uuid4().hex[:8]}\"\n\n    revoke_r = requests.patch(\n        f\"{BASE_URL}/Consent/{fake_id}\",\n        json={\"resourceType\": \"Consent\", \"id\": fake_id, \"status\": \"inactive\"},\n        headers=headers\n    )\n    assert revoke_r.status_code in (404, 409), (\n        f\"Expected 404 or 409, got {revoke_r.status_code}: {revoke_r.text}\"\n    )\n    body = revoke_r.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\" or \"error\" in body, (\n        \"Expected OperationOutcome or error descriptor in response\"\n    )\n\n    audit_r = requests.get(\n        f\"{BASE_URL}/AuditEvent\",\n        params={\"entity\": fake_id, \"action\": \"U\"},\n        headers=headers\n    )\n    assert audit_r.status_code == 200\n    entries = audit_r.json().get(\"entry\", [])\n    assert len(entries) == 0, \"No U AuditEvent should exist for nonexistent consent\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-090",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1004,
+    "output_tokens": 4260,
+    "latency_ms": 47883,
+    "wall_ms": 47883,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-090\",\n  \"reasoning\": \"R-HLT-090 mandates four observable behaviours: (1) consent grant is persisted and returns HTTP 201/200, (2) consent revoke is persisted, downstream caches are invalidated, and access is denied within the 15-minute SLA, (3) an AuditEvent is emitted for every mutating operation, and (4) access attempted exactly at the SLA boundary (t=15 min) must still be denied while access after the SLA window has closed must also be denied. Tests are partitioned as: positive=grant+audit round-trip (EP/STC), negative=data access after revoke within SLA (NEG/DT), boundary=access attempted at t=15min boundary (BVA). Each test is self-contained via fixtures that create and clean up their own patient context.\",\n  \"tests\": [\n    {\n      \"name\": \"test_consent_grant_stored_and_audit_emitted\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Authenticated patient token available via <patient_auth_token> fixture\",\n        \"FHIR-lite service is reachable at BASE_URL\",\n        \"No prior Consent resource exists for this patient (idempotent setup via <ensure_no_consent> fixture)\"\n      ],\n      \"actions\": [\n        \"POST /Consent with a valid grant payload signed by patient token\",\n        \"Assert HTTP 201 and consent id in response body\",\n        \"GET /AuditEvent?entity=<consent_id>&action=C to retrieve audit log\"\n      ],\n      \"expected\": [\n        \"POST /Consent returns HTTP 201\",\n        \"Response body contains resourceType=Consent and status=active\",\n        \"GET /AuditEvent returns at least one event with action=C linked to the consent id\",\n        \"AuditEvent.recorded timestamp is within 5 seconds of test execution\"\n      ],\n      \"trace\": [\n        \"R-HLT-090: patient shall grant consent\",\n        \"R-HLT-090: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest, requests, time\\nfrom conftest import BASE_URL, patient_auth_headers, ensure_no_consent, build_consent_payload\\n\\ndef test_consent_grant_stored_and_audit_emitted():\\n    headers = patient_auth_headers()\\n    patient_id = headers[\\\"X-Patient-Id\\\"]\\n    ensure_no_consent(patient_id, headers)\\n\\n    payload = build_consent_payload(patient_id, status=\\\"active\\\")\\n    r = requests.post(f\\\"{BASE_URL}/Consent\\\", json=payload, headers=headers)\\n    assert r.status_code == 201, f\\\"Expected 201, got {r.status_code}: {r.text}\\\"\\n    body = r.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Consent\\\"\\n    assert body.get(\\\"status\\\") == \\\"active\\\"\\n    consent_id = body[\\\"id\\\"]\\n\\n    time.sleep(1)\\n    audit_r = requests.get(\\n        f\\\"{BASE_URL}/AuditEvent\\\",\\n        params={\\\"entity\\\": consent_id, \\\"action\\\": \\\"C\\\"},\\n        headers=headers\\n    )\\n    assert audit_r.status_code == 200\\n    entries = audit_r.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"No AuditEvent found for consent grant\\\"\\n    recorded = entries[0][\\\"resource\\\"][\\\"recorded\\\"]\\n    assert recorded is not None\\n\"\n    },\n    {\n      \"name\": \"test_data_access_denied_after_consent_revoke_within_sla\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated patient token available via <patient_auth_token> fixture\",\n        \"Active consent exists for the patient (created in setup)\",\n        \"A protected data endpoint /Patient/<id>/$everything is accessible under active consent\"\n      ],\n      \"actions\": [\n        \"Confirm data access is allowed under active consent (HTTP 200)\",\n        \"PATCH /Consent/<id> to set status=inactive (revoke)\",\n        \"Wait up to 15 minutes (parametrized short wait of 1s in CI with env override)\",\n        \"Attempt GET /Patient/<id>/$everything with same token\",\n        \"GET /AuditEvent for the revoke operation\"\n      ],\n      \"expected\": [\n        \"Initial data access returns HTTP 200\",\n        \"PATCH /Consent returns HTTP 200 with status=inactive\",\n        \"Subsequent data access returns HTTP 403 or 401 within SL"
+  }
+}

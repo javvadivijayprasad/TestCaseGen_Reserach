@@ -1,0 +1,215 @@
+{
+  "req": {
+    "id": "R-HLT-050",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider (boundary)",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-050",
+    "reasoning": "R-HLT-050 covers three distinct risk areas: (1) happy-path message delivery with provider notification, (2) PHI-exfiltration blocking on attachments, and (3) boundary behaviour on timestamps and numeric fields. I apply EP for the happy path (valid partition), NEG for the disallowed attachment (error pathway), BVA for timestamp/character-count boundaries, STC for the state change from draft\u2192sent\u2192notified, and DT for the attachment-scan decision matrix. Each test is self-contained via fixtures that create and teardown their own data, making them idempotent.",
+    "tests": [
+      {
+        "name": "test_patient_sends_plain_text_message_successfully",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated (session cookie present)",
+          "Provider exists in the system with a known provider_id",
+          "No prior unread messages exist for the provider in this session"
+        ],
+        "actions": [
+          "POST /messages with valid subject, body text (no attachment), and provider_id",
+          "Assert HTTP 201 response",
+          "GET /messages/{message_id} to verify stored content",
+          "GET /notifications?provider_id=<id> to verify provider notification created"
+        ],
+        "expected": [
+          "HTTP 201 with message_id in response body",
+          "Stored message body matches submitted body",
+          "Provider notification record exists with status='unread'"
+        ],
+        "trace": [
+          "R-HLT-050: message stored",
+          "R-HLT-050: provider notified",
+          "R-HLT-050: positive path"
+        ],
+        "executable": "import pytest\n\ndef test_patient_sends_plain_text_message_successfully(auth_session, provider_id, api_base_url, cleanup_messages):\n    payload = {\n        \"provider_id\": provider_id,\n        \"subject\": \"Test appointment query\",\n        \"body\": \"Please confirm my appointment for next Monday.\"\n    }\n    resp = auth_session.post(f\"{api_base_url}/messages\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n\n    msg_id = resp.json()[\"message_id\"]\n    cleanup_messages.append(msg_id)\n\n    stored = auth_session.get(f\"{api_base_url}/messages/{msg_id}\")\n    assert stored.status_code == 200\n    assert stored.json()[\"body\"] == payload[\"body\"]\n\n    notif_resp = auth_session.get(\n        f\"{api_base_url}/notifications\",\n        params={\"provider_id\": provider_id, \"message_id\": msg_id}\n    )\n    assert notif_resp.status_code == 200\n    notifications = notif_resp.json().get(\"items\", [])\n    assert any(n[\"status\"] == \"unread\" for n in notifications), \"Provider notification not found\"\n"
+      },
+      {
+        "name": "test_message_with_phi_attachment_is_blocked",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated",
+          "PHI-exfiltration scan service is active",
+          "A file containing disallowed PHI patterns (SSN, DOB) is available on the test host"
+        ],
+        "actions": [
+          "POST /messages with a multipart body including an attachment that contains SSN pattern '\\d{3}-\\d{2}-\\d{4}'",
+          "Assert HTTP 422 or 400 response",
+          "Confirm response error code references PHI scan failure",
+          "Verify no message record was persisted via GET /messages"
+        ],
+        "expected": [
+          "HTTP 400 or 422 returned",
+          "Response body contains error code 'PHI_EXFILTRATION_BLOCKED'",
+          "No message_id created; GET /messages returns no new entry"
+        ],
+        "trace": [
+          "R-HLT-050: error pathway \u2013 blocked when disallowed attachment detected",
+          "R-HLT-050: PHI exfiltration scan"
+        ],
+        "executable": "import pytest\nimport io\n\ndef test_message_with_phi_attachment_is_blocked(auth_session, provider_id, api_base_url):\n    phi_content = b\"Patient SSN: 123-45-6789, DOB: 01/01/1980\"\n    files = {\"attachment\": (\"record.txt\", io.BytesIO(phi_content), \"text/plain\")}\n    data = {\"provider_id\": provider_id, \"subject\": \"Records\", \"body\": \"See attached.\"}\n\n    resp = auth_session.post(f\"{api_base_url}/messages\", data=data, files=files)\n    assert resp.status_code in (400, 422), f\"Expected 4xx, got {resp.status_code}\"\n\n    error_body = resp.json()\n    assert error_body.get(\"error_code\") == \"PHI_EXFILTRATION_BLOCKED\", \\\n        f\"Unexpected error_code: {error_body.get('error_code')}\"\n\n    list_resp = auth_session.get(f\"{api_base_url}/messages\", params={\"provider_id\": provider_id})\n    messages = list_resp.json().get(\"items\", [])\n    blocked_msgs = [m for m in messages if m.get(\"subject\") == \"Records\"]\n    assert len(blocked_msgs) == 0, \"Blocked message must not be persisted\"\n"
+      },
+      {
+        "name": "test_message_timestamp_at_epoch_zero_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated",
+          "API accepts an optional client_timestamp field in the message payload",
+          "System validates timestamps must be >= Unix epoch (0)"
+        ],
+        "actions": [
+          "POST /messages with client_timestamp=0 (Unix epoch boundary)",
+          "Assert response indicates acceptance or a defined validation error",
+          "POST /messages with client_timestamp=-1 (below epoch lower bound)",
+          "Assert HTTP 400 with validation error for negative timestamp"
+        ],
+        "expected": [
+          "client_timestamp=0 returns HTTP 201 or documented 422 with 'TIMESTAMP_TOO_OLD'",
+          "client_timestamp=-1 returns HTTP 400 with error_code 'INVALID_TIMESTAMP'",
+          "No message persisted for negative timestamp"
+        ],
+        "trace": [
+          "R-HLT-050: boundary cases on timestamps",
+          "R-HLT-050: numeric element boundary"
+        ],
+        "executable": "import pytest\n\ndef test_message_timestamp_at_epoch_zero_boundary(auth_session, provider_id, api_base_url, cleanup_messages):\n    base_payload = {\"provider_id\": provider_id, \"subject\": \"BVA ts\", \"body\": \"Boundary check.\"}\n\n    # Lower-bound valid: epoch zero\n    payload_zero = {**base_payload, \"client_timestamp\": 0}\n    resp_zero = auth_session.post(f\"{api_base_url}/messages\", json=payload_zero)\n    assert resp_zero.status_code in (201, 422), \\\n        f\"Epoch-0 timestamp: unexpected status {resp_zero.status_code}\"\n    if resp_zero.status_code == 201:\n        cleanup_messages.append(resp_zero.json()[\"message_id\"])\n    else:\n        assert resp_zero.json().get(\"error_code\") == \"TIMESTAMP_TOO_OLD\"\n\n    # Below lower-bound: negative timestamp\n    payload_neg = {**base_payload, \"client_timestamp\": -1}\n    resp_neg = auth_session.post(f\"{api_base_url}/messages\", json=payload_neg)\n    assert resp_neg.status_code == 400, \\\n        f\"Negative timestamp: expected 400, got {resp_neg.status_code}\"\n    assert resp_neg.json().get(\"error_code\") == \"INVALID_TIMESTAMP\", \\\n        f\"Unexpected error_code: {resp_neg.json().get('error_code')}\"\n"
+      },
+      {
+        "name": "test_message_body_at_maximum_character_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated",
+          "System enforces a maximum message body length of 5000 characters"
+        ],
+        "actions": [
+          "POST /messages with body of exactly 5000 characters",
+          "Assert HTTP 201",
+          "POST /messages with body of 5001 characters",
+          "Assert HTTP 400 with error_code 'BODY_TOO_LONG'"
+        ],
+        "expected": [
+          "5000-character body accepted with HTTP 201",
+          "5001-character body rejected with HTTP 400 and 'BODY_TOO_LONG'"
+        ],
+        "trace": [
+          "R-HLT-050: boundary cases on numeric elements",
+          "R-HLT-050: message stored (positive bound)"
+        ],
+        "executable": "import pytest\n\nMAX_BODY_LEN = 5000\n\ndef test_message_body_at_maximum_character_boundary(auth_session, provider_id, api_base_url, cleanup_messages):\n    base = {\"provider_id\": provider_id, \"subject\": \"BVA length\"}\n\n    # Exactly at max: should succeed\n    payload_max = {**base, \"body\": \"A\" * MAX_BODY_LEN}\n    resp_max = auth_session.post(f\"{api_base_url}/messages\", json=payload_max)\n    assert resp_max.status_code == 201, \\\n        f\"Max-length body rejected unexpectedly: {resp_max.status_code}\"\n    cleanup_messages.append(resp_max.json()[\"message_id\"])\n\n    # One over max: should fail\n    payload_over = {**base, \"body\": \"A\" * (MAX_BODY_LEN + 1)}\n    resp_over = auth_session.post(f\"{api_base_url}/messages\", json=payload_over)\n    assert resp_over.status_code == 400, \\\n        f\"Over-max body not rejected: {resp_over.status_code}\"\n    assert resp_over.json().get(\"error_code\") == \"BODY_TOO_LONG\"\n"
+      },
+      {
+        "name": "test_message_state_transitions_draft_to_sent_to_notified",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient is authenticated",
+          "Provider exists in the system",
+          "Messages API supports draft creation and explicit send action"
+        ],
+        "actions": [
+          "POST /messages/draft to create a message in DRAFT state",
+          "Assert status='draft' in response",
+          "POST /messages/{draft_id}/send to transition to SENT",
+          "Assert status='sent' in response",
+          "GET /notifications for provider and assert notification status='unread' (NOTIFIED state)"
+        ],
+        "expected": [
+          "Draft message created with status='draft'",
+          "Send action transitions message to status='sent'",
+          "Provider notification appears with status='unread'"
+        ],
+        "trace": [
+          "R-HLT-050: message stored",
+          "R-HLT-050: provider notified",
+          "R-HLT-050: state transition draft\u2192sent\u2192notified"
+        ],
+        "executable": "import pytest\n\ndef test_message_state_transitions_draft_to_sent_to_notified(auth_session, provider_id, api_base_url, cleanup_messages):\n    draft_payload = {\"provider_id\": provider_id, \"subject\": \"STC draft\", \"body\": \"Will send soon.\"}\n    draft_resp = auth_session.post(f\"{api_base_url}/messages/draft\", json=draft_payload)\n    assert draft_resp.status_code == 201\n    draft = draft_resp.json()\n    assert draft[\"status\"] == \"draft\"\n    draft_id = draft[\"message_id\"]\n    cleanup_messages.append(draft_id)\n\n    send_resp = auth_session.post(f\"{api_base_url}/messages/{draft_id}/send\")\n    assert send_resp.status_code == 200\n    assert send_resp.json()[\"status\"] == \"sent\"\n\n    notif_resp = auth_session.get(\n        f\"{api_base_url}/notifications\",\n        params={\"provider_id\": provider_id, \"message_id\": draft_id}\n    )\n    assert notif_resp.status_code == 200\n    items = notif_resp.json().get(\"items\", [])\n    assert any(n[\"status\"] == \"unread\" for n in items), \"Expected unread notification after send\"\n"
+      },
+      {
+        "name": "test_attachment_scan_decision_table_allowed_vs_disallowed_types",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is authenticated",
+          "Scan service distinguishes allowed (image/png) from disallowed (text/plain with PHI patterns)"
+        ],
+        "actions": [
+          "POST /messages with an image/png attachment containing no PHI patterns",
+          "Assert HTTP 201 (allowed combination)",
+          "POST /messages with a text/plain attachment containing an SSN pattern",
+          "Assert HTTP 400 with 'PHI_EXFILTRATION_BLOCKED' (disallowed combination)",
+          "POST /messages with no attachment",
+          "Assert HTTP 201 (no-attachment always allowed)"
+        ],
+        "expected": [
+          "PNG with no PHI: HTTP 201",
+          "TXT with PHI: HTTP 400 PHI_EXFILTRATION_BLOCKED",
+          "No attachment: HTTP 201"
+        ],
+        "trace": [
+          "R-HLT-050: attachments shall scan for disallowed PHI exfiltration patterns",
+          "R-HLT-050: decision table \u2013 type \u00d7 PHI presence"
+        ],
+        "executable": "import pytest\nimport io\n\ndef test_attachment_scan_decision_table_allowed_vs_disallowed_types(auth_session, provider_id, api_base_url, cleanup_messages, minimal_png_bytes):\n    base = {\"provider_id\": provider_id, \"subject\": \"DT scan\", \"body\": \"Scan matrix test.\"}\n\n    # Row 1: image/png, no PHI -> allowed\n    files_ok = {\"attachment\": (\"img.png\", io.BytesIO(minimal_png_bytes), \"image/png\")}\n    r1 = auth_session.post(f\"{api_base_url}/messages\", data=base, files=files_ok)\n    assert r1.status_code == 201, f\"PNG no-PHI should be accepted: {r1.status_code}\"\n    cleanup_messages.append(r1.json()[\"message_id\"])\n\n    # Row 2: text/plain, SSN present -> blocked\n    phi = b\"SSN: 987-65-4321\"\n    files_phi = {\"attachment\": (\"note.txt\", io.BytesIO(phi), \"text/plain\")}\n    r2 = auth_session.post(f\"{api_base_url}/messages\", data=base, files=files_phi)\n    assert r2.status_code in (400, 422), f\"PHI txt should be blocked: {r2.status_code}\"\n    assert r2.json().get(\"error_code\") == \"PHI_EXFILTRATION_BLOCKED\"\n\n    # Row 3: no attachment -> allowed\n    r3 = auth_session.post(f\"{api_base_url}/messages\", json=base)\n    assert r3.status_code == 201, f\"No-attachment should be accepted: {r3.status_code}\"\n    cleanup_messages.append(r3.json()[\"message_id\"])\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-050",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 993,
+    "output_tokens": 4289,
+    "latency_ms": 47401,
+    "wall_ms": 47401,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-050\",\n  \"reasoning\": \"R-HLT-050 covers three distinct risk areas: (1) happy-path message delivery with provider notification, (2) PHI-exfiltration blocking on attachments, and (3) boundary behaviour on timestamps and numeric fields. I apply EP for the happy path (valid partition), NEG for the disallowed attachment (error pathway), BVA for timestamp/character-count boundaries, STC for the state change from draft\u2192sent\u2192notified, and DT for the attachment-scan decision matrix. Each test is self-contained via fixtures that create and teardown their own data, making them idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_patient_sends_plain_text_message_successfully\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated (session cookie present)\",\n        \"Provider exists in the system with a known provider_id\",\n        \"No prior unread messages exist for the provider in this session\"\n      ],\n      \"actions\": [\n        \"POST /messages with valid subject, body text (no attachment), and provider_id\",\n        \"Assert HTTP 201 response\",\n        \"GET /messages/{message_id} to verify stored content\",\n        \"GET /notifications?provider_id=<id> to verify provider notification created\"\n      ],\n      \"expected\": [\n        \"HTTP 201 with message_id in response body\",\n        \"Stored message body matches submitted body\",\n        \"Provider notification record exists with status='unread'\"\n      ],\n      \"trace\": [\n        \"R-HLT-050: message stored\",\n        \"R-HLT-050: provider notified\",\n        \"R-HLT-050: positive path\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_patient_sends_plain_text_message_successfully(auth_session, provider_id, api_base_url, cleanup_messages):\\n    payload = {\\n        \\\"provider_id\\\": provider_id,\\n        \\\"subject\\\": \\\"Test appointment query\\\",\\n        \\\"body\\\": \\\"Please confirm my appointment for next Monday.\\\"\\n    }\\n    resp = auth_session.post(f\\\"{api_base_url}/messages\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}\\\"\\n\\n    msg_id = resp.json()[\\\"message_id\\\"]\\n    cleanup_messages.append(msg_id)\\n\\n    stored = auth_session.get(f\\\"{api_base_url}/messages/{msg_id}\\\")\\n    assert stored.status_code == 200\\n    assert stored.json()[\\\"body\\\"] == payload[\\\"body\\\"]\\n\\n    notif_resp = auth_session.get(\\n        f\\\"{api_base_url}/notifications\\\",\\n        params={\\\"provider_id\\\": provider_id, \\\"message_id\\\": msg_id}\\n    )\\n    assert notif_resp.status_code == 200\\n    notifications = notif_resp.json().get(\\\"items\\\", [])\\n    assert any(n[\\\"status\\\"] == \\\"unread\\\" for n in notifications), \\\"Provider notification not found\\\"\\n\"\n    },\n    {\n      \"name\": \"test_message_with_phi_attachment_is_blocked\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated\",\n        \"PHI-exfiltration scan service is active\",\n        \"A file containing disallowed PHI patterns (SSN, DOB) is available on the test host\"\n      ],\n      \"actions\": [\n        \"POST /messages with a multipart body including an attachment that contains SSN pattern '\\\\d{3}-\\\\d{2}-\\\\d{4}'\",\n        \"Assert HTTP 422 or 400 response\",\n        \"Confirm response error code references PHI scan failure\",\n        \"Verify no message record was persisted via GET /messages\"\n      ],\n      \"expected\": [\n        \"HTTP 400 or 422 returned\",\n        \"Response body contains error code 'PHI_EXFILTRATION_BLOCKED'\",\n        \"No message_id created; GET /messages returns no new entry\"\n      ],\n      \"trace\": [\n        \"R-HLT-050: error pathway \u2013 blocked when disallowed attachment detected\",\n        \"R-HLT-050: PHI exfiltration scan\"\n      ],\n      \"executable\": \"import pytest\\nimport io\\n\\ndef test_message_with_phi_attachment_is_blocked(auth_session, provider_id, api_base_url):\\n    phi_content = b\\\"Patient SSN: 123-45-6789, DOB: 01/01/1980\\\"\\n    files = {\\\"attachment\\\":"
+  }
+}

@@ -1,0 +1,165 @@
+{
+  "req": {
+    "id": "R-HLT-019",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-019",
+    "reasoning": "R-HLT-019 requires that vital-signs Observations are validated against clinically plausible ranges, stored on success, and flagged for review when out-of-range. I selected: (1) EP positive \u2014 a normal heart-rate value from the valid equivalence class, confirming 201 and no flag; (2) NEG negative \u2014 a physiologically impossible heart-rate (300 bpm) that must trigger a review task; (3) BVA boundary \u2014 heart-rate exactly at the accepted upper boundary (200 bpm) to probe fence-post behavior. A fourth DT case covers a multi-vital payload where one value is in-range and one is out-of-range, exercising the decision logic per-component. Each test uses a clinician-role auth fixture, posts to /Observation, and asserts both HTTP status and the flag/review-task state.",
+    "tests": [
+      {
+        "name": "test_vital_signs_normal_heart_rate_stored_no_flag",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds role:clinician JWT",
+          "fhir-lite service is running and reachable",
+          "No pre-existing Observation with the test identifier exists"
+        ],
+        "actions": [
+          "Authenticate as clinician via <clinician_auth_fixture>",
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=72 (unit: /min)",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType=Observation",
+          "No extension or tag indicating out-of-range flag",
+          "No review Task created for this Observation"
+        ],
+        "trace": [
+          "R-HLT-019: value in clinically plausible range -> observation stored",
+          "R-HLT-019: out-of-range flag NOT raised for normal value"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_normal_heart_rate_stored_no_flag(clinician_auth_headers, base_url, unique_id):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": unique_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n    assert \"out-of-range\" not in tags, \"Unexpected out-of-range flag on normal value\"\n    task_resp = requests.get(f\"{base_url}/Task\", params={\"focus\": f\"Observation/{unique_id}\"}, headers=clinician_auth_headers)\n    assert task_resp.status_code == 200\n    assert task_resp.json().get(\"total\", 0) == 0, \"Review Task must not exist for in-range observation\""
+      },
+      {
+        "name": "test_vital_signs_impossible_heart_rate_flagged_and_review_task_created",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role:clinician JWT",
+          "fhir-lite service is running and reachable",
+          "No pre-existing Observation with the test identifier exists"
+        ],
+        "actions": [
+          "Authenticate as clinician via <clinician_auth_fixture>",
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=300 (physiologically impossible)",
+          "Capture HTTP response status and body",
+          "Query /Task for a review task referencing the created Observation"
+        ],
+        "expected": [
+          "HTTP 201 Created (observation accepted but flagged) OR HTTP 422 with flag details",
+          "Response body or subsequent GET contains out-of-range tag/extension",
+          "A review Task resource exists referencing the Observation"
+        ],
+        "trace": [
+          "R-HLT-019: out-of-range value -> flag raised for review",
+          "R-HLT-019: error pathway -> review task created"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_impossible_heart_rate_flagged_and_review_task_created(clinician_auth_headers, base_url, unique_id):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": unique_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 300, \"unit\": \"/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code in (201, 422), f\"Unexpected status {resp.status_code}: {resp.text}\"\n    if resp.status_code == 201:\n        body = resp.json()\n        tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n        assert \"out-of-range\" in tags, \"Missing out-of-range flag on impossible value\"\n        task_resp = requests.get(f\"{base_url}/Task\", params={\"focus\": f\"Observation/{unique_id}\"}, headers=clinician_auth_headers)\n        assert task_resp.status_code == 200\n        assert task_resp.json().get(\"total\", 0) >= 1, \"Review Task must be created for out-of-range observation\"\n    else:\n        body = resp.json()\n        issues = [i.get(\"diagnostics\", \"\") for i in body.get(\"issue\", [])]\n        assert any(\"range\" in d.lower() or \"flag\" in d.lower() for d in issues), f\"Expected range/flag diagnostic, got: {issues}\""
+      },
+      {
+        "name": "test_vital_signs_heart_rate_at_upper_boundary_behavior",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role:clinician JWT",
+          "fhir-lite service is running and reachable",
+          "System upper boundary for heart-rate is defined as 200 bpm",
+          "No pre-existing Observation with the test identifier exists"
+        ],
+        "actions": [
+          "Authenticate as clinician via <clinician_auth_fixture>",
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=200 (exact upper boundary)",
+          "Capture HTTP response status, body, and any flag tags",
+          "Query /Task to check for review task"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "If boundary is inclusive: no out-of-range flag; no review Task",
+          "If boundary is exclusive: out-of-range flag present; review Task created",
+          "Behavior is consistent and deterministic for value=200"
+        ],
+        "trace": [
+          "R-HLT-019: boundary value at upper limit of plausible range -> deterministic flag/no-flag outcome",
+          "R-HLT-019: BVA fence-post probe for clinically plausible range definition"
+        ],
+        "executable": "import pytest\nimport requests\n\nUPPER_BOUNDARY = 200\n\ndef test_vital_signs_heart_rate_at_upper_boundary_behavior(clinician_auth_headers, base_url, unique_id, vital_signs_range_config):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": unique_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": UPPER_BOUNDARY, \"unit\": \"/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201, f\"Expected 201 at boundary, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n    upper_inclusive = vital_signs_range_config.get(\"heart_rate_upper_inclusive\", True)\n    task_resp = requests.get(f\"{base_url}/Task\", params={\"focus\": f\"Observation/{unique_id}\"}, headers=clinician_auth_headers)\n    assert task_resp.status_code == 200\n    task_count = task_resp.json().get(\"total\", 0)\n    if upper_inclusive:\n        assert \"out-of-range\" not in tags, \"Boundary (inclusive) must not be flagged\"\n        assert task_count == 0, \"No review Task expected for inclusive boundary value\"\n    else:\n        assert \"out-of-range\" in tags, \"Boundary (exclusive) must be flagged\"\n        assert task_count >= 1, \"Review Task expected for exclusive boundary value\""
+      },
+      {
+        "name": "test_vital_signs_mixed_observation_partial_flag_decision",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role:clinician JWT",
+          "fhir-lite service is running and reachable",
+          "System supports multi-component Observation for vital-signs",
+          "No pre-existing Observation with the test identifier exists"
+        ],
+        "actions": [
+          "Authenticate as clinician via <clinician_auth_fixture>",
+          "POST /Observation with category=vital-signs containing two components: systolic BP=120 (in-range) and diastolic BP=200 (out-of-range)",
+          "Capture HTTP response status and body",
+          "Query /Task for review task referencing the Observation"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Observation stored with out-of-range flag (due to diastolic component)",
+          "Review Task created referencing the Observation",
+          "In-range component (systolic) does not independently suppress the flag"
+        ],
+        "trace": [
+          "R-HLT-019: decision table \u2014 one component in-range, one out-of-range -> flag raised",
+          "R-HLT-019: partial-validity decision row -> review task created"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_mixed_observation_partial_flag_decision(clinician_auth_headers, base_url, unique_id):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": unique_id,\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"55284-4\", \"display\": \"Blood pressure\"}]},\n        \"component\": [\n            {\"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8480-6\", \"display\": \"Systolic BP\"}]}, \"valueQuantity\": {\"value\": 120, \"unit\": \"mmHg\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"mm[Hg]\"}},\n            {\"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8462-4\", \"display\": \"Diastolic BP\"}]}, \"valueQuantity\": {\"value\": 200, \"unit\": \"mmHg\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"mm[Hg]\"}}\n        ]\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=clinician_auth_headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n    assert \"out-of-range\" in tags, \"Expected out-of-range flag due to abnormal diastolic component\"\n    task_resp = requests.get(f\"{base_url}/Task\", params={\"focus\": f\"Observation/{unique_id}\"}, headers=clinician_auth_headers)\n    assert task_resp.status_code == 200\n    assert task_resp.json().get(\"total\", 0) >= 1, \"Review Task must exist when any component is out-of-range\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-019",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 987,
+    "output_tokens": 3844,
+    "latency_ms": 38964,
+    "wall_ms": 38964,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-019\",\n  \"reasoning\": \"R-HLT-019 requires that vital-signs Observations are validated against clinically plausible ranges, stored on success, and flagged for review when out-of-range. I selected: (1) EP positive \u2014 a normal heart-rate value from the valid equivalence class, confirming 201 and no flag; (2) NEG negative \u2014 a physiologically impossible heart-rate (300 bpm) that must trigger a review task; (3) BVA boundary \u2014 heart-rate exactly at the accepted upper boundary (200 bpm) to probe fence-post behavior. A fourth DT case covers a multi-vital payload where one value is in-range and one is out-of-range, exercising the decision logic per-component. Each test uses a clinician-role auth fixture, posts to /Observation, and asserts both HTTP status and the flag/review-task state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vital_signs_normal_heart_rate_stored_no_flag\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds role:clinician JWT\",\n        \"fhir-lite service is running and reachable\",\n        \"No pre-existing Observation with the test identifier exists\"\n      ],\n      \"actions\": [\n        \"Authenticate as clinician via <clinician_auth_fixture>\",\n        \"POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=72 (unit: /min)\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType=Observation\",\n        \"No extension or tag indicating out-of-range flag\",\n        \"No review Task created for this Observation\"\n      ],\n      \"trace\": [\n        \"R-HLT-019: value in clinically plausible range -> observation stored\",\n        \"R-HLT-019: out-of-range flag NOT raised for normal value\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vital_signs_normal_heart_rate_stored_no_flag(clinician_auth_headers, base_url, unique_id):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"id\\\": unique_id,\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"/min\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_url}/Observation\\\", json=payload, headers=clinician_auth_headers)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Observation\\\"\\n    tags = [t.get(\\\"code\\\") for t in body.get(\\\"meta\\\", {}).get(\\\"tag\\\", [])]\\n    assert \\\"out-of-range\\\" not in tags, \\\"Unexpected out-of-range flag on normal value\\\"\\n    task_resp = requests.get(f\\\"{base_url}/Task\\\", params={\\\"focus\\\": f\\\"Observation/{unique_id}\\\"}, headers=clinician_auth_headers)\\n    assert task_resp.status_code == 200\\n    assert task_resp.json().get(\\\"total\\\", 0) == 0, \\\"Review Task must not exist for in-range observation\\\"\"\n    },\n    {\n      \"name\": \"test_vital_signs_impossible_heart_rate_flagged_and_review_task_created\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role:clinician JWT\",\n        \"fhir-lite service is running and reachable\",\n        \"No pre-existing Observation with the test identifier exists\"\n      ],\n      \"actions\": [\n        \"Authenticate as clinician via <clinician_auth_fixture>\",\n        \"POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=300 (physiologically impossible)\",\n        \"Capture HTTP response status and body\",\n        \"Query /Task for a review task referencing the created Observation\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (observation accepted but flag"
+  }
+}

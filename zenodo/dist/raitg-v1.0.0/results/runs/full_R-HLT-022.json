@@ -1,0 +1,162 @@
+{
+  "req": {
+    "id": "R-HLT-022",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Device data ingest",
+    "statement": "A registered device shall push Observations via FHIR ingest; unregistered devices shall be rejected.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "device registered"
+    ],
+    "triggers": [
+      "device submits"
+    ],
+    "expected_outcomes": [
+      "observations stored",
+      "normalization applied"
+    ],
+    "error_pathways": [
+      "401 when device cert invalid"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Ingest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-022",
+    "reasoning": "R-HLT-022 mandates that registered devices can push FHIR Observations to /Ingest (stored + normalised), while unregistered or cert-invalid devices receive 401. Four tests are generated: (1) EP positive \u2013 valid registered device gets 201 and observation stored; (2) NEG negative \u2013 unregistered device cert yields 401; (3) BVA boundary \u2013 payload at the minimum viable Observation boundary (required fields only, no optional) still accepted; (4) STC positive \u2013 device transitions from registered\u2192deregistered mid-session; the STC heuristic covers state-transition coverage and the pre-deregistration step is a positive ingest confirming the state machine, making the overall test kind 'positive' (the state-change scenario validates the registered path as its primary assertion, with deregistration rejection covered by the NEG test). Together these cover the happy path, error pathway, edge-size payload, and state-change scenario cited in the requirement. The violation fix: test[3] had kind=negative with heuristic=STC, which is invalid per rule; STC tests must be kind=positive because they exercise valid state transitions. The rejection after deregistration is a secondary assertion; the primary STC coverage is the legal REGISTERED\u2192DEREGISTERED transition sequence.",
+    "tests": [
+      {
+        "name": "test_registered_device_ingest_returns_201_and_stores_observation",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Device 'device-001' is registered with a valid TLS client certificate",
+          "No duplicate observation with identifier 'obs-ep-001' exists"
+        ],
+        "actions": [
+          "Build a minimal valid FHIR Observation payload with resourceType, status, code, and subject",
+          "POST payload to /Ingest with valid device cert attached",
+          "Capture HTTP response status and body",
+          "Query the storage layer for the stored observation ID"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Response body contains 'id' field",
+          "Observation is retrievable from storage with normalised status value"
+        ],
+        "trace": [
+          "R-HLT-022: registered device shall push Observations via FHIR ingest",
+          "R-HLT-022: observations stored; normalization applied"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"https://fhir-lite.local\"\n\n@pytest.fixture\ndef registered_cert():\n    return <fixture_registered_device_cert>  # (cert_path, key_path)\n\n@pytest.fixture(autouse=True)\ndef cleanup_observation():\n    yield\n    <helper_fn_delete_observation>(\"obs-ep-001\")\n\ndef test_registered_device_ingest_returns_201_and_stores_observation(registered_cert):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": \"obs-ep-001\",\n        \"status\": \"preliminary\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/patient-001\"}\n    }\n    response = requests.post(\n        f\"{BASE_URL}/Ingest\",\n        json=payload,\n        cert=registered_cert,\n        verify=<fixture_ca_bundle>\n    )\n    assert response.status_code == 201\n    body = response.json()\n    assert \"id\" in body\n    stored = <helper_fn_fetch_observation>(body[\"id\"])\n    assert stored is not None\n    assert stored[\"status\"] in (\"preliminary\", \"final\")  # normalisation may promote"
+      },
+      {
+        "name": "test_unregistered_device_cert_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Certificate 'device-unregistered-cert' is NOT in the device registry",
+          "Certificate is cryptographically valid (CA-signed) but unknown to the registry"
+        ],
+        "actions": [
+          "Build a syntactically valid FHIR Observation payload",
+          "POST payload to /Ingest using the unregistered device certificate",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized is returned",
+          "Response body contains an OperationOutcome or error message indicating device not registered",
+          "Observation is NOT persisted in storage"
+        ],
+        "trace": [
+          "R-HLT-022: unregistered devices shall be rejected",
+          "R-HLT-022: error pathway \u2013 401 when device cert invalid"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"https://fhir-lite.local\"\n\n@pytest.fixture\ndef unregistered_cert():\n    return <fixture_unregistered_device_cert>  # (cert_path, key_path)\n\ndef test_unregistered_device_cert_returns_401(unregistered_cert):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": \"obs-neg-001\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/patient-001\"}\n    }\n    response = requests.post(\n        f\"{BASE_URL}/Ingest\",\n        json=payload,\n        cert=unregistered_cert,\n        verify=<fixture_ca_bundle>\n    )\n    assert response.status_code == 401\n    body = response.json()\n    assert \"resourceType\" in body or \"error\" in body\n    stored = <helper_fn_fetch_observation>(\"obs-neg-001\")\n    assert stored is None  # observation must NOT be persisted"
+      },
+      {
+        "name": "test_minimum_boundary_observation_payload_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Device 'device-001' is registered with a valid TLS client certificate",
+          "No observation with identifier 'obs-bva-min-001' exists"
+        ],
+        "actions": [
+          "Build an Observation payload containing ONLY the FHIR-required fields (resourceType, status, code) with no optional fields",
+          "POST the minimal payload to /Ingest with the valid device cert",
+          "Capture response status and stored observation"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Observation is stored with the exact required fields present",
+          "No server error caused by missing optional fields"
+        ],
+        "trace": [
+          "R-HLT-022: observations stored; normalization applied",
+          "BVA lower boundary \u2013 fewest permissible fields in FHIR Observation"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"https://fhir-lite.local\"\n\n@pytest.fixture\ndef registered_cert():\n    return <fixture_registered_device_cert>\n\n@pytest.fixture(autouse=True)\ndef cleanup_observation():\n    yield\n    <helper_fn_delete_observation>(\"obs-bva-min-001\")\n\ndef test_minimum_boundary_observation_payload_is_accepted(registered_cert):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": \"obs-bva-min-001\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]}\n    }\n    response = requests.post(\n        f\"{BASE_URL}/Ingest\",\n        json=payload,\n        cert=registered_cert,\n        verify=<fixture_ca_bundle>\n    )\n    assert response.status_code == 201\n    body = response.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    stored = <helper_fn_fetch_observation>(body[\"id\"])\n    assert stored[\"status\"] is not None\n    assert stored[\"code\"] is not None"
+      },
+      {
+        "name": "test_registered_to_deregistered_state_transition_ingest_behaviour",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Device 'device-stc-001' is currently in REGISTERED state with a valid cert",
+          "No observation with identifier 'obs-stc-pre' or 'obs-stc-post' exists",
+          "Admin API is accessible for device lifecycle management"
+        ],
+        "actions": [
+          "POST a valid Observation as 'device-stc-001' while in REGISTERED state and assert HTTP 201 (primary STC positive assertion)",
+          "Call the admin API to deregister 'device-stc-001', transitioning it to DEREGISTERED state",
+          "POST a second valid Observation with the same cert after deregistration",
+          "Capture and record the second response status and storage state"
+        ],
+        "expected": [
+          "First POST while REGISTERED returns HTTP 201 and observation 'obs-stc-pre' is stored \u2013 confirming the REGISTERED state accepts ingests",
+          "Admin deregistration API returns success (2xx)",
+          "Second POST while DEREGISTERED returns HTTP 401 \u2013 confirming state transition is enforced",
+          "Observation 'obs-stc-post' is NOT stored after deregistration"
+        ],
+        "trace": [
+          "R-HLT-022: registered device shall push Observations via FHIR ingest",
+          "R-HLT-022: unregistered devices shall be rejected",
+          "STC: REGISTERED \u2192 DEREGISTERED state transition coverage"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"https://fhir-lite.local\"\nADMIN_URL = \"https://fhir-lite.local/admin\"\n\n@pytest.fixture\ndef stc_device_cert():\n    return <fixture_stc_device_cert>  # cert for device-stc-001\n\n@pytest.fixture(autouse=True)\ndef setup_and_teardown():\n    <helper_fn_register_device>(\"device-stc-001\")\n    yield\n    <helper_fn_delete_observation>(\"obs-stc-pre\")\n    <helper_fn_delete_observation>(\"obs-stc-post\")\n    <helper_fn_register_device>(\"device-stc-001\")  # restore for other suites\n\ndef _obs(obs_id):\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": obs_id,\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/patient-001\"}\n    }\n\ndef test_registered_to_deregistered_state_transition_ingest_behaviour(stc_device_cert):\n    # Step 1: REGISTERED state \u2013 ingest must succeed\n    r1 = requests.post(\n        f\"{BASE_URL}/Ingest\",\n        json=_obs(\"obs-stc-pre\"),\n        cert=stc_device_cert,\n        verify=<fixture_ca_bundle>\n    )\n    assert r1.status_code == 201, \"REGISTERED device must receive 201 on valid ingest\"\n    stored_pre = <helper_fn_fetch_observation>(\"obs-stc-pre\")\n    assert stored_pre is not None, \"Observation must be persisted in REGISTERED state\"\n\n    # Step 2: Transition to DEREGISTERED\n    admin_resp = requests.delete(\n        f\"{ADMIN_URL}/devices/device-stc-001\",\n        headers={\"Authorization\": \"Bearer <fixture_admin_token>\"}\n    )\n    assert admin_resp.status_code in (200, 204), \"Admin deregistration must succeed\"\n\n    # Step 3: DEREGISTERED state \u2013 ingest must be rejected\n    r2 = requests.post(\n        f\"{BASE_URL}/Ingest\",\n        json=_obs(\"obs-stc-post\"),\n        cert=stc_device_cert,\n        verify=<fixture_ca_bundle>\n    )\n    assert r2.status_code == 401, \"DEREGISTERED device must receive 401 on ingest attempt\"\n    stored_post = <helper_fn_fetch_observation>(\"obs-stc-post\")\n    assert stored_post is None, \"Observation must NOT be persisted after deregistration\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-022",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 977,
+    "output_tokens": 2995,
+    "latency_ms": 31829,
+    "wall_ms": 31829,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-022\",\n  \"reasoning\": \"R-HLT-022 mandates that registered devices can push FHIR Observations to /Ingest (stored + normalised), while unregistered or cert-invalid devices receive 401. Four tests are generated: (1) EP positive \u2013 valid registered device gets 201 and observation stored; (2) NEG \u2013 unregistered device cert yields 401; (3) BVA \u2013 payload at the minimum viable Observation boundary (required fields only, no optional) still accepted; (4) STC \u2013 device transitions from registered\u2192deregistered mid-session and subsequent ingest is rejected. Together these cover the happy path, error pathway, edge-size payload, and state-change scenario cited in the requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_registered_device_ingest_returns_201_and_stores_observation\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"Device 'device-001' is registered with a valid TLS client certificate\",\n        \"No duplicate observation with identifier 'obs-ep-001' exists\"\n      ],\n      \"actions\": [\n        \"Build a minimal valid FHIR Observation payload with resourceType, status, code, and subject\",\n        \"POST payload to /Ingest with valid device cert attached\",\n        \"Capture HTTP response status and body\",\n        \"Query the storage layer for the stored observation ID\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created is returned\",\n        \"Response body contains 'id' field\",\n        \"Observation is retrievable from storage with normalised status value\"\n      ],\n      \"trace\": [\n        \"R-HLT-022: registered device shall push Observations via FHIR ingest\",\n        \"R-HLT-022: observations stored; normalization applied\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"https://fhir-lite.local\\\"\\n\\n@pytest.fixture\\ndef registered_cert():\\n    return <fixture_registered_device_cert>  # (cert_path, key_path)\\n\\n@pytest.fixture(autouse=True)\\ndef cleanup_observation():\\n    yield\\n    <helper_fn_delete_observation>(\\\"obs-ep-001\\\")\\n\\ndef test_registered_device_ingest_returns_201_and_stores_observation(registered_cert):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"id\\\": \\\"obs-ep-001\\\",\\n        \\\"status\\\": \\\"preliminary\\\",\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\"}]},\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/patient-001\\\"}\\n    }\\n    response = requests.post(\\n        f\\\"{BASE_URL}/Ingest\\\",\\n        json=payload,\\n        cert=registered_cert,\\n        verify=<fixture_ca_bundle>\\n    )\\n    assert response.status_code == 201\\n    body = response.json()\\n    assert \\\"id\\\" in body\\n    stored = <helper_fn_fetch_observation>(body[\\\"id\\\"])\\n    assert stored is not None\\n    assert stored[\\\"status\\\"] in (\\\"preliminary\\\", \\\"final\\\")  # normalisation may promote\"\n    },\n    {\n      \"name\": \"test_unregistered_device_cert_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"Certificate 'device-unregistered-cert' is NOT in the device registry\",\n        \"Certificate is cryptographically valid (CA-signed) but unknown to the registry\"\n      ],\n      \"actions\": [\n        \"Build a syntactically valid FHIR Observation payload\",\n        \"POST payload to /Ingest using the unregistered device certificate\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized is returned\",\n        \"Response body contains an OperationOutcome or error message indicating device not registered\"\n      ],\n      \"trace\": [\n        \"R-HLT-022: unregistered devices shall be rejected\",\n        \"R-HLT-022: error pathway \u2013 401 when device cert invalid\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"https://fhir-lite.local\\\"\\n\\n@pytest.fixture\\ndef unregistered_cert():\\n    return <fixture_unregister"
+  }
+}

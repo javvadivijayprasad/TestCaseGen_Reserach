@@ -1,0 +1,210 @@
+{
+  "req": {
+    "id": "R-HLT-044",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation (boundary)",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-044",
+    "reasoning": "Vital signs validation requires testing: (1) EP positive \u2014 a clinically normal heart-rate value stored without a flag; (2) NEG negative \u2014 a physiologically impossible value triggers a review task; (3) BVA boundary \u2014 values exactly at the lower and upper accepted limits are accepted/flagged correctly; (4) DT \u2014 timestamp edge cases (future timestamp, epoch-zero) expose decision-branch gaps; (5) STC \u2014 state transition from 'preliminary' to 'final' status after review-task resolution. Each test is self-contained via a clinician-auth fixture and a unique effectiveDateTime to avoid collision.",
+    "tests": [
+      {
+        "name": "test_vital_signs_normal_heart_rate_stored_without_flag",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "role:clinician credentials available via <auth_fixture>",
+          "fhir-lite service reachable at BASE_URL",
+          "heart-rate code 8867-4 supported by server"
+        ],
+        "actions": [
+          "Authenticate as clinician using <auth_fixture>",
+          "POST /Observation with category=vital-signs, code=8867-4 (heart-rate), valueQuantity=72 bpm, effectiveDateTime=now()",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains id field",
+          "Response body status equals 'final'",
+          "No review task reference present in response"
+        ],
+        "trace": [
+          "R-HLT-044: observation stored for in-range value",
+          "R-HLT-044: no flag raised for clinically plausible value"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone\n\ndef test_vital_signs_normal_heart_rate_stored_without_flag(<auth_fixture>, base_url):\n    token = <auth_fixture>.clinician_token()\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"effectiveDateTime\": datetime.now(timezone.utc).isoformat(),\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"beats/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"id\" in body\n    assert body.get(\"status\") == \"final\"\n    assert \"reviewTask\" not in body\n"
+      },
+      {
+        "name": "test_vital_signs_impossible_heart_rate_raises_review_flag",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "role:clinician credentials available via <auth_fixture>",
+          "fhir-lite service reachable at BASE_URL",
+          "server supports review-task creation on out-of-range values"
+        ],
+        "actions": [
+          "Authenticate as clinician using <auth_fixture>",
+          "POST /Observation with category=vital-signs, code=8867-4, valueQuantity=350 bpm (physiologically impossible)",
+          "Capture HTTP response status, body, and any created review task reference"
+        ],
+        "expected": [
+          "HTTP 201 Created (observation accepted for review, not rejected)",
+          "Response body contains a reviewTask or extension flagging out-of-range",
+          "Response body status equals 'preliminary' indicating pending review"
+        ],
+        "trace": [
+          "R-HLT-044: out-of-range value shall be flagged for review",
+          "R-HLT-044: error pathway \u2014 review task created"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone\n\ndef test_vital_signs_impossible_heart_rate_raises_review_flag(<auth_fixture>, base_url):\n    token = <auth_fixture>.clinician_token()\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"preliminary\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"effectiveDateTime\": datetime.now(timezone.utc).isoformat(),\n        \"valueQuantity\": {\"value\": 350, \"unit\": \"beats/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    flag_present = (\"reviewTask\" in body) or any(\n        ext.get(\"url\", \"\").endswith(\"out-of-range\") for ext in body.get(\"extension\", [])\n    )\n    assert flag_present, \"Expected out-of-range flag or reviewTask reference\"\n    assert body.get(\"status\") == \"preliminary\"\n"
+      },
+      {
+        "name": "test_vital_signs_boundary_heart_rate_lower_limit_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "role:clinician credentials available via <auth_fixture>",
+          "fhir-lite service reachable at BASE_URL",
+          "clinical lower boundary for heart-rate defined as 30 bpm"
+        ],
+        "actions": [
+          "Authenticate as clinician using <auth_fixture>",
+          "POST /Observation with valueQuantity=30 bpm (exact lower boundary)",
+          "Capture response and check for flag",
+          "POST /Observation with valueQuantity=29 bpm (one below lower boundary)",
+          "Capture response and check for flag"
+        ],
+        "expected": [
+          "valueQuantity=30: HTTP 201, status='final', no flag",
+          "valueQuantity=29: HTTP 201, status='preliminary', flag present"
+        ],
+        "trace": [
+          "R-HLT-044: boundary cases on numeric elements must be tested",
+          "R-HLT-044: out-of-range shall be flagged for review"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone\n\ndef <post_observation>(base_url, token, value):\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": datetime.now(timezone.utc).isoformat(),\n        \"valueQuantity\": {\"value\": value, \"unit\": \"beats/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    return requests.post(f\"{base_url}/Observation\", json=payload, headers=headers)\n\ndef test_vital_signs_boundary_heart_rate_lower_limit_accepted(<auth_fixture>, base_url):\n    token = <auth_fixture>.clinician_token()\n    resp_at = <post_observation>(base_url, token, 30)\n    assert resp_at.status_code == 201\n    body_at = resp_at.json()\n    assert body_at.get(\"status\") == \"final\"\n    assert \"reviewTask\" not in body_at\n    resp_below = <post_observation>(base_url, token, 29)\n    assert resp_below.status_code == 201\n    body_below = resp_below.json()\n    flag = (\"reviewTask\" in body_below) or any(\n        e.get(\"url\", \"\").endswith(\"out-of-range\") for e in body_below.get(\"extension\", [])\n    )\n    assert flag, \"Value below lower boundary must be flagged\"\n"
+      },
+      {
+        "name": "test_vital_signs_boundary_heart_rate_upper_limit_flagged",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "role:clinician credentials available via <auth_fixture>",
+          "fhir-lite service reachable at BASE_URL",
+          "clinical upper boundary for heart-rate defined as 250 bpm"
+        ],
+        "actions": [
+          "Authenticate as clinician using <auth_fixture>",
+          "POST /Observation with valueQuantity=250 bpm (exact upper boundary \u2014 accepted)",
+          "POST /Observation with valueQuantity=251 bpm (one above upper boundary \u2014 flagged)"
+        ],
+        "expected": [
+          "valueQuantity=250: HTTP 201, status='final', no flag",
+          "valueQuantity=251: HTTP 201, status='preliminary', flag present"
+        ],
+        "trace": [
+          "R-HLT-044: boundary cases on numeric elements must be tested",
+          "R-HLT-044: out-of-range shall be flagged for review"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone\n\ndef <post_obs_upper>(base_url, token, value):\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": datetime.now(timezone.utc).isoformat(),\n        \"valueQuantity\": {\"value\": value, \"unit\": \"beats/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    return requests.post(f\"{base_url}/Observation\", json=payload, headers=headers)\n\ndef test_vital_signs_boundary_heart_rate_upper_limit_flagged(<auth_fixture>, base_url):\n    token = <auth_fixture>.clinician_token()\n    resp_at = <post_obs_upper>(base_url, token, 250)\n    assert resp_at.status_code == 201\n    assert resp_at.json().get(\"status\") == \"final\"\n    resp_above = <post_obs_upper>(base_url, token, 251)\n    assert resp_above.status_code == 201\n    body_above = resp_above.json()\n    flag = (\"reviewTask\" in body_above) or any(\n        e.get(\"url\", \"\").endswith(\"out-of-range\") for e in body_above.get(\"extension\", [])\n    )\n    assert flag, \"Value above upper boundary must be flagged\"\n"
+      },
+      {
+        "name": "test_vital_signs_future_timestamp_rejected_or_flagged",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "role:clinician credentials available via <auth_fixture>",
+          "fhir-lite service reachable at BASE_URL",
+          "server enforces effectiveDateTime must not be in the future"
+        ],
+        "actions": [
+          "Authenticate as clinician using <auth_fixture>",
+          "POST /Observation with a valid vital-signs value but effectiveDateTime set 1 year in the future",
+          "Capture HTTP status and OperationOutcome"
+        ],
+        "expected": [
+          "HTTP 400 or 422 Unprocessable Entity",
+          "OperationOutcome.issue contains a diagnostic referencing invalid timestamp",
+          "No Observation resource is persisted"
+        ],
+        "trace": [
+          "R-HLT-044: boundary cases on timestamps must be tested",
+          "R-HLT-044: invalid timestamp is an error pathway"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone, timedelta\n\ndef test_vital_signs_future_timestamp_rejected_or_flagged(<auth_fixture>, base_url):\n    token = <auth_fixture>.clinician_token()\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    future_ts = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": future_ts,\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"beats/min\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code in (400, 422), f\"Expected 400/422, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\"timestamp\" in str(i.get(\"diagnostics\", \"\")).lower() or\n               \"date\" in str(i.get(\"diagnostics\", \"\")).lower() for i in issues)\n"
+      },
+      {
+        "name": "test_vital_signs_review_task_state_transition_on_resolution",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "role:clinician credentials available via <auth_fixture>",
+          "fhir-lite service reachable at BASE_URL",
+          "An out-of-range Observation exists with an associated review Task in 'requested' status",
+          "<create_flagged_observation> helper creates said Observation and returns task_id"
+        ],
+        "actions": [
+          "Authenticate as clinician using <auth_fixture>",
+          "Create out-of-range Observation via <create_flagged_observation>, capture task_id",
+          "PUT /Task/{task_id} with status='completed' to resolve the review",
+          "GET /Observation/{obs_id} and verify status transitions to 'final'"
+        ],
+        "expected": [
+          "PUT /Task/{task_id} returns HTTP 200",
+          "GET /Observation/{obs_id} returns status='final'",
+          "No open review task reference remains on the Observation"
+        ],
+        "trace": [
+          "R-HLT-044: error pathway \u2014 review task created",
+          "R-HLT-044: expected outcome \u2014 observation stored; flag raised if out of range"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_review_task_state_transition_on_resolution(<auth_fixture>, base_url):\n    token = <auth_fixture>.clinician_token()\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Content-Type\": \"application/fhir+json\"}\n    obs_id, task_id = <create_flagged_observation>(base_url, token)\n    task_update = {\n        \"resourceType\": \"Task\",\n        \"id\": task_id,\n        \"status\": \"completed\",\n        \"intent\": \"order\"\n    }\n    put_resp = requests.put(f\"{base_url}/Task/{task_id}\", json=task_update, headers=headers)\n    assert put_resp.status_code == 200\n    get_resp = requests.get(f\"{base_url}/Observation/{obs_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    obs_body = get_resp.json()\n    assert obs_body.get(\"status\") == \"final\", \"Observation should transition to final after task completion\"\n    open_tasks = [e for e in obs_body.get(\"extension\", []) if \"review\" in e.get(\"url\", \"\").lower()]\n    assert not open_tasks, \"No open review extensions should remain after resolution\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-044",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 4715,
+    "latency_ms": 45170,
+    "wall_ms": 45170,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-044\",\n  \"reasoning\": \"Vital signs validation requires testing: (1) EP positive \u2014 a clinically normal heart-rate value stored without a flag; (2) NEG negative \u2014 a physiologically impossible value triggers a review task; (3) BVA boundary \u2014 values exactly at the lower and upper accepted limits are accepted/flagged correctly; (4) DT \u2014 timestamp edge cases (future timestamp, epoch-zero) expose decision-branch gaps; (5) STC \u2014 state transition from 'preliminary' to 'final' status after review-task resolution. Each test is self-contained via a clinician-auth fixture and a unique effectiveDateTime to avoid collision.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vital_signs_normal_heart_rate_stored_without_flag\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"role:clinician credentials available via <auth_fixture>\",\n        \"fhir-lite service reachable at BASE_URL\",\n        \"heart-rate code 8867-4 supported by server\"\n      ],\n      \"actions\": [\n        \"Authenticate as clinician using <auth_fixture>\",\n        \"POST /Observation with category=vital-signs, code=8867-4 (heart-rate), valueQuantity=72 bpm, effectiveDateTime=now()\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains id field\",\n        \"Response body status equals 'final'\",\n        \"No review task reference present in response\"\n      ],\n      \"trace\": [\n        \"R-HLT-044: observation stored for in-range value\",\n        \"R-HLT-044: no flag raised for clinically plausible value\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import datetime, timezone\\n\\ndef test_vital_signs_normal_heart_rate_stored_without_flag(<auth_fixture>, base_url):\\n    token = <auth_fixture>.clinician_token()\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\", \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"effectiveDateTime\\\": datetime.now(timezone.utc).isoformat(),\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"beats/min\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{base_url}/Observation\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"id\\\" in body\\n    assert body.get(\\\"status\\\") == \\\"final\\\"\\n    assert \\\"reviewTask\\\" not in body\\n\"\n    },\n    {\n      \"name\": \"test_vital_signs_impossible_heart_rate_raises_review_flag\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"role:clinician credentials available via <auth_fixture>\",\n        \"fhir-lite service reachable at BASE_URL\",\n        \"server supports review-task creation on out-of-range values\"\n      ],\n      \"actions\": [\n        \"Authenticate as clinician using <auth_fixture>\",\n        \"POST /Observation with category=vital-signs, code=8867-4, valueQuantity=350 bpm (physiologically impossible)\",\n        \"Capture HTTP response status, body, and any created review task reference\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (observation accepted for review, not rejected)\",\n        \"Response body contains a reviewTask or extension flagging out-of-range\",\n        \"Response body status equals 'preliminary' indicating pending review\"\n      ],\n      \"trace\": [\n        \"R-HLT-044: out-of-range value shall be flagged for review\",\n        \"R-HLT-044: error pathway \u2014 review task created\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import datetime, timezone\\n\\ndef test_vital_signs_impossible_heart_rate_raises_revi"
+  }
+}

@@ -1,0 +1,186 @@
+{
+  "req": {
+    "id": "R-WEB-013",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Manager creates leave-request",
+    "statement": "An authenticated manager shall be able to create a leave-request through the UI form. Mandatory fields must be validated and an audit record must be written on success.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "authenticated",
+      "role:manager",
+      "leave-request module is enabled"
+    ],
+    "triggers": [
+      "manager creates a leave-request"
+    ],
+    "expected_outcomes": [
+      "leave-request is created",
+      "audit record written",
+      "response 200 or 201 with entity id"
+    ],
+    "error_pathways": [
+      "400 on validation error",
+      "401 if unauthenticated",
+      "403 if role forbidden"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-013",
+    "reasoning": "The requirement covers three distinct risk zones: (1) happy-path creation by an authenticated manager, (2) validation rejection when mandatory fields are absent, and (3) boundary behaviour on field length limits. A fourth test covers the authentication boundary (unauthenticated actor). Together these tests exercise EP (valid partition), NEG (missing fields, wrong role, no auth), BVA (max-length field value), and STC (unauthenticated \u2192 authenticated state transition). Each test is self-contained via fixtures that create and clean up their own state.",
+    "tests": [
+      {
+        "name": "test_manager_creates_leave_request_successfully",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Leave-request module is enabled",
+          "Browser session is active at /leave-requests"
+        ],
+        "actions": [
+          "Navigate to /leave-requests",
+          "Fill all mandatory fields with valid data",
+          "Submit the form",
+          "Capture the created entity ID from the response / page"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains a non-empty entity ID",
+          "Audit record exists for the created leave-request"
+        ],
+        "trace": [
+          "R-WEB-013: positive path \u2013 authenticated manager, all mandatory fields present"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_manager_creates_leave_request_successfully(\n    manager_page,        # <fixture>: authenticated Playwright Page for role:manager\n    api_client,          # <fixture>: authenticated requests.Session for manager\n    audit_helper,        # <helper_fn>: checks audit log via API\n    leave_request_cleanup,  # <fixture>: deletes created entity after test\n):\n    page = manager_page\n    page.goto(\"/leave-requests\")\n    page.get_by_label(\"Start Date\").fill(\"2025-09-01\")\n    page.get_by_label(\"End Date\").fill(\"2025-09-05\")\n    page.get_by_label(\"Reason\").fill(\"Annual leave\")\n    page.get_by_label(\"Type\").select_option(\"ANNUAL\")\n    with page.expect_response(\n        lambda r: \"/leave-requests\" in r.url and r.request.method == \"POST\"\n    ) as resp_info:\n        page.get_by_role(\"button\", name=\"Submit\").click()\n    response = resp_info.value\n    assert response.status in (200, 201), f\"Unexpected status {response.status}\"\n    body = response.json()\n    entity_id = body.get(\"id\")\n    assert entity_id, \"Response must contain a non-empty entity id\"\n    leave_request_cleanup(entity_id)\n    assert audit_helper.record_exists(\n        action=\"CREATE\", resource=\"leave-request\", resource_id=entity_id\n    ), \"Audit record not found for created leave-request\"\n"
+      },
+      {
+        "name": "test_create_leave_request_missing_mandatory_fields_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Leave-request module is enabled",
+          "Browser session is active at /leave-requests"
+        ],
+        "actions": [
+          "Navigate to /leave-requests",
+          "Leave all mandatory fields empty",
+          "Attempt to submit the form"
+        ],
+        "expected": [
+          "Form submission is rejected (HTTP 400 or browser-level validation prevents POST)",
+          "At least one inline validation error message is visible on the page",
+          "No leave-request entity is created",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-013: error pathway \u2013 400 on validation error; mandatory fields missing"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_create_leave_request_missing_mandatory_fields_returns_400(\n    manager_page,    # <fixture>: authenticated Playwright Page for role:manager\n    audit_helper,    # <helper_fn>: checks audit log via API\n):\n    page = manager_page\n    page.goto(\"/leave-requests\")\n    # Deliberately skip filling any mandatory field\n    responses = []\n    page.on(\"response\", lambda r: responses.append(r)\n            if \"/leave-requests\" in r.url and r.request.method == \"POST\" else None)\n    page.get_by_role(\"button\", name=\"Submit\").click()\n    page.wait_for_timeout(500)  # allow any async validation to settle\n    # Either a 400 was returned or the browser blocked submission entirely\n    api_responses = [r for r in responses if r.request.method == \"POST\"]\n    if api_responses:\n        assert api_responses[0].status == 400, (\n            f\"Expected 400, got {api_responses[0].status}\"\n        )\n    # Validation messages must be visible\n    error_locator = page.locator(\"[role='alert'], .field-error, [aria-invalid='true']\")\n    expect(error_locator.first).to_be_visible()\n    # Confirm no audit record was written for an anonymous/empty resource\n    assert not audit_helper.any_recent_create(\n        action=\"CREATE\", resource=\"leave-request\", window_seconds=5\n    ), \"Audit record must not be written on validation failure\"\n"
+      },
+      {
+        "name": "test_create_leave_request_reason_at_max_length_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Leave-request module is enabled",
+          "Maximum allowed length for the Reason field is known (assumed 255 characters)",
+          "Browser session is active at /leave-requests"
+        ],
+        "actions": [
+          "Navigate to /leave-requests",
+          "Fill all mandatory fields; set Reason to exactly 255 characters",
+          "Submit the form",
+          "Capture the entity ID"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Leave-request is created with the full 255-character reason preserved",
+          "Audit record is written"
+        ],
+        "trace": [
+          "R-WEB-013: boundary \u2013 maximum allowed field length for 'Reason' (255 chars)"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\nMAX_REASON_LEN = 255\n\ndef test_create_leave_request_reason_at_max_length_boundary(\n    manager_page,\n    audit_helper,\n    leave_request_cleanup,\n):\n    page = manager_page\n    page.goto(\"/leave-requests\")\n    boundary_reason = \"A\" * MAX_REASON_LEN\n    page.get_by_label(\"Start Date\").fill(\"2025-10-01\")\n    page.get_by_label(\"End Date\").fill(\"2025-10-03\")\n    page.get_by_label(\"Reason\").fill(boundary_reason)\n    page.get_by_label(\"Type\").select_option(\"ANNUAL\")\n    with page.expect_response(\n        lambda r: \"/leave-requests\" in r.url and r.request.method == \"POST\"\n    ) as resp_info:\n        page.get_by_role(\"button\", name=\"Submit\").click()\n    response = resp_info.value\n    assert response.status in (200, 201), f\"Unexpected status {response.status}\"\n    body = response.json()\n    entity_id = body.get(\"id\")\n    assert entity_id, \"Response must contain a non-empty entity id\"\n    assert body.get(\"reason\") == boundary_reason, \"255-char reason not persisted verbatim\"\n    leave_request_cleanup(entity_id)\n    assert audit_helper.record_exists(\n        action=\"CREATE\", resource=\"leave-request\", resource_id=entity_id\n    ), \"Audit record not found for boundary-length leave-request\"\n"
+      },
+      {
+        "name": "test_unauthenticated_user_cannot_create_leave_request",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "No active authenticated session exists (cookies cleared)",
+          "Leave-request module is enabled"
+        ],
+        "actions": [
+          "Open a fresh browser context with no session cookies",
+          "Navigate directly to /leave-requests",
+          "Attempt to POST a well-formed leave-request payload via API"
+        ],
+        "expected": [
+          "UI redirects to login page OR displays 401/403 error",
+          "Direct API POST to /leave-requests returns HTTP 401",
+          "No leave-request entity is created",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-013: error pathway \u2013 401 if unauthenticated; STC from unauthenticated state"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://hr-app\"  # <fixture>: replace with env-var or config fixture\n\ndef test_unauthenticated_user_cannot_create_leave_request(\n    browser,         # <fixture>: Playwright Browser instance (no session)\n    audit_helper,    # <helper_fn>: checks audit log via API\n):\n    # --- UI layer: must redirect to login ---\n    context = browser.new_context()  # fresh context; no stored auth state\n    page = context.new_page()\n    page.goto(f\"{BASE_URL}/leave-requests\")\n    # Expect redirect to login or a 401/403 page indicator\n    assert \"/login\" in page.url or page.get_by_text(\"401\").is_visible() \\\n        or page.get_by_text(\"Unauthorized\").is_visible(), (\n        f\"Unauthenticated user should not reach /leave-requests; landed at {page.url}\"\n    )\n    context.close()\n    # --- API layer: raw POST without auth token must return 401 ---\n    payload = {\n        \"startDate\": \"2025-11-01\",\n        \"endDate\": \"2025-11-05\",\n        \"reason\": \"test-unauth\",\n        \"type\": \"ANNUAL\",\n    }\n    resp = requests.post(f\"{BASE_URL}/leave-requests\", json=payload, timeout=10)\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}\"\n    assert not audit_helper.any_recent_create(\n        action=\"CREATE\", resource=\"leave-request\", window_seconds=5\n    ), \"Audit record must not be written for unauthenticated request\"\n"
+      },
+      {
+        "name": "test_role_forbidden_employee_cannot_create_leave_request",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with role: employee (NOT manager)",
+          "Leave-request module is enabled"
+        ],
+        "actions": [
+          "Authenticate as a user with role:employee",
+          "POST a well-formed leave-request payload directly to /leave-requests API"
+        ],
+        "expected": [
+          "API returns HTTP 403",
+          "No leave-request entity is created",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-013: error pathway \u2013 403 if role forbidden; DT covers role=employee column"
+        ],
+        "executable": "import pytest\n\ndef test_role_forbidden_employee_cannot_create_leave_request(\n    employee_api_client,  # <fixture>: authenticated requests.Session for role:employee\n    audit_helper,         # <helper_fn>: checks audit log via API\n    base_url,             # <fixture>: base URL string for hr-app\n):\n    payload = {\n        \"startDate\": \"2025-12-01\",\n        \"endDate\": \"2025-12-05\",\n        \"reason\": \"role-forbidden-test\",\n        \"type\": \"ANNUAL\",\n    }\n    resp = employee_api_client.post(\n        f\"{base_url}/leave-requests\", json=payload, timeout=10\n    )\n    assert resp.status_code == 403, (\n        f\"Expected 403 for role:employee, got {resp.status_code}\"\n    )\n    assert not audit_helper.any_recent_create(\n        action=\"CREATE\", resource=\"leave-request\", window_seconds=5\n    ), \"Audit record must not be written when role is forbidden\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-013",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1030,
+    "output_tokens": 3390,
+    "latency_ms": 45097,
+    "wall_ms": 45097,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-013\",\n  \"reasoning\": \"The requirement covers three distinct risk zones: (1) happy-path creation by an authenticated manager, (2) validation rejection when mandatory fields are absent, and (3) boundary behaviour on field length limits. A fourth test covers the authentication boundary (unauthenticated actor). Together these tests exercise EP (valid partition), NEG (missing fields, wrong role, no auth), BVA (max-length field value), and STC (unauthenticated \u2192 authenticated state transition). Each test is self-contained via fixtures that create and clean up their own state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_creates_leave_request_successfully\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a manager\",\n        \"Leave-request module is enabled\",\n        \"Browser session is active at /leave-requests\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests\",\n        \"Fill all mandatory fields with valid data\",\n        \"Submit the form\",\n        \"Capture the created entity ID from the response / page\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 200 or 201\",\n        \"Response body contains a non-empty entity ID\",\n        \"Audit record exists for the created leave-request\"\n      ],\n      \"trace\": [\n        \"R-WEB-013: positive path \u2013 authenticated manager, all mandatory fields present\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_manager_creates_leave_request_successfully(\\n    manager_page,        # <fixture>: authenticated Playwright Page for role:manager\\n    api_client,          # <fixture>: authenticated requests.Session for manager\\n    audit_helper,        # <helper_fn>: checks audit log via API\\n    leave_request_cleanup,  # <fixture>: deletes created entity after test\\n):\\n    page = manager_page\\n    page.goto(\\\"/leave-requests\\\")\\n    page.get_by_label(\\\"Start Date\\\").fill(\\\"2025-09-01\\\")\\n    page.get_by_label(\\\"End Date\\\").fill(\\\"2025-09-05\\\")\\n    page.get_by_label(\\\"Reason\\\").fill(\\\"Annual leave\\\")\\n    page.get_by_label(\\\"Type\\\").select_option(\\\"ANNUAL\\\")\\n    with page.expect_response(\\n        lambda r: \\\"/leave-requests\\\" in r.url and r.request.method == \\\"POST\\\"\\n    ) as resp_info:\\n        page.get_by_role(\\\"button\\\", name=\\\"Submit\\\").click()\\n    response = resp_info.value\\n    assert response.status in (200, 201), f\\\"Unexpected status {response.status}\\\"\\n    body = response.json()\\n    entity_id = body.get(\\\"id\\\")\\n    assert entity_id, \\\"Response must contain a non-empty entity id\\\"\\n    leave_request_cleanup(entity_id)\\n    assert audit_helper.record_exists(\\n        action=\\\"CREATE\\\", resource=\\\"leave-request\\\", resource_id=entity_id\\n    ), \\\"Audit record not found for created leave-request\\\"\\n\"\n    },\n    {\n      \"name\": \"test_create_leave_request_missing_mandatory_fields_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as a manager\",\n        \"Leave-request module is enabled\",\n        \"Browser session is active at /leave-requests\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests\",\n        \"Leave all mandatory fields empty\",\n        \"Attempt to submit the form\"\n      ],\n      \"expected\": [\n        \"Form submission is rejected (HTTP 400 or browser-level validation prevents POST)\",\n        \"At least one inline validation error message is visible on the page\",\n        \"No leave-request entity is created\",\n        \"No audit record is written\"\n      ],\n      \"trace\": [\n        \"R-WEB-013: error pathway \u2013 400 on validation error; mandatory fields missing\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_create_leave_request_missing_mandatory_fields_returns_400(\\n    manager_page,    # <fixture>: authenticated Playwright Page for role:manager\\n    audit_helper,    # <helper_fn>: checks audit l"
+  }
+}

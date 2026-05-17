@@ -1,0 +1,179 @@
+{
+  "req": {
+    "id": "R-FIN-015",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "KYC refresh",
+    "statement": "A customer shall complete a KYC refresh every 365 days; accounts beyond refresh window shall be restricted to inbound transactions only.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "refresh form submitted"
+    ],
+    "expected_outcomes": [
+      "customer.verified=true refreshed"
+    ],
+    "error_pathways": [
+      "403 when submission fails compliance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/kyc/refresh"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-015",
+    "reasoning": "KYC refresh is a time-gated compliance control. Testing spans three dimensions: (1) successful refresh within the 365-day window (EP positive path), (2) rejection when compliance fails (NEG), and (3) boundary conditions at refresh window edges (BVA). State transitions (STC) validate the customer.verified flag lifecycle. Decision table logic covers authenticated state + submission validity combinations.",
+    "tests": [
+      {
+        "name": "test_kyc_refresh_valid_submission_within_window",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "customer authenticated with valid session",
+          "customer.kyc_last_refresh < 365 days ago",
+          "customer.account_status = 'active'"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid form data (name, address, dob, tax_id)",
+          "capture response status and body"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.customer.verified = true",
+          "response.customer.kyc_refresh_ts = current_timestamp",
+          "response.account_restriction = null"
+        ],
+        "trace": [
+          "R-FIN-015: customer.verified=true refreshed",
+          "Trigger: refresh form submitted",
+          "Outcome: positive acceptance"
+        ],
+        "executable": "import requests\nimport time\nfrom datetime import datetime, timedelta\n\ndef test_kyc_refresh_valid_submission_within_window():\n    auth_token = <get_auth_token_fixture>\n    customer_id = <customer_id_fixture>\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    payload = {\n        \"name\": \"John Doe\",\n        \"address\": \"123 Main St\",\n        \"dob\": \"1990-01-15\",\n        \"tax_id\": \"12-3456789\"\n    }\n    resp = requests.post(\n        f\"http://banking-api/kyc/refresh\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 200\n    data = resp.json()\n    assert data[\"customer\"][\"verified\"] is True\n    assert \"kyc_refresh_ts\" in data[\"customer\"]\n    assert data.get(\"account_restriction\") is None"
+      },
+      {
+        "name": "test_kyc_refresh_compliance_failure_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "customer authenticated",
+          "submission form contains invalid/incomplete compliance data",
+          "e.g. tax_id fails format validation or name contains prohibited characters"
+        ],
+        "actions": [
+          "POST /kyc/refresh with malformed compliance payload",
+          "capture HTTP response code and error message"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden returned",
+          "response.error.code = 'COMPLIANCE_FAILURE'",
+          "customer.verified unchanged from previous state",
+          "no kyc_refresh_ts updated"
+        ],
+        "trace": [
+          "R-FIN-015: Error pathways: 403 when submission fails compliance",
+          "Negative path: rejection on compliance violation"
+        ],
+        "executable": "import requests\n\ndef test_kyc_refresh_compliance_failure_returns_403():\n    auth_token = <get_auth_token_fixture>\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    payload = {\n        \"name\": \"Invalid@Name#\",\n        \"address\": \"123 Main St\",\n        \"dob\": \"1990-01-15\",\n        \"tax_id\": \"INVALID\"\n    }\n    resp = requests.post(\n        f\"http://banking-api/kyc/refresh\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 403\n    data = resp.json()\n    assert data.get(\"error\", {}).get(\"code\") == \"COMPLIANCE_FAILURE\"\n    assert \"kyc_refresh_ts\" not in data.get(\"customer\", {})"
+      },
+      {
+        "name": "test_kyc_refresh_boundary_365_days_exact",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "customer authenticated",
+          "customer.kyc_last_refresh = exactly 365 days ago",
+          "customer account currently unrestricted"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid form data",
+          "verify state transition"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "customer.verified = true",
+          "account_restriction remains null",
+          "kyc_refresh_ts updated to current time"
+        ],
+        "trace": [
+          "R-FIN-015: Boundary value at refresh window threshold (365 days)",
+          "STC: state transitions from 'needs_refresh' to 'verified'"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_kyc_refresh_boundary_365_days_exact():\n    auth_token = <get_auth_token_fixture>\n    customer_id = <customer_id_fixture>\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    <set_customer_kyc_last_refresh_to_365_days_ago>\n    payload = {\n        \"name\": \"Jane Smith\",\n        \"address\": \"456 Oak Ave\",\n        \"dob\": \"1985-03-22\",\n        \"tax_id\": \"98-7654321\"\n    }\n    resp = requests.post(\n        f\"http://banking-api/kyc/refresh\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 200\n    data = resp.json()\n    assert data[\"customer\"][\"verified\"] is True\n    assert data.get(\"account_restriction\") is None"
+      },
+      {
+        "name": "test_kyc_refresh_account_restricted_beyond_window",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "customer authenticated",
+          "customer.kyc_last_refresh > 365 days ago",
+          "customer.account_status = 'restricted_to_inbound'"
+        ],
+        "actions": [
+          "POST /kyc/refresh with valid form data",
+          "capture response and account state"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "customer.verified = true",
+          "account_restriction lifted (set to null)",
+          "full transaction access restored"
+        ],
+        "trace": [
+          "R-FIN-015: accounts beyond refresh window shall be restricted to inbound transactions only",
+          "Boundary: account state recovery post-refresh"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_kyc_refresh_account_restricted_beyond_window():\n    auth_token = <get_auth_token_fixture>\n    customer_id = <customer_id_fixture>\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    <set_customer_kyc_last_refresh_to_400_days_ago>\n    <set_account_restriction_to_inbound_only>\n    payload = {\n        \"name\": \"Robert Brown\",\n        \"address\": \"789 Pine Rd\",\n        \"dob\": \"1992-07-10\",\n        \"tax_id\": \"55-1234567\"\n    }\n    resp = requests.post(\n        f\"http://banking-api/kyc/refresh\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == 200\n    data = resp.json()\n    assert data[\"customer\"][\"verified\"] is True\n    assert data.get(\"account_restriction\") is None"
+      },
+      {
+        "name": "test_kyc_refresh_unauthenticated_denied",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "request lacks valid authentication token or session"
+        ],
+        "actions": [
+          "POST /kyc/refresh without Authorization header",
+          "capture response"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized returned",
+          "response.error.code = 'UNAUTHENTICATED'",
+          "no kyc refresh processed"
+        ],
+        "trace": [
+          "R-FIN-015: Preconditions: authenticated",
+          "Decision table: authenticated=false \u2192 deny"
+        ],
+        "executable": "import requests\n\ndef test_kyc_refresh_unauthenticated_denied():\n    payload = {\n        \"name\": \"Test User\",\n        \"address\": \"123 Main St\",\n        \"dob\": \"1990-01-15\",\n        \"tax_id\": \"12-3456789\"\n    }\n    resp = requests.post(\n        f\"http://banking-api/kyc/refresh\",\n        json=payload\n    )\n    assert resp.status_code == 401\n    data = resp.json()\n    assert data.get(\"error\", {}).get(\"code\") == \"UNAUTHENTICATED\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-015",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1024,
+    "output_tokens": 2495,
+    "latency_ms": 14075,
+    "wall_ms": 14075,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-015\",\n  \"reasoning\": \"KYC refresh is a time-gated compliance control. Testing spans three dimensions: (1) successful refresh within the 365-day window (EP positive path), (2) rejection when compliance fails (NEG), and (3) boundary conditions at refresh window edges (BVA). State transitions (STC) validate the customer.verified flag lifecycle. Decision table logic covers authenticated state + submission validity combinations.\",\n  \"tests\": [\n    {\n      \"name\": \"test_kyc_refresh_valid_submission_within_window\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"customer authenticated with valid session\",\n        \"customer.kyc_last_refresh < 365 days ago\",\n        \"customer.account_status = 'active'\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with valid form data (name, address, dob, tax_id)\",\n        \"capture response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"response.customer.verified = true\",\n        \"response.customer.kyc_refresh_ts = current_timestamp\",\n        \"response.account_restriction = null\"\n      ],\n      \"trace\": [\n        \"R-FIN-015: customer.verified=true refreshed\",\n        \"Trigger: refresh form submitted\",\n        \"Outcome: positive acceptance\"\n      ],\n      \"executable\": \"import requests\\nimport time\\nfrom datetime import datetime, timedelta\\n\\ndef test_kyc_refresh_valid_submission_within_window():\\n    auth_token = <get_auth_token_fixture>\\n    customer_id = <customer_id_fixture>\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"}\\n    payload = {\\n        \\\"name\\\": \\\"John Doe\\\",\\n        \\\"address\\\": \\\"123 Main St\\\",\\n        \\\"dob\\\": \\\"1990-01-15\\\",\\n        \\\"tax_id\\\": \\\"12-3456789\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"http://banking-api/kyc/refresh\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n    assert resp.status_code == 200\\n    data = resp.json()\\n    assert data[\\\"customer\\\"][\\\"verified\\\"] is True\\n    assert \\\"kyc_refresh_ts\\\" in data[\\\"customer\\\"]\\n    assert data.get(\\\"account_restriction\\\") is None\"\n    },\n    {\n      \"name\": \"test_kyc_refresh_compliance_failure_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"customer authenticated\",\n        \"submission form contains invalid/incomplete compliance data\",\n        \"e.g. tax_id fails format validation or name contains prohibited characters\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with malformed compliance payload\",\n        \"capture HTTP response code and error message\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden returned\",\n        \"response.error.code = 'COMPLIANCE_FAILURE'\",\n        \"customer.verified unchanged from previous state\",\n        \"no kyc_refresh_ts updated\"\n      ],\n      \"trace\": [\n        \"R-FIN-015: Error pathways: 403 when submission fails compliance\",\n        \"Negative path: rejection on compliance violation\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_kyc_refresh_compliance_failure_returns_403():\\n    auth_token = <get_auth_token_fixture>\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"}\\n    payload = {\\n        \\\"name\\\": \\\"Invalid@Name#\\\",\\n        \\\"address\\\": \\\"123 Main St\\\",\\n        \\\"dob\\\": \\\"1990-01-15\\\",\\n        \\\"tax_id\\\": \\\"INVALID\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"http://banking-api/kyc/refresh\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n    assert resp.status_code == 403\\n    data = resp.json()\\n    assert data.get(\\\"error\\\", {}).get(\\\"code\\\") == \\\"COMPLIANCE_FAILURE\\\"\\n    assert \\\"kyc_refresh_ts\\\" not in data.get(\\\"customer\\\", {})\"\n    },\n    {\n      \"name\": \"test_kyc_refresh_boundary_365_days_exact\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"customer authenticated\",\n        \"customer.kyc_last_refresh = exactly 365 days ago\",\n        \"customer account currently unrestricted\"\n      ],\n   "
+  }
+}

@@ -1,0 +1,169 @@
+{
+  "req": {
+    "id": "R-HLT-053",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Update patient (negative)",
+    "statement": "A clinician shall update patient demographics; historical versions must be preserved. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician updates resource"
+    ],
+    "expected_outcomes": [
+      "new version stored",
+      "history preserved"
+    ],
+    "error_pathways": [
+      "409 on version conflict"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-053",
+    "reasoning": "R-HLT-053 mandates that a clinician can update patient demographics with version preservation, and that negative paths (permission denial, missing mandatory fields, version conflict) are covered. The violation reported was that test[3] had kind=negative but heuristic=STC; STC (State Transition Coverage) is valid for negative tests when the scenario exercises an invalid state transition (stale version conflict), so the fix is to correct the heuristic to NEG which is the appropriate heuristic for error-pathway negative tests, while keeping the test logic identical. Tests: (1) positive/EP confirming valid PUT returns 200 and increments versionId; (2) negative/NEG confirming a non-clinician role receives 403; (3) negative/DT confirming missing mandatory field returns 400; (4) negative/NEG confirming stale versionId produces 409 conflict; (5) boundary/BVA sending a name field of exactly 1 character to verify acceptance.",
+    "tests": [
+      {
+        "name": "test_clinician_update_patient_valid_preserves_history",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A patient resource exists with a known id and versionId",
+          "Caller is authenticated as a clinician role",
+          "FHIR-Lite service is reachable"
+        ],
+        "actions": [
+          "GET /Patient/{id} to obtain current versionId",
+          "PUT /Patient/{id} with If-Match header set to current ETag and updated family name",
+          "GET /Patient/{id}/_history to verify previous version is retained"
+        ],
+        "expected": [
+          "PUT response status is 200",
+          "Response body versionId is incremented by 1",
+          "History endpoint returns at least 2 entries including the previous version"
+        ],
+        "trace": [
+          "R-HLT-053: clinician shall update patient demographics",
+          "R-HLT-053: historical versions must be preserved"
+        ],
+        "executable": "def test_clinician_update_patient_valid_preserves_history(clinician_client, existing_patient):\n    pid = existing_patient[\"id\"]\n    old_version = existing_patient[\"meta\"][\"versionId\"]\n    old_etag = f'W/\"{old_version}\"'\n\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": pid,\n        \"name\": [{\"family\": \"UpdatedFamily\", \"given\": [\"Jane\"]}]\n    }\n    resp = clinician_client.put(\n        f\"/Patient/{pid}\",\n        json=payload,\n        headers={\"If-Match\": old_etag, \"Content-Type\": \"application/fhir+json\"}\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    new_version = body[\"meta\"][\"versionId\"]\n    assert int(new_version) == int(old_version) + 1\n\n    hist = clinician_client.get(f\"/Patient/{pid}/_history\")\n    assert hist.status_code == 200\n    entries = hist.json().get(\"entry\", [])\n    version_ids = [e[\"resource\"][\"meta\"][\"versionId\"] for e in entries]\n    assert old_version in version_ids\n    assert new_version in version_ids"
+      },
+      {
+        "name": "test_non_clinician_update_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A patient resource exists with a known id",
+          "Caller is authenticated as a guest/read-only role (not clinician)",
+          "FHIR-Lite service is reachable"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with valid payload using a non-clinician token"
+        ],
+        "expected": [
+          "Response status is 403 Forbidden",
+          "Response body contains an OperationOutcome indicating insufficient privileges"
+        ],
+        "trace": [
+          "R-HLT-053: error pathway \u2014 permission denial"
+        ],
+        "executable": "def test_non_clinician_update_patient_returns_403(guest_client, existing_patient):\n    pid = existing_patient[\"id\"]\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": pid,\n        \"name\": [{\"family\": \"ShouldFail\"}]\n    }\n    resp = guest_client.put(\n        f\"/Patient/{pid}\",\n        json=payload,\n        headers={\"Content-Type\": \"application/fhir+json\"}\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\""
+      },
+      {
+        "name": "test_update_patient_missing_resource_type_returns_400",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A patient resource exists with a known id",
+          "Caller is authenticated as a clinician role",
+          "FHIR-Lite service is reachable"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with a payload that omits the mandatory resourceType field"
+        ],
+        "expected": [
+          "Response status is 400 Bad Request",
+          "Response body OperationOutcome references missing mandatory element"
+        ],
+        "trace": [
+          "R-HLT-053: error pathway \u2014 missing mandatory elements"
+        ],
+        "executable": "def test_update_patient_missing_resource_type_returns_400(clinician_client, existing_patient):\n    pid = existing_patient[\"id\"]\n    old_version = existing_patient[\"meta\"][\"versionId\"]\n    old_etag = f'W/\"{old_version}\"'\n\n    payload = {\n        \"id\": pid,\n        \"name\": [{\"family\": \"NoResourceType\"}]\n    }\n    resp = clinician_client.put(\n        f\"/Patient/{pid}\",\n        json=payload,\n        headers={\"If-Match\": old_etag, \"Content-Type\": \"application/fhir+json\"}\n    )\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(\"resourceType\" in str(i) for i in issues)"
+      },
+      {
+        "name": "test_update_patient_stale_version_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A patient resource exists with a known id and versionId V",
+          "A second update has already advanced the resource to versionId V+1",
+          "Caller is authenticated as a clinician role",
+          "FHIR-Lite service is reachable"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with If-Match header referencing the outdated ETag (V, not V+1)"
+        ],
+        "expected": [
+          "Response status is 409 Conflict",
+          "Response body contains an OperationOutcome indicating version conflict"
+        ],
+        "trace": [
+          "R-HLT-053: error pathway \u2014 409 on version conflict",
+          "R-HLT-053: conflicting state transitions must be tested"
+        ],
+        "executable": "def test_update_patient_stale_version_returns_409(clinician_client, existing_patient):\n    pid = existing_patient[\"id\"]\n    old_version = existing_patient[\"meta\"][\"versionId\"]\n    stale_etag = f'W/\"{old_version}\"'\n\n    first_payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": pid,\n        \"name\": [{\"family\": \"FirstUpdate\"}]\n    }\n    advance = clinician_client.put(\n        f\"/Patient/{pid}\",\n        json=first_payload,\n        headers={\"If-Match\": stale_etag, \"Content-Type\": \"application/fhir+json\"}\n    )\n    assert advance.status_code == 200\n\n    stale_payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": pid,\n        \"name\": [{\"family\": \"StaleUpdate\"}]\n    }\n    resp = clinician_client.put(\n        f\"/Patient/{pid}\",\n        json=stale_payload,\n        headers={\"If-Match\": stale_etag, \"Content-Type\": \"application/fhir+json\"}\n    )\n    assert resp.status_code == 409\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\""
+      },
+      {
+        "name": "test_update_patient_name_single_char_boundary_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A patient resource exists with a known id",
+          "Caller is authenticated as a clinician role",
+          "FHIR-Lite service is reachable"
+        ],
+        "actions": [
+          "PUT /Patient/{id} with family name set to exactly 1 character (lower BVA boundary)"
+        ],
+        "expected": [
+          "Response status is 200",
+          "Stored family name equals the single character supplied"
+        ],
+        "trace": [
+          "R-HLT-053: clinician shall update patient demographics",
+          "R-HLT-053: boundary on name field length (minimum valid value)"
+        ],
+        "executable": "def test_update_patient_name_single_char_boundary_accepted(clinician_client, existing_patient):\n    pid = existing_patient[\"id\"]\n    old_version = existing_patient[\"meta\"][\"versionId\"]\n    old_etag = f'W/\"{old_version}\"'\n\n    payload = {\n        \"resourceType\": \"Patient\",\n        \"id\": pid,\n        \"name\": [{\"family\": \"X\", \"given\": [\"Y\"]}]\n    }\n    resp = clinician_client.put(\n        f\"/Patient/{pid}\",\n        json=payload,\n        headers={\"If-Match\": old_etag, \"Content-Type\": \"application/fhir+json\"}\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    names = body.get(\"name\", [])\n    assert any(n.get(\"family\") == \"X\" for n in names)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-053",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 2799,
+    "latency_ms": 27658,
+    "wall_ms": 27658,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-053\",\n  \"reasoning\": \"R-HLT-053 mandates that a clinician can update patient demographics with version preservation, and that negative paths (permission denial, missing mandatory fields, version conflict) are covered. I selected: (1) a positive EP test confirming a valid PUT returns 200 and increments versionId; (2) a NEG test confirming a non-clinician role (e.g., guest) receives 403; (3) a NEG/DT test confirming a missing mandatory field (resourceType) returns 400; (4) a STC test confirming a stale versionId produces 409; (5) a BVA test sending a name field of exactly 1 character (lower boundary) to verify acceptance. Together these cover all error pathways cited in the requirement and satisfy the minimum positive/negative/boundary rule.\",\n  \"tests\": [\n    {\n      \"name\": \"test_clinician_update_patient_valid_preserves_history\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A patient resource exists with a known id and versionId\",\n        \"Caller is authenticated as a clinician role\",\n        \"FHIR-Lite service is reachable\"\n      ],\n      \"actions\": [\n        \"GET /Patient/{id} to obtain current versionId\",\n        \"PUT /Patient/{id} with If-Match header set to current ETag and updated family name\",\n        \"GET /Patient/{id}/_history to verify previous version is retained\"\n      ],\n      \"expected\": [\n        \"PUT response status is 200\",\n        \"Response body versionId is incremented by 1\",\n        \"History endpoint returns at least 2 entries including the previous version\"\n      ],\n      \"trace\": [\n        \"R-HLT-053: clinician shall update patient demographics\",\n        \"R-HLT-053: historical versions must be preserved\"\n      ],\n      \"executable\": \"def test_clinician_update_patient_valid_preserves_history(clinician_client, existing_patient):\\n    pid = existing_patient[\\\"id\\\"]\\n    old_version = existing_patient[\\\"meta\\\"][\\\"versionId\\\"]\\n    old_etag = f'W/\\\"{old_version}\\\"'\\n\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"id\\\": pid,\\n        \\\"name\\\": [{\\\"family\\\": \\\"UpdatedFamily\\\", \\\"given\\\": [\\\"Jane\\\"]}]\\n    }\\n    resp = clinician_client.put(\\n        f\\\"/Patient/{pid}\\\",\\n        json=payload,\\n        headers={\\\"If-Match\\\": old_etag, \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    new_version = body[\\\"meta\\\"][\\\"versionId\\\"]\\n    assert int(new_version) == int(old_version) + 1\\n\\n    hist = clinician_client.get(f\\\"/Patient/{pid}/_history\\\")\\n    assert hist.status_code == 200\\n    entries = hist.json().get(\\\"entry\\\", [])\\n    version_ids = [e[\\\"resource\\\"][\\\"meta\\\"][\\\"versionId\\\"] for e in entries]\\n    assert old_version in version_ids\\n    assert new_version in version_ids\"\n    },\n    {\n      \"name\": \"test_non_clinician_update_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A patient resource exists with a known id\",\n        \"Caller is authenticated as a guest/read-only role (not clinician)\",\n        \"FHIR-Lite service is reachable\"\n      ],\n      \"actions\": [\n        \"PUT /Patient/{id} with valid payload using a non-clinician token\"\n      ],\n      \"expected\": [\n        \"Response status is 403 Forbidden\",\n        \"Response body contains an OperationOutcome indicating insufficient privileges\"\n      ],\n      \"trace\": [\n        \"R-HLT-053: error pathway \u2014 permission denial\"\n      ],\n      \"executable\": \"def test_non_clinician_update_patient_returns_403(guest_client, existing_patient):\\n    pid = existing_patient[\\\"id\\\"]\\n    payload = {\\n        \\\"resourceType\\\": \\\"Patient\\\",\\n        \\\"id\\\": pid,\\n        \\\"name\\\": [{\\\"family\\\": \\\"ShouldFail\\\"}]\\n    }\\n    resp = guest_client.put(\\n        f\\\"/Patient/{pid}\\\",\\n        json=payload,\\n        headers={\\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n    )\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert body.get(\\\"resour"
+  }
+}

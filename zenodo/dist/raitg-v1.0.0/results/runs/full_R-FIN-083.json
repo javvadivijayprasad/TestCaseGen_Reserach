@@ -1,0 +1,196 @@
+{
+  "req": {
+    "id": "R-FIN-083",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Account statement generation (idempotency variant)",
+    "statement": "A customer shall request monthly statements as PDF; statements older than 7 years shall be fetched from cold storage. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer requests statement"
+    ],
+    "expected_outcomes": [
+      "PDF delivered",
+      "retrieval logged"
+    ],
+    "error_pathways": [
+      "404 if no activity in period",
+      "503 if cold storage unavailable"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/statements/{month}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-083",
+    "reasoning": "The requirement covers four distinct behavioral zones: (1) normal statement retrieval for recent months, (2) cold-storage retrieval for statements older than 7 years, (3) idempotency enforcement on duplicate Idempotency-Key submissions, (4) 404 when no activity exists in the period, and (5) 503 when cold storage is unavailable. Tests are mapped using EP for the happy-path partition, BVA for the 7-year boundary, STC for the idempotency state transition (first-call vs duplicate-call), NEG for the no-activity 404, and DT for the cold-storage 503 condition table. Each test is self-contained via fixtures and uses unique Idempotency-Keys to prevent cross-test contamination.",
+    "tests": [
+      {
+        "name": "test_statement_pdf_returned_for_recent_month",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer owns the account",
+          "Account has activity in the requested month (within last 7 years)",
+          "Cold storage is not involved"
+        ],
+        "actions": [
+          "GET /statements/{month} with valid bearer token and unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Content-Type: application/pdf",
+          "Response body is non-empty binary PDF",
+          "Retrieval event logged (X-Log-ID header present)"
+        ],
+        "trace": [
+          "R-FIN-083: PDF delivered",
+          "R-FIN-083: retrieval logged",
+          "R-FIN-083: account.owner == caller precondition"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_statement_pdf_returned_for_recent_month(api_client, recent_active_month):\n    idempotency_key = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {api_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    resp = api_client.get(f\"/statements/{recent_active_month}\", headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers.get(\"Content-Type\") == \"application/pdf\"\n    assert len(resp.content) > 0\n    assert resp.headers.get(\"X-Log-ID\") is not None\n"
+      },
+      {
+        "name": "test_statement_idempotency_duplicate_key_returns_original",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer owns the account",
+          "Account has activity in the requested month",
+          "A fixed Idempotency-Key is available for reuse"
+        ],
+        "actions": [
+          "POST/GET /statements/{month} first time with Idempotency-Key K",
+          "POST/GET /statements/{month} second time with the same Idempotency-Key K"
+        ],
+        "expected": [
+          "Both calls return HTTP 200",
+          "Second response body is byte-for-byte identical to first",
+          "Second response carries header X-Idempotent-Replayed: true"
+        ],
+        "trace": [
+          "R-FIN-083: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_statement_idempotency_duplicate_key_returns_original(api_client, recent_active_month):\n    idempotency_key = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {api_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n\n    resp1 = api_client.get(f\"/statements/{recent_active_month}\", headers=headers)\n    assert resp1.status_code == 200\n\n    resp2 = api_client.get(f\"/statements/{recent_active_month}\", headers=headers)\n    assert resp2.status_code == 200\n\n    assert resp1.content == resp2.content\n    assert resp2.headers.get(\"X-Idempotent-Replayed\") == \"true\"\n"
+      },
+      {
+        "name": "test_statement_at_7_year_boundary_fetched_from_cold_storage",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer owns the account",
+          "A statement exists for exactly 7 years ago (boundary month)",
+          "Cold storage is available"
+        ],
+        "actions": [
+          "GET /statements/{month} where month == today minus exactly 84 months (7 years)"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Content-Type: application/pdf",
+          "Response header X-Storage-Tier: cold indicates cold-storage retrieval",
+          "Retrieval logged"
+        ],
+        "trace": [
+          "R-FIN-083: statements older than 7 years shall be fetched from cold storage",
+          "R-FIN-083: PDF delivered"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import date, timedelta\nfrom dateutil.relativedelta import relativedelta\n\ndef test_statement_at_7_year_boundary_fetched_from_cold_storage(api_client, ensure_cold_storage_available):\n    boundary_month = (date.today() - relativedelta(years=7)).strftime(\"%Y-%m\")\n    idempotency_key = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {api_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n\n    resp = api_client.get(f\"/statements/{boundary_month}\", headers=headers)\n\n    assert resp.status_code == 200\n    assert resp.headers.get(\"Content-Type\") == \"application/pdf\"\n    assert resp.headers.get(\"X-Storage-Tier\") == \"cold\"\n    assert resp.headers.get(\"X-Log-ID\") is not None\n"
+      },
+      {
+        "name": "test_statement_404_when_no_activity_in_period",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer owns the account",
+          "Account has NO activity in the requested month"
+        ],
+        "actions": [
+          "GET /statements/{month} for an inactive month with a unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 404",
+          "Response body contains error code NO_ACTIVITY or equivalent",
+          "No PDF content returned"
+        ],
+        "trace": [
+          "R-FIN-083: 404 if no activity in period"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_statement_404_when_no_activity_in_period(api_client, inactive_month):\n    idempotency_key = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {api_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n\n    resp = api_client.get(f\"/statements/{inactive_month}\", headers=headers)\n\n    assert resp.status_code == 404\n    body = resp.json()\n    assert body.get(\"error\") in (\"NO_ACTIVITY\", \"not_found\", \"STATEMENT_NOT_FOUND\")\n    assert resp.headers.get(\"Content-Type\", \"\") != \"application/pdf\"\n"
+      },
+      {
+        "name": "test_statement_503_when_cold_storage_unavailable",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer owns the account",
+          "Statement is older than 7 years (requires cold storage)",
+          "Cold storage service is simulated as unavailable (fault injected)"
+        ],
+        "actions": [
+          "Inject cold-storage fault via <fault_injection_fixture>",
+          "GET /statements/{month} for a month older than 7 years with a unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 503",
+          "Response body contains error code COLD_STORAGE_UNAVAILABLE or equivalent",
+          "Retry-After header is present"
+        ],
+        "trace": [
+          "R-FIN-083: 503 if cold storage unavailable",
+          "R-FIN-083: statements older than 7 years fetched from cold storage"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom datetime import date\nfrom dateutil.relativedelta import relativedelta\n\ndef test_statement_503_when_cold_storage_unavailable(\n    api_client, cold_storage_fault_injected\n):\n    old_month = (date.today() - relativedelta(years=8)).strftime(\"%Y-%m\")\n    idempotency_key = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {api_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n\n    resp = api_client.get(f\"/statements/{old_month}\", headers=headers)\n\n    assert resp.status_code == 503\n    body = resp.json()\n    assert body.get(\"error\") in (\"COLD_STORAGE_UNAVAILABLE\", \"service_unavailable\")\n    assert \"Retry-After\" in resp.headers\n"
+      },
+      {
+        "name": "test_statement_401_when_caller_is_not_account_owner",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Two distinct authenticated customers exist: owner and non-owner",
+          "Account belongs to owner, not non-owner"
+        ],
+        "actions": [
+          "GET /statements/{month} using non-owner's bearer token targeting owner's account"
+        ],
+        "expected": [
+          "HTTP 401 or 403",
+          "Response body indicates authorization failure",
+          "No PDF content returned"
+        ],
+        "trace": [
+          "R-FIN-083: account.owner == caller precondition enforced"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_statement_401_when_caller_is_not_account_owner(\n    api_client_non_owner, owner_account_recent_month\n):\n    idempotency_key = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {api_client_non_owner.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    month, account_id = owner_account_recent_month\n\n    resp = api_client_non_owner.get(\n        f\"/statements/{month}\",\n        headers=headers,\n        params={\"account_id\": account_id},\n    )\n\n    assert resp.status_code in (401, 403)\n    body = resp.json()\n    assert \"error\" in body\n    assert resp.headers.get(\"Content-Type\", \"\") != \"application/pdf\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-083",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1023,
+    "output_tokens": 3005,
+    "latency_ms": 35829,
+    "wall_ms": 35829,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-083\",\n  \"reasoning\": \"The requirement covers four distinct behavioral zones: (1) normal statement retrieval for recent months, (2) cold-storage retrieval for statements older than 7 years, (3) idempotency enforcement on duplicate Idempotency-Key submissions, (4) 404 when no activity exists in the period, and (5) 503 when cold storage is unavailable. Tests are mapped using EP for the happy-path partition, BVA for the 7-year boundary, STC for the idempotency state transition (first-call vs duplicate-call), NEG for the no-activity 404, and DT for the cold-storage 503 condition table. Each test is self-contained via fixtures and uses unique Idempotency-Keys to prevent cross-test contamination.\",\n  \"tests\": [\n    {\n      \"name\": \"test_statement_pdf_returned_for_recent_month\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer owns the account\",\n        \"Account has activity in the requested month (within last 7 years)\",\n        \"Cold storage is not involved\"\n      ],\n      \"actions\": [\n        \"GET /statements/{month} with valid bearer token and unique Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Content-Type: application/pdf\",\n        \"Response body is non-empty binary PDF\",\n        \"Retrieval event logged (X-Log-ID header present)\"\n      ],\n      \"trace\": [\n        \"R-FIN-083: PDF delivered\",\n        \"R-FIN-083: retrieval logged\",\n        \"R-FIN-083: account.owner == caller precondition\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_statement_pdf_returned_for_recent_month(api_client, recent_active_month):\\n    idempotency_key = str(uuid.uuid4())\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {api_client.token}\\\",\\n        \\\"Idempotency-Key\\\": idempotency_key,\\n    }\\n    resp = api_client.get(f\\\"/statements/{recent_active_month}\\\", headers=headers)\\n\\n    assert resp.status_code == 200\\n    assert resp.headers.get(\\\"Content-Type\\\") == \\\"application/pdf\\\"\\n    assert len(resp.content) > 0\\n    assert resp.headers.get(\\\"X-Log-ID\\\") is not None\\n\"\n    },\n    {\n      \"name\": \"test_statement_idempotency_duplicate_key_returns_original\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Authenticated customer owns the account\",\n        \"Account has activity in the requested month\",\n        \"A fixed Idempotency-Key is available for reuse\"\n      ],\n      \"actions\": [\n        \"POST/GET /statements/{month} first time with Idempotency-Key K\",\n        \"POST/GET /statements/{month} second time with the same Idempotency-Key K\"\n      ],\n      \"expected\": [\n        \"Both calls return HTTP 200\",\n        \"Second response body is byte-for-byte identical to first\",\n        \"Second response carries header X-Idempotent-Replayed: true\"\n      ],\n      \"trace\": [\n        \"R-FIN-083: duplicate submission with same Idempotency-Key must return original result\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_statement_idempotency_duplicate_key_returns_original(api_client, recent_active_month):\\n    idempotency_key = str(uuid.uuid4())\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {api_client.token}\\\",\\n        \\\"Idempotency-Key\\\": idempotency_key,\\n    }\\n\\n    resp1 = api_client.get(f\\\"/statements/{recent_active_month}\\\", headers=headers)\\n    assert resp1.status_code == 200\\n\\n    resp2 = api_client.get(f\\\"/statements/{recent_active_month}\\\", headers=headers)\\n    assert resp2.status_code == 200\\n\\n    assert resp1.content == resp2.content\\n    assert resp2.headers.get(\\\"X-Idempotent-Replayed\\\") == \\\"true\\\"\\n\"\n    },\n    {\n      \"name\": \"test_statement_at_7_year_boundary_fetched_from_cold_storage\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer owns the account\",\n        \"A statement exists for exactly 7 years ago (boundary month)\",\n        \"Cold storage is available\"\n      ],\n   "
+  }
+}

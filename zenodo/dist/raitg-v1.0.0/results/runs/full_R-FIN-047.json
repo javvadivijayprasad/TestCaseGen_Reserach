@@ -1,0 +1,170 @@
+{
+  "req": {
+    "id": "R-FIN-047",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Card PIN change (boundary variant)",
+    "statement": "A customer shall change their card PIN at most 5 times per 24-hour window. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer changes PIN"
+    ],
+    "expected_outcomes": [
+      "PIN updated"
+    ],
+    "error_pathways": [
+      "429 when rate limit exceeded"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/pin"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-047",
+    "reasoning": "The requirement enforces a rate limit of at most 5 PIN changes per 24-hour window for a given card. Key test partitions are: (1) a valid single PIN change within the window (EP positive), (2) exactly the 5th change in the window (BVA upper boundary - still allowed, kind=boundary), (3) the 6th change in the window (boundary+1 - must be rejected with 429, kind=boundary per BVA since it is the first value outside the valid range), (4) a PIN change on a card not belonging to the caller (NEG authorization, kind=negative), and (5) a state transition from under-limit to at-limit to over-limit (STC). The violation was that test[2] had kind=negative but heuristic=BVA; BVA boundary+1 tests are classified as kind=boundary because they probe the boundary of the input domain, not a general negative equivalence class. Fixed by changing kind to boundary for that test.",
+    "tests": [
+      {
+        "name": "test_single_pin_change_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated with valid token",
+          "Card belongs to the authenticated customer",
+          "No PIN changes have been made in the current 24-hour window for this card"
+        ],
+        "actions": [
+          "PATCH /cards/{id}/pin with a valid new PIN payload"
+        ],
+        "expected": [
+          "HTTP 200 or 204 response",
+          "Response body (if any) confirms PIN updated"
+        ],
+        "trace": [
+          "R-FIN-047: PIN change allowed within limit",
+          "EP: representative value from the valid-change partition (1 of 5)"
+        ],
+        "executable": "def test_single_pin_change_succeeds(fresh_card, auth_headers):\n    card_id = fresh_card[\"id\"]\n    payload = {\"pin\": \"1234\"}\n    resp = <api_client>.patch(\n        f\"/cards/{card_id}/pin\",\n        json=payload,\n        headers=auth_headers,\n    )\n    assert resp.status_code in (200, 204), (\n        f\"Expected 200/204, got {resp.status_code}: {resp.text}\"\n    )\n"
+      },
+      {
+        "name": "test_fifth_pin_change_is_allowed",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated with valid token",
+          "Card belongs to the authenticated customer",
+          "Exactly 4 PIN changes have already been made within the current 24-hour window"
+        ],
+        "actions": [
+          "Exhaust 4 PIN changes via helper",
+          "PATCH /cards/{id}/pin for the 5th time"
+        ],
+        "expected": [
+          "HTTP 200 or 204 on the 5th request",
+          "Rate-limit counter is now at its maximum (5)"
+        ],
+        "trace": [
+          "R-FIN-047: at most 5 changes per 24 h",
+          "BVA: exact upper boundary value (N = 5) must still succeed"
+        ],
+        "executable": "def test_fifth_pin_change_is_allowed(fresh_card, auth_headers):\n    card_id = fresh_card[\"id\"]\n    pins = [\"1111\", \"2222\", \"3333\", \"4444\"]\n    for pin in pins:\n        r = <api_client>.patch(\n            f\"/cards/{card_id}/pin\",\n            json={\"pin\": pin},\n            headers=auth_headers,\n        )\n        assert r.status_code in (200, 204), (\n            f\"Pre-condition setup failed on change {pin}: {r.status_code}\"\n        )\n    resp = <api_client>.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"pin\": \"5555\"},\n        headers=auth_headers,\n    )\n    assert resp.status_code in (200, 204), (\n        f\"5th change should succeed; got {resp.status_code}: {resp.text}\"\n    )\n"
+      },
+      {
+        "name": "test_sixth_pin_change_returns_429",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated with valid token",
+          "Card belongs to the authenticated customer",
+          "Exactly 5 PIN changes have already been made within the current 24-hour window"
+        ],
+        "actions": [
+          "Exhaust 5 PIN changes via helper",
+          "PATCH /cards/{id}/pin for the 6th time"
+        ],
+        "expected": [
+          "HTTP 429 Too Many Requests",
+          "Response body contains rate-limit error message or Retry-After header"
+        ],
+        "trace": [
+          "R-FIN-047: error pathway - 429 when rate limit exceeded",
+          "BVA: upper boundary + 1 (N = 6) must be rejected; first value outside the valid partition"
+        ],
+        "executable": "def test_sixth_pin_change_returns_429(fresh_card, auth_headers):\n    card_id = fresh_card[\"id\"]\n    pins = [\"1111\", \"2222\", \"3333\", \"4444\", \"5555\"]\n    for pin in pins:\n        r = <api_client>.patch(\n            f\"/cards/{card_id}/pin\",\n            json={\"pin\": pin},\n            headers=auth_headers,\n        )\n        assert r.status_code in (200, 204), (\n            f\"Setup failed on change {pin}: {r.status_code}\"\n        )\n    resp = <api_client>.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"pin\": \"6666\"},\n        headers=auth_headers,\n    )\n    assert resp.status_code == 429, (\n        f\"Expected 429, got {resp.status_code}: {resp.text}\"\n    )\n"
+      },
+      {
+        "name": "test_pin_change_on_unowned_card_is_forbidden",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Two distinct authenticated customers exist: owner and attacker",
+          "Card belongs to owner, not to attacker",
+          "No PIN changes made in the current window for this card"
+        ],
+        "actions": [
+          "PATCH /cards/{owner_card_id}/pin using attacker auth token"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden or 404 Not Found",
+          "PIN is NOT changed"
+        ],
+        "trace": [
+          "R-FIN-047: precondition - card belongs to caller",
+          "NEG: unauthorized access attempt on another customer's card"
+        ],
+        "executable": "def test_pin_change_on_unowned_card_is_forbidden(\n    owner_card, attacker_auth_headers\n):\n    card_id = owner_card[\"id\"]\n    resp = <api_client>.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"pin\": \"9999\"},\n        headers=attacker_auth_headers,\n    )\n    assert resp.status_code in (403, 404), (\n        f\"Expected 403 or 404 for unowned card, got {resp.status_code}: {resp.text}\"\n    )\n"
+      },
+      {
+        "name": "test_state_transition_under_limit_to_at_limit_to_over_limit",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated with valid token",
+          "Card belongs to the authenticated customer",
+          "Rate-limit counter is reset (0 changes in current 24-hour window)"
+        ],
+        "actions": [
+          "Perform PIN changes 1 through 5 and assert each returns 200/204 (under-limit -> at-limit states)",
+          "Perform the 6th PIN change and assert it returns 429 (at-limit -> over-limit transition)"
+        ],
+        "expected": [
+          "Requests 1-5 each return HTTP 200 or 204",
+          "Request 6 returns HTTP 429",
+          "System transitions correctly through: idle -> [1..4 changes] -> at_limit -> blocked"
+        ],
+        "trace": [
+          "R-FIN-047: full state lifecycle of rate-limit enforcement",
+          "STC: covers idle, incrementing, at-boundary, and exceeded states"
+        ],
+        "executable": "def test_state_transition_under_to_at_to_over_limit(\n    fresh_card, auth_headers\n):\n    card_id = fresh_card[\"id\"]\n    for i, pin in enumerate([\"1111\",\"2222\",\"3333\",\"4444\",\"5555\"], start=1):\n        r = <api_client>.patch(\n            f\"/cards/{card_id}/pin\",\n            json={\"pin\": pin},\n            headers=auth_headers,\n        )\n        assert r.status_code in (200, 204), (\n            f\"Change {i} should succeed; got {r.status_code}\"\n        )\n    over = <api_client>.patch(\n        f\"/cards/{card_id}/pin\",\n        json={\"pin\": \"6666\"},\n        headers=auth_headers,\n    )\n    assert over.status_code == 429, (\n        f\"6th change must be blocked; got {over.status_code}: {over.text}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-047",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 990,
+    "output_tokens": 2515,
+    "latency_ms": 33515,
+    "wall_ms": 33515,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-047\",\n  \"reasoning\": \"The requirement enforces a rate limit of at most 5 PIN changes per 24-hour window for a given card. Key test partitions are: (1) a valid single PIN change within the window (EP positive), (2) exactly the 5th change in the window (BVA upper boundary - still allowed), (3) the 6th change in the window (BVA upper boundary + 1 - must be rejected with 429), (4) a PIN change on a card not belonging to the caller (NEG authorization), and (5) a state transition from under-limit to at-limit to over-limit (STC). Each test resets rate-limit state via a fixture that issues a unique card or resets the counter through an admin endpoint, ensuring idempotency. Internal double-quotes in JSON payloads are escaped with backslash.\",\n  \"tests\": [\n    {\n      \"name\": \"test_single_pin_change_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated with valid token\",\n        \"Card belongs to the authenticated customer\",\n        \"No PIN changes have been made in the current 24-hour window for this card\"\n      ],\n      \"actions\": [\n        \"PATCH /cards/{id}/pin with a valid new PIN payload\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 response\",\n        \"Response body (if any) confirms PIN updated\"\n      ],\n      \"trace\": [\n        \"R-FIN-047: PIN change allowed within limit\",\n        \"EP: representative value from the valid-change partition (1 of 5)\"\n      ],\n      \"executable\": \"def test_single_pin_change_succeeds(fresh_card, auth_headers):\\n    card_id = fresh_card[\\\"id\\\"]\\n    payload = {\\\"pin\\\": \\\"1234\\\"}\\n    resp = <api_client>.patch(\\n        f\\\"/cards/{card_id}/pin\\\",\\n        json=payload,\\n        headers=auth_headers,\\n    )\\n    assert resp.status_code in (200, 204), (\\n        f\\\"Expected 200/204, got {resp.status_code}: {resp.text}\\\"\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_fifth_pin_change_is_allowed\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Caller is authenticated with valid token\",\n        \"Card belongs to the authenticated customer\",\n        \"Exactly 4 PIN changes have already been made within the current 24-hour window\"\n      ],\n      \"actions\": [\n        \"Exhaust 4 PIN changes via helper\",\n        \"PATCH /cards/{id}/pin for the 5th time\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 on the 5th request\",\n        \"Rate-limit counter is now at its maximum (5)\"\n      ],\n      \"trace\": [\n        \"R-FIN-047: at most 5 changes per 24 h\",\n        \"BVA: exact upper boundary value (N = 5) must still succeed\"\n      ],\n      \"executable\": \"def test_fifth_pin_change_is_allowed(fresh_card, auth_headers):\\n    card_id = fresh_card[\\\"id\\\"]\\n    pins = [\\\"1111\\\", \\\"2222\\\", \\\"3333\\\", \\\"4444\\\"]\\n    for pin in pins:\\n        r = <api_client>.patch(\\n            f\\\"/cards/{card_id}/pin\\\",\\n            json={\\\"pin\\\": pin},\\n            headers=auth_headers,\\n        )\\n        assert r.status_code in (200, 204), (\\n            f\\\"Pre-condition setup failed on change {pin}: {r.status_code}\\\"\\n        )\\n    resp = <api_client>.patch(\\n        f\\\"/cards/{card_id}/pin\\\",\\n        json={\\\"pin\\\": \\\"5555\\\"},\\n        headers=auth_headers,\\n    )\\n    assert resp.status_code in (200, 204), (\\n        f\\\"5th change should succeed; got {resp.status_code}: {resp.text}\\\"\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_sixth_pin_change_returns_429\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Caller is authenticated with valid token\",\n        \"Card belongs to the authenticated customer\",\n        \"Exactly 5 PIN changes have already been made within the current 24-hour window\"\n      ],\n      \"actions\": [\n        \"Exhaust 5 PIN changes via helper\",\n        \"PATCH /cards/{id}/pin for the 6th time\"\n      ],\n      \"expected\": [\n        \"HTTP 429 Too Many Requests\",\n        \"Response body contains rate-limit error message or Retry-After header\"\n      "
+  }
+}

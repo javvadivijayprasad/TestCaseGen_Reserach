@@ -1,0 +1,175 @@
+{
+  "req": {
+    "id": "R-HLT-066",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Bulk data export (negative)",
+    "statement": "A provisioned client shall request a FHIR bulk export; large datasets shall be paginated with NDJSON output. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authorized bulk-client"
+    ],
+    "triggers": [
+      "client requests export"
+    ],
+    "expected_outcomes": [
+      "export job queued",
+      "NDJSON stream produced"
+    ],
+    "error_pathways": [
+      "403 when unauthorised"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/$export"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-066",
+    "reasoning": "R-HLT-066 mandates FHIR bulk export via /$export with NDJSON pagination for authorised clients and a 403 for unauthorised ones. Five test cases are designed: (1) EP-positive: authorised client triggers export and receives 202 with Content-Location; (2) NEG: unauthorised client receives 403; (3) BVA: export with exactly 1 record produces a single-line NDJSON file (lower boundary of pagination); (4) STC: a second kick-off while a job is already in-flight must be rejected (conflicting state transition); (5) DT: request with a missing mandatory _outputFormat element triggers a 400. Each test is self-contained via fixtures and cleanup hooks.",
+    "tests": [
+      {
+        "name": "test_bulk_export_authorised_client_returns_202",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite is running and reachable",
+          "Client is provisioned with bulk-export scope",
+          "Bearer token is valid"
+        ],
+        "actions": [
+          "POST /$export with Accept: application/fhir+json and Prefer: respond-async",
+          "Capture HTTP status code and Content-Location header"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Content-Location header is present and points to a polling URL"
+        ],
+        "trace": [
+          "R-HLT-066: export job queued",
+          "R-HLT-066: authorised bulk-client precondition"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_bulk_export_authorised_client_returns_202(fhir_base_url, authorised_headers):\n    resp = requests.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\n            **authorised_headers,\n            \"Accept\": \"application/fhir+json\",\n            \"Prefer\": \"respond-async\",\n        },\n    )\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}: {resp.text}\"\n    assert \"Content-Location\" in resp.headers, \"Content-Location header missing\"\n    polling_url = resp.headers[\"Content-Location\"]\n    assert polling_url.startswith(\"http\"), f\"Unexpected polling URL: {polling_url}\""
+      },
+      {
+        "name": "test_bulk_export_unauthorised_client_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite is running and reachable",
+          "Client token lacks bulk-export scope or is entirely absent"
+        ],
+        "actions": [
+          "GET /$export with Accept: application/fhir+json, Prefer: respond-async and no/invalid Bearer token",
+          "Capture HTTP status code"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an OperationOutcome resource"
+        ],
+        "trace": [
+          "R-HLT-066: error pathway 403 when unauthorised"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_bulk_export_unauthorised_client_returns_403(fhir_base_url, unauthorised_headers):\n    resp = requests.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\n            **unauthorised_headers,\n            \"Accept\": \"application/fhir+json\",\n            \"Prefer\": \"respond-async\",\n        },\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\", (\n        f\"Expected OperationOutcome, got: {body.get('resourceType')}\"\n    )"
+      },
+      {
+        "name": "test_bulk_export_single_record_produces_one_line_ndjson",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite is running and reachable",
+          "Exactly 1 Patient resource exists in the test tenant",
+          "Client is provisioned with bulk-export scope"
+        ],
+        "actions": [
+          "GET /$export?_type=Patient with authorised headers and Prefer: respond-async",
+          "Poll Content-Location until status is 200",
+          "Download the first NDJSON output URL from the manifest",
+          "Count newline-delimited lines in the NDJSON body"
+        ],
+        "expected": [
+          "Export manifest lists exactly 1 output file for Patient",
+          "NDJSON file contains exactly 1 non-empty line",
+          "Each line is valid JSON with resourceType == Patient"
+        ],
+        "trace": [
+          "R-HLT-066: large datasets paginated with NDJSON output (lower boundary = 1 record)"
+        ],
+        "executable": "import pytest, requests, time, json as _json\n\ndef test_bulk_export_single_record_produces_one_line_ndjson(\n    fhir_base_url, authorised_headers, single_patient_tenant\n):\n    resp = requests.get(\n        f\"{fhir_base_url}/$export\",\n        params={\"_type\": \"Patient\"},\n        headers={**authorised_headers, \"Accept\": \"application/fhir+json\", \"Prefer\": \"respond-async\"},\n    )\n    assert resp.status_code == 202\n    poll_url = resp.headers[\"Content-Location\"]\n    manifest = <poll_until_complete>(poll_url, authorised_headers, timeout=30)\n    patient_outputs = [o for o in manifest[\"output\"] if o[\"type\"] == \"Patient\"]\n    assert len(patient_outputs) == 1, f\"Expected 1 Patient output, got {len(patient_outputs)}\"\n    ndjson_resp = requests.get(patient_outputs[0][\"url\"], headers=authorised_headers)\n    assert ndjson_resp.status_code == 200\n    lines = [l for l in ndjson_resp.text.splitlines() if l.strip()]\n    assert len(lines) == 1, f\"Expected 1 NDJSON line, got {len(lines)}\"\n    record = _json.loads(lines[0])\n    assert record[\"resourceType\"] == \"Patient\""
+      },
+      {
+        "name": "test_bulk_export_duplicate_kickoff_while_job_in_flight_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite is running and reachable",
+          "Client is provisioned with bulk-export scope",
+          "No existing in-flight export for this client"
+        ],
+        "actions": [
+          "GET /$export (first kick-off) \u2014 expect 202",
+          "Immediately GET /$export again (second kick-off) without cancelling the first",
+          "Capture HTTP status code of the second request"
+        ],
+        "expected": [
+          "First request returns 202",
+          "Second request returns 429 or 409 indicating conflicting state transition",
+          "Response body describes the conflict"
+        ],
+        "trace": [
+          "R-HLT-066: conflicting state transitions must be tested"
+        ],
+        "executable": "import pytest, requests\n\ndef test_bulk_export_duplicate_kickoff_while_job_in_flight_rejected(\n    fhir_base_url, authorised_headers\n):\n    export_headers = {\n        **authorised_headers,\n        \"Accept\": \"application/fhir+json\",\n        \"Prefer\": \"respond-async\",\n    }\n    first = requests.get(f\"{fhir_base_url}/$export\", headers=export_headers)\n    assert first.status_code == 202, f\"First kick-off failed: {first.status_code}\"\n    second = requests.get(f\"{fhir_base_url}/$export\", headers=export_headers)\n    assert second.status_code in (409, 429), (\n        f\"Expected 409/429 for duplicate kick-off, got {second.status_code}: {second.text}\"\n    )\n    body = second.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    <cancel_export_job>(first.headers.get(\"Content-Location\"), authorised_headers)"
+      },
+      {
+        "name": "test_bulk_export_missing_output_format_returns_400",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite is running and reachable",
+          "Client is provisioned with bulk-export scope",
+          "Request deliberately omits the _outputFormat parameter which the server mandates"
+        ],
+        "actions": [
+          "GET /$export with Accept header explicitly set to an unsupported media type and without _outputFormat",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Response body is an OperationOutcome with severity error",
+          "Diagnostics message references the missing or invalid element"
+        ],
+        "trace": [
+          "R-HLT-066: missing mandatory elements must be tested"
+        ],
+        "executable": "import pytest, requests\n\ndef test_bulk_export_missing_output_format_returns_400(\n    fhir_base_url, authorised_headers\n):\n    resp = requests.get(\n        f\"{fhir_base_url}/$export\",\n        params={\"_outputFormat\": \"\"},\n        headers={\n            **authorised_headers,\n            \"Accept\": \"application/fhir+json\",\n            \"Prefer\": \"respond-async\",\n        },\n    )\n    assert resp.status_code == 400, f\"Expected 400, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"severity\") == \"error\" for i in issues), (\n        f\"No error-severity issue found in: {issues}\"\n    )\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues).lower()\n    assert \"_outputformat\" in diagnostics or \"output\" in diagnostics, (\n        f\"Diagnostics do not mention missing element: {diagnostics}\"\n    )"
+      }
+    ]
+  },
+  "req_id": "R-HLT-066",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1009,
+    "output_tokens": 2841,
+    "latency_ms": 36437,
+    "wall_ms": 36437,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-066\",\n  \"reasoning\": \"R-HLT-066 mandates FHIR bulk export via /$export with NDJSON pagination for authorised clients and a 403 for unauthorised ones. Five test cases are designed: (1) EP-positive: authorised client triggers export and receives 202 with Content-Location; (2) NEG: unauthorised client receives 403; (3) BVA: export with exactly 1 record produces a single-line NDJSON file (lower boundary of pagination); (4) STC: a second kick-off while a job is already in-flight must be rejected (conflicting state transition); (5) DT: request with a missing mandatory _outputFormat element triggers a 400. Each test is self-contained via fixtures and cleanup hooks.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_export_authorised_client_returns_202\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite is running and reachable\",\n        \"Client is provisioned with bulk-export scope\",\n        \"Bearer token is valid\"\n      ],\n      \"actions\": [\n        \"POST /$export with Accept: application/fhir+json and Prefer: respond-async\",\n        \"Capture HTTP status code and Content-Location header\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Content-Location header is present and points to a polling URL\"\n      ],\n      \"trace\": [\n        \"R-HLT-066: export job queued\",\n        \"R-HLT-066: authorised bulk-client precondition\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_bulk_export_authorised_client_returns_202(fhir_base_url, authorised_headers):\\n    resp = requests.get(\\n        f\\\"{fhir_base_url}/$export\\\",\\n        headers={\\n            **authorised_headers,\\n            \\\"Accept\\\": \\\"application/fhir+json\\\",\\n            \\\"Prefer\\\": \\\"respond-async\\\",\\n        },\\n    )\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}: {resp.text}\\\"\\n    assert \\\"Content-Location\\\" in resp.headers, \\\"Content-Location header missing\\\"\\n    polling_url = resp.headers[\\\"Content-Location\\\"]\\n    assert polling_url.startswith(\\\"http\\\"), f\\\"Unexpected polling URL: {polling_url}\\\"\"\n    },\n    {\n      \"name\": \"test_bulk_export_unauthorised_client_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite is running and reachable\",\n        \"Client token lacks bulk-export scope or is entirely absent\"\n      ],\n      \"actions\": [\n        \"GET /$export with Accept: application/fhir+json, Prefer: respond-async and no/invalid Bearer token\",\n        \"Capture HTTP status code\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an OperationOutcome resource\"\n      ],\n      \"trace\": [\n        \"R-HLT-066: error pathway 403 when unauthorised\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_bulk_export_unauthorised_client_returns_403(fhir_base_url, unauthorised_headers):\\n    resp = requests.get(\\n        f\\\"{fhir_base_url}/$export\\\",\\n        headers={\\n            **unauthorised_headers,\\n            \\\"Accept\\\": \\\"application/fhir+json\\\",\\n            \\\"Prefer\\\": \\\"respond-async\\\",\\n        },\\n    )\\n    assert resp.status_code == 403, f\\\"Expected 403, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\", (\\n        f\\\"Expected OperationOutcome, got: {body.get('resourceType')}\\\"\\n    )\"\n    },\n    {\n      \"name\": \"test_bulk_export_single_record_produces_one_line_ndjson\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"fhir-lite is running and reachable\",\n        \"Exactly 1 Patient resource exists in the test tenant\",\n        \"Client is provisioned with bulk-export scope\"\n      ],\n      \"actions\": [\n        \"GET /$export?_type=Patient with authorised headers and Prefer: respond-async\",\n        \"Poll Content-Location until status is 200\",\n        \"Download the first NDJSON output URL from the manifest\""
+  }
+}

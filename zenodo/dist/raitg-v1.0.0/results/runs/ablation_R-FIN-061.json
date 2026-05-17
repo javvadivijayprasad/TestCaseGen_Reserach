@@ -1,0 +1,215 @@
+{
+  "req": {
+    "id": "R-FIN-061",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Beneficiary management (negative variant)",
+    "statement": "A customer shall add a beneficiary which enters a 24-hour cooling-off period before it can receive transfers. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds beneficiary"
+    ],
+    "expected_outcomes": [
+      "beneficiary saved in pending state"
+    ],
+    "error_pathways": [
+      "409 if duplicate account"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/beneficiaries"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-061",
+    "reasoning": "R-FIN-061 covers beneficiary management with a 24-hour cooling-off period and several negative paths. Test selection: (1) EP positive \u2013 a valid, authenticated request creates a beneficiary in 'pending' state (HTTP 201); (2) NEG duplicate \u2013 re-submitting the same account number returns 409 Conflict; (3) BVA account-number length \u2013 submitting an account number at the maximum allowed boundary (typically 34 chars for IBAN) is accepted, while one character over is rejected; (4) NEG unauthorised \u2013 missing/invalid bearer token returns 401; (5) DT insufficient-funds / exceeded-limits \u2013 the API must reject a transfer attempt to a beneficiary still inside the 24-hour window, confirming the cooling-off state machine. Each test is self-contained, uses a dedicated fixture for auth and cleanup, and tears down any created resource in a finally block to preserve idempotency.",
+    "tests": [
+      {
+        "name": "test_add_beneficiary_valid_returns_201_pending",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Beneficiary account does not already exist for this customer"
+        ],
+        "actions": [
+          "POST /beneficiaries with valid account_number, sort_code, and account_name",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status == 'pending'",
+          "Response body contains cooling_off_ends_at timestamp ~24 h in the future",
+          "Response body contains a non-null beneficiary_id"
+        ],
+        "trace": [
+          "R-FIN-061: beneficiary saved in pending state",
+          "R-FIN-061: 24-hour cooling-off period begins on creation"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone, timedelta\n\ndef test_add_beneficiary_valid_returns_201_pending(auth_headers, api_base_url, cleanup_beneficiary):\n    payload = {\n        \"account_number\": \"12345678\",\n        \"sort_code\": \"01-02-03\",\n        \"account_name\": \"Alice Smith\"\n    }\n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"beneficiary_id\") is not None\n    cooling_off = datetime.fromisoformat(body[\"cooling_off_ends_at\"])\n    now = datetime.now(timezone.utc)\n    delta = cooling_off - now\n    assert timedelta(hours=23, minutes=55) <= delta <= timedelta(hours=24, minutes=5)\n    cleanup_beneficiary(body[\"beneficiary_id\"])\n"
+      },
+      {
+        "name": "test_add_duplicate_beneficiary_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "A beneficiary with account_number '12345678' already exists for this customer"
+        ],
+        "actions": [
+          "POST /beneficiaries with the same account_number used in the existing record",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains error code DUPLICATE_BENEFICIARY or equivalent"
+        ],
+        "trace": [
+          "R-FIN-061: Error pathway \u2013 409 if duplicate account"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_add_duplicate_beneficiary_returns_409(auth_headers, api_base_url, existing_beneficiary):\n    # existing_beneficiary fixture pre-creates account_number '12345678' and yields its id\n    payload = {\n        \"account_number\": existing_beneficiary[\"account_number\"],\n        \"sort_code\": existing_beneficiary[\"sort_code\"],\n        \"account_name\": \"Alice Smith Duplicate\"\n    }\n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_code = body.get(\"error_code\", body.get(\"code\", \"\"))\n    assert \"DUPLICATE\" in error_code.upper() or \"CONFLICT\" in error_code.upper()\n"
+      },
+      {
+        "name": "test_add_beneficiary_max_length_account_number_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "No existing beneficiary with the 34-character IBAN account_number"
+        ],
+        "actions": [
+          "POST /beneficiaries with account_number of exactly 34 characters (IBAN max)",
+          "Capture HTTP response status"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body status == 'pending'"
+        ],
+        "trace": [
+          "R-FIN-061: boundary \u2013 maximum valid account_number length (34 chars, IBAN)",
+          "R-FIN-061: beneficiary saved in pending state"
+        ],
+        "executable": "import pytest\nimport requests\n\nMAX_ACCOUNT_LEN = 34  # IBAN maximum per ISO 13616\n\ndef test_add_beneficiary_max_length_account_number_accepted(auth_headers, api_base_url, cleanup_beneficiary):\n    account_number = \"GB\" + \"9\" * (MAX_ACCOUNT_LEN - 2)  # 34 chars total\n    assert len(account_number) == MAX_ACCOUNT_LEN\n    payload = {\n        \"account_number\": account_number,\n        \"sort_code\": \"20-00-00\",\n        \"account_name\": \"BVA Boundary User\"\n    }\n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    cleanup_beneficiary(body[\"beneficiary_id\"])\n"
+      },
+      {
+        "name": "test_add_beneficiary_over_max_length_account_number_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token"
+        ],
+        "actions": [
+          "POST /beneficiaries with account_number of 35 characters (one over IBAN max)",
+          "Capture HTTP response status and error body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity or HTTP 400 Bad Request",
+          "Response body contains a validation error referencing account_number"
+        ],
+        "trace": [
+          "R-FIN-061: boundary \u2013 one character beyond maximum account_number length (35 chars)"
+        ],
+        "executable": "import pytest\nimport requests\n\nOVER_MAX_ACCOUNT_LEN = 35  # one beyond IBAN max of 34\n\ndef test_add_beneficiary_over_max_length_account_number_rejected(auth_headers, api_base_url):\n    account_number = \"GB\" + \"9\" * (OVER_MAX_ACCOUNT_LEN - 2)  # 35 chars total\n    assert len(account_number) == OVER_MAX_ACCOUNT_LEN\n    payload = {\n        \"account_number\": account_number,\n        \"sort_code\": \"20-00-00\",\n        \"account_name\": \"BVA Over-Boundary User\"\n    }\n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code in (400, 422), (\n        f\"Expected 400 or 422, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    errors = str(body).lower()\n    assert \"account_number\" in errors or \"account number\" in errors\n"
+      },
+      {
+        "name": "test_add_beneficiary_unauthenticated_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No authentication token is provided"
+        ],
+        "actions": [
+          "POST /beneficiaries with a valid payload but without Authorization header",
+          "Capture HTTP response status"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response body contains an authentication error message"
+        ],
+        "trace": [
+          "R-FIN-061: Error pathway \u2013 unauthorised",
+          "R-FIN-061: Precondition \u2013 authenticated (violated deliberately)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_add_beneficiary_unauthenticated_returns_401(api_base_url):\n    payload = {\n        \"account_number\": \"87654321\",\n        \"sort_code\": \"99-88-77\",\n        \"account_name\": \"Unauth User\"\n    }\n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload\n        # deliberately omit auth headers\n    )\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_text = str(body).lower()\n    assert \"unauthorized\" in error_text or \"unauthenticated\" in error_text or \"token\" in error_text\n"
+      },
+      {
+        "name": "test_transfer_to_pending_beneficiary_blocked_by_cooling_off",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "A beneficiary was just added and is in 'pending' (cooling-off) state",
+          "Customer account has sufficient funds"
+        ],
+        "actions": [
+          "POST /beneficiaries to create a new beneficiary (status = pending)",
+          "Immediately POST /transfers targeting the newly created beneficiary_id",
+          "Capture HTTP response status for the transfer attempt"
+        ],
+        "expected": [
+          "Beneficiary creation returns HTTP 201 with status == 'pending'",
+          "Transfer attempt returns HTTP 403 Forbidden or HTTP 422 Unprocessable Entity",
+          "Response body references cooling-off period restriction"
+        ],
+        "trace": [
+          "R-FIN-061: 24-hour cooling-off period before beneficiary can receive transfers",
+          "R-FIN-061: State transition \u2013 pending state blocks outbound transfers"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_transfer_to_pending_beneficiary_blocked_by_cooling_off(auth_headers, api_base_url, cleanup_beneficiary):\n    ben_payload = {\n        \"account_number\": \"55556666\",\n        \"sort_code\": \"11-22-33\",\n        \"account_name\": \"Cooling Off Target\"\n    }\n    ben_resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=ben_payload,\n        headers=auth_headers\n    )\n    assert ben_resp.status_code == 201\n    ben_body = ben_resp.json()\n    assert ben_body[\"status\"] == \"pending\"\n    beneficiary_id = ben_body[\"beneficiary_id\"]\n    transfer_payload = {\n        \"beneficiary_id\": beneficiary_id,\n        \"amount\": 100,\n        \"currency\": \"GBP\",\n        \"reference\": \"cooling-off-test\"\n    }\n    transfer_resp = requests.post(\n        f\"{api_base_url}/transfers\",\n        json=transfer_payload,\n        headers=auth_headers\n    )\n    assert transfer_resp.status_code in (403, 422), (\n        f\"Expected 403 or 422, got {transfer_resp.status_code}: {transfer_resp.text}\"\n    )\n    body = transfer_resp.json()\n    assert \"cooling\" in str(body).lower() or \"pending\" in str(body).lower()\n    cleanup_beneficiary(beneficiary_id)\n"
+      },
+      {
+        "name": "test_add_beneficiary_decision_table_insufficient_funds_and_limit_exceeded",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Customer account balance is 0 (insufficient funds condition)",
+          "Daily transfer limit has been reached for the customer"
+        ],
+        "actions": [
+          "POST /beneficiaries with a valid payload under zero-balance, limit-exceeded account",
+          "Attempt POST /transfers to an active beneficiary with amount exceeding daily limit",
+          "Capture HTTP response status and error codes for each call"
+        ],
+        "expected": [
+          "Beneficiary POST returns 201 (adding beneficiary itself is not funds-gated)",
+          "Transfer POST returns 422 or 403 with error code indicating INSUFFICIENT_FUNDS or LIMIT_EXCEEDED"
+        ],
+        "trace": [
+          "R-FIN-061: Negative paths \u2013 insufficient funds and exceeded limits",
+          "R-FIN-061: Decision table \u2013 both blocking conditions active simultaneously"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_add_beneficiary_decision_table_insufficient_funds_and_limit_exceeded(\n    zero_balance_auth_headers, api_base_url, cleanup_beneficiary, active_beneficiary\n):\n    # Step 1: beneficiary creation is not funds-gated\n    ben_payload = {\n        \"account_number\": \"00001111\",\n        \"sort_code\": \"44-55-66\",\n        \"account_name\": \"DT Test User\"\n    }\n    ben_resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=ben_payload,\n        headers=zero_balance_auth_headers\n    )\n    assert ben_resp.status_code == 201\n    ben_id = ben_resp.json()[\"beneficiary_id\"]\n    # Step 2: attempt transfer \u2013 should fail on funds/limit\n    transfer_payload = {\n        \"beneficiary_id\": active_beneficiary[\"beneficiary_id\"],\n        \"amount\": 999999,\n        \"currency\": \"GBP\",\n        \"reference\": \"dt-neg-test\"\n    }\n    tx_resp = requests.post(\n        f\"{api_base_url}/transfers\",\n        json=transfer_payload,\n        headers=zero_balance_auth_headers\n    )\n    assert tx_resp.status_code in (403, 422), (\n        f\"Expected 403/422, got {tx_resp.status_code}: {tx_resp.text}\"\n    )\n    error_code = str(tx_resp.json()).upper()\n    assert \"INSUFFICIENT\" in error_code or \"LIMIT\" in error_code or \"EXCEEDED\" in error_code\n    cleanup_beneficiary(ben_id)\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-061",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[5] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 4210,
+    "latency_ms": 44564,
+    "wall_ms": 44564,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-061\",\n  \"reasoning\": \"R-FIN-061 covers beneficiary management with a 24-hour cooling-off period and several negative paths. Test selection: (1) EP positive \u2013 a valid, authenticated request creates a beneficiary in 'pending' state (HTTP 201); (2) NEG duplicate \u2013 re-submitting the same account number returns 409 Conflict; (3) BVA account-number length \u2013 submitting an account number at the maximum allowed boundary (typically 34 chars for IBAN) is accepted, while one character over is rejected; (4) NEG unauthorised \u2013 missing/invalid bearer token returns 401; (5) DT insufficient-funds / exceeded-limits \u2013 the API must reject a transfer attempt to a beneficiary still inside the 24-hour window, confirming the cooling-off state machine. Each test is self-contained, uses a dedicated fixture for auth and cleanup, and tears down any created resource in a finally block to preserve idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_add_beneficiary_valid_returns_201_pending\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"Beneficiary account does not already exist for this customer\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with valid account_number, sort_code, and account_name\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status == 'pending'\",\n        \"Response body contains cooling_off_ends_at timestamp ~24 h in the future\",\n        \"Response body contains a non-null beneficiary_id\"\n      ],\n      \"trace\": [\n        \"R-FIN-061: beneficiary saved in pending state\",\n        \"R-FIN-061: 24-hour cooling-off period begins on creation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_add_beneficiary_valid_returns_201_pending(auth_headers, api_base_url, cleanup_beneficiary):\\n    payload = {\\n        \\\"account_number\\\": \\\"12345678\\\",\\n        \\\"sort_code\\\": \\\"01-02-03\\\",\\n        \\\"account_name\\\": \\\"Alice Smith\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{api_base_url}/beneficiaries\\\",\\n        json=payload,\\n        headers=auth_headers\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert body.get(\\\"beneficiary_id\\\") is not None\\n    cooling_off = datetime.fromisoformat(body[\\\"cooling_off_ends_at\\\"])\\n    now = datetime.now(timezone.utc)\\n    delta = cooling_off - now\\n    assert timedelta(hours=23, minutes=55) <= delta <= timedelta(hours=24, minutes=5)\\n    cleanup_beneficiary(body[\\\"beneficiary_id\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_add_duplicate_beneficiary_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"A beneficiary with account_number '12345678' already exists for this customer\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with the same account_number used in the existing record\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response body contains error code DUPLICATE_BENEFICIARY or equivalent\"\n      ],\n      \"trace\": [\n        \"R-FIN-061: Error pathway \u2013 409 if duplicate account\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_add_duplicate_beneficiary_returns_409(auth_headers, api_base_url, existing_beneficiary):\\n    # existing_beneficiary fixture pre-creates account_number '12345678' and yields its id\\n    payload = {\\n        \\\"account_number\\\": existing_beneficiary[\\\"account_number\\\"],\\n        \\\"sort_code\\\": existing_beneficiary[\\\"sort_code\\\"],\\n        \\\"account_name\\\": \\\"Alice Smith Duplicate\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{api_base_url}/benefici"
+  }
+}

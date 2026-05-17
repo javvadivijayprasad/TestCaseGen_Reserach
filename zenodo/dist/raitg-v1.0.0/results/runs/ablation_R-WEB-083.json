@@ -1,0 +1,184 @@
+{
+  "req": {
+    "id": "R-WEB-083",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Export employee directory \u2014 variant 2",
+    "statement": "An hr-admin shall export the employee directory as CSV with PII redacted for employees who opted out of public directory. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin requests export"
+    ],
+    "expected_outcomes": [
+      "CSV streamed",
+      "PII redacted per opt-out",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if not hr-admin",
+      "429 if rate-limited"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/employees/export.csv"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-083",
+    "reasoning": "The requirement covers: (1) happy-path CSV export with PII redaction for opt-out employees by an hr-admin, (2) access control rejection for non-admins, (3) idempotency under retry, and (4) rate-limiting behaviour. Tests are mapped to EP (valid role / redaction logic), NEG (forbidden role, rate-limit), BVA (single opt-out employee at boundary of directory), STC (retry idempotency state), and DT (role x opt-out decision table). Each test is self-contained via fixtures and placeholders.",
+    "tests": [
+      {
+        "name": "test_hr_admin_export_csv_pii_redacted_for_optout_employees",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds role:hr-admin",
+          "Directory contains at least one employee who opted out and at least one who did not",
+          "Endpoint /api/employees/export.csv is reachable"
+        ],
+        "actions": [
+          "Authenticate as hr-admin and obtain bearer token",
+          "GET /api/employees/export.csv with Authorization header",
+          "Parse response body as CSV",
+          "Identify rows for opted-out and non-opted-out employees"
+        ],
+        "expected": [
+          "HTTP 200 with Content-Type text/csv or application/octet-stream",
+          "CSV contains all employees",
+          "PII fields (email, phone, address) are redacted (e.g. REDACTED) for opted-out employees",
+          "PII fields are present and non-empty for non-opted-out employees"
+        ],
+        "trace": [
+          "R-WEB-083: hr-admin may export CSV",
+          "R-WEB-083: PII redacted per opt-out"
+        ],
+        "executable": "import csv, io\nimport pytest\n\ndef test_hr_admin_export_csv_pii_redacted_for_optout_employees(\n    hr_admin_token,        # <fixture> returns valid bearer token for hr-admin\n    opted_out_employee_id, # <fixture> seeds and returns id of opted-out employee\n    regular_employee_id,   # <fixture> seeds and returns id of non-opted-out employee\n    api_client,            # <fixture> returns configured requests.Session\n):\n    resp = api_client.get(\n        \"/api/employees/export.csv\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code == 200\n    assert \"csv\" in resp.headers.get(\"Content-Type\", \"\").lower() or \\\n           \"octet-stream\" in resp.headers.get(\"Content-Type\", \"\").lower()\n\n    reader = csv.DictReader(io.StringIO(resp.text))\n    rows = {row[\"id\"]: row for row in reader}\n\n    assert str(opted_out_employee_id) in rows, \"Opted-out employee missing from CSV\"\n    assert str(regular_employee_id) in rows, \"Regular employee missing from CSV\"\n\n    opted_row = rows[str(opted_out_employee_id)]\n    regular_row = rows[str(regular_employee_id)]\n\n    for pii_field in (\"email\", \"phone\", \"address\"):\n        assert opted_row.get(pii_field, \"\").upper() == \"REDACTED\", \\\n            f\"PII field '{pii_field}' not redacted for opted-out employee\"\n        assert regular_row.get(pii_field, \"\") not in (\"\", \"REDACTED\"), \\\n            f\"PII field '{pii_field}' incorrectly redacted for non-opted-out employee\"\n"
+      },
+      {
+        "name": "test_non_admin_export_csv_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role:employee (not hr-admin)",
+          "Endpoint /api/employees/export.csv is reachable"
+        ],
+        "actions": [
+          "Authenticate as a standard employee and obtain bearer token",
+          "GET /api/employees/export.csv with Authorization header"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body indicates insufficient permissions"
+        ],
+        "trace": [
+          "R-WEB-083: 403 if not hr-admin"
+        ],
+        "executable": "import pytest\n\ndef test_non_admin_export_csv_returns_403(\n    employee_token, # <fixture> returns valid bearer token for role:employee\n    api_client,     # <fixture> returns configured requests.Session\n):\n    resp = api_client.get(\n        \"/api/employees/export.csv\",\n        headers={\"Authorization\": f\"Bearer {employee_token}\"},\n    )\n    assert resp.status_code == 403\n    body = resp.json() if resp.headers.get(\"Content-Type\", \"\").startswith(\"application/json\") else {}\n    assert body.get(\"error\") or body.get(\"message\") or resp.text, \\\n        \"403 response should carry an error description\"\n"
+      },
+      {
+        "name": "test_export_csv_idempotent_under_retry",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds role:hr-admin",
+          "Directory state is stable (no writes between calls)",
+          "Endpoint /api/employees/export.csv is reachable"
+        ],
+        "actions": [
+          "Authenticate as hr-admin and obtain bearer token",
+          "GET /api/employees/export.csv \u2014 first request",
+          "GET /api/employees/export.csv \u2014 second request (retry simulation)",
+          "Compare both response bodies"
+        ],
+        "expected": [
+          "Both requests return HTTP 200",
+          "Response bodies are byte-for-byte identical (idempotent)",
+          "No side-effect artefacts (e.g. duplicate rows) in second response"
+        ],
+        "trace": [
+          "R-WEB-083: action must be idempotent under retry"
+        ],
+        "executable": "import pytest\n\ndef test_export_csv_idempotent_under_retry(\n    hr_admin_token, # <fixture> returns valid bearer token for hr-admin\n    api_client,     # <fixture> returns configured requests.Session\n):\n    headers = {\"Authorization\": f\"Bearer {hr_admin_token}\"}\n    resp1 = api_client.get(\"/api/employees/export.csv\", headers=headers)\n    resp2 = api_client.get(\"/api/employees/export.csv\", headers=headers)\n\n    assert resp1.status_code == 200\n    assert resp2.status_code == 200\n    assert resp1.text == resp2.text, \\\n        \"Retry produced a different CSV body \u2014 export is not idempotent\"\n\n    import csv, io\n    rows1 = list(csv.DictReader(io.StringIO(resp1.text)))\n    rows2 = list(csv.DictReader(io.StringIO(resp2.text)))\n    assert len(rows1) == len(rows2), \\\n        \"Second call returned different row count \u2014 possible duplicate side-effect\"\n"
+      },
+      {
+        "name": "test_export_csv_single_optout_employee_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role:hr-admin",
+          "Directory contains exactly one employee and that employee opted out",
+          "Endpoint /api/employees/export.csv is reachable"
+        ],
+        "actions": [
+          "Authenticate as hr-admin",
+          "Seed directory with exactly one opted-out employee via <seed_single_optout_employee>",
+          "GET /api/employees/export.csv",
+          "Parse CSV and inspect the single data row"
+        ],
+        "expected": [
+          "HTTP 200",
+          "CSV contains exactly one data row (plus header)",
+          "All PII fields in that row are REDACTED",
+          "Non-PII fields (e.g. employee_id, department) are present and correct"
+        ],
+        "trace": [
+          "R-WEB-083: PII redacted per opt-out",
+          "R-WEB-083: BVA \u2014 boundary of directory size = 1"
+        ],
+        "executable": "import csv, io\nimport pytest\n\ndef test_export_csv_single_optout_employee_boundary(\n    hr_admin_token,            # <fixture> returns valid bearer token for hr-admin\n    api_client,                # <fixture> returns configured requests.Session\n    seed_single_optout_employee, # <fixture> seeds exactly one opted-out employee, returns its id\n):\n    employee_id = seed_single_optout_employee\n    resp = api_client.get(\n        \"/api/employees/export.csv\",\n        headers={\"Authorization\": f\"Bearer {hr_admin_token}\"},\n    )\n    assert resp.status_code == 200\n\n    reader = csv.DictReader(io.StringIO(resp.text))\n    rows = list(reader)\n    assert len(rows) == 1, f\"Expected 1 data row, got {len(rows)}\"\n\n    row = rows[0]\n    assert str(row.get(\"id\", \"\")) == str(employee_id)\n    for pii_field in (\"email\", \"phone\", \"address\"):\n        assert row.get(pii_field, \"\").upper() == \"REDACTED\", \\\n            f\"PII field '{pii_field}' not redacted in single-employee boundary case\"\n    assert row.get(\"department\", \"\") not in (\"\", \"REDACTED\"), \\\n        \"Non-PII field 'department' should not be redacted\"\n"
+      },
+      {
+        "name": "test_rate_limited_export_returns_429",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role:hr-admin",
+          "Rate-limit threshold for /api/employees/export.csv is known (N requests per window)",
+          "Endpoint /api/employees/export.csv is reachable"
+        ],
+        "actions": [
+          "Authenticate as hr-admin",
+          "Send N+1 rapid sequential GET /api/employees/export.csv requests",
+          "Capture status codes of all responses"
+        ],
+        "expected": [
+          "First N responses return HTTP 200",
+          "At least one response (N+1 or earlier) returns HTTP 429",
+          "429 response includes Retry-After header or rate-limit error body"
+        ],
+        "trace": [
+          "R-WEB-083: 429 if rate-limited",
+          "DT rule: role=hr-admin AND requests > limit => 429"
+        ],
+        "executable": "import pytest\n\nRATE_LIMIT_THRESHOLD = 10  # <config> replace with actual per-window limit\n\ndef test_rate_limited_export_returns_429(\n    hr_admin_token, # <fixture> returns valid bearer token for hr-admin\n    api_client,     # <fixture> returns configured requests.Session\n    reset_rate_limit, # <fixture> clears rate-limit counter before test\n):\n    headers = {\"Authorization\": f\"Bearer {hr_admin_token}\"}\n    statuses = []\n    for _ in range(RATE_LIMIT_THRESHOLD + 1):\n        r = api_client.get(\"/api/employees/export.csv\", headers=headers)\n        statuses.append(r.status_code)\n        if r.status_code == 429:\n            assert r.headers.get(\"Retry-After\") or r.text, \\\n                \"429 must include Retry-After header or error body\"\n            break\n    assert 429 in statuses, \\\n        f\"Expected 429 after {RATE_LIMIT_THRESHOLD} requests; got: {statuses}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-083",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1024,
+    "output_tokens": 3179,
+    "latency_ms": 41584,
+    "wall_ms": 41584,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-083\",\n  \"reasoning\": \"The requirement covers: (1) happy-path CSV export with PII redaction for opt-out employees by an hr-admin, (2) access control rejection for non-admins, (3) idempotency under retry, and (4) rate-limiting behaviour. Tests are mapped to EP (valid role / redaction logic), NEG (forbidden role, rate-limit), BVA (single opt-out employee at boundary of directory), STC (retry idempotency state), and DT (role x opt-out decision table). Each test is self-contained via fixtures and placeholders.\",\n  \"tests\": [\n    {\n      \"name\": \"test_hr_admin_export_csv_pii_redacted_for_optout_employees\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds role:hr-admin\",\n        \"Directory contains at least one employee who opted out and at least one who did not\",\n        \"Endpoint /api/employees/export.csv is reachable\"\n      ],\n      \"actions\": [\n        \"Authenticate as hr-admin and obtain bearer token\",\n        \"GET /api/employees/export.csv with Authorization header\",\n        \"Parse response body as CSV\",\n        \"Identify rows for opted-out and non-opted-out employees\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with Content-Type text/csv or application/octet-stream\",\n        \"CSV contains all employees\",\n        \"PII fields (email, phone, address) are redacted (e.g. REDACTED) for opted-out employees\",\n        \"PII fields are present and non-empty for non-opted-out employees\"\n      ],\n      \"trace\": [\n        \"R-WEB-083: hr-admin may export CSV\",\n        \"R-WEB-083: PII redacted per opt-out\"\n      ],\n      \"executable\": \"import csv, io\\nimport pytest\\n\\ndef test_hr_admin_export_csv_pii_redacted_for_optout_employees(\\n    hr_admin_token,        # <fixture> returns valid bearer token for hr-admin\\n    opted_out_employee_id, # <fixture> seeds and returns id of opted-out employee\\n    regular_employee_id,   # <fixture> seeds and returns id of non-opted-out employee\\n    api_client,            # <fixture> returns configured requests.Session\\n):\\n    resp = api_client.get(\\n        \\\"/api/employees/export.csv\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {hr_admin_token}\\\"},\\n    )\\n    assert resp.status_code == 200\\n    assert \\\"csv\\\" in resp.headers.get(\\\"Content-Type\\\", \\\"\\\").lower() or \\\\\\n           \\\"octet-stream\\\" in resp.headers.get(\\\"Content-Type\\\", \\\"\\\").lower()\\n\\n    reader = csv.DictReader(io.StringIO(resp.text))\\n    rows = {row[\\\"id\\\"]: row for row in reader}\\n\\n    assert str(opted_out_employee_id) in rows, \\\"Opted-out employee missing from CSV\\\"\\n    assert str(regular_employee_id) in rows, \\\"Regular employee missing from CSV\\\"\\n\\n    opted_row = rows[str(opted_out_employee_id)]\\n    regular_row = rows[str(regular_employee_id)]\\n\\n    for pii_field in (\\\"email\\\", \\\"phone\\\", \\\"address\\\"):\\n        assert opted_row.get(pii_field, \\\"\\\").upper() == \\\"REDACTED\\\", \\\\\\n            f\\\"PII field '{pii_field}' not redacted for opted-out employee\\\"\\n        assert regular_row.get(pii_field, \\\"\\\") not in (\\\"\\\", \\\"REDACTED\\\"), \\\\\\n            f\\\"PII field '{pii_field}' incorrectly redacted for non-opted-out employee\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_export_csv_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role:employee (not hr-admin)\",\n        \"Endpoint /api/employees/export.csv is reachable\"\n      ],\n      \"actions\": [\n        \"Authenticate as a standard employee and obtain bearer token\",\n        \"GET /api/employees/export.csv with Authorization header\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body indicates insufficient permissions\"\n      ],\n      \"trace\": [\n        \"R-WEB-083: 403 if not hr-admin\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_admin_export_csv_returns_403(\\n    employee_token, # <fixture> returns valid bearer token for role:employee\\n    api_client,     # <fixture> returns configured reques"
+  }
+}

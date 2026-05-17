@@ -1,0 +1,168 @@
+{
+  "req": {
+    "id": "R-HLT-068",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Lab order routing (negative)",
+    "statement": "A clinician shall order a lab test; orders shall route to the patient's preferred lab when available. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician orders lab"
+    ],
+    "expected_outcomes": [
+      "order routed",
+      "status tracked"
+    ],
+    "error_pathways": [
+      "fallback to default lab when preferred unavailable"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ServiceRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-068",
+    "reasoning": "The violation was that test[3] (cancelling an already-cancelled order) had kind=negative but heuristic=STC. STC (State Transition Coverage) is a structural/positive-coverage heuristic and must not be paired with kind=negative. Fix: change heuristic from STC to NEG for that test, which correctly classifies it as a negative path exercising an invalid state transition. All other tests are preserved unchanged.",
+    "tests": [
+      {
+        "name": "test_lab_order_routes_to_preferred_lab",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated user holds role: clinician",
+          "Patient record exists with preferred lab set to 'LabCorp'",
+          "LabCorp is available and accepting orders"
+        ],
+        "actions": [
+          "POST /ServiceRequest with valid payload including subject, code, requester, and performer referencing preferred lab"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains status: 'active'",
+          "Response body performer references 'LabCorp'",
+          "Order ID is returned in Location header"
+        ],
+        "trace": [
+          "R-HLT-068 \u2013 positive routing path, preferred lab available"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/ServiceRequest\"\n\n@pytest.fixture\ndef clinician_headers():\n    return <auth_fixture>(role=\"clinician\")\n\n@pytest.fixture\ndef preferred_lab_payload():\n    return <build_service_request_payload>(\n        subject=\"Patient/p-001\",\n        code=\"58410-2\",\n        requester=\"Practitioner/prac-001\",\n        performer=\"Organization/LabCorp\"\n    )\n\ndef test_lab_order_routes_to_preferred_lab(clinician_headers, preferred_lab_payload):\n    resp = requests.post(BASE_URL, json=preferred_lab_payload, headers=clinician_headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"active\"\n    performers = [p[\"reference\"] for p in body.get(\"performer\", [])]\n    assert any(\"LabCorp\" in p for p in performers)\n    assert \"Location\" in resp.headers\n    <teardown_resource>(resp.headers[\"Location\"], clinician_headers)\n"
+      },
+      {
+        "name": "test_lab_order_denied_for_non_clinician_role",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user holds role: receptionist (not clinician)",
+          "Patient record exists"
+        ],
+        "actions": [
+          "POST /ServiceRequest with otherwise-valid payload using receptionist credentials"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains OperationOutcome with severity: 'error'",
+          "No ServiceRequest resource is persisted"
+        ],
+        "trace": [
+          "R-HLT-068 \u2013 negative path: permission denial"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/ServiceRequest\"\n\n@pytest.fixture\ndef receptionist_headers():\n    return <auth_fixture>(role=\"receptionist\")\n\n@pytest.fixture\ndef valid_payload():\n    return <build_service_request_payload>(\n        subject=\"Patient/p-002\",\n        code=\"58410-2\",\n        requester=\"Practitioner/prac-001\",\n        performer=\"Organization/LabCorp\"\n    )\n\ndef test_lab_order_denied_for_non_clinician_role(receptionist_headers, valid_payload):\n    resp = requests.post(BASE_URL, json=valid_payload, headers=receptionist_headers)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i[\"severity\"] == \"error\" for i in issues)\n    verify_resp = requests.get(\n        BASE_URL,\n        params={\"subject\": \"Patient/p-002\"},\n        headers=<admin_headers_fixture>()\n    )\n    assert verify_resp.json().get(\"total\", 0) == 0\n"
+      },
+      {
+        "name": "test_lab_order_rejected_when_mandatory_code_missing",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated user holds role: clinician",
+          "Patient record exists"
+        ],
+        "actions": [
+          "POST /ServiceRequest with payload missing the mandatory 'code' element"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "OperationOutcome returned with issue pointing to missing 'code'",
+          "No ServiceRequest resource is persisted"
+        ],
+        "trace": [
+          "R-HLT-068 \u2013 negative path: missing mandatory element"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/ServiceRequest\"\n\n@pytest.fixture\ndef clinician_headers():\n    return <auth_fixture>(role=\"clinician\")\n\n@pytest.fixture\ndef payload_missing_code():\n    payload = <build_service_request_payload>(\n        subject=\"Patient/p-003\",\n        requester=\"Practitioner/prac-001\",\n        performer=\"Organization/LabCorp\"\n    )\n    payload.pop(\"code\", None)\n    return payload\n\ndef test_lab_order_rejected_when_mandatory_code_missing(clinician_headers, payload_missing_code):\n    resp = requests.post(BASE_URL, json=payload_missing_code, headers=clinician_headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues)\n    assert \"code\" in diagnostics.lower()\n"
+      },
+      {
+        "name": "test_cancelling_already_cancelled_order_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user holds role: clinician",
+          "A ServiceRequest exists with status: 'revoked' (already cancelled)"
+        ],
+        "actions": [
+          "PATCH /ServiceRequest/{id} attempting to set status to 'revoked' again"
+        ],
+        "expected": [
+          "HTTP 409 Conflict or 422 Unprocessable Entity",
+          "OperationOutcome returned describing invalid state transition",
+          "Existing resource status remains 'revoked'"
+        ],
+        "trace": [
+          "R-HLT-068 \u2013 negative path: conflicting state transition (revoke an already-revoked order)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/ServiceRequest\"\n\n@pytest.fixture\ndef clinician_headers():\n    return <auth_fixture>(role=\"clinician\")\n\n@pytest.fixture\ndef revoked_order_id(clinician_headers):\n    order_id = <create_and_cancel_order>(\n        subject=\"Patient/p-004\",\n        code=\"58410-2\",\n        headers=clinician_headers\n    )\n    return order_id\n\ndef test_cancelling_already_cancelled_order_rejected(clinician_headers, revoked_order_id):\n    patch_body = {\"resourceType\": \"ServiceRequest\", \"id\": revoked_order_id, \"status\": \"revoked\"}\n    resp = requests.patch(\n        f\"{BASE_URL}/{revoked_order_id}\",\n        json=patch_body,\n        headers=clinician_headers\n    )\n    assert resp.status_code in (409, 422)\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    get_resp = requests.get(f\"{BASE_URL}/{revoked_order_id}\", headers=clinician_headers)\n    assert get_resp.json()[\"status\"] == \"revoked\"\n"
+      },
+      {
+        "name": "test_lab_order_falls_back_to_default_when_preferred_unavailable",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated user holds role: clinician",
+          "Patient record exists with preferred lab set to 'LabCorp'",
+          "LabCorp is marked unavailable in the routing table",
+          "A default fallback lab 'DefaultLab' is configured"
+        ],
+        "actions": [
+          "POST /ServiceRequest with performer referencing unavailable 'LabCorp'",
+          "System evaluates preferred lab availability at routing time"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body status is 'active'",
+          "Response body performer references 'DefaultLab' (fallback), not 'LabCorp'",
+          "An extension or note indicates preferred lab was unavailable"
+        ],
+        "trace": [
+          "R-HLT-068 \u2013 boundary/error pathway: fallback to default lab when preferred unavailable"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/ServiceRequest\"\n\n@pytest.fixture(autouse=True)\ndef mark_labcorp_unavailable():\n    <set_lab_availability>(lab=\"LabCorp\", available=False)\n    yield\n    <set_lab_availability>(lab=\"LabCorp\", available=True)\n\n@pytest.fixture\ndef clinician_headers():\n    return <auth_fixture>(role=\"clinician\")\n\n@pytest.fixture\ndef preferred_lab_payload():\n    return <build_service_request_payload>(\n        subject=\"Patient/p-005\",\n        code=\"58410-2\",\n        requester=\"Practitioner/prac-001\",\n        performer=\"Organization/LabCorp\"\n    )\n\ndef test_lab_order_falls_back_to_default_when_preferred_unavailable(clinician_headers, preferred_lab_payload):\n    resp = requests.post(BASE_URL, json=preferred_lab_payload, headers=clinician_headers)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"status\"] == \"active\"\n    performers = [p[\"reference\"] for p in body.get(\"performer\", [])]\n    assert any(\"DefaultLab\" in p for p in performers)\n    assert not any(\"LabCorp\" in p for p in performers)\n    extensions = body.get(\"extension\", [])\n    notes = body.get(\"note\", [])\n    fallback_indicated = (\n        any(\"unavailable\" in str(e).lower() for e in extensions) or\n        any(\"unavailable\" in str(n).lower() for n in notes)\n    )\n    assert fallback_indicated\n    <teardown_resource>(resp.headers[\"Location\"], clinician_headers)\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-068",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 2974,
+    "latency_ms": 36047,
+    "wall_ms": 36047,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-068\",\n  \"reasoning\": \"The requirement covers lab order routing via /ServiceRequest with positive routing to a preferred lab, negative paths (permission denial, missing fields, bad state transitions), and boundary conditions. Five tests are designed: (1) EP positive \u2013 valid clinician order routes to preferred lab; (2) NEG \u2013 non-clinician role is denied; (3) NEG \u2013 missing mandatory element rejected; (4) STC \u2013 conflicting state transition (cancel already-cancelled order) rejected; (5) BVA \u2013 preferred lab unavailable triggers fallback to default. Each test is self-contained, uses fixtures/helpers as placeholders, and stays within 40 lines of executable code.\",\n  \"tests\": [\n    {\n      \"name\": \"test_lab_order_routes_to_preferred_lab\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated user holds role: clinician\",\n        \"Patient record exists with preferred lab set to 'LabCorp'\",\n        \"LabCorp is available and accepting orders\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with valid payload including subject, code, requester, and performer referencing preferred lab\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains status: 'active'\",\n        \"Response body performer references 'LabCorp'\",\n        \"Order ID is returned in Location header\"\n      ],\n      \"trace\": [\"R-HLT-068 \u2013 positive routing path, preferred lab available\"],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite/ServiceRequest\\\"\\n\\n@pytest.fixture\\ndef clinician_headers():\\n    return <auth_fixture>(role=\\\"clinician\\\")\\n\\n@pytest.fixture\\ndef preferred_lab_payload():\\n    return <build_service_request_payload>(\\n        subject=\\\"Patient/p-001\\\",\\n        code=\\\"58410-2\\\",\\n        requester=\\\"Practitioner/prac-001\\\",\\n        performer=\\\"Organization/LabCorp\\\"\\n    )\\n\\ndef test_lab_order_routes_to_preferred_lab(clinician_headers, preferred_lab_payload):\\n    resp = requests.post(BASE_URL, json=preferred_lab_payload, headers=clinician_headers)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"active\\\"\\n    performers = [p[\\\"reference\\\"] for p in body.get(\\\"performer\\\", [])]\\n    assert any(\\\"LabCorp\\\" in p for p in performers)\\n    assert \\\"Location\\\" in resp.headers\\n    <teardown_resource>(resp.headers[\\\"Location\\\"], clinician_headers)\\n\"\n    },\n    {\n      \"name\": \"test_lab_order_denied_for_non_clinician_role\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated user holds role: receptionist (not clinician)\",\n        \"Patient record exists\"\n      ],\n      \"actions\": [\n        \"POST /ServiceRequest with otherwise-valid payload using receptionist credentials\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome with severity: 'error'\",\n        \"No ServiceRequest resource is persisted\"\n      ],\n      \"trace\": [\"R-HLT-068 \u2013 negative path: permission denial\"],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite/ServiceRequest\\\"\\n\\n@pytest.fixture\\ndef receptionist_headers():\\n    return <auth_fixture>(role=\\\"receptionist\\\")\\n\\n@pytest.fixture\\ndef valid_payload():\\n    return <build_service_request_payload>(\\n        subject=\\\"Patient/p-002\\\",\\n        code=\\\"58410-2\\\",\\n        requester=\\\"Practitioner/prac-001\\\",\\n        performer=\\\"Organization/LabCorp\\\"\\n    )\\n\\ndef test_lab_order_denied_for_non_clinician_role(receptionist_headers, valid_payload):\\n    resp = requests.post(BASE_URL, json=valid_payload, headers=receptionist_headers)\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"OperationOutcome\\\"\\n    issues = body.get(\\\"issue\\\", [])\\n    assert any(i[\\\"severity\\\"] == \\\"error\\\" for i in issues)\\n    verify_resp = requests.get(\\n        BASE_URL,\\n        params"
+  }
+}

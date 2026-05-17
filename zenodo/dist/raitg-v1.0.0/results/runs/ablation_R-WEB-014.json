@@ -1,0 +1,216 @@
+{
+  "req": {
+    "id": "R-WEB-014",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Hr-Admin updates leave-request",
+    "statement": "An authenticated hr-admin shall be able to update a leave-request through the UI form. Mandatory fields must be validated and an audit record must be written on success.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "authenticated",
+      "role:hr-admin",
+      "leave-request module is enabled"
+    ],
+    "triggers": [
+      "hr-admin updates a leave-request"
+    ],
+    "expected_outcomes": [
+      "leave-request is updated",
+      "audit record written",
+      "response 200 or 201 with entity id"
+    ],
+    "error_pathways": [
+      "400 on validation error",
+      "401 if unauthenticated",
+      "403 if role forbidden"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-014",
+    "reasoning": "R-WEB-014 covers four distinct concern areas: (1) happy-path update by a valid hr-admin, (2) validation failure on missing mandatory fields, (3) boundary on field length limits, (4) unauthenticated access, and (5) forbidden role access. I selected EP for the happy-path (valid input partition), BVA for field-length boundary, NEG for missing-field validation and auth/authz failures, DT for the role-based access matrix, and STC to capture the leave-request state transition from existing -> updated. Each test uses dedicated fixtures to ensure idempotency.",
+    "tests": [
+      {
+        "name": "test_hr_admin_update_leave_request_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "Leave-request module is enabled",
+          "A leave-request with known id exists in state PENDING"
+        ],
+        "actions": [
+          "Navigate to /leave-requests",
+          "Open the existing leave-request form",
+          "Fill all mandatory fields with valid data",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains the updated entity id",
+          "An audit record is written for the update event",
+          "UI shows success confirmation"
+        ],
+        "trace": [
+          "R-WEB-014: positive path - valid hr-admin update",
+          "Expected outcomes: leave-request updated; audit record written; response 200/201 with entity id"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_hr_admin_update_leave_request_success(\n    hr_admin_page,        # <fixture>: authenticated Playwright Page as hr-admin\n    existing_leave_request,  # <fixture>: creates & yields a PENDING leave-request dict\n    audit_log_client,     # <fixture>: client to query audit records\n):\n    page = hr_admin_page\n    lr_id = existing_leave_request[\"id\"]\n\n    page.goto(f\"/leave-requests/{lr_id}/edit\")\n    page.fill(\"[data-testid='reason']\", \"Updated reason - valid text\")\n    page.select_option(\"[data-testid='leave-type']\", \"annual\")\n    page.fill(\"[data-testid='start-date']\", \"2025-08-01\")\n    page.fill(\"[data-testid='end-date']\", \"2025-08-05\")\n\n    with page.expect_response(\n        lambda r: f\"/leave-requests/{lr_id}\" in r.url and r.request.method in (\"PUT\", \"PATCH\")\n    ) as resp_info:\n        page.click(\"[data-testid='submit-btn']\")\n\n    response = resp_info.value\n    assert response.status in (200, 201), f\"Expected 200/201, got {response.status}\"\n    body = response.json()\n    assert str(body.get(\"id\")) == str(lr_id)\n\n    expect(page.locator(\"[data-testid='success-banner']\")).to_be_visible()\n\n    audit_entries = audit_log_client.get_entries(entity_id=lr_id, action=\"UPDATE\")\n    assert len(audit_entries) >= 1, \"Audit record not written\"\n"
+      },
+      {
+        "name": "test_hr_admin_update_leave_request_missing_mandatory_fields",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "Leave-request module is enabled",
+          "A leave-request with known id exists"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/edit",
+          "Clear all mandatory fields",
+          "Submit the form without filling mandatory fields"
+        ],
+        "expected": [
+          "HTTP response status is 400",
+          "UI displays field-level validation error messages",
+          "Leave-request record is NOT updated in the database",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-014: error pathway - 400 on validation error",
+          "Mandatory fields must be validated"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_hr_admin_update_leave_request_missing_mandatory_fields(\n    hr_admin_page,\n    existing_leave_request,\n    audit_log_client,\n):\n    page = hr_admin_page\n    lr_id = existing_leave_request[\"id\"]\n    original_reason = existing_leave_request[\"reason\"]\n\n    page.goto(f\"/leave-requests/{lr_id}/edit\")\n    page.fill(\"[data-testid='reason']\", \"\")\n    page.fill(\"[data-testid='start-date']\", \"\")\n    page.fill(\"[data-testid='end-date']\", \"\")\n\n    with page.expect_response(\n        lambda r: f\"/leave-requests/{lr_id}\" in r.url and r.request.method in (\"PUT\", \"PATCH\"),\n        timeout=5000\n    ) as resp_info:\n        page.click(\"[data-testid='submit-btn']\")\n\n    response = resp_info.value\n    assert response.status == 400, f\"Expected 400, got {response.status}\"\n\n    expect(page.locator(\"[data-testid='field-error']\").first).to_be_visible()\n\n    pre_count = len(audit_log_client.get_entries(entity_id=lr_id, action=\"UPDATE\"))\n    assert pre_count == 0, \"Audit record must not be written on validation failure\"\n"
+      },
+      {
+        "name": "test_hr_admin_update_leave_request_reason_at_max_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "Leave-request module is enabled",
+          "A leave-request with known id exists",
+          "Max allowed length for 'reason' field is 500 characters"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/edit",
+          "Fill 'reason' field with exactly 500 characters",
+          "Fill all other mandatory fields with valid data",
+          "Submit the form"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Leave-request is updated with the 500-character reason",
+          "An audit record is written"
+        ],
+        "trace": [
+          "R-WEB-014: boundary - maximum field length accepted",
+          "BVA upper boundary on 'reason' mandatory field"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\nMAX_REASON_LEN = 500\n\ndef test_hr_admin_update_leave_request_reason_at_max_length(\n    hr_admin_page,\n    existing_leave_request,\n    audit_log_client,\n):\n    page = hr_admin_page\n    lr_id = existing_leave_request[\"id\"]\n    boundary_reason = \"A\" * MAX_REASON_LEN\n\n    page.goto(f\"/leave-requests/{lr_id}/edit\")\n    page.fill(\"[data-testid='reason']\", boundary_reason)\n    page.select_option(\"[data-testid='leave-type']\", \"annual\")\n    page.fill(\"[data-testid='start-date']\", \"2025-09-01\")\n    page.fill(\"[data-testid='end-date']\", \"2025-09-03\")\n\n    with page.expect_response(\n        lambda r: f\"/leave-requests/{lr_id}\" in r.url and r.request.method in (\"PUT\", \"PATCH\")\n    ) as resp_info:\n        page.click(\"[data-testid='submit-btn']\")\n\n    response = resp_info.value\n    assert response.status in (200, 201), f\"Expected 200/201 at boundary, got {response.status}\"\n    body = response.json()\n    assert len(body.get(\"reason\", \"\")) == MAX_REASON_LEN\n\n    expect(page.locator(\"[data-testid='success-banner']\")).to_be_visible()\n    audit_entries = audit_log_client.get_entries(entity_id=lr_id, action=\"UPDATE\")\n    assert len(audit_entries) >= 1\n"
+      },
+      {
+        "name": "test_unauthenticated_user_cannot_update_leave_request",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No user session is active (unauthenticated)",
+          "Leave-request module is enabled",
+          "A leave-request with known id exists"
+        ],
+        "actions": [
+          "Directly navigate to /leave-requests/{id}/edit without authentication",
+          "Attempt to submit an update"
+        ],
+        "expected": [
+          "HTTP response status is 401",
+          "User is redirected to login page or receives 401 error",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-014: error pathway - 401 if unauthenticated",
+          "Precondition: authenticated"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_unauthenticated_user_cannot_update_leave_request(\n    browser_context_no_auth,  # <fixture>: fresh Playwright BrowserContext with no session\n    existing_leave_request,\n    audit_log_client,\n    base_url,                 # <fixture>: str base URL of hr-app\n):\n    page = browser_context_no_auth.new_page()\n    lr_id = existing_leave_request[\"id\"]\n    api_url = f\"{base_url}/api/leave-requests/{lr_id}\"\n\n    with page.expect_response(lambda r: r.url == api_url) as resp_info:\n        page.goto(f\"{base_url}/leave-requests/{lr_id}/edit\")\n\n    response = resp_info.value\n    assert response.status == 401, f\"Expected 401, got {response.status}\"\n\n    current = page.url\n    assert \"login\" in current or \"/auth\" in current, \\\n        f\"Expected redirect to login, got {current}\"\n\n    audit_entries = audit_log_client.get_entries(entity_id=lr_id, action=\"UPDATE\")\n    assert len(audit_entries) == 0, \"No audit record expected for unauthenticated attempt\"\n    page.close()\n"
+      },
+      {
+        "name": "test_forbidden_role_cannot_update_leave_request",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with role 'employee' (not hr-admin)",
+          "Leave-request module is enabled",
+          "A leave-request with known id exists"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/edit as an employee-role user",
+          "Attempt to submit an update"
+        ],
+        "expected": [
+          "HTTP response status is 403",
+          "UI shows forbidden/access-denied message",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-014: error pathway - 403 if role forbidden",
+          "DT: role=employee -> deny; role=hr-admin -> allow"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_forbidden_role_cannot_update_leave_request(\n    employee_page,        # <fixture>: authenticated Playwright Page as role=employee\n    existing_leave_request,\n    audit_log_client,\n    base_url,\n):\n    page = employee_page\n    lr_id = existing_leave_request[\"id\"]\n    api_url = f\"{base_url}/api/leave-requests/{lr_id}\"\n\n    with page.expect_response(\n        lambda r: f\"/leave-requests/{lr_id}\" in r.url\n    ) as resp_info:\n        page.goto(f\"{base_url}/leave-requests/{lr_id}/edit\")\n\n    response = resp_info.value\n    assert response.status == 403, f\"Expected 403, got {response.status}\"\n\n    expect(\n        page.locator(\"[data-testid='access-denied-msg']\")\n    ).to_be_visible()\n\n    audit_entries = audit_log_client.get_entries(entity_id=lr_id, action=\"UPDATE\")\n    assert len(audit_entries) == 0, \"No audit record expected for forbidden role\"\n"
+      },
+      {
+        "name": "test_leave_request_state_transitions_pending_to_updated",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as hr-admin",
+          "Leave-request module is enabled",
+          "A leave-request exists in state PENDING"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/edit",
+          "Update leave type from 'sick' to 'annual' and adjust dates",
+          "Submit the form",
+          "Verify the record state transitions to UPDATED/MODIFIED"
+        ],
+        "expected": [
+          "Leave-request status transitions from PENDING to UPDATED",
+          "HTTP response 200 or 201 with updated entity",
+          "Audit record captures the state transition with before/after values"
+        ],
+        "trace": [
+          "R-WEB-014: state transition PENDING -> UPDATED on successful hr-admin edit",
+          "STC: covers the valid edit transition in the leave-request state machine"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_leave_request_state_transitions_pending_to_updated(\n    hr_admin_page,\n    pending_leave_request,   # <fixture>: leave-request guaranteed in PENDING state\n    leave_request_api_client,  # <fixture>: REST client to fetch leave-request by id\n    audit_log_client,\n):\n    page = hr_admin_page\n    lr_id = pending_leave_request[\"id\"]\n\n    assert pending_leave_request[\"status\"] == \"PENDING\"\n\n    page.goto(f\"/leave-requests/{lr_id}/edit\")\n    page.select_option(\"[data-testid='leave-type']\", \"annual\")\n    page.fill(\"[data-testid='start-date']\", \"2025-10-01\")\n    page.fill(\"[data-testid='end-date']\", \"2025-10-04\")\n\n    with page.expect_response(\n        lambda r: f\"/leave-requests/{lr_id}\" in r.url and r.request.method in (\"PUT\", \"PATCH\")\n    ) as resp_info:\n        page.click(\"[data-testid='submit-btn']\")\n\n    response = resp_info.value\n    assert response.status in (200, 201)\n\n    updated_lr = leave_request_api_client.get(lr_id)\n    assert updated_lr[\"status\"] in (\"UPDATED\", \"MODIFIED\", \"PENDING\"), \\\n        f\"Unexpected state: {updated_lr['status']}\"\n    assert updated_lr[\"leave_type\"] == \"annual\"\n\n    audit_entries = audit_log_client.get_entries(entity_id=lr_id, action=\"UPDATE\")\n    assert len(audit_entries) >= 1\n    assert audit_entries[0].get(\"before\") is not None\n    assert audit_entries[0].get(\"after\") is not None\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-014",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1040,
+    "output_tokens": 4240,
+    "latency_ms": 50126,
+    "wall_ms": 50126,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-014\",\n  \"reasoning\": \"R-WEB-014 covers four distinct concern areas: (1) happy-path update by a valid hr-admin, (2) validation failure on missing mandatory fields, (3) boundary on field length limits, (4) unauthenticated access, and (5) forbidden role access. I selected EP for the happy-path (valid input partition), BVA for field-length boundary, NEG for missing-field validation and auth/authz failures, DT for the role-based access matrix, and STC to capture the leave-request state transition from existing -> updated. Each test uses dedicated fixtures to ensure idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_hr_admin_update_leave_request_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as hr-admin\",\n        \"Leave-request module is enabled\",\n        \"A leave-request with known id exists in state PENDING\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests\",\n        \"Open the existing leave-request form\",\n        \"Fill all mandatory fields with valid data\",\n        \"Submit the form\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 200 or 201\",\n        \"Response body contains the updated entity id\",\n        \"An audit record is written for the update event\",\n        \"UI shows success confirmation\"\n      ],\n      \"trace\": [\n        \"R-WEB-014: positive path - valid hr-admin update\",\n        \"Expected outcomes: leave-request updated; audit record written; response 200/201 with entity id\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_hr_admin_update_leave_request_success(\\n    hr_admin_page,        # <fixture>: authenticated Playwright Page as hr-admin\\n    existing_leave_request,  # <fixture>: creates & yields a PENDING leave-request dict\\n    audit_log_client,     # <fixture>: client to query audit records\\n):\\n    page = hr_admin_page\\n    lr_id = existing_leave_request[\\\"id\\\"]\\n\\n    page.goto(f\\\"/leave-requests/{lr_id}/edit\\\")\\n    page.fill(\\\"[data-testid='reason']\\\", \\\"Updated reason - valid text\\\")\\n    page.select_option(\\\"[data-testid='leave-type']\\\", \\\"annual\\\")\\n    page.fill(\\\"[data-testid='start-date']\\\", \\\"2025-08-01\\\")\\n    page.fill(\\\"[data-testid='end-date']\\\", \\\"2025-08-05\\\")\\n\\n    with page.expect_response(\\n        lambda r: f\\\"/leave-requests/{lr_id}\\\" in r.url and r.request.method in (\\\"PUT\\\", \\\"PATCH\\\")\\n    ) as resp_info:\\n        page.click(\\\"[data-testid='submit-btn']\\\")\\n\\n    response = resp_info.value\\n    assert response.status in (200, 201), f\\\"Expected 200/201, got {response.status}\\\"\\n    body = response.json()\\n    assert str(body.get(\\\"id\\\")) == str(lr_id)\\n\\n    expect(page.locator(\\\"[data-testid='success-banner']\\\")).to_be_visible()\\n\\n    audit_entries = audit_log_client.get_entries(entity_id=lr_id, action=\\\"UPDATE\\\")\\n    assert len(audit_entries) >= 1, \\\"Audit record not written\\\"\\n\"\n    },\n    {\n      \"name\": \"test_hr_admin_update_leave_request_missing_mandatory_fields\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as hr-admin\",\n        \"Leave-request module is enabled\",\n        \"A leave-request with known id exists\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/{id}/edit\",\n        \"Clear all mandatory fields\",\n        \"Submit the form without filling mandatory fields\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 400\",\n        \"UI displays field-level validation error messages\",\n        \"Leave-request record is NOT updated in the database\",\n        \"No audit record is written\"\n      ],\n      \"trace\": [\n        \"R-WEB-014: error pathway - 400 on validation error\",\n        \"Mandatory fields must be validated\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_hr_admin_update_leave_request_missing_mandatory_fields(\\n    hr_admin_page,\\n    existing_leave_request,\\n    "
+  }
+}

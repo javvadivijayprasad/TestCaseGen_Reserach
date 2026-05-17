@@ -1,0 +1,179 @@
+{
+  "req": {
+    "id": "R-HLT-072",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Device data ingest (negative)",
+    "statement": "A registered device shall push Observations via FHIR ingest; unregistered devices shall be rejected. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "device registered"
+    ],
+    "triggers": [
+      "device submits"
+    ],
+    "expected_outcomes": [
+      "observations stored",
+      "normalization applied"
+    ],
+    "error_pathways": [
+      "401 when device cert invalid"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Ingest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-072",
+    "reasoning": "The requirement covers FHIR device data ingest with multiple failure modes. I selected five tests: (1) EP positive \u2014 a fully valid registered device pushes a well-formed Observation and gets 201 with normalization applied; (2) NEG \u2014 an unregistered device cert yields 401; (3) NEG \u2014 a payload missing the mandatory 'subject' element is rejected with 422; (4) STC \u2014 a device already in 'completed' state attempts a conflicting transition back to 'active', which must be rejected; (5) BVA \u2014 a payload at exactly the maximum allowed Observation component count (boundary) is accepted. Together these cover EP, NEG, STC, BVA, and DT heuristics and satisfy the \u22651 positive, \u22651 negative, \u22651 boundary requirement.",
+    "tests": [
+      {
+        "name": "test_registered_device_ingest_valid_observation",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Device is registered in fhir-lite with a valid certificate",
+          "FHIR server is reachable at BASE_URL/Ingest",
+          "registered_device_cert fixture provides a valid mTLS cert pair"
+        ],
+        "actions": [
+          "Build a minimal valid FHIR Observation payload with resourceType, status, code, subject, and effectiveDateTime",
+          "POST the payload to /Ingest using the registered device certificate",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'id' field (server-assigned)",
+          "Response body contains 'meta.tag' indicating normalization was applied"
+        ],
+        "trace": [
+          "R-HLT-072: registered device shall push Observations via FHIR ingest",
+          "R-HLT-072: observations stored; normalization applied"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_registered_device_ingest_valid_observation(base_url, registered_device_cert):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"effectiveDateTime\": \"2024-01-15T10:00:00Z\",\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"beats/min\"}\n    }\n    resp = requests.post(\n        f\"{base_url}/Ingest\",\n        json=payload,\n        cert=registered_device_cert,\n        timeout=10\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"id\" in body, \"Response missing server-assigned id\"\n    tags = [t.get(\"code\") for t in body.get(\"meta\", {}).get(\"tag\", [])]\n    assert \"normalized\" in tags, f\"Normalization tag not found; tags={tags}\"\n"
+      },
+      {
+        "name": "test_unregistered_device_cert_rejected_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "An unregistered (self-signed) certificate pair is available via unregistered_device_cert fixture",
+          "FHIR server enforces mTLS certificate validation against its device registry"
+        ],
+        "actions": [
+          "Build a structurally valid FHIR Observation payload",
+          "POST the payload to /Ingest using the unregistered device certificate",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response body contains an error indicating certificate is invalid or device is unregistered"
+        ],
+        "trace": [
+          "R-HLT-072: unregistered devices shall be rejected",
+          "R-HLT-072: 401 when device cert invalid"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unregistered_device_cert_rejected_401(base_url, unregistered_device_cert):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"effectiveDateTime\": \"2024-01-15T10:00:00Z\",\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"beats/min\"}\n    }\n    resp = requests.post(\n        f\"{base_url}/Ingest\",\n        json=payload,\n        cert=unregistered_device_cert,\n        timeout=10\n    )\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    issue_codes = [i.get(\"code\") for i in body.get(\"issue\", [])]\n    assert any(c in (\"security\", \"forbidden\", \"unknown\") for c in issue_codes), \\\n        f\"Unexpected issue codes: {issue_codes}\"\n"
+      },
+      {
+        "name": "test_missing_mandatory_subject_element_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Device is registered with a valid certificate (registered_device_cert fixture)",
+          "Server enforces FHIR Observation profile requiring 'subject'"
+        ],
+        "actions": [
+          "Build an Observation payload omitting the mandatory 'subject' element",
+          "POST the malformed payload to /Ingest with a valid registered cert",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response OperationOutcome identifies 'subject' as the offending missing element"
+        ],
+        "trace": [
+          "R-HLT-072: missing mandatory elements must be tested",
+          "R-HLT-072: negative paths including missing mandatory elements"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_missing_mandatory_subject_element_rejected(base_url, registered_device_cert):\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"effectiveDateTime\": \"2024-01-15T10:00:00Z\",\n        \"valueQuantity\": {\"value\": 72, \"unit\": \"beats/min\"}\n        # 'subject' intentionally omitted\n    }\n    resp = requests.post(\n        f\"{base_url}/Ingest\",\n        json=payload,\n        cert=registered_device_cert,\n        timeout=10\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    diagnostics = \" \".join(\n        i.get(\"diagnostics\", \"\") for i in body.get(\"issue\", [])\n    ).lower()\n    assert \"subject\" in diagnostics, \\\n        f\"Expected 'subject' in diagnostics, got: {diagnostics}\"\n"
+      },
+      {
+        "name": "test_conflicting_state_transition_completed_to_active_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "A previously ingested Observation with status 'final' exists on the server (observation_in_final_state fixture)",
+          "Device is registered with a valid certificate (registered_device_cert fixture)",
+          "Server enforces FHIR status state machine: 'final' -> 'registered' transition is forbidden"
+        ],
+        "actions": [
+          "Retrieve the existing Observation ID from the fixture",
+          "Build an update payload changing status from 'final' back to 'registered' (illegal backward transition)",
+          "PUT/POST the conflicting payload to /Ingest referencing the existing Observation",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 409 Conflict or 422 Unprocessable Entity",
+          "Response OperationOutcome references invalid state transition"
+        ],
+        "trace": [
+          "R-HLT-072: conflicting state transitions must be tested",
+          "R-HLT-072: negative paths including conflicting state transitions"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_conflicting_state_transition_completed_to_active_rejected(\n    base_url, registered_device_cert, observation_in_final_state\n):\n    obs_id = observation_in_final_state[\"id\"]\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"id\": obs_id,\n        \"status\": \"registered\",  # illegal: rolling back from 'final'\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"effectiveDateTime\": \"2024-01-15T10:00:00Z\"\n    }\n    resp = requests.put(\n        f\"{base_url}/Ingest/{obs_id}\",\n        json=payload,\n        cert=registered_device_cert,\n        timeout=10\n    )\n    assert resp.status_code in (409, 422), \\\n        f\"Expected 409 or 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    all_diag = \" \".join(\n        i.get(\"diagnostics\", \"\") for i in body.get(\"issue\", [])\n    ).lower()\n    assert any(kw in all_diag for kw in (\"state\", \"transition\", \"status\", \"invalid\")), \\\n        f\"Expected state-transition error, got: {all_diag}\"\n"
+      },
+      {
+        "name": "test_observation_at_max_component_count_boundary_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Device is registered with a valid certificate (registered_device_cert fixture)",
+          "MAX_COMPONENTS constant reflects the server's documented upper limit (e.g. 100 component entries)",
+          "Server accepts payloads up to but not exceeding MAX_COMPONENTS"
+        ],
+        "actions": [
+          "Build an Observation payload with exactly MAX_COMPONENTS component entries (boundary value)",
+          "POST the payload to /Ingest with a valid registered cert",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "All MAX_COMPONENTS components are persisted in the stored resource"
+        ],
+        "trace": [
+          "R-HLT-072: observations stored; normalization applied",
+          "R-HLT-072: boundary \u2014 exactly at maximum allowed component count"
+        ],
+        "executable": "import pytest\nimport requests\n\nMAX_COMPONENTS = 100\n\ndef test_observation_at_max_component_count_boundary_accepted(\n    base_url, registered_device_cert\n):\n    components = [\n        {\n            \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": f\"000{i}-{i}\"}]},\n            \"valueQuantity\": {\"value\": i, \"unit\": \"unit\"}\n        }\n        for i in range(MAX_COMPONENTS)\n    ]\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"85353-1\"}]},\n        \"subject\": {\"reference\": \"Patient/test-patient-001\"},\n        \"effectiveDateTime\": \"2024-01-15T10:00:00Z\",\n        \"component\": components\n    }\n    resp = requests.post(\n        f\"{base_url}/Ingest\",\n        json=payload,\n        cert=registered_device_cert,\n        timeout=15\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    stored_count = len(body.get(\"component\", []))\n    assert stored_count == MAX_COMPONENTS, \\\n        f\"Expected {MAX_COMPONENTS} components stored, got {stored_count}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-072",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 3466,
+    "latency_ms": 42203,
+    "wall_ms": 42203,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-072\",\n  \"reasoning\": \"The requirement covers FHIR device data ingest with multiple failure modes. I selected five tests: (1) EP positive \u2014 a fully valid registered device pushes a well-formed Observation and gets 201 with normalization applied; (2) NEG \u2014 an unregistered device cert yields 401; (3) NEG \u2014 a payload missing the mandatory 'subject' element is rejected with 422; (4) STC \u2014 a device already in 'completed' state attempts a conflicting transition back to 'active', which must be rejected; (5) BVA \u2014 a payload at exactly the maximum allowed Observation component count (boundary) is accepted. Together these cover EP, NEG, STC, BVA, and DT heuristics and satisfy the \u22651 positive, \u22651 negative, \u22651 boundary requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_registered_device_ingest_valid_observation\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Device is registered in fhir-lite with a valid certificate\",\n        \"FHIR server is reachable at BASE_URL/Ingest\",\n        \"registered_device_cert fixture provides a valid mTLS cert pair\"\n      ],\n      \"actions\": [\n        \"Build a minimal valid FHIR Observation payload with resourceType, status, code, subject, and effectiveDateTime\",\n        \"POST the payload to /Ingest using the registered device certificate\",\n        \"Capture the HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains 'id' field (server-assigned)\",\n        \"Response body contains 'meta.tag' indicating normalization was applied\"\n      ],\n      \"trace\": [\n        \"R-HLT-072: registered device shall push Observations via FHIR ingest\",\n        \"R-HLT-072: observations stored; normalization applied\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_registered_device_ingest_valid_observation(base_url, registered_device_cert):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\"}]},\\n        \\\"subject\\\": {\\\"reference\\\": \\\"Patient/test-patient-001\\\"},\\n        \\\"effectiveDateTime\\\": \\\"2024-01-15T10:00:00Z\\\",\\n        \\\"valueQuantity\\\": {\\\"value\\\": 72, \\\"unit\\\": \\\"beats/min\\\"}\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Ingest\\\",\\n        json=payload,\\n        cert=registered_device_cert,\\n        timeout=10\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"id\\\" in body, \\\"Response missing server-assigned id\\\"\\n    tags = [t.get(\\\"code\\\") for t in body.get(\\\"meta\\\", {}).get(\\\"tag\\\", [])]\\n    assert \\\"normalized\\\" in tags, f\\\"Normalization tag not found; tags={tags}\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unregistered_device_cert_rejected_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"An unregistered (self-signed) certificate pair is available via unregistered_device_cert fixture\",\n        \"FHIR server enforces mTLS certificate validation against its device registry\"\n      ],\n      \"actions\": [\n        \"Build a structurally valid FHIR Observation payload\",\n        \"POST the payload to /Ingest using the unregistered device certificate\",\n        \"Capture the HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized\",\n        \"Response body contains an error indicating certificate is invalid or device is unregistered\"\n      ],\n      \"trace\": [\n        \"R-HLT-072: unregistered devices shall be rejected\",\n        \"R-HLT-072: 401 when device cert invalid\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_unregistered_device_cert_rejected_401(base_url, unregistered_device_cert):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\"}]},\\n        \\\"sub"
+  }
+}

@@ -1,0 +1,198 @@
+{
+  "req": {
+    "id": "R-HLT-070",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "auth",
+    "title": "Data retention (negative)",
+    "statement": "Resources shall be retained per policy; expired resources shall be purged on a nightly job with full audit trail. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "nightly job runs"
+    ],
+    "expected_outcomes": [
+      "expired resources purged",
+      "audit log written"
+    ],
+    "error_pathways": [
+      "incident raised on policy mismatch"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/cron/retention"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-070",
+    "reasoning": "R-HLT-070 mandates a nightly retention job that purges expired resources and writes a full audit trail. Negative paths cover permission denial, missing mandatory elements, and conflicting state transitions. The suite targets /cron/retention on fhir-lite. Five tests are designed: (1) EP positive \u2014 valid expired resources are purged and audit log written; (2) NEG \u2014 unauthorized caller is denied with 403 and incident raised; (3) BVA \u2014 resource expiring exactly at the retention boundary (midnight cutoff) is purged; (4) STC \u2014 resource in a conflicting state (locked/in-use) triggers correct error transition; (5) DT \u2014 missing mandatory retention policy element causes policy-mismatch incident. Each test is self-contained and idempotent via setup/teardown helpers.",
+    "tests": [
+      {
+        "name": "test_retention_job_purges_expired_resources_and_writes_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running",
+          "At least one resource exists with expiry date in the past",
+          "Caller has system-job role with valid CRON_SECRET header",
+          "Audit log store is accessible"
+        ],
+        "actions": [
+          "Seed one expired resource via <seed_expired_resource> fixture",
+          "POST /cron/retention with Authorization: Bearer <CRON_SECRET>",
+          "Capture HTTP response status and body",
+          "Query audit log via <get_audit_entries> helper for the purged resource ID"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains purged_count >= 1",
+          "Expired resource no longer exists (GET /Resource/{id} returns 404 or 410)",
+          "Audit log entry exists with action=PURGE and resource_id matching seeded record"
+        ],
+        "trace": [
+          "R-HLT-070: expired resources shall be purged",
+          "R-HLT-070: full audit trail written after purge"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_SECRET = \"<CRON_SECRET>\"\n\n@pytest.fixture(autouse=True)\ndef setup_teardown():\n    resource_id = <seed_expired_resource>(BASE_URL)\n    yield resource_id\n    <cleanup_resource>(BASE_URL, resource_id)\n\ndef test_retention_job_purges_expired_resources_and_writes_audit(setup_teardown):\n    resource_id = setup_teardown\n    headers = {\"Authorization\": f\"Bearer {CRON_SECRET}\"}\n\n    resp = requests.post(f\"{BASE_URL}/cron/retention\", headers=headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body.get(\"purged_count\", 0) >= 1\n\n    get_resp = requests.get(\n        f\"{BASE_URL}/Resource/{resource_id}\", headers=headers\n    )\n    assert get_resp.status_code in (404, 410)\n\n    audit = <get_audit_entries>(BASE_URL, resource_id)\n    assert any(\n        e[\"action\"] == \"PURGE\" and e[\"resource_id\"] == resource_id\n        for e in audit\n    )"
+      },
+      {
+        "name": "test_retention_job_denied_without_valid_credentials",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running",
+          "Caller presents an invalid or missing Authorization header",
+          "Incident management endpoint is reachable via <get_incidents> helper"
+        ],
+        "actions": [
+          "POST /cron/retention with Authorization: Bearer <INVALID_TOKEN>",
+          "Capture HTTP response status and body",
+          "Query incident log via <get_incidents> helper for policy-mismatch events"
+        ],
+        "expected": [
+          "HTTP 403 returned",
+          "Response body contains error field indicating permission denied",
+          "No resources are purged (purged_count absent or 0)",
+          "Incident raised with reason=PERMISSION_DENIED in incident log"
+        ],
+        "trace": [
+          "R-HLT-070: negative path \u2014 permission denial must be tested",
+          "R-HLT-070: incident raised on policy mismatch"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nINVALID_TOKEN = \"<INVALID_TOKEN>\"\n\ndef test_retention_job_denied_without_valid_credentials():\n    headers = {\"Authorization\": f\"Bearer {INVALID_TOKEN}\"}\n\n    resp = requests.post(f\"{BASE_URL}/cron/retention\", headers=headers)\n    assert resp.status_code == 403\n\n    body = resp.json()\n    assert \"error\" in body\n    assert body.get(\"purged_count\", 0) == 0\n\n    incidents = <get_incidents>(BASE_URL, reason=\"PERMISSION_DENIED\")\n    assert len(incidents) >= 1\n    assert incidents[-1][\"endpoint\"] == \"/cron/retention\""
+      },
+      {
+        "name": "test_retention_job_purges_resource_expiring_at_exact_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running",
+          "A resource exists with expiry timestamp equal to exactly T-0 (now minus 0 seconds)",
+          "Caller has system-job role with valid CRON_SECRET header",
+          "Server clock is synchronized and known"
+        ],
+        "actions": [
+          "Seed one resource with expiry set to <boundary_expiry_timestamp> (exactly at retention cutoff) via <seed_resource_with_expiry>",
+          "POST /cron/retention with Authorization: Bearer <CRON_SECRET>",
+          "Capture HTTP response and purged_count",
+          "Verify resource no longer accessible"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "purged_count >= 1 confirming boundary resource was included",
+          "GET /Resource/{id} returns 404 or 410",
+          "Audit log entry present for the boundary resource"
+        ],
+        "trace": [
+          "R-HLT-070: expired resources purged \u2014 boundary at exact expiry instant",
+          "BVA applied to the retention cutoff timestamp"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import timezone, datetime\n\nBASE_URL = \"http://localhost:8080\"\nCRON_SECRET = \"<CRON_SECRET>\"\n\n@pytest.fixture(autouse=True)\ndef setup_teardown():\n    boundary_ts = <boundary_expiry_timestamp>()\n    resource_id = <seed_resource_with_expiry>(BASE_URL, boundary_ts)\n    yield resource_id\n    <cleanup_resource>(BASE_URL, resource_id)\n\ndef test_retention_job_purges_resource_expiring_at_exact_boundary(setup_teardown):\n    resource_id = setup_teardown\n    headers = {\"Authorization\": f\"Bearer {CRON_SECRET}\"}\n\n    resp = requests.post(f\"{BASE_URL}/cron/retention\", headers=headers)\n    assert resp.status_code == 200\n    assert resp.json().get(\"purged_count\", 0) >= 1\n\n    get_resp = requests.get(\n        f\"{BASE_URL}/Resource/{resource_id}\", headers=headers\n    )\n    assert get_resp.status_code in (404, 410)\n\n    audit = <get_audit_entries>(BASE_URL, resource_id)\n    assert any(e[\"action\"] == \"PURGE\" for e in audit)"
+      },
+      {
+        "name": "test_retention_job_raises_incident_on_conflicting_locked_resource",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running",
+          "An expired resource exists in LOCKED state (in-use by another process)",
+          "Caller has system-job role with valid CRON_SECRET header",
+          "State transition from LOCKED to PURGED is not permitted per policy"
+        ],
+        "actions": [
+          "Seed an expired resource in LOCKED state via <seed_locked_expired_resource>",
+          "POST /cron/retention with Authorization: Bearer <CRON_SECRET>",
+          "Capture HTTP response and body",
+          "Query incident log for CONFLICTING_STATE_TRANSITION events"
+        ],
+        "expected": [
+          "HTTP 207 or 200 returned (partial success acceptable) OR 409 if all resources conflict",
+          "Response body includes failed_purges list containing the locked resource ID",
+          "Locked resource still exists (GET returns 200 or 423)",
+          "Incident raised with reason=CONFLICTING_STATE_TRANSITION for the locked resource"
+        ],
+        "trace": [
+          "R-HLT-070: conflicting state transitions must be tested",
+          "R-HLT-070: incident raised on policy mismatch",
+          "STC: LOCKED -> PURGED transition is invalid and must be blocked"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_SECRET = \"<CRON_SECRET>\"\n\n@pytest.fixture(autouse=True)\ndef setup_teardown():\n    resource_id = <seed_locked_expired_resource>(BASE_URL)\n    yield resource_id\n    <force_unlock_and_cleanup>(BASE_URL, resource_id)\n\ndef test_retention_job_raises_incident_on_conflicting_locked_resource(setup_teardown):\n    resource_id = setup_teardown\n    headers = {\"Authorization\": f\"Bearer {CRON_SECRET}\"}\n\n    resp = requests.post(f\"{BASE_URL}/cron/retention\", headers=headers)\n    assert resp.status_code in (200, 207, 409)\n\n    body = resp.json()\n    failed = body.get(\"failed_purges\", [])\n    assert resource_id in failed\n\n    get_resp = requests.get(\n        f\"{BASE_URL}/Resource/{resource_id}\", headers=headers\n    )\n    assert get_resp.status_code in (200, 423)\n\n    incidents = <get_incidents>(\n        BASE_URL, reason=\"CONFLICTING_STATE_TRANSITION\"\n    )\n    assert any(i[\"resource_id\"] == resource_id for i in incidents)"
+      },
+      {
+        "name": "test_retention_job_raises_incident_when_mandatory_policy_element_missing",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite service is running",
+          "A resource exists that has no retention_policy field (mandatory element absent)",
+          "Caller has system-job role with valid CRON_SECRET header"
+        ],
+        "actions": [
+          "Seed an expired resource with retention_policy field omitted via <seed_resource_no_policy>",
+          "POST /cron/retention with Authorization: Bearer <CRON_SECRET>",
+          "Capture HTTP response and body",
+          "Query incident log for MISSING_MANDATORY_ELEMENT events"
+        ],
+        "expected": [
+          "HTTP 200 or 207 returned",
+          "Response body includes policy_errors list referencing the resource with missing policy",
+          "Resource is NOT purged (remains accessible)",
+          "Incident raised with reason=MISSING_MANDATORY_ELEMENT and resource_id matching seeded record"
+        ],
+        "trace": [
+          "R-HLT-070: missing mandatory elements must be tested as negative path",
+          "R-HLT-070: incident raised on policy mismatch",
+          "DT: decision table row \u2014 expired=true, policy_present=false => skip purge, raise incident"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_SECRET = \"<CRON_SECRET>\"\n\n@pytest.fixture(autouse=True)\ndef setup_teardown():\n    resource_id = <seed_resource_no_policy>(BASE_URL)\n    yield resource_id\n    <cleanup_resource>(BASE_URL, resource_id)\n\ndef test_retention_job_raises_incident_when_mandatory_policy_element_missing(setup_teardown):\n    resource_id = setup_teardown\n    headers = {\"Authorization\": f\"Bearer {CRON_SECRET}\"}\n\n    resp = requests.post(f\"{BASE_URL}/cron/retention\", headers=headers)\n    assert resp.status_code in (200, 207)\n\n    body = resp.json()\n    policy_errors = body.get(\"policy_errors\", [])\n    assert resource_id in policy_errors\n\n    get_resp = requests.get(\n        f\"{BASE_URL}/Resource/{resource_id}\", headers=headers\n    )\n    assert get_resp.status_code == 200\n\n    incidents = <get_incidents>(\n        BASE_URL, reason=\"MISSING_MANDATORY_ELEMENT\"\n    )\n    assert any(i[\"resource_id\"] == resource_id for i in incidents)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-070",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 3532,
+    "latency_ms": 37540,
+    "wall_ms": 37540,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-070\",\n  \"reasoning\": \"R-HLT-070 mandates a nightly retention job that purges expired resources and writes a full audit trail. Negative paths cover permission denial, missing mandatory elements, and conflicting state transitions. The suite targets /cron/retention on fhir-lite. Five tests are designed: (1) EP positive \u2014 valid expired resources are purged and audit log written; (2) NEG \u2014 unauthorized caller is denied with 403 and incident raised; (3) BVA \u2014 resource expiring exactly at the retention boundary (midnight cutoff) is purged; (4) STC \u2014 resource in a conflicting state (locked/in-use) triggers correct error transition; (5) DT \u2014 missing mandatory retention policy element causes policy-mismatch incident. Each test is self-contained and idempotent via setup/teardown helpers.\",\n  \"tests\": [\n    {\n      \"name\": \"test_retention_job_purges_expired_resources_and_writes_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"At least one resource exists with expiry date in the past\",\n        \"Caller has system-job role with valid CRON_SECRET header\",\n        \"Audit log store is accessible\"\n      ],\n      \"actions\": [\n        \"Seed one expired resource via <seed_expired_resource> fixture\",\n        \"POST /cron/retention with Authorization: Bearer <CRON_SECRET>\",\n        \"Capture HTTP response status and body\",\n        \"Query audit log via <get_audit_entries> helper for the purged resource ID\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains purged_count >= 1\",\n        \"Expired resource no longer exists (GET /Resource/{id} returns 404 or 410)\",\n        \"Audit log entry exists with action=PURGE and resource_id matching seeded record\"\n      ],\n      \"trace\": [\n        \"R-HLT-070: expired resources shall be purged\",\n        \"R-HLT-070: full audit trail written after purge\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://localhost:8080\\\"\\nCRON_SECRET = \\\"<CRON_SECRET>\\\"\\n\\n@pytest.fixture(autouse=True)\\ndef setup_teardown():\\n    resource_id = <seed_expired_resource>(BASE_URL)\\n    yield resource_id\\n    <cleanup_resource>(BASE_URL, resource_id)\\n\\ndef test_retention_job_purges_expired_resources_and_writes_audit(setup_teardown):\\n    resource_id = setup_teardown\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {CRON_SECRET}\\\"}\\n\\n    resp = requests.post(f\\\"{BASE_URL}/cron/retention\\\", headers=headers)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body.get(\\\"purged_count\\\", 0) >= 1\\n\\n    get_resp = requests.get(\\n        f\\\"{BASE_URL}/Resource/{resource_id}\\\", headers=headers\\n    )\\n    assert get_resp.status_code in (404, 410)\\n\\n    audit = <get_audit_entries>(BASE_URL, resource_id)\\n    assert any(\\n        e[\\\"action\\\"] == \\\"PURGE\\\" and e[\\\"resource_id\\\"] == resource_id\\n        for e in audit\\n    )\"\n    },\n    {\n      \"name\": \"test_retention_job_denied_without_valid_credentials\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running\",\n        \"Caller presents an invalid or missing Authorization header\",\n        \"Incident management endpoint is reachable via <get_incidents> helper\"\n      ],\n      \"actions\": [\n        \"POST /cron/retention with Authorization: Bearer <INVALID_TOKEN>\",\n        \"Capture HTTP response status and body\",\n        \"Query incident log via <get_incidents> helper for policy-mismatch events\"\n      ],\n      \"expected\": [\n        \"HTTP 403 returned\",\n        \"Response body contains error field indicating permission denied\",\n        \"No resources are purged (purged_count absent or 0)\",\n        \"Incident raised with reason=PERMISSION_DENIED in incident log\"\n      ],\n      \"trace\": [\n        \"R-HLT-070: negative path \u2014 permission denial must be tested\",\n        \"R-HLT-070: incident raised on policy mismatch\"\n      ],\n      \"executable\": \"import p"
+  }
+}

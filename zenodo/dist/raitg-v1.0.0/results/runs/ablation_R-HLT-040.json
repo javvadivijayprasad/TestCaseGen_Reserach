@@ -1,0 +1,192 @@
+{
+  "req": {
+    "id": "R-HLT-040",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Consent management (boundary)",
+    "statement": "A patient shall grant or revoke consent for data sharing; revoked consent shall be enforced within 15 minutes. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "patient"
+    ],
+    "preconditions": [
+      "role:patient"
+    ],
+    "triggers": [
+      "patient updates consent"
+    ],
+    "expected_outcomes": [
+      "consent stored",
+      "downstream caches invalidated"
+    ],
+    "error_pathways": [
+      "accesses after revoke within SLA denied"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Consent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-040",
+    "reasoning": "The requirement covers consent grant/revoke lifecycle with a 15-minute SLA for cache invalidation. I selected: (1) EP positive \u2013 a valid grant then revoke sequence confirming 200 storage; (2) NEG negative \u2013 data access attempted immediately after revoke must be denied within the SLA window; (3) BVA boundary \u2013 consent start/end timestamps at exact boundary values (epoch=0, max-int seconds) and a period.duration of 0 days to probe numeric edge cases; (4) STC state-transition \u2013 full active\u2192revoked\u2192re-granted cycle confirming idempotent state changes; (5) DT decision-table \u2013 matrix of status \u00d7 category \u00d7 actor combinations to verify enforcement logic. Each test is self-contained via fixtures that create and clean up their own patient and consent resources.",
+    "tests": [
+      {
+        "name": "test_consent_grant_and_revoke_returns_200",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Caller holds a valid patient-scoped JWT (role:patient)",
+          "No prior consent resource exists for this patient ID"
+        ],
+        "actions": [
+          "POST /Consent with status=active and valid scope",
+          "Assert HTTP 201 and resource id returned",
+          "PUT /Consent/{id} with status=inactive (revoke)",
+          "Assert HTTP 200 and status=inactive in response body"
+        ],
+        "expected": [
+          "Grant returns HTTP 201 with resource id",
+          "Revoke returns HTTP 200 with status=inactive",
+          "GET /Consent/{id} returns status=inactive"
+        ],
+        "trace": [
+          "R-HLT-040: patient shall grant or revoke consent",
+          "R-HLT-040: consent stored"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import patient_token, api_client, build_consent_payload, cleanup_consent\n\n@pytest.fixture()\ndef client():\n    return api_client(base_url=\"<FHIR_BASE_URL>\")\n\ndef test_consent_grant_and_revoke_returns_200(client):\n    token = patient_token(patient_id=\"pt-ep-001\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    payload = build_consent_payload(\n        patient_id=\"pt-ep-001\",\n        status=\"active\",\n        category=\"research\"\n    )\n    post_resp = client.post(\"/Consent\", json=payload, headers=headers)\n    assert post_resp.status_code == 201\n    consent_id = post_resp.json()[\"id\"]\n\n    revoke_payload = {**payload, \"status\": \"inactive\", \"id\": consent_id}\n    put_resp = client.put(f\"/Consent/{consent_id}\", json=revoke_payload, headers=headers)\n    assert put_resp.status_code == 200\n    assert put_resp.json()[\"status\"] == \"inactive\"\n\n    get_resp = client.get(f\"/Consent/{consent_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"inactive\"\n\n    cleanup_consent(client, headers, consent_id)\n"
+      },
+      {
+        "name": "test_data_access_denied_after_revoke_within_sla",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Patient pt-neg-001 has an active consent already stored",
+          "A downstream /Patient/{id}/$everything endpoint is available",
+          "Caller holds a valid patient-scoped JWT (role:patient)"
+        ],
+        "actions": [
+          "PUT /Consent/{id} with status=inactive to revoke consent",
+          "Immediately (< 1 s) attempt GET /Patient/pt-neg-001/$everything",
+          "Wait 14 minutes 55 seconds",
+          "Attempt GET /Patient/pt-neg-001/$everything again",
+          "Wait for SLA boundary (15 min mark) and retry"
+        ],
+        "expected": [
+          "Revoke returns HTTP 200",
+          "Access within 15-min SLA window returns HTTP 403 or 401",
+          "Access after SLA may still return 403 (consent revoked permanently)"
+        ],
+        "trace": [
+          "R-HLT-040: revoked consent shall be enforced within 15 minutes",
+          "R-HLT-040: error pathway \u2013 accesses after revoke within SLA denied"
+        ],
+        "executable": "import time\nimport pytest\nfrom <helper_fn> import patient_token, api_client, ensure_active_consent, cleanup_consent\n\n@pytest.fixture()\ndef client():\n    return api_client(base_url=\"<FHIR_BASE_URL>\")\n\ndef test_data_access_denied_after_revoke_within_sla(client):\n    token = patient_token(patient_id=\"pt-neg-001\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    consent_id = ensure_active_consent(client, headers, patient_id=\"pt-neg-001\")\n\n    revoke = {\"resourceType\": \"Consent\", \"id\": consent_id, \"status\": \"inactive\"}\n    rev_resp = client.put(f\"/Consent/{consent_id}\", json=revoke, headers=headers)\n    assert rev_resp.status_code == 200\n\n    # Immediate access \u2013 must be denied within SLA\n    access_resp = client.get(\"/Patient/pt-neg-001/$everything\", headers=headers)\n    assert access_resp.status_code in (401, 403), (\n        f\"Expected 401/403 immediately after revoke, got {access_resp.status_code}\"\n    )\n\n    # Access at 14 min 55 s \u2013 still within SLA\n    time.sleep(895)\n    access_resp2 = client.get(\"/Patient/pt-neg-001/$everything\", headers=headers)\n    assert access_resp2.status_code in (401, 403), (\n        f\"Expected denial within SLA window, got {access_resp2.status_code}\"\n    )\n\n    cleanup_consent(client, headers, consent_id)\n"
+      },
+      {
+        "name": "test_consent_boundary_timestamps_and_zero_duration",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Caller holds a valid patient-scoped JWT (role:patient)",
+          "Server accepts FHIR dateTime strings"
+        ],
+        "actions": [
+          "POST /Consent with dateTime=1970-01-01T00:00:00Z (epoch boundary)",
+          "POST /Consent with dateTime=9999-12-31T23:59:59Z (max FHIR dateTime boundary)",
+          "POST /Consent with period.duration=0 (zero-length period)",
+          "POST /Consent with period.duration=-1 (below-zero, invalid)"
+        ],
+        "expected": [
+          "Epoch dateTime accepted: HTTP 201",
+          "Max dateTime accepted or server returns defined validation error <= 422",
+          "Zero-duration period returns HTTP 422 with OperationOutcome",
+          "Negative duration returns HTTP 422 with OperationOutcome"
+        ],
+        "trace": [
+          "R-HLT-040: boundary cases on timestamps and numeric elements must be tested",
+          "R-HLT-040: consent stored (valid cases)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import patient_token, api_client, build_consent_payload, cleanup_consent\n\n@pytest.fixture()\ndef client():\n    return api_client(base_url=\"<FHIR_BASE_URL>\")\n\n@pytest.mark.parametrize(\"dt,duration,expect_status\", [\n    (\"1970-01-01T00:00:00Z\", 1,    201),\n    (\"9999-12-31T23:59:59Z\", 1,    (201, 422)),\n    (\"2024-01-01T00:00:00Z\", 0,    422),\n    (\"2024-01-01T00:00:00Z\", -1,   422),\n])\ndef test_consent_boundary_timestamps_and_zero_duration(\n    client, dt, duration, expect_status\n):\n    token = patient_token(patient_id=\"pt-bva-001\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    payload = build_consent_payload(\n        patient_id=\"pt-bva-001\",\n        status=\"active\",\n        category=\"research\",\n        date_time=dt,\n        period_duration_days=duration\n    )\n    resp = client.post(\"/Consent\", json=payload, headers=headers)\n\n    if isinstance(expect_status, tuple):\n        assert resp.status_code in expect_status, f\"Got {resp.status_code}\"\n    else:\n        assert resp.status_code == expect_status, f\"Got {resp.status_code}\"\n\n    if resp.status_code == 422:\n        body = resp.json()\n        assert body.get(\"resourceType\") == \"OperationOutcome\"\n    elif resp.status_code == 201:\n        cleanup_consent(client, headers, resp.json()[\"id\"])\n"
+      },
+      {
+        "name": "test_consent_state_transition_active_revoked_regranted",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Caller holds a valid patient-scoped JWT (role:patient)",
+          "Patient pt-stc-001 has no existing consent resource"
+        ],
+        "actions": [
+          "POST /Consent status=active  \u2192 state: ACTIVE",
+          "PUT  /Consent/{id} status=inactive \u2192 state: REVOKED",
+          "PUT  /Consent/{id} status=active   \u2192 state: RE-GRANTED",
+          "DELETE or PUT status=inactive to clean up"
+        ],
+        "expected": [
+          "Transition ACTIVE: HTTP 201, status=active",
+          "Transition REVOKED: HTTP 200, status=inactive",
+          "Transition RE-GRANTED: HTTP 200, status=active",
+          "Each GET after transition reflects new status"
+        ],
+        "trace": [
+          "R-HLT-040: patient shall grant or revoke consent",
+          "R-HLT-040: consent stored; downstream caches invalidated"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import patient_token, api_client, build_consent_payload, cleanup_consent\n\n@pytest.fixture()\ndef client():\n    return api_client(base_url=\"<FHIR_BASE_URL>\")\n\ndef test_consent_state_transition_active_revoked_regranted(client):\n    token = patient_token(patient_id=\"pt-stc-001\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    base = build_consent_payload(patient_id=\"pt-stc-001\", status=\"active\", category=\"treatment\")\n\n    # ACTIVE\n    r1 = client.post(\"/Consent\", json=base, headers=headers)\n    assert r1.status_code == 201\n    cid = r1.json()[\"id\"]\n    assert r1.json()[\"status\"] == \"active\"\n\n    # REVOKED\n    r2 = client.put(f\"/Consent/{cid}\", json={**base, \"id\": cid, \"status\": \"inactive\"}, headers=headers)\n    assert r2.status_code == 200\n    assert r2.json()[\"status\"] == \"inactive\"\n    assert client.get(f\"/Consent/{cid}\", headers=headers).json()[\"status\"] == \"inactive\"\n\n    # RE-GRANTED\n    r3 = client.put(f\"/Consent/{cid}\", json={**base, \"id\": cid, \"status\": \"active\"}, headers=headers)\n    assert r3.status_code == 200\n    assert r3.json()[\"status\"] == \"active\"\n    assert client.get(f\"/Consent/{cid}\", headers=headers).json()[\"status\"] == \"active\"\n\n    cleanup_consent(client, headers, cid)\n"
+      },
+      {
+        "name": "test_consent_decision_table_status_category_actor",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Valid patient-scoped JWT available",
+          "Non-patient (practitioner) JWT available for negative actor case"
+        ],
+        "actions": [
+          "POST /Consent with status=entered-in-error (invalid status) as patient \u2192 expect 422",
+          "POST /Consent with status=active, category=<unknown-code> as patient \u2192 expect 422",
+          "POST /Consent with status=active, valid category as practitioner \u2192 expect 403",
+          "POST /Consent with status=active, valid category as patient \u2192 expect 201"
+        ],
+        "expected": [
+          "Invalid status + valid category + patient \u2192 HTTP 422",
+          "Valid status + unknown category + patient \u2192 HTTP 422",
+          "Valid status + valid category + practitioner \u2192 HTTP 403",
+          "Valid status + valid category + patient \u2192 HTTP 201"
+        ],
+        "trace": [
+          "R-HLT-040: patient shall grant or revoke consent (actor constraint)",
+          "R-HLT-040: error pathways"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import patient_token, practitioner_token, api_client, build_consent_payload, cleanup_consent\n\n@pytest.fixture()\ndef client():\n    return api_client(base_url=\"<FHIR_BASE_URL>\")\n\n@pytest.mark.parametrize(\"status,category,actor,expected_code\", [\n    (\"entered-in-error\", \"research\",    \"patient\",      422),\n    (\"active\",           \"INVALID-CAT\", \"patient\",      422),\n    (\"active\",           \"research\",    \"practitioner\", 403),\n    (\"active\",           \"research\",    \"patient\",      201),\n])\ndef test_consent_decision_table_status_category_actor(\n    client, status, category, actor, expected_code\n):\n    if actor == \"patient\":\n        token = patient_token(patient_id=\"pt-dt-001\")\n    else:\n        token = practitioner_token(practitioner_id=\"prac-dt-001\")\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n\n    payload = build_consent_payload(\n        patient_id=\"pt-dt-001\", status=status, category=category\n    )\n    resp = client.post(\"/Consent\", json=payload, headers=headers)\n    assert resp.status_code == expected_code, (\n        f\"status={status} category={category} actor={actor}: \"\n        f\"expected {expected_code}, got {resp.status_code}\"\n    )\n    if resp.status_code == 201:\n        cleanup_consent(client, headers, resp.json()[\"id\"])\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-040",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 996,
+    "output_tokens": 4093,
+    "latency_ms": 52663,
+    "wall_ms": 52663,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-040\",\n  \"reasoning\": \"The requirement covers consent grant/revoke lifecycle with a 15-minute SLA for cache invalidation. I selected: (1) EP positive \u2013 a valid grant then revoke sequence confirming 200 storage; (2) NEG negative \u2013 data access attempted immediately after revoke must be denied within the SLA window; (3) BVA boundary \u2013 consent start/end timestamps at exact boundary values (epoch=0, max-int seconds) and a period.duration of 0 days to probe numeric edge cases; (4) STC state-transition \u2013 full active\u2192revoked\u2192re-granted cycle confirming idempotent state changes; (5) DT decision-table \u2013 matrix of status \u00d7 category \u00d7 actor combinations to verify enforcement logic. Each test is self-contained via fixtures that create and clean up their own patient and consent resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_consent_grant_and_revoke_returns_200\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"FHIR-lite service is running\",\n        \"Caller holds a valid patient-scoped JWT (role:patient)\",\n        \"No prior consent resource exists for this patient ID\"\n      ],\n      \"actions\": [\n        \"POST /Consent with status=active and valid scope\",\n        \"Assert HTTP 201 and resource id returned\",\n        \"PUT /Consent/{id} with status=inactive (revoke)\",\n        \"Assert HTTP 200 and status=inactive in response body\"\n      ],\n      \"expected\": [\n        \"Grant returns HTTP 201 with resource id\",\n        \"Revoke returns HTTP 200 with status=inactive\",\n        \"GET /Consent/{id} returns status=inactive\"\n      ],\n      \"trace\": [\n        \"R-HLT-040: patient shall grant or revoke consent\",\n        \"R-HLT-040: consent stored\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import patient_token, api_client, build_consent_payload, cleanup_consent\\n\\n@pytest.fixture()\\ndef client():\\n    return api_client(base_url=\\\"<FHIR_BASE_URL>\\\")\\n\\ndef test_consent_grant_and_revoke_returns_200(client):\\n    token = patient_token(patient_id=\\\"pt-ep-001\\\")\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n\\n    payload = build_consent_payload(\\n        patient_id=\\\"pt-ep-001\\\",\\n        status=\\\"active\\\",\\n        category=\\\"research\\\"\\n    )\\n    post_resp = client.post(\\\"/Consent\\\", json=payload, headers=headers)\\n    assert post_resp.status_code == 201\\n    consent_id = post_resp.json()[\\\"id\\\"]\\n\\n    revoke_payload = {**payload, \\\"status\\\": \\\"inactive\\\", \\\"id\\\": consent_id}\\n    put_resp = client.put(f\\\"/Consent/{consent_id}\\\", json=revoke_payload, headers=headers)\\n    assert put_resp.status_code == 200\\n    assert put_resp.json()[\\\"status\\\"] == \\\"inactive\\\"\\n\\n    get_resp = client.get(f\\\"/Consent/{consent_id}\\\", headers=headers)\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"inactive\\\"\\n\\n    cleanup_consent(client, headers, consent_id)\\n\"\n    },\n    {\n      \"name\": \"test_data_access_denied_after_revoke_within_sla\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"FHIR-lite service is running\",\n        \"Patient pt-neg-001 has an active consent already stored\",\n        \"A downstream /Patient/{id}/$everything endpoint is available\",\n        \"Caller holds a valid patient-scoped JWT (role:patient)\"\n      ],\n      \"actions\": [\n        \"PUT /Consent/{id} with status=inactive to revoke consent\",\n        \"Immediately (< 1 s) attempt GET /Patient/pt-neg-001/$everything\",\n        \"Wait 14 minutes 55 seconds\",\n        \"Attempt GET /Patient/pt-neg-001/$everything again\",\n        \"Wait for SLA boundary (15 min mark) and retry\"\n      ],\n      \"expected\": [\n        \"Revoke returns HTTP 200\",\n        \"Access within 15-min SLA window returns HTTP 403 or 401\",\n        \"Access after SLA may still return 403 (consent revoked permanently)\"\n      ],\n      \"trace\": [\n        \"R-HLT-040: revoked consent shall be enforced within 15 minutes\",\n        \"R-HLT-040: error pathway \u2013 accesses after revoke wit"
+  }
+}

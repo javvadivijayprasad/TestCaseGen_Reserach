@@ -1,0 +1,192 @@
+{
+  "req": {
+    "id": "R-HLT-047",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Device data ingest (boundary)",
+    "statement": "A registered device shall push Observations via FHIR ingest; unregistered devices shall be rejected. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "device registered"
+    ],
+    "triggers": [
+      "device submits"
+    ],
+    "expected_outcomes": [
+      "observations stored",
+      "normalization applied"
+    ],
+    "error_pathways": [
+      "401 when device cert invalid"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Ingest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-047",
+    "reasoning": "The requirement covers three distinct test dimensions: (1) a registered device successfully pushing a valid FHIR Observation (EP positive path), (2) an unregistered/invalid-cert device being rejected with HTTP 401 (NEG), and (3) boundary values on timestamp and numeric elements such as the minimum/maximum allowed numeric value and an extreme timestamp at epoch boundary (BVA). Additional coverage uses Decision Table reasoning to verify normalization is applied when the observation is stored, and State Transition Coverage to confirm the device moves from 'submitted' to 'stored' state only when registered. Each test posts to /Ingest and asserts the HTTP response code and body content.",
+    "tests": [
+      {
+        "name": "test_registered_device_ingest_valid_observation",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Device is registered in fhir-lite device registry",
+          "Valid TLS client certificate is available via <registered_cert_fixture>",
+          "FHIR Observation payload with a normal numeric value and current ISO-8601 timestamp is prepared"
+        ],
+        "actions": [
+          "Build a valid FHIR Observation JSON body with resourceType='Observation', status='final', effectiveDateTime=now(), valueQuantity.value=98.6",
+          "POST the payload to /Ingest using the registered device certificate",
+          "Capture HTTP response status code and body"
+        ],
+        "expected": [
+          "HTTP response status is 201 Created",
+          "Response body contains a FHIR OperationOutcome or Observation resource with id populated",
+          "Stored Observation is retrievable via GET /Observation/{id}",
+          "Normalization flag or normalized unit is present in the stored resource"
+        ],
+        "trace": [
+          "R-HLT-047: registered device shall push Observations via FHIR ingest",
+          "R-HLT-047: observations stored; normalization applied"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/Ingest\"\n\n@pytest.fixture\ndef registered_cert():\n    return <registered_cert_fixture>\n\n@pytest.fixture\ndef valid_observation():\n    return <build_fhir_observation>(value=98.6, timestamp=<utc_now_iso8601>())\n\ndef test_registered_device_ingest_valid_observation(registered_cert, valid_observation):\n    resp = requests.post(\n        BASE_URL,\n        json=valid_observation,\n        cert=registered_cert,\n        headers={\"Content-Type\": \"application/fhir+json\"},\n        timeout=10\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    obs_id = body.get(\"id\") or (body.get(\"entry\", [{}])[0].get(\"resource\", {}).get(\"id\"))\n    assert obs_id, \"No Observation id returned\"\n    get_resp = requests.get(\n        f\"http://fhir-lite/Observation/{obs_id}\",\n        cert=registered_cert,\n        timeout=10\n    )\n    assert get_resp.status_code == 200\n    stored = get_resp.json()\n    assert stored.get(\"resourceType\") == \"Observation\"\n    assert <normalization_applied>(stored), \"Normalization not applied\"\n"
+      },
+      {
+        "name": "test_unregistered_device_cert_rejected_with_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "An invalid or unregistered TLS client certificate is available via <unregistered_cert_fixture>",
+          "A syntactically valid FHIR Observation payload is prepared"
+        ],
+        "actions": [
+          "Build a syntactically valid FHIR Observation JSON body",
+          "POST the payload to /Ingest using the unregistered/invalid device certificate",
+          "Capture HTTP response status code and body"
+        ],
+        "expected": [
+          "HTTP response status is 401 Unauthorized",
+          "Response body indicates authentication failure (e.g. OperationOutcome with issue.code='security')",
+          "No Observation resource is created in the data store"
+        ],
+        "trace": [
+          "R-HLT-047: unregistered devices shall be rejected",
+          "R-HLT-047: error pathway 401 when device cert invalid"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/Ingest\"\n\n@pytest.fixture\ndef unregistered_cert():\n    return <unregistered_cert_fixture>\n\n@pytest.fixture\ndef valid_observation():\n    return <build_fhir_observation>(value=72.0, timestamp=<utc_now_iso8601>())\n\ndef test_unregistered_device_cert_rejected_with_401(unregistered_cert, valid_observation):\n    resp = requests.post(\n        BASE_URL,\n        json=valid_observation,\n        cert=unregistered_cert,\n        headers={\"Content-Type\": \"application/fhir+json\"},\n        timeout=10\n    )\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    issues = body.get(\"issue\", [])\n    codes = [i.get(\"code\") for i in issues]\n    assert \"security\" in codes or \"forbidden\" in codes, (\n        f\"Expected security issue code, got: {codes}\"\n    )\n"
+      },
+      {
+        "name": "test_boundary_timestamp_epoch_and_max_numeric_value",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Device is registered in fhir-lite device registry",
+          "Valid TLS client certificate is available via <registered_cert_fixture>",
+          "System accepts FHIR dateTime values at Unix epoch (1970-01-01T00:00:00Z)",
+          "System defines maximum allowed valueQuantity.value as per profile constraints"
+        ],
+        "actions": [
+          "Build a FHIR Observation with effectiveDateTime set to Unix epoch '1970-01-01T00:00:00Z'",
+          "Set valueQuantity.value to the maximum allowed boundary value (e.g. 999999.99)",
+          "POST the payload to /Ingest using the registered device certificate",
+          "Capture HTTP response status code and body",
+          "Also POST a payload with valueQuantity.value exceeding maximum (e.g. 1000000.00) and assert rejection"
+        ],
+        "expected": [
+          "Epoch timestamp observation returns 201 or 422 per profile rules (documented boundary)",
+          "Max-value-at-boundary observation returns 201 Created",
+          "Value exceeding maximum returns 422 Unprocessable Entity",
+          "Response body for rejection contains OperationOutcome with issue describing value constraint"
+        ],
+        "trace": [
+          "R-HLT-047: boundary cases on timestamps and numeric elements must be tested",
+          "R-HLT-047: observations stored; normalization applied"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/Ingest\"\nEPOCH_TS = \"1970-01-01T00:00:00Z\"\nMAX_VALUE = 999999.99\nOVER_MAX_VALUE = 1000000.00\n\n@pytest.fixture\ndef registered_cert():\n    return <registered_cert_fixture>\n\ndef test_boundary_timestamp_epoch_and_max_numeric_value(registered_cert):\n    epoch_obs = <build_fhir_observation>(value=MAX_VALUE, timestamp=EPOCH_TS)\n    resp_epoch = requests.post(\n        BASE_URL,\n        json=epoch_obs,\n        cert=registered_cert,\n        headers={\"Content-Type\": \"application/fhir+json\"},\n        timeout=10\n    )\n    assert resp_epoch.status_code in (201, 422), (\n        f\"Epoch TS: expected 201 or 422, got {resp_epoch.status_code}\"\n    )\n    max_obs = <build_fhir_observation>(value=MAX_VALUE, timestamp=<utc_now_iso8601>())\n    resp_max = requests.post(\n        BASE_URL,\n        json=max_obs,\n        cert=registered_cert,\n        headers={\"Content-Type\": \"application/fhir+json\"},\n        timeout=10\n    )\n    assert resp_max.status_code == 201, f\"Max boundary value: expected 201, got {resp_max.status_code}\"\n    over_obs = <build_fhir_observation>(value=OVER_MAX_VALUE, timestamp=<utc_now_iso8601>())\n    resp_over = requests.post(\n        BASE_URL,\n        json=over_obs,\n        cert=registered_cert,\n        headers={\"Content-Type\": \"application/fhir+json\"},\n        timeout=10\n    )\n    assert resp_over.status_code == 422, f\"Over-max value: expected 422, got {resp_over.status_code}\"\n"
+      },
+      {
+        "name": "test_device_state_transition_registered_to_stored",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Device is registered in fhir-lite device registry with status='active'",
+          "Valid TLS client certificate is available via <registered_cert_fixture>",
+          "No prior Observation exists for this device in the current test run"
+        ],
+        "actions": [
+          "Confirm device status is 'active' via GET /Device/{device_id}",
+          "POST a valid FHIR Observation to /Ingest using the registered certificate",
+          "Assert transition: Observation moves from 'submitted' to 'stored' state",
+          "Retrieve the Observation by returned id and verify status='final'"
+        ],
+        "expected": [
+          "Device remains in 'active' state after submission",
+          "Observation resource status is 'final' in the stored representation",
+          "HTTP 201 returned on POST",
+          "GET /Observation/{id} returns the stored resource with status='final'"
+        ],
+        "trace": [
+          "R-HLT-047: registered device shall push Observations via FHIR ingest",
+          "R-HLT-047: observations stored; normalization applied",
+          "R-HLT-047: preconditions: device registered"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite\"\nDEVICE_ID = <test_device_id>\n\n@pytest.fixture\ndef registered_cert():\n    return <registered_cert_fixture>\n\ndef test_device_state_transition_registered_to_stored(registered_cert):\n    dev_resp = requests.get(\n        f\"{BASE_URL}/Device/{DEVICE_ID}\",\n        cert=registered_cert,\n        timeout=10\n    )\n    assert dev_resp.status_code == 200\n    assert dev_resp.json().get(\"status\") == \"active\", \"Device not active before test\"\n    obs = <build_fhir_observation>(value=75.0, timestamp=<utc_now_iso8601>())\n    post_resp = requests.post(\n        f\"{BASE_URL}/Ingest\",\n        json=obs,\n        cert=registered_cert,\n        headers={\"Content-Type\": \"application/fhir+json\"},\n        timeout=10\n    )\n    assert post_resp.status_code == 201, f\"POST failed: {post_resp.status_code}\"\n    obs_id = post_resp.json().get(\"id\")\n    assert obs_id, \"No id in POST response\"\n    get_resp = requests.get(\n        f\"{BASE_URL}/Observation/{obs_id}\",\n        cert=registered_cert,\n        timeout=10\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json().get(\"status\") == \"final\"\n"
+      },
+      {
+        "name": "test_decision_table_cert_and_registration_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Registered device cert is available via <registered_cert_fixture>",
+          "Unregistered device cert is available via <unregistered_cert_fixture>",
+          "A syntactically valid FHIR Observation payload is available"
+        ],
+        "actions": [
+          "Case A: registered cert + valid payload -> POST /Ingest -> expect 201",
+          "Case B: unregistered cert + valid payload -> POST /Ingest -> expect 401",
+          "Case C: no cert (anonymous) + valid payload -> POST /Ingest -> expect 401 or 403",
+          "Assert each case independently; record response codes"
+        ],
+        "expected": [
+          "Case A returns HTTP 201",
+          "Case B returns HTTP 401",
+          "Case C returns HTTP 401 or 403",
+          "No observation is stored for Cases B and C"
+        ],
+        "trace": [
+          "R-HLT-047: unregistered devices shall be rejected",
+          "R-HLT-047: error pathway 401 when device cert invalid",
+          "R-HLT-047: registered device shall push Observations via FHIR ingest"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://fhir-lite/Ingest\"\nHEADERS = {\"Content-Type\": \"application/fhir+json\"}\n\n@pytest.fixture\ndef registered_cert():\n    return <registered_cert_fixture>\n\n@pytest.fixture\ndef unregistered_cert():\n    return <unregistered_cert_fixture>\n\n@pytest.fixture\ndef valid_observation():\n    return <build_fhir_observation>(value=80.0, timestamp=<utc_now_iso8601>())\n\ndef test_decision_table_cert_and_registration_combinations(\n    registered_cert, unregistered_cert, valid_observation\n):\n    resp_a = requests.post(\n        BASE_URL, json=valid_observation, cert=registered_cert,\n        headers=HEADERS, timeout=10\n    )\n    assert resp_a.status_code == 201, f\"Case A failed: {resp_a.status_code}\"\n    resp_b = requests.post(\n        BASE_URL, json=valid_observation, cert=unregistered_cert,\n        headers=HEADERS, timeout=10\n    )\n    assert resp_b.status_code == 401, f\"Case B failed: {resp_b.status_code}\"\n    resp_c = requests.post(\n        BASE_URL, json=valid_observation,\n        headers=HEADERS, timeout=10\n    )\n    assert resp_c.status_code in (401, 403), f\"Case C failed: {resp_c.status_code}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-047",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 992,
+    "output_tokens": 4028,
+    "latency_ms": 41230,
+    "wall_ms": 41230,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-047\",\n  \"reasoning\": \"The requirement covers three distinct test dimensions: (1) a registered device successfully pushing a valid FHIR Observation (EP positive path), (2) an unregistered/invalid-cert device being rejected with HTTP 401 (NEG), and (3) boundary values on timestamp and numeric elements such as the minimum/maximum allowed numeric value and an extreme timestamp at epoch boundary (BVA). Additional coverage uses Decision Table reasoning to verify normalization is applied when the observation is stored, and State Transition Coverage to confirm the device moves from 'submitted' to 'stored' state only when registered. Each test posts to /Ingest and asserts the HTTP response code and body content.\",\n  \"tests\": [\n    {\n      \"name\": \"test_registered_device_ingest_valid_observation\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Device is registered in fhir-lite device registry\",\n        \"Valid TLS client certificate is available via <registered_cert_fixture>\",\n        \"FHIR Observation payload with a normal numeric value and current ISO-8601 timestamp is prepared\"\n      ],\n      \"actions\": [\n        \"Build a valid FHIR Observation JSON body with resourceType='Observation', status='final', effectiveDateTime=now(), valueQuantity.value=98.6\",\n        \"POST the payload to /Ingest using the registered device certificate\",\n        \"Capture HTTP response status code and body\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 201 Created\",\n        \"Response body contains a FHIR OperationOutcome or Observation resource with id populated\",\n        \"Stored Observation is retrievable via GET /Observation/{id}\",\n        \"Normalization flag or normalized unit is present in the stored resource\"\n      ],\n      \"trace\": [\n        \"R-HLT-047: registered device shall push Observations via FHIR ingest\",\n        \"R-HLT-047: observations stored; normalization applied\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://fhir-lite/Ingest\\\"\\n\\n@pytest.fixture\\ndef registered_cert():\\n    return <registered_cert_fixture>\\n\\n@pytest.fixture\\ndef valid_observation():\\n    return <build_fhir_observation>(value=98.6, timestamp=<utc_now_iso8601>())\\n\\ndef test_registered_device_ingest_valid_observation(registered_cert, valid_observation):\\n    resp = requests.post(\\n        BASE_URL,\\n        json=valid_observation,\\n        cert=registered_cert,\\n        headers={\\\"Content-Type\\\": \\\"application/fhir+json\\\"},\\n        timeout=10\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    obs_id = body.get(\\\"id\\\") or (body.get(\\\"entry\\\", [{}])[0].get(\\\"resource\\\", {}).get(\\\"id\\\"))\\n    assert obs_id, \\\"No Observation id returned\\\"\\n    get_resp = requests.get(\\n        f\\\"http://fhir-lite/Observation/{obs_id}\\\",\\n        cert=registered_cert,\\n        timeout=10\\n    )\\n    assert get_resp.status_code == 200\\n    stored = get_resp.json()\\n    assert stored.get(\\\"resourceType\\\") == \\\"Observation\\\"\\n    assert <normalization_applied>(stored), \\\"Normalization not applied\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unregistered_device_cert_rejected_with_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"An invalid or unregistered TLS client certificate is available via <unregistered_cert_fixture>\",\n        \"A syntactically valid FHIR Observation payload is prepared\"\n      ],\n      \"actions\": [\n        \"Build a syntactically valid FHIR Observation JSON body\",\n        \"POST the payload to /Ingest using the unregistered/invalid device certificate\",\n        \"Capture HTTP response status code and body\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 401 Unauthorized\",\n        \"Response body indicates authentication failure (e.g. OperationOutcome with issue.code='security')\",\n        \"No Observation resource is created in the data"
+  }
+}

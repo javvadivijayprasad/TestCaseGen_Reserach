@@ -1,0 +1,168 @@
+{
+  "req": {
+    "id": "R-FIN-011",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Beneficiary management",
+    "statement": "A customer shall add a beneficiary which enters a 24-hour cooling-off period before it can receive transfers.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds beneficiary"
+    ],
+    "expected_outcomes": [
+      "beneficiary saved in pending state"
+    ],
+    "error_pathways": [
+      "409 if duplicate account"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/beneficiaries"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-011",
+    "reasoning": "Beneficiary management requires validation of state transitions (pending \u2192 active after 24h), duplicate detection, and data persistence. Test suite covers: (1) happy path with valid beneficiary creation entering pending state (EP, STC), (2) duplicate account rejection with 409 error (NEG, DT), (3) boundary condition at cooling-off period threshold (BVA). All tests are deterministic, use request/response assertions, and verify state transitions without external dependencies.",
+    "tests": [
+      {
+        "name": "test_add_valid_beneficiary_enters_pending_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with valid JWT token",
+          "Beneficiary account does not exist in system",
+          "Banking API is accessible at base URL"
+        ],
+        "actions": [
+          "POST /beneficiaries with valid beneficiary payload (name, account_number, bank_code, account_type)",
+          "Verify HTTP response code",
+          "Verify response body contains beneficiary_id and status field",
+          "Query GET /beneficiaries to retrieve created beneficiary",
+          "Inspect status field in response"
+        ],
+        "expected": [
+          "POST returns HTTP 201 Created",
+          "Response includes beneficiary_id (UUID format)",
+          "Response includes status = 'pending'",
+          "Response includes created_at timestamp (ISO 8601)",
+          "Subsequent GET returns same beneficiary with status 'pending'",
+          "Beneficiary cannot initiate transfers (verified via transfer endpoint rejection)"
+        ],
+        "trace": [
+          "R-FIN-011 \u2192 customer adds beneficiary",
+          "R-FIN-011 \u2192 beneficiary saved in pending state",
+          "R-FIN-011 \u2192 24-hour cooling-off period begins"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime\n\ndef test_add_valid_beneficiary_enters_pending_state(api_base_url, auth_token):\n    payload = {\n        \"name\": \"John Doe\",\n        \"account_number\": \"987654321\",\n        \"bank_code\": \"CHASE\",\n        \"account_type\": \"checking\"\n    }\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=headers\n    )\n    \n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"beneficiary_id\" in body\n    assert body[\"status\"] == \"pending\"\n    assert \"created_at\" in body\n    \n    get_resp = requests.get(\n        f\"{api_base_url}/beneficiaries/{body['beneficiary_id']}\",\n        headers=headers\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"pending\""
+      },
+      {
+        "name": "test_add_duplicate_beneficiary_returns_409_conflict",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with valid JWT token",
+          "Beneficiary with account_number '123456789' already exists for customer",
+          "Banking API is accessible at base URL"
+        ],
+        "actions": [
+          "POST /beneficiaries with duplicate account_number",
+          "Verify HTTP response code and error message",
+          "Verify error response structure and clarity"
+        ],
+        "expected": [
+          "POST returns HTTP 409 Conflict",
+          "Response includes error_code = 'DUPLICATE_BENEFICIARY'",
+          "Response includes human-readable message indicating duplicate account",
+          "No new beneficiary record is created",
+          "Original beneficiary state remains unchanged"
+        ],
+        "trace": [
+          "R-FIN-011 \u2192 customer adds beneficiary (duplicate scenario)",
+          "R-FIN-011 \u2192 error pathway: 409 if duplicate account"
+        ],
+        "executable": "import requests\n\ndef test_add_duplicate_beneficiary_returns_409_conflict(api_base_url, auth_token):\n    payload = {\n        \"name\": \"Jane Smith\",\n        \"account_number\": \"123456789\",\n        \"bank_code\": \"BNY\",\n        \"account_type\": \"savings\"\n    }\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=headers\n    )\n    \n    assert resp.status_code == 409\n    body = resp.json()\n    assert body[\"error_code\"] == \"DUPLICATE_BENEFICIARY\"\n    assert \"already exists\" in body[\"message\"].lower()"
+      },
+      {
+        "name": "test_beneficiary_cooling_off_period_boundary_at_24_hours",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with valid JWT token",
+          "Beneficiary was added exactly 24 hours ago (within 5-second tolerance)",
+          "Beneficiary is currently in 'pending' state",
+          "Banking API supports time-mocked testing or test database with controlled timestamps"
+        ],
+        "actions": [
+          "Add new beneficiary with mocked created_at timestamp",
+          "Attempt transfer to beneficiary at +23h 59m 55s (before expiry)",
+          "Verify transfer rejection with 'pending' state error",
+          "Advance mocked time to +24h 0m 5s",
+          "Attempt transfer to same beneficiary (after cooling-off)",
+          "Verify transfer acceptance or state transition to 'active'"
+        ],
+        "expected": [
+          "Transfer at 23h 59m 55s returns error code 'BENEFICIARY_COOLING_OFF_ACTIVE'",
+          "Error message indicates pending state and time remaining",
+          "Transfer at 24h 0m 5s succeeds with HTTP 202 or status updates to 'active'",
+          "Beneficiary can now initiate transfers without state-blocking errors"
+        ],
+        "trace": [
+          "R-FIN-011 \u2192 24-hour cooling-off period boundary",
+          "R-FIN-011 \u2192 state transition from pending to active",
+          "STC: pending \u2192 (after 24h) \u2192 active"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_beneficiary_cooling_off_period_boundary_at_24_hours(\n    api_base_url, auth_token, mock_time_fn\n):\n    now = datetime.utcnow()\n    payload = {\n        \"name\": \"Boundary Test\",\n        \"account_number\": \"555999888\",\n        \"bank_code\": \"FED\",\n        \"account_type\": \"checking\"\n    }\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=headers\n    )\n    beneficiary_id = resp.json()[\"beneficiary_id\"]\n    \n    mock_time_fn(now + timedelta(hours=23, minutes=59, seconds=55))\n    transfer_resp = requests.post(\n        f\"{api_base_url}/transfers\",\n        json={\"to_beneficiary_id\": beneficiary_id, \"amount\": 100},\n        headers=headers\n    )\n    assert transfer_resp.status_code in [400, 403]\n    assert \"COOLING_OFF\" in transfer_resp.json()[\"error_code\"]\n    \n    mock_time_fn(now + timedelta(hours=24, minutes=0, seconds=5))\n    transfer_resp2 = requests.post(\n        f\"{api_base_url}/transfers\",\n        json={\"to_beneficiary_id\": beneficiary_id, \"amount\": 100},\n        headers=headers\n    )\n    assert transfer_resp2.status_code in [200, 202]"
+      },
+      {
+        "name": "test_add_beneficiary_with_malformed_account_number_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with valid JWT token",
+          "Banking API accepts account number in specific format (e.g., digits only, 8\u201317 chars)"
+        ],
+        "actions": [
+          "POST /beneficiaries with invalid account_number (special chars, wrong length)",
+          "Verify HTTP response code and validation error"
+        ],
+        "expected": [
+          "POST returns HTTP 400 Bad Request",
+          "Response includes error_code = 'INVALID_ACCOUNT_NUMBER'",
+          "Response includes field-level error message",
+          "No beneficiary is created"
+        ],
+        "trace": [
+          "R-FIN-011 \u2192 data validation at beneficiary entry point"
+        ],
+        "executable": "import requests\n\ndef test_add_beneficiary_with_malformed_account_number_returns_400(\n    api_base_url, auth_token\n):\n    payload = {\n        \"name\": \"Bad Account\",\n        \"account_number\": \"ABC@#$%XYZ\",\n        \"bank_code\": \"TEST\",\n        \"account_type\": \"checking\"\n    }\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    \n    resp = requests.post(\n        f\"{api_base_url}/beneficiaries\",\n        json=payload,\n        headers=headers\n    )\n    \n    assert resp.status_code == 400\n    body = resp.json()\n    assert \"account_number\" in body.get(\"errors\", {})\n    assert body[\"error_code\"] == \"INVALID_ACCOUNT_NUMBER\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-011",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1018,
+    "output_tokens": 2635,
+    "latency_ms": 15717,
+    "wall_ms": 15717,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-011\",\n  \"reasoning\": \"Beneficiary management requires validation of state transitions (pending \u2192 active after 24h), duplicate detection, and data persistence. Test suite covers: (1) happy path with valid beneficiary creation entering pending state (EP, STC), (2) duplicate account rejection with 409 error (NEG, DT), (3) boundary condition at cooling-off period threshold (BVA). All tests are deterministic, use request/response assertions, and verify state transitions without external dependencies.\",\n  \"tests\": [\n    {\n      \"name\": \"test_add_valid_beneficiary_enters_pending_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with valid JWT token\",\n        \"Beneficiary account does not exist in system\",\n        \"Banking API is accessible at base URL\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with valid beneficiary payload (name, account_number, bank_code, account_type)\",\n        \"Verify HTTP response code\",\n        \"Verify response body contains beneficiary_id and status field\",\n        \"Query GET /beneficiaries to retrieve created beneficiary\",\n        \"Inspect status field in response\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 201 Created\",\n        \"Response includes beneficiary_id (UUID format)\",\n        \"Response includes status = 'pending'\",\n        \"Response includes created_at timestamp (ISO 8601)\",\n        \"Subsequent GET returns same beneficiary with status 'pending'\",\n        \"Beneficiary cannot initiate transfers (verified via transfer endpoint rejection)\"\n      ],\n      \"trace\": [\n        \"R-FIN-011 \u2192 customer adds beneficiary\",\n        \"R-FIN-011 \u2192 beneficiary saved in pending state\",\n        \"R-FIN-011 \u2192 24-hour cooling-off period begins\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom datetime import datetime\\n\\ndef test_add_valid_beneficiary_enters_pending_state(api_base_url, auth_token):\\n    payload = {\\n        \\\"name\\\": \\\"John Doe\\\",\\n        \\\"account_number\\\": \\\"987654321\\\",\\n        \\\"bank_code\\\": \\\"CHASE\\\",\\n        \\\"account_type\\\": \\\"checking\\\"\\n    }\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"}\\n    \\n    resp = requests.post(\\n        f\\\"{api_base_url}/beneficiaries\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n    \\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"beneficiary_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert \\\"created_at\\\" in body\\n    \\n    get_resp = requests.get(\\n        f\\\"{api_base_url}/beneficiaries/{body['beneficiary_id']}\\\",\\n        headers=headers\\n    )\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"pending\\\"\"\n    },\n    {\n      \"name\": \"test_add_duplicate_beneficiary_returns_409_conflict\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated with valid JWT token\",\n        \"Beneficiary with account_number '123456789' already exists for customer\",\n        \"Banking API is accessible at base URL\"\n      ],\n      \"actions\": [\n        \"POST /beneficiaries with duplicate account_number\",\n        \"Verify HTTP response code and error message\",\n        \"Verify error response structure and clarity\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 409 Conflict\",\n        \"Response includes error_code = 'DUPLICATE_BENEFICIARY'\",\n        \"Response includes human-readable message indicating duplicate account\",\n        \"No new beneficiary record is created\",\n        \"Original beneficiary state remains unchanged\"\n      ],\n      \"trace\": [\n        \"R-FIN-011 \u2192 customer adds beneficiary (duplicate scenario)\",\n        \"R-FIN-011 \u2192 error pathway: 409 if duplicate account\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_add_duplicate_beneficiary_returns_409_conflict(api_base_url, auth_token):\\n    payload = {\\n        \\\"name\\\": \\\"Jane Smith\\\",\\n        \\\"account_num"
+  }
+}

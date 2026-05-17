@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-WEB-110",
+    "domain": "commercial_web",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Webhook delivery",
+    "statement": "Outbound webhooks shall retry on 5xx with exponential backoff up to 5 times; permanent failures shall be DLQ'd.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "webhook configured"
+    ],
+    "triggers": [
+      "event fires"
+    ],
+    "expected_outcomes": [
+      "delivered or DLQ'd"
+    ],
+    "error_pathways": [
+      "5 retries on 5xx"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/hooks/*"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-110",
+    "reasoning": "The requirement specifies: (1) successful delivery on 2xx \u2013 positive/EP; (2) 5xx triggers up to 5 retries with exponential backoff then DLQ on persistent failure \u2013 negative/NEG and boundary/BVA at the exact retry limit of 5. State transitions covered are: PENDING\u2192DELIVERED, PENDING\u2192RETRY(x5)\u2192DLQ. A Decision Table test covers the mixed case where early retries fail but the final attempt succeeds, confirming no DLQ is raised when delivery eventually succeeds within the allowed window.",
+    "tests": [
+      {
+        "name": "test_webhook_delivered_on_first_attempt_200",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Webhook endpoint is configured for hr-app under /hooks/*",
+          "Target URL returns HTTP 200 on first call",
+          "A triggering event is ready to be fired"
+        ],
+        "actions": [
+          "Start a mock HTTP server that always responds 200",
+          "Register the webhook pointing at mock server via <register_webhook_fixture>",
+          "Fire the triggering event via <fire_event_helper>",
+          "Poll delivery log until status is DELIVERED or timeout"
+        ],
+        "expected": [
+          "Webhook is delivered with status DELIVERED",
+          "Exactly 1 HTTP call is recorded by mock server",
+          "No DLQ entry is created"
+        ],
+        "trace": [
+          "R-WEB-110: successful delivery path",
+          "EP: 2xx response class \u2013 delivered partition"
+        ],
+        "executable": "import pytest\nimport time\nfrom unittest.mock import patch\n\ndef test_webhook_delivered_on_first_attempt_200(\n    register_webhook_fixture,\n    fire_event_helper,\n    mock_http_server,\n    delivery_log_client,\n    dlq_client,\n):\n    mock_http_server.set_responses([200])\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\n\n    event_id = fire_event_helper(hook_id=hook_id)\n\n    status = delivery_log_client.wait_for_terminal(\n        event_id, timeout=10\n    )\n\n    assert status == \"DELIVERED\"\n    assert mock_http_server.call_count == 1\n    assert dlq_client.contains(event_id) is False\n"
+      },
+      {
+        "name": "test_webhook_dlqd_after_5_consecutive_5xx",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Webhook endpoint is configured for hr-app under /hooks/*",
+          "Target URL always returns HTTP 500",
+          "A triggering event is ready to be fired"
+        ],
+        "actions": [
+          "Start a mock HTTP server that always responds 500",
+          "Register the webhook pointing at mock server via <register_webhook_fixture>",
+          "Fire the triggering event via <fire_event_helper>",
+          "Wait for all retries to exhaust (poll delivery log for DLQ status)"
+        ],
+        "expected": [
+          "Mock server receives exactly 6 calls (1 initial + 5 retries)",
+          "Final delivery status is FAILED",
+          "Event appears in DLQ"
+        ],
+        "trace": [
+          "R-WEB-110: 5xx error pathway \u2013 DLQ after max retries",
+          "NEG: persistent 5xx forces DLQ"
+        ],
+        "executable": "import pytest\n\ndef test_webhook_dlqd_after_5_consecutive_5xx(\n    register_webhook_fixture,\n    fire_event_helper,\n    mock_http_server,\n    delivery_log_client,\n    dlq_client,\n):\n    mock_http_server.set_responses([500] * 6)\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\n\n    event_id = fire_event_helper(hook_id=hook_id)\n\n    status = delivery_log_client.wait_for_terminal(\n        event_id, timeout=60\n    )\n\n    assert status == \"FAILED\"\n    assert mock_http_server.call_count == 6, (\n        f\"Expected 6 attempts, got {mock_http_server.call_count}\"\n    )\n    assert dlq_client.contains(event_id) is True\n"
+      },
+      {
+        "name": "test_webhook_succeeds_on_5th_retry_no_dlq",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Webhook endpoint is configured for hr-app under /hooks/*",
+          "Target URL returns HTTP 500 for first 5 calls then 200 on the 6th call (5th retry)",
+          "A triggering event is ready to be fired"
+        ],
+        "actions": [
+          "Start a mock HTTP server returning [500,500,500,500,500,200]",
+          "Register the webhook pointing at mock server via <register_webhook_fixture>",
+          "Fire the triggering event via <fire_event_helper>",
+          "Poll delivery log until DELIVERED or FAILED terminal state or timeout"
+        ],
+        "expected": [
+          "Mock server receives exactly 6 calls",
+          "Final delivery status is DELIVERED",
+          "No DLQ entry is created \u2013 success on boundary attempt prevents DLQ"
+        ],
+        "trace": [
+          "R-WEB-110: boundary \u2013 success on exactly the 5th retry (maximum allowed)",
+          "BVA: upper boundary of retry count = 5"
+        ],
+        "executable": "import pytest\n\ndef test_webhook_succeeds_on_5th_retry_no_dlq(\n    register_webhook_fixture,\n    fire_event_helper,\n    mock_http_server,\n    delivery_log_client,\n    dlq_client,\n):\n    # 5 failures then success on attempt 6 (retry #5)\n    mock_http_server.set_responses([500, 500, 500, 500, 500, 200])\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\n\n    event_id = fire_event_helper(hook_id=hook_id)\n\n    status = delivery_log_client.wait_for_terminal(\n        event_id, timeout=120\n    )\n\n    assert status == \"DELIVERED\"\n    assert mock_http_server.call_count == 6, (\n        f\"Expected 6 attempts, got {mock_http_server.call_count}\"\n    )\n    assert dlq_client.contains(event_id) is False\n"
+      },
+      {
+        "name": "test_webhook_retry_state_transitions_with_exponential_backoff",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Webhook endpoint is configured for hr-app under /hooks/*",
+          "Target URL returns 500 for 3 calls then 200",
+          "Delivery log exposes per-attempt timestamps"
+        ],
+        "actions": [
+          "Start a mock server returning [500, 500, 500, 200]",
+          "Register webhook and fire triggering event",
+          "Collect per-attempt timestamps from delivery log after DELIVERED",
+          "Compute inter-attempt intervals"
+        ],
+        "expected": [
+          "State transitions: PENDING -> RETRY_1 -> RETRY_2 -> RETRY_3 -> DELIVERED",
+          "Each interval is >= previous interval (exponential growth)",
+          "No DLQ entry created"
+        ],
+        "trace": [
+          "R-WEB-110: state transition coverage of retry states",
+          "STC: PENDING->RETRY(n)->DELIVERED state path"
+        ],
+        "executable": "import pytest\n\ndef test_webhook_retry_state_transitions_with_exponential_backoff(\n    register_webhook_fixture,\n    fire_event_helper,\n    mock_http_server,\n    delivery_log_client,\n    dlq_client,\n):\n    mock_http_server.set_responses([500, 500, 500, 200])\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\n\n    event_id = fire_event_helper(hook_id=hook_id)\n\n    status = delivery_log_client.wait_for_terminal(\n        event_id, timeout=60\n    )\n    assert status == \"DELIVERED\"\n\n    attempts = delivery_log_client.get_attempts(event_id)\n    assert len(attempts) == 4\n\n    intervals = [\n        (attempts[i+1][\"ts\"] - attempts[i][\"ts\"]).total_seconds()\n        for i in range(len(attempts) - 1)\n    ]\n    for i in range(1, len(intervals)):\n        assert intervals[i] >= intervals[i-1], (\n            f\"Backoff not increasing: {intervals}\"\n        )\n    assert dlq_client.contains(event_id) is False\n"
+      },
+      {
+        "name": "test_webhook_no_retry_on_4xx_response",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Webhook endpoint is configured for hr-app under /hooks/*",
+          "Target URL returns HTTP 400 on first call (client error, non-retriable)",
+          "A triggering event is ready to be fired"
+        ],
+        "actions": [
+          "Start a mock HTTP server returning 400",
+          "Register webhook and fire triggering event",
+          "Poll delivery log for terminal state"
+        ],
+        "expected": [
+          "Mock server receives exactly 1 call \u2013 no retries for 4xx",
+          "Delivery status is FAILED",
+          "Event is DLQ'd immediately (non-retriable failure)"
+        ],
+        "trace": [
+          "R-WEB-110: decision table \u2013 4xx is non-retriable, distinct from 5xx path",
+          "DT: response class 4xx -> no retry -> immediate DLQ"
+        ],
+        "executable": "import pytest\n\ndef test_webhook_no_retry_on_4xx_response(\n    register_webhook_fixture,\n    fire_event_helper,\n    mock_http_server,\n    delivery_log_client,\n    dlq_client,\n):\n    mock_http_server.set_responses([400])\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\n\n    event_id = fire_event_helper(hook_id=hook_id)\n\n    status = delivery_log_client.wait_for_terminal(\n        event_id, timeout=15\n    )\n\n    assert mock_http_server.call_count == 1, (\n        f\"4xx must not be retried, got {mock_http_server.call_count} calls\"\n    )\n    assert status == \"FAILED\"\n    assert dlq_client.contains(event_id) is True\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-110",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 984,
+    "output_tokens": 2899,
+    "latency_ms": 32136,
+    "wall_ms": 32136,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-110\",\n  \"reasoning\": \"The requirement specifies: (1) successful delivery on 2xx \u2013 positive/EP; (2) 5xx triggers up to 5 retries with exponential backoff then DLQ on persistent failure \u2013 negative/NEG and boundary/BVA at the exact retry limit of 5. State transitions covered are: PENDING\u2192DELIVERED, PENDING\u2192RETRY(x5)\u2192DLQ. A Decision Table test covers the mixed case where early retries fail but the final attempt succeeds, confirming no DLQ is raised when delivery eventually succeeds within the allowed window.\",\n  \"tests\": [\n    {\n      \"name\": \"test_webhook_delivered_on_first_attempt_200\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Webhook endpoint is configured for hr-app under /hooks/*\",\n        \"Target URL returns HTTP 200 on first call\",\n        \"A triggering event is ready to be fired\"\n      ],\n      \"actions\": [\n        \"Start a mock HTTP server that always responds 200\",\n        \"Register the webhook pointing at mock server via <register_webhook_fixture>\",\n        \"Fire the triggering event via <fire_event_helper>\",\n        \"Poll delivery log until status is DELIVERED or timeout\"\n      ],\n      \"expected\": [\n        \"Webhook is delivered with status DELIVERED\",\n        \"Exactly 1 HTTP call is recorded by mock server\",\n        \"No DLQ entry is created\"\n      ],\n      \"trace\": [\n        \"R-WEB-110: successful delivery path\",\n        \"EP: 2xx response class \u2013 delivered partition\"\n      ],\n      \"executable\": \"import pytest\\nimport time\\nfrom unittest.mock import patch\\n\\ndef test_webhook_delivered_on_first_attempt_200(\\n    register_webhook_fixture,\\n    fire_event_helper,\\n    mock_http_server,\\n    delivery_log_client,\\n    dlq_client,\\n):\\n    mock_http_server.set_responses([200])\\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\\n\\n    event_id = fire_event_helper(hook_id=hook_id)\\n\\n    status = delivery_log_client.wait_for_terminal(\\n        event_id, timeout=10\\n    )\\n\\n    assert status == \\\"DELIVERED\\\"\\n    assert mock_http_server.call_count == 1\\n    assert dlq_client.contains(event_id) is False\\n\"\n    },\n    {\n      \"name\": \"test_webhook_dlqd_after_5_consecutive_5xx\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Webhook endpoint is configured for hr-app under /hooks/*\",\n        \"Target URL always returns HTTP 500\",\n        \"A triggering event is ready to be fired\"\n      ],\n      \"actions\": [\n        \"Start a mock HTTP server that always responds 500\",\n        \"Register the webhook pointing at mock server via <register_webhook_fixture>\",\n        \"Fire the triggering event via <fire_event_helper>\",\n        \"Wait for all retries to exhaust (poll delivery log for DLQ status)\"\n      ],\n      \"expected\": [\n        \"Mock server receives exactly 6 calls (1 initial + 5 retries)\",\n        \"Final delivery status is FAILED\",\n        \"Event appears in DLQ\"\n      ],\n      \"trace\": [\n        \"R-WEB-110: 5xx error pathway \u2013 DLQ after max retries\",\n        \"NEG: persistent 5xx forces DLQ\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_webhook_dlqd_after_5_consecutive_5xx(\\n    register_webhook_fixture,\\n    fire_event_helper,\\n    mock_http_server,\\n    delivery_log_client,\\n    dlq_client,\\n):\\n    mock_http_server.set_responses([500] * 6)\\n    hook_id = register_webhook_fixture(url=mock_http_server.url)\\n\\n    event_id = fire_event_helper(hook_id=hook_id)\\n\\n    status = delivery_log_client.wait_for_terminal(\\n        event_id, timeout=60\\n    )\\n\\n    assert status == \\\"FAILED\\\"\\n    assert mock_http_server.call_count == 6, (\\n        f\\\"Expected 6 attempts, got {mock_http_server.call_count}\\\"\\n    )\\n    assert dlq_client.contains(event_id) is True\\n\"\n    },\n    {\n      \"name\": \"test_webhook_succeeds_on_5th_retry_no_dlq\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Webhook endpoint is configured for hr-app under /hooks/*\",\n        \"Target URL re"
+  }
+}

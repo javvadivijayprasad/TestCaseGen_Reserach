@@ -1,0 +1,194 @@
+{
+  "req": {
+    "id": "R-FIN-016",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-016",
+    "reasoning": "R-FIN-016 requires daily interest accrual at tier rates and monthly credit on the last business day. Test coverage must validate: (1) positive path\u2014interest correctly accrued and credited on month-end; (2) negative path\u2014interest not credited on non-business-days or when preconditions fail; (3) boundary cases\u2014edge dates (month-end, leap years, zero balance). These tests ensure the cron job executes deterministically and produces auditable ledger entries per account, with reconciliation variance detection.",
+    "tests": [
+      {
+        "name": "test_interest_accrual_positive_month_end_last_business_day",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Savings account exists with balance 10000.00",
+          "Tier rate applicable: 2.5% per annum",
+          "Current date is last business day of month",
+          "No prior interest credited this month",
+          "Account status is ACTIVE"
+        ],
+        "actions": [
+          "POST /cron/interest with account_id and month_end_date",
+          "Retrieve account ledger entries",
+          "Verify interest amount calculation"
+        ],
+        "expected": [
+          "HTTP 200 OK response",
+          "Interest credited equals (10000 * 0.025 / 365 * days_in_month)",
+          "Ledger entry created with type=INTEREST_CREDIT",
+          "Account balance increased by interest amount",
+          "Transaction timestamp matches cron execution time"
+        ],
+        "trace": [
+          "R-FIN-016: interest credited",
+          "R-FIN-016: ledger entry per account"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime, timedelta\n\ndef test_interest_accrual_positive_month_end_last_business_day():\n    base_url = \"http://localhost:8080\"\n    account_id = \"ACC-001\"\n    \n    payload = {\n        \"account_id\": account_id,\n        \"month_end_date\": \"2024-01-31\"\n    }\n    \n    resp = requests.post(f\"{base_url}/cron/interest\", json=payload)\n    assert resp.status_code == 200\n    \n    data = resp.json()\n    assert data[\"status\"] == \"success\"\n    assert data[\"accounts_processed\"] == 1\n    assert data[\"interest_credited\"] > 0\n    \n    ledger_resp = requests.get(\n        f\"{base_url}/accounts/{account_id}/ledger\"\n    )\n    ledger = ledger_resp.json()\n    interest_entries = [\n        e for e in ledger if e[\"type\"] == \"INTEREST_CREDIT\"\n    ]\n    assert len(interest_entries) >= 1\n    assert interest_entries[-1][\"amount\"] == data[\"interest_credited\"]\n"
+      },
+      {
+        "name": "test_interest_accrual_negative_non_business_day",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Savings account exists with balance 5000.00",
+          "Current date is a weekend or holiday (non-business day)",
+          "No prior interest credited this month",
+          "Account status is ACTIVE"
+        ],
+        "actions": [
+          "POST /cron/interest with account_id and non_business_day date",
+          "Retrieve account ledger entries",
+          "Check interest transaction history"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request or 422 Unprocessable Entity",
+          "Error message indicates non-business day rejection",
+          "No INTEREST_CREDIT ledger entry created",
+          "Account balance unchanged",
+          "Response includes error_code=INVALID_CRON_DATE"
+        ],
+        "trace": [
+          "R-FIN-016: error pathways (non-business day guard)"
+        ],
+        "executable": "import requests\nfrom datetime import datetime\n\ndef test_interest_accrual_negative_non_business_day():\n    base_url = \"http://localhost:8080\"\n    account_id = \"ACC-002\"\n    \n    payload = {\n        \"account_id\": account_id,\n        \"month_end_date\": \"2024-01-28\"\n    }\n    \n    resp = requests.post(f\"{base_url}/cron/interest\", json=payload)\n    assert resp.status_code in [400, 422]\n    \n    data = resp.json()\n    assert \"error\" in data or \"error_code\" in data\n    assert \"non-business day\" in data.get(\"message\", \"\").lower() or \\\n           data.get(\"error_code\") == \"INVALID_CRON_DATE\"\n    \n    ledger_resp = requests.get(\n        f\"{base_url}/accounts/{account_id}/ledger\"\n    )\n    ledger = ledger_resp.json()\n    interest_entries = [\n        e for e in ledger if e[\"type\"] == \"INTEREST_CREDIT\" and \\\n        \"2024-01-28\" in e.get(\"timestamp\", \"\")\n    ]\n    assert len(interest_entries) == 0\n"
+      },
+      {
+        "name": "test_interest_accrual_boundary_zero_balance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Savings account exists with balance 0.00",
+          "Tier rate applicable: 2.5% per annum",
+          "Current date is last business day of month",
+          "Account status is ACTIVE"
+        ],
+        "actions": [
+          "POST /cron/interest with account_id and month_end_date",
+          "Retrieve interest amount credited",
+          "Verify ledger entries"
+        ],
+        "expected": [
+          "HTTP 200 OK response",
+          "Interest credited equals 0.00",
+          "Ledger entry created with type=INTEREST_CREDIT and amount=0.00",
+          "Account balance remains 0.00",
+          "No reconciliation variance reported"
+        ],
+        "trace": [
+          "R-FIN-016: interest accrual at boundary (zero balance)",
+          "R-FIN-016: ledger entry per account (zero amount)"
+        ],
+        "executable": "import requests\n\ndef test_interest_accrual_boundary_zero_balance():\n    base_url = \"http://localhost:8080\"\n    account_id = \"ACC-003\"\n    \n    payload = {\n        \"account_id\": account_id,\n        \"month_end_date\": \"2024-02-29\"\n    }\n    \n    resp = requests.post(f\"{base_url}/cron/interest\", json=payload)\n    assert resp.status_code == 200\n    \n    data = resp.json()\n    assert data[\"status\"] == \"success\"\n    assert data[\"interest_credited\"] == 0.00\n    \n    acct_resp = requests.get(f\"{base_url}/accounts/{account_id}\")\n    account = acct_resp.json()\n    assert account[\"balance\"] == 0.00\n    \n    ledger_resp = requests.get(\n        f\"{base_url}/accounts/{account_id}/ledger\"\n    )\n    ledger = ledger_resp.json()\n    interest_entries = [\n        e for e in ledger if e[\"type\"] == \"INTEREST_CREDIT\" and \\\n        \"2024-02-29\" in e.get(\"timestamp\", \"\")\n    ]\n    assert len(interest_entries) == 1\n    assert interest_entries[0][\"amount\"] == 0.00\n"
+      },
+      {
+        "name": "test_interest_accrual_boundary_leap_year_month_end",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Savings account exists with balance 50000.00",
+          "Tier rate applicable: 3.0% per annum",
+          "Current date is Feb 29 (leap year) \u2013 last business day",
+          "Account status is ACTIVE"
+        ],
+        "actions": [
+          "POST /cron/interest with account_id and leap_year_month_end",
+          "Calculate expected interest (50000 * 0.03 / 366 * 29)",
+          "Verify actual interest credited matches expected"
+        ],
+        "expected": [
+          "HTTP 200 OK response",
+          "Interest credited correctly accounts for 366-day leap year",
+          "Ledger entry timestamp is 2024-02-29",
+          "Interest amount matches leap-year calculation",
+          "Account balance updated correctly"
+        ],
+        "trace": [
+          "R-FIN-016: interest accrual at boundary (leap year)",
+          "R-FIN-016: daily accrual using correct day count"
+        ],
+        "executable": "import requests\nfrom decimal import Decimal\n\ndef test_interest_accrual_boundary_leap_year_month_end():\n    base_url = \"http://localhost:8080\"\n    account_id = \"ACC-004\"\n    balance = 50000.00\n    annual_rate = 0.03\n    \n    payload = {\n        \"account_id\": account_id,\n        \"month_end_date\": \"2024-02-29\"\n    }\n    \n    resp = requests.post(f\"{base_url}/cron/interest\", json=payload)\n    assert resp.status_code == 200\n    \n    data = resp.json()\n    expected_interest = balance * annual_rate / 366 * 29\n    actual_interest = data[\"interest_credited\"]\n    \n    assert abs(float(actual_interest) - expected_interest) < 0.01\n    \n    ledger_resp = requests.get(\n        f\"{base_url}/accounts/{account_id}/ledger\"\n    )\n    ledger = ledger_resp.json()\n    entries = [e for e in ledger if \"2024-02-29\" in e[\"timestamp\"]]\n    assert len(entries) >= 1\n"
+      },
+      {
+        "name": "test_interest_accrual_negative_inactive_account",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Savings account exists with status INACTIVE",
+          "Balance is 10000.00",
+          "Current date is last business day of month"
+        ],
+        "actions": [
+          "POST /cron/interest with inactive account_id",
+          "Check ledger and account status"
+        ],
+        "expected": [
+          "HTTP 200 OK (job completes) or 400 Bad Request",
+          "No interest credited to inactive account",
+          "Ledger shows no INTEREST_CREDIT entry",
+          "Account status remains INACTIVE",
+          "Response indicates account was skipped or rejected"
+        ],
+        "trace": [
+          "R-FIN-016: error pathways (account state guard)"
+        ],
+        "executable": "import requests\n\ndef test_interest_accrual_negative_inactive_account():\n    base_url = \"http://localhost:8080\"\n    account_id = \"ACC-INACTIVE-001\"\n    \n    payload = {\n        \"account_id\": account_id,\n        \"month_end_date\": \"2024-01-31\"\n    }\n    \n    resp = requests.post(f\"{base_url}/cron/interest\", json=payload)\n    assert resp.status_code in [200, 400]\n    \n    ledger_resp = requests.get(\n        f\"{base_url}/accounts/{account_id}/ledger\"\n    )\n    ledger = ledger_resp.json()\n    interest_entries = [\n        e for e in ledger if e[\"type\"] == \"INTEREST_CREDIT\" and \\\n        \"2024-01\" in e.get(\"timestamp\", \"\")\n    ]\n    assert len(interest_entries) == 0\n    \n    acct_resp = requests.get(f\"{base_url}/accounts/{account_id}\")\n    account = acct_resp.json()\n    assert account[\"status\"] == \"INACTIVE\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-016",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1019,
+    "output_tokens": 3261,
+    "latency_ms": 17705,
+    "wall_ms": 17705,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-016\",\n  \"reasoning\": \"R-FIN-016 requires daily interest accrual at tier rates and monthly credit on the last business day. Test coverage must validate: (1) positive path\u2014interest correctly accrued and credited on month-end; (2) negative path\u2014interest not credited on non-business-days or when preconditions fail; (3) boundary cases\u2014edge dates (month-end, leap years, zero balance). These tests ensure the cron job executes deterministically and produces auditable ledger entries per account, with reconciliation variance detection.\",\n  \"tests\": [\n    {\n      \"name\": \"test_interest_accrual_positive_month_end_last_business_day\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Savings account exists with balance 10000.00\",\n        \"Tier rate applicable: 2.5% per annum\",\n        \"Current date is last business day of month\",\n        \"No prior interest credited this month\",\n        \"Account status is ACTIVE\"\n      ],\n      \"actions\": [\n        \"POST /cron/interest with account_id and month_end_date\",\n        \"Retrieve account ledger entries\",\n        \"Verify interest amount calculation\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK response\",\n        \"Interest credited equals (10000 * 0.025 / 365 * days_in_month)\",\n        \"Ledger entry created with type=INTEREST_CREDIT\",\n        \"Account balance increased by interest amount\",\n        \"Transaction timestamp matches cron execution time\"\n      ],\n      \"trace\": [\n        \"R-FIN-016: interest credited\",\n        \"R-FIN-016: ledger entry per account\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom datetime import datetime, timedelta\\n\\ndef test_interest_accrual_positive_month_end_last_business_day():\\n    base_url = \\\"http://localhost:8080\\\"\\n    account_id = \\\"ACC-001\\\"\\n    \\n    payload = {\\n        \\\"account_id\\\": account_id,\\n        \\\"month_end_date\\\": \\\"2024-01-31\\\"\\n    }\\n    \\n    resp = requests.post(f\\\"{base_url}/cron/interest\\\", json=payload)\\n    assert resp.status_code == 200\\n    \\n    data = resp.json()\\n    assert data[\\\"status\\\"] == \\\"success\\\"\\n    assert data[\\\"accounts_processed\\\"] == 1\\n    assert data[\\\"interest_credited\\\"] > 0\\n    \\n    ledger_resp = requests.get(\\n        f\\\"{base_url}/accounts/{account_id}/ledger\\\"\\n    )\\n    ledger = ledger_resp.json()\\n    interest_entries = [\\n        e for e in ledger if e[\\\"type\\\"] == \\\"INTEREST_CREDIT\\\"\\n    ]\\n    assert len(interest_entries) >= 1\\n    assert interest_entries[-1][\\\"amount\\\"] == data[\\\"interest_credited\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_interest_accrual_negative_non_business_day\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Savings account exists with balance 5000.00\",\n        \"Current date is a weekend or holiday (non-business day)\",\n        \"No prior interest credited this month\",\n        \"Account status is ACTIVE\"\n      ],\n      \"actions\": [\n        \"POST /cron/interest with account_id and non_business_day date\",\n        \"Retrieve account ledger entries\",\n        \"Check interest transaction history\"\n      ],\n      \"expected\": [\n        \"HTTP 400 Bad Request or 422 Unprocessable Entity\",\n        \"Error message indicates non-business day rejection\",\n        \"No INTEREST_CREDIT ledger entry created\",\n        \"Account balance unchanged\",\n        \"Response includes error_code=INVALID_CRON_DATE\"\n      ],\n      \"trace\": [\n        \"R-FIN-016: error pathways (non-business day guard)\"\n      ],\n      \"executable\": \"import requests\\nfrom datetime import datetime\\n\\ndef test_interest_accrual_negative_non_business_day():\\n    base_url = \\\"http://localhost:8080\\\"\\n    account_id = \\\"ACC-002\\\"\\n    \\n    payload = {\\n        \\\"account_id\\\": account_id,\\n        \\\"month_end_date\\\": \\\"2024-01-28\\\"\\n    }\\n    \\n    resp = requests.post(f\\\"{base_url}/cron/interest\\\", json=payload)\\n    assert resp.status_code in [400, 422]\\n    \\n    data = resp.json()\\n    assert \\\"error\\\" in data or "
+  }
+}

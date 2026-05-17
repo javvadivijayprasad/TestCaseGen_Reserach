@@ -1,0 +1,158 @@
+{
+  "req": {
+    "id": "R-HLT-023",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Patient portal login",
+    "statement": "A patient shall log in using SSO; failed attempts shall be rate-limited and notify the patient.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "valid SSO assertion"
+    ],
+    "triggers": [
+      "patient logs in"
+    ],
+    "expected_outcomes": [
+      "session established"
+    ],
+    "error_pathways": [
+      "429 when too many attempts"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/portal/login"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-023",
+    "reasoning": "The requirement mandates SSO-based patient login with session establishment on success, rate-limiting (HTTP 429) on excessive failed attempts, and patient notification on failure. Four tests are designed: (1) EP positive \u2013 valid SSO assertion yields an authenticated session; (2) NEG negative \u2013 invalid SSO assertion is rejected without a session; (3) BVA boundary \u2013 exactly N failed attempts before the rate-limit threshold succeeds, while N+1 triggers 429; (4) STC state-transition \u2013 system moves correctly through Unauthenticated \u2192 Authenticating \u2192 Authenticated states. Each test is self-contained via fixtures and resets state before execution.",
+    "tests": [
+      {
+        "name": "test_valid_sso_login_establishes_session",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "SSO IdP is reachable",
+          "Patient account exists with valid SSO binding",
+          "No prior rate-limit state for the test patient"
+        ],
+        "actions": [
+          "POST /portal/login with a valid signed SSO assertion for test patient",
+          "Capture response status code and Set-Cookie header"
+        ],
+        "expected": [
+          "HTTP 200 or 302 redirect to portal home",
+          "Response contains a session cookie (e.g. session_id)",
+          "Session cookie has Secure and HttpOnly flags set"
+        ],
+        "trace": [
+          "R-HLT-023: patient shall log in using SSO",
+          "R-HLT-023: session established"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import sync_playwright\n\ndef test_valid_sso_login_establishes_session(base_url, valid_sso_assertion, reset_rate_limit):\n    with sync_playwright() as pw:\n        browser = pw.chromium.launch(headless=True)\n        ctx = browser.new_context()\n        page = ctx.new_page()\n\n        page.goto(f\"{base_url}/portal/login\")\n        <helper_fn: inject_sso_assertion>(page, valid_sso_assertion)\n        page.click(\"[data-testid='sso-login-btn']\")\n        page.wait_for_url(f\"{base_url}/portal/home\", timeout=10_000)\n\n        cookies = ctx.cookies()\n        session_cookies = [c for c in cookies if c[\"name\"] == \"session_id\"]\n        assert len(session_cookies) == 1, \"session_id cookie not set\"\n        sc = session_cookies[0]\n        assert sc[\"secure\"], \"cookie missing Secure flag\"\n        assert sc[\"httpOnly\"], \"cookie missing HttpOnly flag\"\n\n        browser.close()"
+      },
+      {
+        "name": "test_invalid_sso_assertion_is_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "SSO IdP is reachable",
+          "An expired or tampered SSO assertion is available",
+          "No prior rate-limit state for the test patient"
+        ],
+        "actions": [
+          "POST /portal/login with an expired/tampered SSO assertion",
+          "Observe response status and page content"
+        ],
+        "expected": [
+          "HTTP 401 or login page re-rendered with error message",
+          "No session_id cookie is set in the response",
+          "Patient sees a notification indicating authentication failure"
+        ],
+        "trace": [
+          "R-HLT-023: failed attempts shall notify the patient",
+          "R-HLT-023: error pathway \u2013 invalid SSO assertion"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import sync_playwright\n\ndef test_invalid_sso_assertion_is_rejected(base_url, invalid_sso_assertion, reset_rate_limit):\n    with sync_playwright() as pw:\n        browser = pw.chromium.launch(headless=True)\n        ctx = browser.new_context()\n        page = ctx.new_page()\n\n        page.goto(f\"{base_url}/portal/login\")\n        <helper_fn: inject_sso_assertion>(page, invalid_sso_assertion)\n        page.click(\"[data-testid='sso-login-btn']\")\n        page.wait_for_selector(\"[data-testid='auth-error-msg']\", timeout=8_000)\n\n        error_text = page.inner_text(\"[data-testid='auth-error-msg']\")\n        assert error_text, \"No error notification displayed to patient\"\n\n        cookies = ctx.cookies()\n        session_cookies = [c for c in cookies if c[\"name\"] == \"session_id\"]\n        assert len(session_cookies) == 0, \"session_id must not be set on failure\"\n\n        browser.close()"
+      },
+      {
+        "name": "test_rate_limit_triggered_at_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Rate-limit threshold N is known and configurable (default 5 attempts)",
+          "Patient account exists",
+          "Rate-limit counter for test patient is reset to zero"
+        ],
+        "actions": [
+          "Submit N-1 failed login attempts with invalid SSO assertions",
+          "Verify each attempt returns 401 (not yet rate-limited)",
+          "Submit the Nth failed attempt",
+          "Verify HTTP 429 is returned and patient is notified"
+        ],
+        "expected": [
+          "Attempts 1 through N-1 return HTTP 401 without rate-limit headers",
+          "Attempt N returns HTTP 429 with Retry-After header",
+          "Patient notification text references rate-limiting or lockout"
+        ],
+        "trace": [
+          "R-HLT-023: failed attempts shall be rate-limited",
+          "R-HLT-023: error pathway \u2013 429 when too many attempts"
+        ],
+        "executable": "import pytest\nimport requests\n\nRATE_LIMIT_THRESHOLD = 5\n\ndef test_rate_limit_triggered_at_threshold(base_url, invalid_sso_payload, reset_rate_limit):\n    session = requests.Session()\n\n    for attempt in range(1, RATE_LIMIT_THRESHOLD):\n        resp = session.post(\n            f\"{base_url}/portal/login\",\n            json=invalid_sso_payload,\n            allow_redirects=False,\n        )\n        assert resp.status_code == 401, (\n            f\"Expected 401 on attempt {attempt}, got {resp.status_code}\"\n        )\n        assert \"Retry-After\" not in resp.headers, (\n            f\"Unexpected rate-limit on attempt {attempt}\"\n        )\n\n    resp_threshold = session.post(\n        f\"{base_url}/portal/login\",\n        json=invalid_sso_payload,\n        allow_redirects=False,\n    )\n    assert resp_threshold.status_code == 429, (\n        f\"Expected 429 on attempt {RATE_LIMIT_THRESHOLD}, got {resp_threshold.status_code}\"\n    )\n    assert \"Retry-After\" in resp_threshold.headers, \"Missing Retry-After header on 429\"\n    body = resp_threshold.json()\n    assert body.get(\"message\"), \"Patient must receive a rate-limit notification message\""
+      },
+      {
+        "name": "test_session_state_transitions_on_login",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient is in Unauthenticated state (no active session)",
+          "Valid SSO assertion is available",
+          "Application state machine supports Unauthenticated -> Authenticating -> Authenticated"
+        ],
+        "actions": [
+          "Assert portal home redirects to /portal/login (Unauthenticated state)",
+          "Submit valid SSO assertion (transition to Authenticating)",
+          "Verify redirect to /portal/home and session cookie present (Authenticated state)",
+          "Assert protected endpoint /portal/profile returns 200 using the session"
+        ],
+        "expected": [
+          "Initial access to /portal/home redirects to /portal/login",
+          "Post-login URL is /portal/home (Authenticated state reached)",
+          "Session cookie is active and authorises access to /portal/profile",
+          "No intermediate error states encountered during transition"
+        ],
+        "trace": [
+          "R-HLT-023: patient shall log in using SSO",
+          "R-HLT-023: session established",
+          "R-HLT-023: state \u2013 Unauthenticated to Authenticated"
+        ],
+        "executable": "import pytest\nimport requests\nfrom playwright.sync_api import sync_playwright\n\ndef test_session_state_transitions_on_login(base_url, valid_sso_assertion, reset_rate_limit):\n    with sync_playwright() as pw:\n        browser = pw.chromium.launch(headless=True)\n        ctx = browser.new_context()\n        page = ctx.new_page()\n\n        resp = page.goto(f\"{base_url}/portal/home\")\n        assert \"/portal/login\" in page.url, \"Unauthenticated user must be redirected to login\"\n\n        <helper_fn: inject_sso_assertion>(page, valid_sso_assertion)\n        page.click(\"[data-testid='sso-login-btn']\")\n        page.wait_for_url(f\"{base_url}/portal/home\", timeout=10_000)\n        assert \"/portal/home\" in page.url, \"Must reach Authenticated state at /portal/home\"\n\n        cookies = {c[\"name\"]: c[\"value\"] for c in ctx.cookies()}\n        assert \"session_id\" in cookies, \"session_id cookie required for Authenticated state\"\n\n        api_resp = requests.get(\n            f\"{base_url}/portal/profile\",\n            cookies={\"session_id\": cookies[\"session_id\"]},\n        )\n        assert api_resp.status_code == 200, \"Authenticated session must access /portal/profile\"\n\n        browser.close()"
+      }
+    ]
+  },
+  "req_id": "R-HLT-023",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 971,
+    "output_tokens": 2668,
+    "latency_ms": 35419,
+    "wall_ms": 35419,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-023\",\n  \"reasoning\": \"The requirement mandates SSO-based patient login with session establishment on success, rate-limiting (HTTP 429) on excessive failed attempts, and patient notification on failure. Four tests are designed: (1) EP positive \u2013 valid SSO assertion yields an authenticated session; (2) NEG negative \u2013 invalid SSO assertion is rejected without a session; (3) BVA boundary \u2013 exactly N failed attempts before the rate-limit threshold succeeds, while N+1 triggers 429; (4) STC state-transition \u2013 system moves correctly through Unauthenticated \u2192 Authenticating \u2192 Authenticated states. Each test is self-contained via fixtures and resets state before execution.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_sso_login_establishes_session\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"SSO IdP is reachable\",\n        \"Patient account exists with valid SSO binding\",\n        \"No prior rate-limit state for the test patient\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with a valid signed SSO assertion for test patient\",\n        \"Capture response status code and Set-Cookie header\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 302 redirect to portal home\",\n        \"Response contains a session cookie (e.g. session_id)\",\n        \"Session cookie has Secure and HttpOnly flags set\"\n      ],\n      \"trace\": [\n        \"R-HLT-023: patient shall log in using SSO\",\n        \"R-HLT-023: session established\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import sync_playwright\\n\\ndef test_valid_sso_login_establishes_session(base_url, valid_sso_assertion, reset_rate_limit):\\n    with sync_playwright() as pw:\\n        browser = pw.chromium.launch(headless=True)\\n        ctx = browser.new_context()\\n        page = ctx.new_page()\\n\\n        page.goto(f\\\"{base_url}/portal/login\\\")\\n        <helper_fn: inject_sso_assertion>(page, valid_sso_assertion)\\n        page.click(\\\"[data-testid='sso-login-btn']\\\")\\n        page.wait_for_url(f\\\"{base_url}/portal/home\\\", timeout=10_000)\\n\\n        cookies = ctx.cookies()\\n        session_cookies = [c for c in cookies if c[\\\"name\\\"] == \\\"session_id\\\"]\\n        assert len(session_cookies) == 1, \\\"session_id cookie not set\\\"\\n        sc = session_cookies[0]\\n        assert sc[\\\"secure\\\"], \\\"cookie missing Secure flag\\\"\\n        assert sc[\\\"httpOnly\\\"], \\\"cookie missing HttpOnly flag\\\"\\n\\n        browser.close()\"\n    },\n    {\n      \"name\": \"test_invalid_sso_assertion_is_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"SSO IdP is reachable\",\n        \"An expired or tampered SSO assertion is available\",\n        \"No prior rate-limit state for the test patient\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with an expired/tampered SSO assertion\",\n        \"Observe response status and page content\"\n      ],\n      \"expected\": [\n        \"HTTP 401 or login page re-rendered with error message\",\n        \"No session_id cookie is set in the response\",\n        \"Patient sees a notification indicating authentication failure\"\n      ],\n      \"trace\": [\n        \"R-HLT-023: failed attempts shall notify the patient\",\n        \"R-HLT-023: error pathway \u2013 invalid SSO assertion\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import sync_playwright\\n\\ndef test_invalid_sso_assertion_is_rejected(base_url, invalid_sso_assertion, reset_rate_limit):\\n    with sync_playwright() as pw:\\n        browser = pw.chromium.launch(headless=True)\\n        ctx = browser.new_context()\\n        page = ctx.new_page()\\n\\n        page.goto(f\\\"{base_url}/portal/login\\\")\\n        <helper_fn: inject_sso_assertion>(page, invalid_sso_assertion)\\n        page.click(\\\"[data-testid='sso-login-btn']\\\")\\n        page.wait_for_selector(\\\"[data-testid='auth-error-msg']\\\", timeout=8_000)\\n\\n        error_text = page.inner_text(\\\"[data-testid='auth-error-msg']\\\")\\n        assert error_tex"
+  }
+}

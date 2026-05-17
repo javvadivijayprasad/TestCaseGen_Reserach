@@ -1,0 +1,179 @@
+{
+  "req": {
+    "id": "R-FIN-009",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Transaction dispute",
+    "statement": "A customer shall dispute a transaction within 60 days of posting; disputes beyond 60 days shall be rejected.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "transaction.age < 60d"
+    ],
+    "triggers": [
+      "customer files dispute"
+    ],
+    "expected_outcomes": [
+      "dispute created",
+      "provisional credit applied"
+    ],
+    "error_pathways": [
+      "422 when transaction.age > 60d"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/disputes"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-009",
+    "reasoning": "The requirement defines a strict 60-day window for filing transaction disputes. Three partitions exist: (1) valid disputes where transaction.age < 60 days (EP positive), (2) invalid disputes where transaction.age > 60 days (NEG/EP negative), and (3) the exact boundary at day 60 (BVA). A State Transition test covers the lifecycle from 'dispute submitted' to 'provisional credit applied'. A Decision Table test covers the combination of eligibility factors. BVA dictates testing at day 59 (last valid day), day 60 (exact boundary, expected rejection per strict < 60 rule), and day 61 (clearly invalid). The boundary case tests day 59 as the last accepted value and day 60 as the first rejected value, which is the most critical BVA pair.",
+    "tests": [
+      {
+        "name": "test_dispute_filed_within_valid_window_creates_dispute_and_provisional_credit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "A posted transaction exists with age = 30 days (well within the 60-day window)",
+          "The transaction has not been previously disputed"
+        ],
+        "actions": [
+          "POST /disputes with valid transaction_id and dispute reason",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains dispute_id",
+          "Response body contains status = 'open'",
+          "Response body contains provisional_credit.applied = true"
+        ],
+        "trace": [
+          "R-FIN-009: dispute created within 60 days",
+          "R-FIN-009: provisional credit applied on valid dispute"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timedelta\n\ndef test_dispute_filed_within_valid_window_creates_dispute_and_provisional_credit(\n    auth_headers, base_url, create_posted_transaction\n):\n    txn = create_posted_transaction(age_days=30)\n    payload = {\n        \"transaction_id\": txn[\"id\"],\n        \"reason\": \"unauthorized_charge\",\n        \"description\": \"Did not recognize this transaction\"\n    }\n    resp = requests.post(\n        f\"{base_url}/disputes\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"dispute_id\" in body, \"Response missing dispute_id\"\n    assert body.get(\"status\") == \"open\", f\"Unexpected status: {body.get('status')}\"\n    credit = body.get(\"provisional_credit\", {})\n    assert credit.get(\"applied\") is True, \"Provisional credit not applied\"\n"
+      },
+      {
+        "name": "test_dispute_filed_beyond_60_days_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "A posted transaction exists with age = 61 days (beyond the 60-day limit)",
+          "The transaction has not been previously disputed"
+        ],
+        "actions": [
+          "POST /disputes with transaction_id referencing a 61-day-old transaction",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an error code indicating dispute window expired",
+          "No dispute record is created",
+          "No provisional credit is applied"
+        ],
+        "trace": [
+          "R-FIN-009: disputes beyond 60 days shall be rejected",
+          "R-FIN-009: error pathway 422 when transaction.age > 60d"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_dispute_filed_beyond_60_days_returns_422(\n    auth_headers, base_url, create_posted_transaction\n):\n    txn = create_posted_transaction(age_days=61)\n    payload = {\n        \"transaction_id\": txn[\"id\"],\n        \"reason\": \"unauthorized_charge\",\n        \"description\": \"Late dispute attempt\"\n    }\n    resp = requests.post(\n        f\"{base_url}/disputes\",\n        json=payload,\n        headers=auth_headers\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error = body.get(\"error\", body.get(\"detail\", \"\"))\n    assert \"window\" in str(error).lower() or \"expired\" in str(error).lower() or \"60\" in str(error), (\n        f\"Error message does not reference dispute window: {error}\"\n    )\n"
+      },
+      {
+        "name": "test_dispute_at_day_59_accepted_and_day_60_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Two posted transactions exist: one with age = 59 days, one with age = 60 days",
+          "Neither transaction has been previously disputed"
+        ],
+        "actions": [
+          "POST /disputes for the 59-day-old transaction; capture response",
+          "POST /disputes for the 60-day-old transaction; capture response"
+        ],
+        "expected": [
+          "59-day transaction: HTTP 201, dispute created, provisional credit applied",
+          "60-day transaction: HTTP 422, dispute rejected (age is NOT strictly less than 60)"
+        ],
+        "trace": [
+          "R-FIN-009: precondition transaction.age < 60d means day 59 is last valid day",
+          "R-FIN-009: day 60 is the first rejected value per BVA on the strict inequality"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_dispute_at_day_59_accepted_and_day_60_rejected(\n    auth_headers, base_url, create_posted_transaction\n):\n    txn_59 = create_posted_transaction(age_days=59)\n    txn_60 = create_posted_transaction(age_days=60)\n\n    payload_59 = {\"transaction_id\": txn_59[\"id\"], \"reason\": \"unauthorized_charge\"}\n    resp_59 = requests.post(\n        f\"{base_url}/disputes\", json=payload_59, headers=auth_headers\n    )\n    assert resp_59.status_code == 201, (\n        f\"Day-59 dispute should be accepted, got {resp_59.status_code}: {resp_59.text}\"\n    )\n    body_59 = resp_59.json()\n    assert body_59.get(\"provisional_credit\", {}).get(\"applied\") is True\n\n    payload_60 = {\"transaction_id\": txn_60[\"id\"], \"reason\": \"unauthorized_charge\"}\n    resp_60 = requests.post(\n        f\"{base_url}/disputes\", json=payload_60, headers=auth_headers\n    )\n    assert resp_60.status_code == 422, (\n        f\"Day-60 dispute should be rejected, got {resp_60.status_code}: {resp_60.text}\"\n    )\n"
+      },
+      {
+        "name": "test_dispute_lifecycle_transitions_from_open_to_provisional_credit_applied",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "A posted transaction exists with age = 10 days",
+          "The transaction has not been previously disputed"
+        ],
+        "actions": [
+          "POST /disputes to create a new dispute; verify initial state = 'open'",
+          "GET /disputes/{dispute_id} to confirm transition to state with provisional credit"
+        ],
+        "expected": [
+          "POST returns HTTP 201 and initial status = 'open'",
+          "GET returns dispute with provisional_credit.applied = true",
+          "Dispute status reflects a valid post-creation state (open or under_review)"
+        ],
+        "trace": [
+          "R-FIN-009: dispute created (state: open)",
+          "R-FIN-009: provisional credit applied (state transition after creation)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_dispute_lifecycle_transitions_from_open_to_provisional_credit_applied(\n    auth_headers, base_url, create_posted_transaction\n):\n    txn = create_posted_transaction(age_days=10)\n    payload = {\"transaction_id\": txn[\"id\"], \"reason\": \"merchandise_not_received\"}\n    create_resp = requests.post(\n        f\"{base_url}/disputes\", json=payload, headers=auth_headers\n    )\n    assert create_resp.status_code == 201\n    dispute_id = create_resp.json()[\"dispute_id\"]\n    assert create_resp.json().get(\"status\") == \"open\"\n\n    get_resp = requests.get(\n        f\"{base_url}/disputes/{dispute_id}\", headers=auth_headers\n    )\n    assert get_resp.status_code == 200\n    body = get_resp.json()\n    assert body.get(\"status\") in (\"open\", \"under_review\"), (\n        f\"Unexpected state: {body.get('status')}\"\n    )\n    assert body.get(\"provisional_credit\", {}).get(\"applied\") is True\n"
+      },
+      {
+        "name": "test_dispute_decision_table_reason_codes_within_valid_window",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Three posted transactions exist, each with age = 5 days",
+          "Each transaction represents a distinct dispute reason category"
+        ],
+        "actions": [
+          "POST /disputes with reason = 'unauthorized_charge' for transaction 1",
+          "POST /disputes with reason = 'merchandise_not_received' for transaction 2",
+          "POST /disputes with reason = 'duplicate_transaction' for transaction 3"
+        ],
+        "expected": [
+          "All three POSTs return HTTP 201",
+          "All three responses contain dispute_id and provisional_credit.applied = true",
+          "Each dispute has a distinct dispute_id"
+        ],
+        "trace": [
+          "R-FIN-009: all valid reason codes within window produce dispute + provisional credit",
+          "R-FIN-009: DT covers multiple input conditions (reason) against eligibility"
+        ],
+        "executable": "import pytest\nimport requests\n\nREASON_CODES = [\n    \"unauthorized_charge\",\n    \"merchandise_not_received\",\n    \"duplicate_transaction\"\n]\n\ndef test_dispute_decision_table_reason_codes_within_valid_window(\n    auth_headers, base_url, create_posted_transaction\n):\n    dispute_ids = []\n    for reason in REASON_CODES:\n        txn = create_posted_transaction(age_days=5)\n        payload = {\"transaction_id\": txn[\"id\"], \"reason\": reason}\n        resp = requests.post(\n            f\"{base_url}/disputes\", json=payload, headers=auth_headers\n        )\n        assert resp.status_code == 201, (\n            f\"Reason '{reason}' failed: {resp.status_code} {resp.text}\"\n        )\n        body = resp.json()\n        assert body.get(\"provisional_credit\", {}).get(\"applied\") is True, (\n            f\"No provisional credit for reason '{reason}'\"\n        )\n        dispute_ids.append(body[\"dispute_id\"])\n    assert len(set(dispute_ids)) == len(REASON_CODES), \"Duplicate dispute IDs returned\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-009",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 981,
+    "output_tokens": 3175,
+    "latency_ms": 32964,
+    "wall_ms": 32964,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-009\",\n  \"reasoning\": \"The requirement defines a strict 60-day window for filing transaction disputes. Three partitions exist: (1) valid disputes where transaction.age < 60 days (EP positive), (2) invalid disputes where transaction.age > 60 days (NEG/EP negative), and (3) the exact boundary at day 60 (BVA). A State Transition test covers the lifecycle from 'dispute submitted' to 'provisional credit applied'. A Decision Table test covers the combination of eligibility factors. BVA dictates testing at day 59 (last valid day), day 60 (exact boundary, expected rejection per strict < 60 rule), and day 61 (clearly invalid). The boundary case tests day 59 as the last accepted value and day 60 as the first rejected value, which is the most critical BVA pair.\",\n  \"tests\": [\n    {\n      \"name\": \"test_dispute_filed_within_valid_window_creates_dispute_and_provisional_credit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"A posted transaction exists with age = 30 days (well within the 60-day window)\",\n        \"The transaction has not been previously disputed\"\n      ],\n      \"actions\": [\n        \"POST /disputes with valid transaction_id and dispute reason\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains dispute_id\",\n        \"Response body contains status = 'open'\",\n        \"Response body contains provisional_credit.applied = true\"\n      ],\n      \"trace\": [\n        \"R-FIN-009: dispute created within 60 days\",\n        \"R-FIN-009: provisional credit applied on valid dispute\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import datetime, timedelta\\n\\ndef test_dispute_filed_within_valid_window_creates_dispute_and_provisional_credit(\\n    auth_headers, base_url, create_posted_transaction\\n):\\n    txn = create_posted_transaction(age_days=30)\\n    payload = {\\n        \\\"transaction_id\\\": txn[\\\"id\\\"],\\n        \\\"reason\\\": \\\"unauthorized_charge\\\",\\n        \\\"description\\\": \\\"Did not recognize this transaction\\\"\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/disputes\\\",\\n        json=payload,\\n        headers=auth_headers\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"dispute_id\\\" in body, \\\"Response missing dispute_id\\\"\\n    assert body.get(\\\"status\\\") == \\\"open\\\", f\\\"Unexpected status: {body.get('status')}\\\"\\n    credit = body.get(\\\"provisional_credit\\\", {})\\n    assert credit.get(\\\"applied\\\") is True, \\\"Provisional credit not applied\\\"\\n\"\n    },\n    {\n      \"name\": \"test_dispute_filed_beyond_60_days_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"A posted transaction exists with age = 61 days (beyond the 60-day limit)\",\n        \"The transaction has not been previously disputed\"\n      ],\n      \"actions\": [\n        \"POST /disputes with transaction_id referencing a 61-day-old transaction\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an error code indicating dispute window expired\",\n        \"No dispute record is created\",\n        \"No provisional credit is applied\"\n      ],\n      \"trace\": [\n        \"R-FIN-009: disputes beyond 60 days shall be rejected\",\n        \"R-FIN-009: error pathway 422 when transaction.age > 60d\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_dispute_filed_beyond_60_days_returns_422(\\n    auth_headers, base_url, create_posted_transaction\\n):\\n    txn = create_posted_transaction(age_days=61)\\n    payload = {\\n        \\\"transaction_id\\\": txn[\\\"id\\\"],\\n        \\\"reason\\\": \\\"unauthorized_charge\\\",\\n        \\\"description\\\": \\\"Late dispute atte"
+  }
+}

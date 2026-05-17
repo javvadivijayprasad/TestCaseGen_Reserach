@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-WEB-063",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Approve leave request \u2014 variant 2",
+    "statement": "A manager shall approve or reject leave requests assigned to them within 5 business days; unactioned requests auto-escalate to hr-admin. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager",
+      "request assigned to manager"
+    ],
+    "triggers": [
+      "manager clicks approve"
+    ],
+    "expected_outcomes": [
+      "request state=approved",
+      "employee notified",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if manager not the assignee",
+      "409 if already actioned"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/{id}/approve"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-063",
+    "reasoning": "The requirement covers: (1) a manager approving a valid assigned leave request \u2014 positive/EP; (2) a non-assignee manager attempting approval \u2014 negative/NEG returning 403; (3) idempotent retry on an already-approved request \u2014 boundary/STC returning 409 on second call; (4) decision-table coverage of approve vs. reject + audit entry; (5) BVA on the 5-business-day auto-escalation boundary. Each test uses fixtures for auth tokens and request setup, keeping executables under 40 lines.",
+    "tests": [
+      {
+        "name": "test_manager_approves_assigned_request_positive",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated manager session token available via <manager_auth_token>",
+          "A leave request in state=pending exists assigned to this manager, ID via <create_pending_request>"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with manager auth token",
+          "GET /leave-requests/{id} to verify state",
+          "GET /notifications?employee={employee_id} to verify notification",
+          "GET /audit-log?resource_id={id} to verify audit entry"
+        ],
+        "expected": [
+          "POST returns HTTP 200",
+          "request state == 'approved'",
+          "employee notification exists",
+          "audit log contains entry with action='approved'"
+        ],
+        "trace": [
+          "R-WEB-063: manager approves assigned request",
+          "R-WEB-063: request state=approved",
+          "R-WEB-063: employee notified",
+          "R-WEB-063: audit entry created"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, create_pending_request, get_audit_log, get_notifications\n\ndef test_manager_approves_assigned_request_positive(<manager_auth_token>, <employee_id>):\n    request_id = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\n    client = api_client(token=<manager_auth_token>)\n\n    resp = client.post(f\"/leave-requests/{request_id}/approve\")\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n\n    state_resp = client.get(f\"/leave-requests/{request_id}\")\n    assert state_resp.json()[\"state\"] == \"approved\"\n\n    notifications = get_notifications(employee_id=<employee_id>, token=<manager_auth_token>)\n    assert any(n[\"resource_id\"] == request_id for n in notifications)\n\n    audit = get_audit_log(resource_id=request_id, token=<manager_auth_token>)\n    assert any(e[\"action\"] == \"approved\" for e in audit)\n"
+      },
+      {
+        "name": "test_non_assignee_manager_approve_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated manager session token available via <manager_auth_token> (manager A)",
+          "A second manager token available via <other_manager_auth_token> (manager B)",
+          "A leave request in state=pending assigned to manager A, ID via <create_pending_request>"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with manager B auth token (non-assignee)"
+        ],
+        "expected": [
+          "POST returns HTTP 403",
+          "response body contains error code indicating forbidden/not-assignee",
+          "request state remains pending"
+        ],
+        "trace": [
+          "R-WEB-063: error pathway \u2014 403 if manager not the assignee"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, create_pending_request\n\ndef test_non_assignee_manager_approve_returns_403(<manager_auth_token>, <other_manager_auth_token>, <employee_id>):\n    request_id = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\n    non_assignee_client = api_client(token=<other_manager_auth_token>)\n\n    resp = non_assignee_client.post(f\"/leave-requests/{request_id}/approve\")\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body\n\n    assignee_client = api_client(token=<manager_auth_token>)\n    state_resp = assignee_client.get(f\"/leave-requests/{request_id}\")\n    assert state_resp.json()[\"state\"] == \"pending\"\n"
+      },
+      {
+        "name": "test_duplicate_approve_is_idempotent_returns_409",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated manager session token available via <manager_auth_token>",
+          "A leave request in state=pending assigned to this manager, ID via <create_pending_request>"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve (first call)",
+          "POST /leave-requests/{id}/approve (second call \u2014 retry/duplicate)"
+        ],
+        "expected": [
+          "First POST returns HTTP 200",
+          "Second POST returns HTTP 409 with already-actioned error",
+          "request state remains approved (not corrupted by retry)",
+          "audit log contains exactly one approved entry"
+        ],
+        "trace": [
+          "R-WEB-063: action must be idempotent under retry",
+          "R-WEB-063: error pathway \u2014 409 if already actioned",
+          "R-WEB-063: state transition pending -> approved only once"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, create_pending_request, get_audit_log\n\ndef test_duplicate_approve_is_idempotent_returns_409(<manager_auth_token>, <employee_id>):\n    request_id = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\n    client = api_client(token=<manager_auth_token>)\n\n    first = client.post(f\"/leave-requests/{request_id}/approve\")\n    assert first.status_code == 200, f\"First call expected 200, got {first.status_code}\"\n\n    second = client.post(f\"/leave-requests/{request_id}/approve\")\n    assert second.status_code == 409, f\"Second call expected 409, got {second.status_code}\"\n\n    state_resp = client.get(f\"/leave-requests/{request_id}\")\n    assert state_resp.json()[\"state\"] == \"approved\"\n\n    audit = get_audit_log(resource_id=request_id, token=<manager_auth_token>)\n    approved_entries = [e for e in audit if e[\"action\"] == \"approved\"]\n    assert len(approved_entries) == 1, f\"Expected 1 audit entry, found {len(approved_entries)}\"\n"
+      },
+      {
+        "name": "test_approve_vs_reject_decision_table",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated manager session token available via <manager_auth_token>",
+          "Two leave requests in state=pending assigned to this manager, IDs via <create_pending_request>"
+        ],
+        "actions": [
+          "POST /leave-requests/{id1}/approve with manager token",
+          "POST /leave-requests/{id2}/reject with manager token",
+          "GET both requests to verify final states",
+          "GET audit log for both requests"
+        ],
+        "expected": [
+          "Approve call returns HTTP 200; request id1 state == 'approved'",
+          "Reject call returns HTTP 200; request id2 state == 'rejected'",
+          "Audit log for id1 has action='approved'",
+          "Audit log for id2 has action='rejected'"
+        ],
+        "trace": [
+          "R-WEB-063: manager shall approve OR reject leave requests",
+          "R-WEB-063: audit entry created for each action",
+          "R-WEB-063: both terminal states produce correct transitions"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, create_pending_request, get_audit_log\n\ndef test_approve_vs_reject_decision_table(<manager_auth_token>, <employee_id>):\n    id1 = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\n    id2 = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\n    client = api_client(token=<manager_auth_token>)\n\n    r_approve = client.post(f\"/leave-requests/{id1}/approve\")\n    assert r_approve.status_code == 200\n    assert client.get(f\"/leave-requests/{id1}\").json()[\"state\"] == \"approved\"\n\n    r_reject = client.post(f\"/leave-requests/{id2}/reject\")\n    assert r_reject.status_code == 200\n    assert client.get(f\"/leave-requests/{id2}\").json()[\"state\"] == \"rejected\"\n\n    audit1 = get_audit_log(resource_id=id1, token=<manager_auth_token>)\n    assert any(e[\"action\"] == \"approved\" for e in audit1)\n\n    audit2 = get_audit_log(resource_id=id2, token=<manager_auth_token>)\n    assert any(e[\"action\"] == \"rejected\" for e in audit2)\n"
+      },
+      {
+        "name": "test_unactioned_request_auto_escalates_at_5_business_days",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated hr-admin token available via <hr_admin_auth_token>",
+          "Authenticated manager session token available via <manager_auth_token>",
+          "A leave request created exactly 5 business days ago in state=pending assigned to manager, ID via <create_aged_request(days=5)>"
+        ],
+        "actions": [
+          "Trigger escalation check (via <trigger_escalation_job> or advance system clock)",
+          "GET /leave-requests/{id} as hr-admin to verify escalation",
+          "GET /audit-log?resource_id={id} to verify escalation entry"
+        ],
+        "expected": [
+          "Request assignee changes to hr-admin role or escalation flag is set",
+          "Request state is 'escalated' or assignee == hr-admin",
+          "Audit log contains action='escalated' at the 5-business-day mark"
+        ],
+        "trace": [
+          "R-WEB-063: unactioned requests auto-escalate to hr-admin within 5 business days",
+          "BVA: boundary at exactly 5 business days (inclusive upper bound)"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import api_client, create_aged_request, trigger_escalation_job, get_audit_log\n\ndef test_unactioned_request_auto_escalates_at_5_business_days(<hr_admin_auth_token>, <manager_auth_token>, <employee_id>):\n    request_id = create_aged_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>, business_days=5)\n\n    trigger_escalation_job()\n\n    admin_client = api_client(token=<hr_admin_auth_token>)\n    state_resp = admin_client.get(f\"/leave-requests/{request_id}\")\n    data = state_resp.json()\n    assert state_resp.status_code == 200\n    assert data.get(\"state\") == \"escalated\" or data.get(\"assignee_role\") == \"hr-admin\"\n\n    audit = get_audit_log(resource_id=request_id, token=<hr_admin_auth_token>)\n    assert any(e[\"action\"] == \"escalated\" for e in audit)\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-063",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1032,
+    "output_tokens": 3253,
+    "latency_ms": 33228,
+    "wall_ms": 33228,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-063\",\n  \"reasoning\": \"The requirement covers: (1) a manager approving a valid assigned leave request \u2014 positive/EP; (2) a non-assignee manager attempting approval \u2014 negative/NEG returning 403; (3) idempotent retry on an already-approved request \u2014 boundary/STC returning 409 on second call; (4) decision-table coverage of approve vs. reject + audit entry; (5) BVA on the 5-business-day auto-escalation boundary. Each test uses fixtures for auth tokens and request setup, keeping executables under 40 lines.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_approves_assigned_request_positive\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated manager session token available via <manager_auth_token>\",\n        \"A leave request in state=pending exists assigned to this manager, ID via <create_pending_request>\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with manager auth token\",\n        \"GET /leave-requests/{id} to verify state\",\n        \"GET /notifications?employee={employee_id} to verify notification\",\n        \"GET /audit-log?resource_id={id} to verify audit entry\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 200\",\n        \"request state == 'approved'\",\n        \"employee notification exists\",\n        \"audit log contains entry with action='approved'\"\n      ],\n      \"trace\": [\n        \"R-WEB-063: manager approves assigned request\",\n        \"R-WEB-063: request state=approved\",\n        \"R-WEB-063: employee notified\",\n        \"R-WEB-063: audit entry created\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import api_client, create_pending_request, get_audit_log, get_notifications\\n\\ndef test_manager_approves_assigned_request_positive(<manager_auth_token>, <employee_id>):\\n    request_id = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\\n    client = api_client(token=<manager_auth_token>)\\n\\n    resp = client.post(f\\\"/leave-requests/{request_id}/approve\\\")\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n\\n    state_resp = client.get(f\\\"/leave-requests/{request_id}\\\")\\n    assert state_resp.json()[\\\"state\\\"] == \\\"approved\\\"\\n\\n    notifications = get_notifications(employee_id=<employee_id>, token=<manager_auth_token>)\\n    assert any(n[\\\"resource_id\\\"] == request_id for n in notifications)\\n\\n    audit = get_audit_log(resource_id=request_id, token=<manager_auth_token>)\\n    assert any(e[\\\"action\\\"] == \\\"approved\\\" for e in audit)\\n\"\n    },\n    {\n      \"name\": \"test_non_assignee_manager_approve_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated manager session token available via <manager_auth_token> (manager A)\",\n        \"A second manager token available via <other_manager_auth_token> (manager B)\",\n        \"A leave request in state=pending assigned to manager A, ID via <create_pending_request>\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with manager B auth token (non-assignee)\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 403\",\n        \"response body contains error code indicating forbidden/not-assignee\",\n        \"request state remains pending\"\n      ],\n      \"trace\": [\n        \"R-WEB-063: error pathway \u2014 403 if manager not the assignee\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import api_client, create_pending_request\\n\\ndef test_non_assignee_manager_approve_returns_403(<manager_auth_token>, <other_manager_auth_token>, <employee_id>):\\n    request_id = create_pending_request(assignee_token=<manager_auth_token>, employee_id=<employee_id>)\\n    non_assignee_client = api_client(token=<other_manager_auth_token>)\\n\\n    resp = non_assignee_client.post(f\\\"/leave-requests/{request_id}/approve\\\")\\n    assert resp.status_code == 403, f\\\"Expected 403, got {resp.status_code}\\\"\\n\\n    body = resp.json()\\n    assert \\\"error\\\" in b"
+  }
+}

@@ -1,0 +1,156 @@
+{
+  "req": {
+    "id": "R-WEB-109",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Feature flag rollout",
+    "statement": "An admin shall toggle feature flags per environment; toggles shall be audit-logged.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin toggles flag"
+    ],
+    "expected_outcomes": [
+      "flag state changed",
+      "audit entry"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/feature-flags"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-109",
+    "reasoning": "R-WEB-109 governs feature-flag toggling restricted to admin roles with mandatory audit logging. Four test cases are derived: (1) EP positive \u2013 admin successfully toggles a flag and an audit entry is created; (2) NEG negative \u2013 non-admin user receives HTTP 403; (3) STC boundary \u2013 flag toggled from enabled\u2192disabled\u2192enabled verifying state machine correctness and two audit entries; (4) DT decision-table \u2013 simultaneous toggle across two environments to confirm per-environment isolation. Each test is self-contained via fixtures that create/clean up flag state.",
+    "tests": [
+      {
+        "name": "test_admin_can_toggle_feature_flag_and_audit_logged",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role:admin",
+          "Feature flag 'BETA_DASHBOARD' exists in environment 'staging' with state disabled"
+        ],
+        "actions": [
+          "Navigate to /feature-flags",
+          "Locate the toggle for 'BETA_DASHBOARD' in the 'staging' row",
+          "Click the toggle to enable the flag",
+          "Confirm the success notification appears",
+          "Query the audit log API for the most recent entry for 'BETA_DASHBOARD'"
+        ],
+        "expected": [
+          "Flag 'BETA_DASHBOARD' state changes to enabled on the UI",
+          "Audit log contains an entry with actor=admin_user, flag=BETA_DASHBOARD, env=staging, new_state=enabled"
+        ],
+        "trace": [
+          "R-WEB-109: flag state changed",
+          "R-WEB-109: audit entry created on toggle"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_admin_can_toggle_feature_flag_and_audit_logged(\n    admin_page,          # <fixture>: authenticated Playwright Page for admin\n    ensure_flag_state,   # <fixture>: sets flag to given state pre-test\n    audit_log_client,    # <fixture>: thin API wrapper for audit-log queries\n):\n    ensure_flag_state(flag=\"BETA_DASHBOARD\", env=\"staging\", state=\"disabled\")\n    page = admin_page\n    page.goto(\"/feature-flags\")\n    toggle = page.locator(\n        \"[data-testid='flag-row-BETA_DASHBOARD-staging'] [data-testid='toggle']\"\n    )\n    expect(toggle).to_have_attribute(\"aria-checked\", \"false\")\n    toggle.click()\n    expect(page.locator(\"[data-testid='success-toast']\")).to_be_visible()\n    expect(toggle).to_have_attribute(\"aria-checked\", \"true\")\n    entry = audit_log_client.latest_entry(flag=\"BETA_DASHBOARD\", env=\"staging\")\n    assert entry[\"new_state\"] == \"enabled\"\n    assert entry[\"actor_role\"] == \"admin\"\n    assert entry[\"environment\"] == \"staging\""
+      },
+      {
+        "name": "test_non_admin_toggle_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role:viewer (not admin)",
+          "Feature flag 'BETA_DASHBOARD' exists in environment 'staging'"
+        ],
+        "actions": [
+          "Send a direct PATCH request to /feature-flags/BETA_DASHBOARD with env=staging, state=enabled using the viewer's auth token"
+        ],
+        "expected": [
+          "HTTP response status is 403",
+          "Response body contains error code 'FORBIDDEN' or message indicating insufficient privileges",
+          "Flag state remains unchanged",
+          "No audit entry is created for this attempt"
+        ],
+        "trace": [
+          "R-WEB-109: error pathway \u2013 403 when not admin"
+        ],
+        "executable": "import pytest\n\ndef test_non_admin_toggle_returns_403(\n    viewer_api_client,   # <fixture>: requests.Session authenticated as role:viewer\n    ensure_flag_state,   # <fixture>\n    audit_log_client,    # <fixture>\n):\n    ensure_flag_state(flag=\"BETA_DASHBOARD\", env=\"staging\", state=\"disabled\")\n    before_count = audit_log_client.entry_count(\n        flag=\"BETA_DASHBOARD\", env=\"staging\"\n    )\n    resp = viewer_api_client.patch(\n        \"/feature-flags/BETA_DASHBOARD\",\n        json={\"environment\": \"staging\", \"state\": \"enabled\"},\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"error\") in (\"FORBIDDEN\", \"Forbidden\") or \\\n           \"permission\" in body.get(\"message\", \"\").lower()\n    after_count = audit_log_client.entry_count(\n        flag=\"BETA_DASHBOARD\", env=\"staging\"\n    )\n    assert after_count == before_count, \"No audit entry should be written on 403\""
+      },
+      {
+        "name": "test_flag_toggle_state_cycle_enabled_disabled_enabled",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated session exists for a user with role:admin",
+          "Feature flag 'BETA_DASHBOARD' exists in environment 'staging' with state enabled"
+        ],
+        "actions": [
+          "Navigate to /feature-flags",
+          "Click toggle for 'BETA_DASHBOARD' in 'staging' to disable it (enabled\u2192disabled)",
+          "Verify UI shows disabled and audit entry #1 recorded",
+          "Click toggle again to re-enable it (disabled\u2192enabled)",
+          "Verify UI shows enabled and audit entry #2 recorded"
+        ],
+        "expected": [
+          "After first toggle: flag state is disabled; audit entry new_state=disabled",
+          "After second toggle: flag state is enabled; audit entry new_state=enabled",
+          "Exactly 2 new audit entries are created during this test"
+        ],
+        "trace": [
+          "R-WEB-109: flag state changed",
+          "R-WEB-109: audit entry created on each toggle (state transition coverage)"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_flag_toggle_state_cycle_enabled_disabled_enabled(\n    admin_page,\n    ensure_flag_state,\n    audit_log_client,\n):\n    ensure_flag_state(flag=\"BETA_DASHBOARD\", env=\"staging\", state=\"enabled\")\n    baseline = audit_log_client.entry_count(flag=\"BETA_DASHBOARD\", env=\"staging\")\n    page = admin_page\n    page.goto(\"/feature-flags\")\n    toggle = page.locator(\n        \"[data-testid='flag-row-BETA_DASHBOARD-staging'] [data-testid='toggle']\"\n    )\n    # Transition 1: enabled -> disabled\n    expect(toggle).to_have_attribute(\"aria-checked\", \"true\")\n    toggle.click()\n    expect(toggle).to_have_attribute(\"aria-checked\", \"false\")\n    e1 = audit_log_client.latest_entry(flag=\"BETA_DASHBOARD\", env=\"staging\")\n    assert e1[\"new_state\"] == \"disabled\"\n    # Transition 2: disabled -> enabled\n    toggle.click()\n    expect(toggle).to_have_attribute(\"aria-checked\", \"true\")\n    e2 = audit_log_client.latest_entry(flag=\"BETA_DASHBOARD\", env=\"staging\")\n    assert e2[\"new_state\"] == \"enabled\"\n    final_count = audit_log_client.entry_count(flag=\"BETA_DASHBOARD\", env=\"staging\")\n    assert final_count - baseline == 2"
+      },
+      {
+        "name": "test_flag_toggle_is_isolated_per_environment",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated session exists for a user with role:admin",
+          "Feature flag 'BETA_DASHBOARD' exists in both 'staging' and 'production' with state disabled"
+        ],
+        "actions": [
+          "Navigate to /feature-flags",
+          "Toggle 'BETA_DASHBOARD' to enabled for 'staging' only",
+          "Read the flag state for 'staging' and 'production' from the UI",
+          "Query the audit log for both environments"
+        ],
+        "expected": [
+          "Flag state for 'staging' is enabled",
+          "Flag state for 'production' remains disabled",
+          "Audit log has exactly 1 new entry for staging with new_state=enabled",
+          "Audit log has 0 new entries for production"
+        ],
+        "trace": [
+          "R-WEB-109: toggles shall be per environment",
+          "R-WEB-109: audit entry created only for toggled environment"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_flag_toggle_is_isolated_per_environment(\n    admin_page,\n    ensure_flag_state,\n    audit_log_client,\n):\n    ensure_flag_state(flag=\"BETA_DASHBOARD\", env=\"staging\", state=\"disabled\")\n    ensure_flag_state(flag=\"BETA_DASHBOARD\", env=\"production\", state=\"disabled\")\n    prod_baseline = audit_log_client.entry_count(\n        flag=\"BETA_DASHBOARD\", env=\"production\"\n    )\n    page = admin_page\n    page.goto(\"/feature-flags\")\n    staging_toggle = page.locator(\n        \"[data-testid='flag-row-BETA_DASHBOARD-staging'] [data-testid='toggle']\"\n    )\n    prod_toggle = page.locator(\n        \"[data-testid='flag-row-BETA_DASHBOARD-production'] [data-testid='toggle']\"\n    )\n    staging_toggle.click()\n    expect(staging_toggle).to_have_attribute(\"aria-checked\", \"true\")\n    expect(prod_toggle).to_have_attribute(\"aria-checked\", \"false\")\n    staging_entry = audit_log_client.latest_entry(\n        flag=\"BETA_DASHBOARD\", env=\"staging\"\n    )\n    assert staging_entry[\"new_state\"] == \"enabled\"\n    prod_count = audit_log_client.entry_count(\n        flag=\"BETA_DASHBOARD\", env=\"production\"\n    )\n    assert prod_count == prod_baseline"
+      }
+    ]
+  },
+  "req_id": "R-WEB-109",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 970,
+    "output_tokens": 2796,
+    "latency_ms": 29508,
+    "wall_ms": 29508,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-109\",\n  \"reasoning\": \"R-WEB-109 governs feature-flag toggling restricted to admin roles with mandatory audit logging. Four test cases are derived: (1) EP positive \u2013 admin successfully toggles a flag and an audit entry is created; (2) NEG negative \u2013 non-admin user receives HTTP 403; (3) STC boundary \u2013 flag toggled from enabled\u2192disabled\u2192enabled verifying state machine correctness and two audit entries; (4) DT decision-table \u2013 simultaneous toggle across two environments to confirm per-environment isolation. Each test is self-contained via fixtures that create/clean up flag state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_can_toggle_feature_flag_and_audit_logged\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:admin\",\n        \"Feature flag 'BETA_DASHBOARD' exists in environment 'staging' with state disabled\"\n      ],\n      \"actions\": [\n        \"Navigate to /feature-flags\",\n        \"Locate the toggle for 'BETA_DASHBOARD' in the 'staging' row\",\n        \"Click the toggle to enable the flag\",\n        \"Confirm the success notification appears\",\n        \"Query the audit log API for the most recent entry for 'BETA_DASHBOARD'\"\n      ],\n      \"expected\": [\n        \"Flag 'BETA_DASHBOARD' state changes to enabled on the UI\",\n        \"Audit log contains an entry with actor=admin_user, flag=BETA_DASHBOARD, env=staging, new_state=enabled\"\n      ],\n      \"trace\": [\n        \"R-WEB-109: flag state changed\",\n        \"R-WEB-109: audit entry created on toggle\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_admin_can_toggle_feature_flag_and_audit_logged(\\n    admin_page,          # <fixture>: authenticated Playwright Page for admin\\n    ensure_flag_state,   # <fixture>: sets flag to given state pre-test\\n    audit_log_client,    # <fixture>: thin API wrapper for audit-log queries\\n):\\n    ensure_flag_state(flag=\\\"BETA_DASHBOARD\\\", env=\\\"staging\\\", state=\\\"disabled\\\")\\n    page = admin_page\\n    page.goto(\\\"/feature-flags\\\")\\n    toggle = page.locator(\\n        \\\"[data-testid='flag-row-BETA_DASHBOARD-staging'] [data-testid='toggle']\\\"\\n    )\\n    expect(toggle).to_have_attribute(\\\"aria-checked\\\", \\\"false\\\")\\n    toggle.click()\\n    expect(page.locator(\\\"[data-testid='success-toast']\\\")).to_be_visible()\\n    expect(toggle).to_have_attribute(\\\"aria-checked\\\", \\\"true\\\")\\n    entry = audit_log_client.latest_entry(flag=\\\"BETA_DASHBOARD\\\", env=\\\"staging\\\")\\n    assert entry[\\\"new_state\\\"] == \\\"enabled\\\"\\n    assert entry[\\\"actor_role\\\"] == \\\"admin\\\"\\n    assert entry[\\\"environment\\\"] == \\\"staging\\\"\"\n    },\n    {\n      \"name\": \"test_non_admin_toggle_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:viewer (not admin)\",\n        \"Feature flag 'BETA_DASHBOARD' exists in environment 'staging'\"\n      ],\n      \"actions\": [\n        \"Send a direct PATCH request to /feature-flags/BETA_DASHBOARD with env=staging, state=enabled using the viewer's auth token\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 403\",\n        \"Response body contains error code 'FORBIDDEN' or message indicating insufficient privileges\",\n        \"Flag state remains unchanged\",\n        \"No audit entry is created for this attempt\"\n      ],\n      \"trace\": [\n        \"R-WEB-109: error pathway \u2013 403 when not admin\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_admin_toggle_returns_403(\\n    viewer_api_client,   # <fixture>: requests.Session authenticated as role:viewer\\n    ensure_flag_state,   # <fixture>\\n    audit_log_client,    # <fixture>\\n):\\n    ensure_flag_state(flag=\\\"BETA_DASHBOARD\\\", env=\\\"staging\\\", state=\\\"disabled\\\")\\n    before_count = audit_log_client.entry_count(\\n        flag=\\\"BETA_DASHBOARD\\\", env=\\\"staging\\\"\\n    )\\n    resp = viewer_api_client.patch(\\n        \\\"/feature-flags/BE"
+  }
+}

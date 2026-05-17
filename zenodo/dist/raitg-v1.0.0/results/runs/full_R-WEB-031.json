@@ -1,0 +1,198 @@
+{
+  "req": {
+    "id": "R-WEB-031",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Manager deletes document",
+    "statement": "An authenticated manager shall be able to delete a document through the UI form. Mandatory fields must be validated and an audit record must be written on success.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "authenticated",
+      "role:manager",
+      "document module is enabled"
+    ],
+    "triggers": [
+      "manager deletes a document"
+    ],
+    "expected_outcomes": [
+      "document is deleted",
+      "audit record written",
+      "response 200 or 201 with entity id"
+    ],
+    "error_pathways": [
+      "400 on validation error",
+      "401 if unauthenticated",
+      "403 if role forbidden"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-031",
+    "reasoning": "The requirement mandates that an authenticated manager can delete a document via the UI, with mandatory field validation, audit record creation, and correct HTTP responses. I designed: (1) a positive EP test confirming successful deletion, audit trail, and 200/201 response for a valid manager session; (2) a NEG test confirming 403 when a non-manager role (employee) attempts deletion; (3) a BVA test targeting the boundary of the document ID field (minimum valid ID = 1 vs. ID = 0 which is invalid); (4) a STC test verifying the full state transition from 'document exists' through 'deletion in progress' to 'document deleted'; (5) a DT test covering the decision matrix of authentication x role x document existence to confirm 401 when unauthenticated.",
+    "tests": [
+      {
+        "name": "test_manager_deletes_document_successfully",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as manager",
+          "Document module is enabled",
+          "A document with known ID exists in the system"
+        ],
+        "actions": [
+          "Navigate to /documents",
+          "Select the target document",
+          "Submit the delete form with all mandatory fields populated",
+          "Confirm deletion dialog"
+        ],
+        "expected": [
+          "Response status is 200 or 201",
+          "Response body contains the deleted entity ID",
+          "Document no longer appears in the document list",
+          "An audit record is written for the deletion event"
+        ],
+        "trace": [
+          "R-WEB-031: successful delete path",
+          "R-WEB-031: audit record written on success",
+          "R-WEB-031: response 200 or 201 with entity id"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_manager_deletes_document_successfully(manager_page, create_document, audit_log_client):\n    doc_id = create_document(title=\"EP Test Doc\", owner=\"manager\")\n    page = manager_page\n    page.goto(\"/documents\")\n    page.locator(f\"[data-doc-id='{doc_id}'] [data-action='delete']\").click()\n    page.locator(\"[data-testid='confirm-delete-btn']\").click()\n    response = page.wait_for_response(lambda r: \"/documents\" in r.url and r.request.method in (\"DELETE\", \"POST\"))\n    assert response.status in (200, 201), f\"Expected 200/201, got {response.status}\"\n    body = response.json()\n    assert str(doc_id) in str(body.get(\"id\", body.get(\"entity_id\", \"\")))\n    expect(page.locator(f\"[data-doc-id='{doc_id}']\")).not_to_be_visible()\n    audit_entries = audit_log_client.get_entries(entity_id=doc_id, action=\"DELETE\")\n    assert len(audit_entries) >= 1, \"Audit record not written\"\n"
+      },
+      {
+        "name": "test_non_manager_role_forbidden_from_deleting_document",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as employee (non-manager role)",
+          "Document module is enabled",
+          "A document with known ID exists in the system"
+        ],
+        "actions": [
+          "Authenticate as employee role",
+          "Attempt to POST/DELETE to /documents endpoint for an existing document ID",
+          "Observe response"
+        ],
+        "expected": [
+          "Response status is 403",
+          "Document is NOT deleted",
+          "No audit record written for deletion",
+          "Error message indicates insufficient permissions"
+        ],
+        "trace": [
+          "R-WEB-031: error pathway 403 if role forbidden",
+          "R-WEB-031: role:manager precondition enforced"
+        ],
+        "executable": "import pytest\n\ndef test_non_manager_role_forbidden_from_deleting_document(employee_api_client, create_document, audit_log_client):\n    doc_id = create_document(title=\"NEG Forbidden Doc\", owner=\"manager\")\n    response = employee_api_client.delete(f\"/documents/{doc_id}\")\n    assert response.status_code == 403, f\"Expected 403, got {response.status_code}\"\n    body = response.json()\n    assert \"forbidden\" in body.get(\"error\", \"\").lower() or \"permission\" in body.get(\"message\", \"\").lower()\n    audit_entries = audit_log_client.get_entries(entity_id=doc_id, action=\"DELETE\")\n    assert len(audit_entries) == 0, \"Audit record must not be written on forbidden attempt\"\n    existing = employee_api_client.get(f\"/documents/{doc_id}\")\n    assert existing.status_code != 404, \"Document must still exist after forbidden attempt\"\n"
+      },
+      {
+        "name": "test_delete_document_with_boundary_minimum_valid_id",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as manager",
+          "Document module is enabled",
+          "Document with ID equal to minimum valid integer (1) exists",
+          "Document with ID equal to 0 does not exist (invalid boundary)"
+        ],
+        "actions": [
+          "Attempt to delete document with ID=0 (below minimum boundary)",
+          "Verify 400 response",
+          "Attempt to delete document with ID=1 (minimum valid boundary)",
+          "Verify 200 or 201 response and audit record"
+        ],
+        "expected": [
+          "Delete request with ID=0 returns 400 validation error",
+          "Delete request with ID=1 returns 200 or 201",
+          "Audit record written only for ID=1 deletion",
+          "Document with ID=1 is removed from the system"
+        ],
+        "trace": [
+          "R-WEB-031: boundary value of document ID field",
+          "R-WEB-031: 400 on validation error",
+          "R-WEB-031: response 200 or 201 with entity id"
+        ],
+        "executable": "import pytest\n\ndef test_delete_document_with_boundary_minimum_valid_id(manager_api_client, ensure_document_id_1_exists, audit_log_client):\n    resp_invalid = manager_api_client.delete(\"/documents/0\")\n    assert resp_invalid.status_code == 400, f\"Expected 400 for ID=0, got {resp_invalid.status_code}\"\n    error_body = resp_invalid.json()\n    assert \"error\" in error_body or \"message\" in error_body\n    audit_zero = audit_log_client.get_entries(entity_id=0, action=\"DELETE\")\n    assert len(audit_zero) == 0, \"No audit for invalid ID=0\"\n    ensure_document_id_1_exists()\n    resp_valid = manager_api_client.delete(\"/documents/1\")\n    assert resp_valid.status_code in (200, 201), f\"Expected 200/201 for ID=1, got {resp_valid.status_code}\"\n    body = resp_valid.json()\n    assert str(body.get(\"id\", body.get(\"entity_id\", \"\"))) == \"1\"\n    audit_one = audit_log_client.get_entries(entity_id=1, action=\"DELETE\")\n    assert len(audit_one) >= 1, \"Audit record must exist for valid deletion\"\n"
+      },
+      {
+        "name": "test_document_state_transition_exists_to_deleted",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as manager",
+          "Document module is enabled",
+          "Document is in state ACTIVE (exists and retrievable)"
+        ],
+        "actions": [
+          "Verify document is in ACTIVE state via GET /documents/{id}",
+          "Navigate to /documents and initiate delete flow",
+          "Confirm deletion; observe intermediate PENDING_DELETE state if applicable",
+          "Verify final state is DELETED via GET /documents/{id} returning 404 or status=DELETED"
+        ],
+        "expected": [
+          "Initial GET returns 200 and state ACTIVE",
+          "Delete operation returns 200 or 201",
+          "Final GET returns 404 or document status equals DELETED",
+          "Audit record reflects state transition to DELETED"
+        ],
+        "trace": [
+          "R-WEB-031: state transition from document exists to document deleted",
+          "R-WEB-031: audit record written on success"
+        ],
+        "executable": "import pytest\n\ndef test_document_state_transition_exists_to_deleted(manager_api_client, create_document, audit_log_client):\n    doc_id = create_document(title=\"STC Transition Doc\", owner=\"manager\")\n    pre_resp = manager_api_client.get(f\"/documents/{doc_id}\")\n    assert pre_resp.status_code == 200\n    pre_body = pre_resp.json()\n    assert pre_body.get(\"status\", \"ACTIVE\").upper() in (\"ACTIVE\", \"PUBLISHED\", \"DRAFT\")\n    del_resp = manager_api_client.delete(f\"/documents/{doc_id}\")\n    assert del_resp.status_code in (200, 201), f\"Expected 200/201, got {del_resp.status_code}\"\n    post_resp = manager_api_client.get(f\"/documents/{doc_id}\")\n    if post_resp.status_code == 200:\n        assert post_resp.json().get(\"status\", \"\").upper() == \"DELETED\"\n    else:\n        assert post_resp.status_code == 404\n    audit_entries = audit_log_client.get_entries(entity_id=doc_id, action=\"DELETE\")\n    assert len(audit_entries) >= 1\n    assert audit_entries[0].get(\"new_state\", \"\").upper() in (\"DELETED\", \"REMOVED\")\n"
+      },
+      {
+        "name": "test_unauthenticated_user_cannot_delete_document",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "No active session / no auth token",
+          "Document module is enabled",
+          "A document with known ID exists"
+        ],
+        "actions": [
+          "Send DELETE request to /documents/{id} with no authentication header",
+          "Observe response status and body"
+        ],
+        "expected": [
+          "Response status is 401",
+          "Response body contains authentication error message",
+          "Document is NOT deleted",
+          "No audit record written"
+        ],
+        "trace": [
+          "R-WEB-031: error pathway 401 if unauthenticated",
+          "R-WEB-031: authenticated precondition enforced",
+          "DT row: unauthenticated x any role x document exists => 401"
+        ],
+        "executable": "import pytest\n\ndef test_unauthenticated_user_cannot_delete_document(anon_api_client, create_document, manager_api_client, audit_log_client):\n    doc_id = create_document(title=\"DT Unauth Doc\", owner=\"manager\")\n    response = anon_api_client.delete(f\"/documents/{doc_id}\")\n    assert response.status_code == 401, f\"Expected 401, got {response.status_code}\"\n    body = response.json()\n    assert \"unauthorized\" in body.get(\"error\", \"\").lower() or \"authentication\" in body.get(\"message\", \"\").lower()\n    audit_entries = audit_log_client.get_entries(entity_id=doc_id, action=\"DELETE\")\n    assert len(audit_entries) == 0, \"No audit record should be written for unauthenticated attempt\"\n    still_exists = manager_api_client.get(f\"/documents/{doc_id}\")\n    assert still_exists.status_code == 200, \"Document must still exist after unauthenticated attempt\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-031",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 3185,
+    "latency_ms": 34605,
+    "wall_ms": 34605,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-031\",\n  \"reasoning\": \"The requirement mandates that an authenticated manager can delete a document via the UI, with mandatory field validation, audit record creation, and correct HTTP responses. I designed: (1) a positive EP test confirming successful deletion, audit trail, and 200/201 response for a valid manager session; (2) a NEG test confirming 403 when a non-manager role (employee) attempts deletion; (3) a BVA test targeting the boundary of the document ID field (minimum valid ID = 1 vs. ID = 0 which is invalid); (4) a STC test verifying the full state transition from 'document exists' through 'deletion in progress' to 'document deleted'; (5) a DT test covering the decision matrix of authentication x role x document existence to confirm 401 when unauthenticated.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_deletes_document_successfully\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as manager\",\n        \"Document module is enabled\",\n        \"A document with known ID exists in the system\"\n      ],\n      \"actions\": [\n        \"Navigate to /documents\",\n        \"Select the target document\",\n        \"Submit the delete form with all mandatory fields populated\",\n        \"Confirm deletion dialog\"\n      ],\n      \"expected\": [\n        \"Response status is 200 or 201\",\n        \"Response body contains the deleted entity ID\",\n        \"Document no longer appears in the document list\",\n        \"An audit record is written for the deletion event\"\n      ],\n      \"trace\": [\n        \"R-WEB-031: successful delete path\",\n        \"R-WEB-031: audit record written on success\",\n        \"R-WEB-031: response 200 or 201 with entity id\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_manager_deletes_document_successfully(manager_page, create_document, audit_log_client):\\n    doc_id = create_document(title=\\\"EP Test Doc\\\", owner=\\\"manager\\\")\\n    page = manager_page\\n    page.goto(\\\"/documents\\\")\\n    page.locator(f\\\"[data-doc-id='{doc_id}'] [data-action='delete']\\\").click()\\n    page.locator(\\\"[data-testid='confirm-delete-btn']\\\").click()\\n    response = page.wait_for_response(lambda r: \\\"/documents\\\" in r.url and r.request.method in (\\\"DELETE\\\", \\\"POST\\\"))\\n    assert response.status in (200, 201), f\\\"Expected 200/201, got {response.status}\\\"\\n    body = response.json()\\n    assert str(doc_id) in str(body.get(\\\"id\\\", body.get(\\\"entity_id\\\", \\\"\\\")))\\n    expect(page.locator(f\\\"[data-doc-id='{doc_id}']\\\")).not_to_be_visible()\\n    audit_entries = audit_log_client.get_entries(entity_id=doc_id, action=\\\"DELETE\\\")\\n    assert len(audit_entries) >= 1, \\\"Audit record not written\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_manager_role_forbidden_from_deleting_document\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as employee (non-manager role)\",\n        \"Document module is enabled\",\n        \"A document with known ID exists in the system\"\n      ],\n      \"actions\": [\n        \"Authenticate as employee role\",\n        \"Attempt to POST/DELETE to /documents endpoint for an existing document ID\",\n        \"Observe response\"\n      ],\n      \"expected\": [\n        \"Response status is 403\",\n        \"Document is NOT deleted\",\n        \"No audit record written for deletion\",\n        \"Error message indicates insufficient permissions\"\n      ],\n      \"trace\": [\n        \"R-WEB-031: error pathway 403 if role forbidden\",\n        \"R-WEB-031: role:manager precondition enforced\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_manager_role_forbidden_from_deleting_document(employee_api_client, create_document, audit_log_client):\\n    doc_id = create_document(title=\\\"NEG Forbidden Doc\\\", owner=\\\"manager\\\")\\n    response = employee_api_client.delete(f\\\"/documents/{doc_id}\\\")\\n    assert response.status_code == 403, f\\\"Expected 403, got {response.status_code}\\\"\\n    body"
+  }
+}

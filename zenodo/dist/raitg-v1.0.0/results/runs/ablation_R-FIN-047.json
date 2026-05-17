@@ -1,0 +1,175 @@
+{
+  "req": {
+    "id": "R-FIN-047",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Card PIN change (boundary variant)",
+    "statement": "A customer shall change their card PIN at most 5 times per 24-hour window. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer changes PIN"
+    ],
+    "expected_outcomes": [
+      "PIN updated"
+    ],
+    "error_pathways": [
+      "429 when rate limit exceeded"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/pin"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-047",
+    "reasoning": "The requirement mandates at most 5 PIN changes per 24-hour window. Test design applies: EP for a valid single change in the allowed partition; BVA for the exact boundary at attempt 5 (last allowed) and attempt 6 (first rejected); NEG for exceeding the limit; STC for the state transition from 'limit not reached' to 'limit reached'; DT for the decision of allow vs. reject based on attempt count. Each test resets state via a dedicated fixture that clears rate-limit counters before execution, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_pin_change_single_valid_request_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card belongs to the authenticated caller",
+          "Rate-limit counter for card is reset to 0 (no prior changes in window)"
+        ],
+        "actions": [
+          "Send PATCH /cards/{id}/pin with a valid new PIN",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body confirms PIN updated"
+        ],
+        "trace": [
+          "R-FIN-047: PIN updated expected outcome",
+          "EP: single request is within the allowed equivalence partition (1..5)"
+        ],
+        "executable": "import pytest\n\ndef test_pin_change_single_valid_request_succeeds(api_client, card_with_reset_limit):\n    card_id = card_with_reset_limit[\"id\"]\n    payload = {\"pin\": \"1234\"}\n\n    response = api_client.patch(f\"/cards/{card_id}/pin\", json=payload)\n\n    assert response.status_code == 200\n    body = response.json()\n    assert body.get(\"status\") == \"updated\""
+      },
+      {
+        "name": "test_pin_change_sixth_attempt_returns_429",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card belongs to the authenticated caller",
+          "Rate-limit counter for card is pre-seeded to 5 (limit already exhausted)"
+        ],
+        "actions": [
+          "Send PATCH /cards/{id}/pin with a valid new PIN as the 6th attempt",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 429 returned",
+          "Response body contains rate-limit error message"
+        ],
+        "trace": [
+          "R-FIN-047: 429 when rate limit exceeded",
+          "NEG: request beyond allowed partition triggers error response"
+        ],
+        "executable": "import pytest\n\ndef test_pin_change_sixth_attempt_returns_429(api_client, card_with_exhausted_limit):\n    card_id = card_with_exhausted_limit[\"id\"]\n    payload = {\"pin\": \"5678\"}\n\n    response = api_client.patch(f\"/cards/{card_id}/pin\", json=payload)\n\n    assert response.status_code == 429\n    body = response.json()\n    assert \"rate\" in body.get(\"error\", \"\").lower() or \"limit\" in body.get(\"error\", \"\").lower()"
+      },
+      {
+        "name": "test_pin_change_fifth_attempt_is_allowed_sixth_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card belongs to the authenticated caller",
+          "Rate-limit counter for card is pre-seeded to 4 (four prior changes in window)"
+        ],
+        "actions": [
+          "Send PATCH /cards/{id}/pin \u2014 5th attempt (boundary max allowed)",
+          "Assert HTTP 200 on 5th attempt",
+          "Send PATCH /cards/{id}/pin \u2014 6th attempt (boundary max+1, first rejected)",
+          "Assert HTTP 429 on 6th attempt"
+        ],
+        "expected": [
+          "5th attempt returns HTTP 200 and PIN updated",
+          "6th attempt returns HTTP 429 rate limit error"
+        ],
+        "trace": [
+          "R-FIN-047: at most 5 PIN changes per 24-hour window",
+          "BVA: test at exact upper boundary (5) and one above boundary (6)"
+        ],
+        "executable": "import pytest\n\ndef test_pin_change_fifth_attempt_is_allowed_sixth_is_rejected(\n    api_client, card_with_four_prior_changes\n):\n    card_id = card_with_four_prior_changes[\"id\"]\n\n    r5 = api_client.patch(f\"/cards/{card_id}/pin\", json={\"pin\": \"2468\"})\n    assert r5.status_code == 200, f\"5th attempt failed: {r5.text}\"\n    assert r5.json().get(\"status\") == \"updated\"\n\n    r6 = api_client.patch(f\"/cards/{card_id}/pin\", json={\"pin\": \"1357\"})\n    assert r6.status_code == 429, f\"6th attempt should be rejected: {r6.text}\"\n    body6 = r6.json()\n    assert \"rate\" in body6.get(\"error\", \"\").lower() or \"limit\" in body6.get(\"error\", \"\").lower()"
+      },
+      {
+        "name": "test_pin_change_transitions_state_from_open_to_rate_limited",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card belongs to the authenticated caller",
+          "Rate-limit counter for card is reset to 0"
+        ],
+        "actions": [
+          "Send 5 sequential PATCH /cards/{id}/pin requests and collect all responses",
+          "Send a 6th PATCH /cards/{id}/pin request",
+          "Capture final response status"
+        ],
+        "expected": [
+          "All 5 first responses return HTTP 200",
+          "6th response returns HTTP 429",
+          "State has transitioned from OPEN to RATE_LIMITED after 5th change"
+        ],
+        "trace": [
+          "R-FIN-047: at most 5 PIN changes per 24-hour window",
+          "STC: covers state transition from OPEN (changes allowed) to RATE_LIMITED (changes blocked)"
+        ],
+        "executable": "import pytest\n\ndef test_pin_change_transitions_state_from_open_to_rate_limited(\n    api_client, card_with_reset_limit\n):\n    card_id = card_with_reset_limit[\"id\"]\n    pins = [\"1111\", \"2222\", \"3333\", \"4444\", \"5555\"]\n\n    for i, pin in enumerate(pins, start=1):\n        r = api_client.patch(f\"/cards/{card_id}/pin\", json={\"pin\": pin})\n        assert r.status_code == 200, f\"Attempt {i} should succeed, got {r.status_code}\"\n\n    r_over = api_client.patch(f\"/cards/{card_id}/pin\", json={\"pin\": \"6666\"})\n    assert r_over.status_code == 429, (\n        f\"State should be RATE_LIMITED after 5 changes, got {r_over.status_code}\"\n    )"
+      },
+      {
+        "name": "test_pin_change_rejected_when_card_does_not_belong_to_caller",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer token is available",
+          "Card ID belongs to a different customer (not the caller)",
+          "Rate-limit counter is irrelevant \u2014 authorization check fires first"
+        ],
+        "actions": [
+          "Send PATCH /cards/{other_card_id}/pin with a valid new PIN",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 or 404 returned (card does not belong to caller)",
+          "PIN is not changed"
+        ],
+        "trace": [
+          "R-FIN-047 precondition: card belongs to caller",
+          "DT: decision row where ownership=false and attempts=any => deny access"
+        ],
+        "executable": "import pytest\n\ndef test_pin_change_rejected_when_card_does_not_belong_to_caller(\n    api_client, other_customers_card\n):\n    card_id = other_customers_card[\"id\"]\n    payload = {\"pin\": \"9999\"}\n\n    response = api_client.patch(f\"/cards/{card_id}/pin\", json=payload)\n\n    assert response.status_code in (403, 404), (\n        f\"Expected 403 or 404 for unauthorized card access, got {response.status_code}\"\n    )"
+      }
+    ]
+  },
+  "req_id": "R-FIN-047",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 990,
+    "output_tokens": 2377,
+    "latency_ms": 31073,
+    "wall_ms": 31073,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-047\",\n  \"reasoning\": \"The requirement mandates at most 5 PIN changes per 24-hour window. Test design applies: EP for a valid single change in the allowed partition; BVA for the exact boundary at attempt 5 (last allowed) and attempt 6 (first rejected); NEG for exceeding the limit; STC for the state transition from 'limit not reached' to 'limit reached'; DT for the decision of allow vs. reject based on attempt count. Each test resets state via a dedicated fixture that clears rate-limit counters before execution, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_pin_change_single_valid_request_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer token is available\",\n        \"Card belongs to the authenticated caller\",\n        \"Rate-limit counter for card is reset to 0 (no prior changes in window)\"\n      ],\n      \"actions\": [\n        \"Send PATCH /cards/{id}/pin with a valid new PIN\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body confirms PIN updated\"\n      ],\n      \"trace\": [\n        \"R-FIN-047: PIN updated expected outcome\",\n        \"EP: single request is within the allowed equivalence partition (1..5)\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_pin_change_single_valid_request_succeeds(api_client, card_with_reset_limit):\\n    card_id = card_with_reset_limit[\\\"id\\\"]\\n    payload = {\\\"pin\\\": \\\"1234\\\"}\\n\\n    response = api_client.patch(f\\\"/cards/{card_id}/pin\\\", json=payload)\\n\\n    assert response.status_code == 200\\n    body = response.json()\\n    assert body.get(\\\"status\\\") == \\\"updated\\\"\"\n    },\n    {\n      \"name\": \"test_pin_change_sixth_attempt_returns_429\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated customer token is available\",\n        \"Card belongs to the authenticated caller\",\n        \"Rate-limit counter for card is pre-seeded to 5 (limit already exhausted)\"\n      ],\n      \"actions\": [\n        \"Send PATCH /cards/{id}/pin with a valid new PIN as the 6th attempt\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 429 returned\",\n        \"Response body contains rate-limit error message\"\n      ],\n      \"trace\": [\n        \"R-FIN-047: 429 when rate limit exceeded\",\n        \"NEG: request beyond allowed partition triggers error response\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_pin_change_sixth_attempt_returns_429(api_client, card_with_exhausted_limit):\\n    card_id = card_with_exhausted_limit[\\\"id\\\"]\\n    payload = {\\\"pin\\\": \\\"5678\\\"}\\n\\n    response = api_client.patch(f\\\"/cards/{card_id}/pin\\\", json=payload)\\n\\n    assert response.status_code == 429\\n    body = response.json()\\n    assert \\\"rate\\\" in body.get(\\\"error\\\", \\\"\\\").lower() or \\\"limit\\\" in body.get(\\\"error\\\", \\\"\\\").lower()\"\n    },\n    {\n      \"name\": \"test_pin_change_fifth_attempt_is_allowed_sixth_is_rejected\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer token is available\",\n        \"Card belongs to the authenticated caller\",\n        \"Rate-limit counter for card is pre-seeded to 4 (four prior changes in window)\"\n      ],\n      \"actions\": [\n        \"Send PATCH /cards/{id}/pin \u2014 5th attempt (boundary max allowed)\",\n        \"Assert HTTP 200 on 5th attempt\",\n        \"Send PATCH /cards/{id}/pin \u2014 6th attempt (boundary max+1, first rejected)\",\n        \"Assert HTTP 429 on 6th attempt\"\n      ],\n      \"expected\": [\n        \"5th attempt returns HTTP 200 and PIN updated\",\n        \"6th attempt returns HTTP 429 rate limit error\"\n      ],\n      \"trace\": [\n        \"R-FIN-047: at most 5 PIN changes per 24-hour window\",\n        \"BVA: test at exact upper boundary (5) and one above boundary (6)\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_pin_change_fifth_attempt_is_allowed_sixth_is_rejected(\\n "
+  }
+}

@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-HLT-075",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider (negative)",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-075",
+    "reasoning": "R-HLT-075 requires testing the patient-to-provider messaging flow on /messages with PHI exfiltration scanning for attachments. The suite covers: (1) a positive EP case confirming a valid plain-text message is stored and the provider is notified; (2) a negative NEG case confirming a message with a disallowed PHI attachment pattern is blocked; (3) a boundary BVA case exercising the maximum-length message body exactly at the defined character limit; (4) a state-transition STC case verifying that a message cannot be sent from an unauthenticated/logged-out state; (5) a decision-table DT case combining missing mandatory fields to ensure all disallowed combinations are rejected. Each test is self-contained via fixtures and uses placeholders for helpers that would live in conftest.",
+    "tests": [
+      {
+        "name": "test_send_valid_plain_text_message_to_provider",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists and is assigned to patient",
+          "No pending messages in queue"
+        ],
+        "actions": [
+          "POST /messages with valid subject, body, and recipient provider ID",
+          "Assert HTTP 201 response",
+          "Assert message ID returned in response body",
+          "Assert provider notification event emitted"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response JSON contains 'message_id'",
+          "Message status is 'delivered'",
+          "Provider notification record created in <notification_store>"
+        ],
+        "trace": [
+          "R-HLT-075: message stored",
+          "R-HLT-075: provider notified"
+        ],
+        "executable": "def test_send_valid_plain_text_message_to_provider(auth_patient_session, provider_fixture, api_client):\n    payload = {\n        \"recipient_id\": provider_fixture[\"id\"],\n        \"subject\": \"Appointment follow-up\",\n        \"body\": \"Hello, I have a question about my prescription.\"\n    }\n    resp = api_client.post(\"/messages\", json=payload, headers=auth_patient_session)\n    assert resp.status_code == 201\n    data = resp.json()\n    assert \"message_id\" in data\n    assert data.get(\"status\") == \"delivered\"\n    note = <get_notification>(data[\"message_id\"])\n    assert note[\"recipient_id\"] == provider_fixture[\"id\"]"
+      },
+      {
+        "name": "test_send_message_with_phi_attachment_is_blocked",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Attachment file contains disallowed PHI exfiltration pattern (SSN regex match)",
+          "PHI scan service is running and reachable"
+        ],
+        "actions": [
+          "POST /messages with valid subject and body but attach file containing '123-45-6789' SSN pattern",
+          "Assert HTTP 422 or 400 response",
+          "Assert error code indicates PHI scan failure",
+          "Assert no message record persisted in store"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response JSON error code is 'PHI_ATTACHMENT_BLOCKED'",
+          "Message is NOT stored in message store",
+          "No provider notification is emitted"
+        ],
+        "trace": [
+          "R-HLT-075: blocked when disallowed attachment detected"
+        ],
+        "executable": "def test_send_message_with_phi_attachment_is_blocked(auth_patient_session, provider_fixture, api_client, phi_attachment_fixture):\n    payload = {\n        \"recipient_id\": provider_fixture[\"id\"],\n        \"subject\": \"Test\",\n        \"body\": \"See attached.\"\n    }\n    files = {\"attachment\": phi_attachment_fixture}\n    resp = api_client.post(\"/messages\", data=payload, files=files, headers=auth_patient_session)\n    assert resp.status_code == 422\n    err = resp.json()\n    assert err.get(\"error_code\") == \"PHI_ATTACHMENT_BLOCKED\"\n    exists = <message_exists_in_store>(err.get(\"message_id\"))\n    assert not exists"
+      },
+      {
+        "name": "test_send_message_body_at_max_character_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists and is assigned to patient",
+          "System max message body length is defined as MAX_BODY_LEN (e.g. 5000 chars)"
+        ],
+        "actions": [
+          "POST /messages with body of exactly MAX_BODY_LEN characters",
+          "Assert HTTP 201",
+          "POST /messages with body of MAX_BODY_LEN + 1 characters",
+          "Assert HTTP 400 or 413 with error indicating body too long"
+        ],
+        "expected": [
+          "Exactly MAX_BODY_LEN body: HTTP 201 and message stored",
+          "MAX_BODY_LEN + 1 body: HTTP 400 or 413 with 'BODY_TOO_LONG' error code"
+        ],
+        "trace": [
+          "R-HLT-075: message stored (positive boundary)",
+          "R-HLT-075: missing mandatory elements / invalid input (over-boundary)"
+        ],
+        "executable": "def test_send_message_body_at_max_character_boundary(auth_patient_session, provider_fixture, api_client):\n    MAX_BODY_LEN = <get_config>(\"MESSAGE_MAX_BODY_LEN\")\n    base = {\"recipient_id\": provider_fixture[\"id\"], \"subject\": \"BVA\"}\n\n    at_limit = {**base, \"body\": \"x\" * MAX_BODY_LEN}\n    resp_ok = api_client.post(\"/messages\", json=at_limit, headers=auth_patient_session)\n    assert resp_ok.status_code == 201\n\n    over_limit = {**base, \"body\": \"x\" * (MAX_BODY_LEN + 1)}\n    resp_err = api_client.post(\"/messages\", json=over_limit, headers=auth_patient_session)\n    assert resp_err.status_code in (400, 413)\n    assert resp_err.json().get(\"error_code\") == \"BODY_TOO_LONG\""
+      },
+      {
+        "name": "test_send_message_from_unauthenticated_state_is_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient session has been explicitly logged out (unauthenticated state)",
+          "No valid session token present in headers"
+        ],
+        "actions": [
+          "Attempt POST /messages with no Authorization header",
+          "Assert HTTP 401 response",
+          "Assert error body indicates authentication required",
+          "Confirm no message record is written"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response JSON error code is 'UNAUTHENTICATED'",
+          "Message is NOT stored in message store"
+        ],
+        "trace": [
+          "R-HLT-075: permission denial (unauthenticated state transition)"
+        ],
+        "executable": "def test_send_message_from_unauthenticated_state_is_rejected(provider_fixture, api_client):\n    payload = {\n        \"recipient_id\": provider_fixture[\"id\"],\n        \"subject\": \"Unauthorized attempt\",\n        \"body\": \"This should be blocked.\"\n    }\n    resp = api_client.post(\"/messages\", json=payload)\n    assert resp.status_code == 401\n    err = resp.json()\n    assert err.get(\"error_code\") == \"UNAUTHENTICATED\"\n    msg_id = err.get(\"message_id\")\n    if msg_id:\n        assert not <message_exists_in_store>(msg_id)"
+      },
+      {
+        "name": "test_send_message_with_missing_mandatory_fields_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists and is assigned to patient"
+        ],
+        "actions": [
+          "POST /messages omitting 'recipient_id' \u2014 assert 400",
+          "POST /messages omitting 'subject' \u2014 assert 400",
+          "POST /messages omitting 'body' \u2014 assert 400",
+          "POST /messages omitting both 'subject' and 'body' \u2014 assert 400"
+        ],
+        "expected": [
+          "Each call returns HTTP 400 Bad Request",
+          "Each response contains 'MISSING_REQUIRED_FIELD' error code",
+          "No message stored for any of the four calls"
+        ],
+        "trace": [
+          "R-HLT-075: missing mandatory elements"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"omit_fields\", [\n    [\"recipient_id\"],\n    [\"subject\"],\n    [\"body\"],\n    [\"subject\", \"body\"]\n])\ndef test_send_message_with_missing_mandatory_fields_combinations(\n    auth_patient_session, provider_fixture, api_client, omit_fields\n):\n    full = {\n        \"recipient_id\": provider_fixture[\"id\"],\n        \"subject\": \"Check-in\",\n        \"body\": \"How are things?\"\n    }\n    payload = {k: v for k, v in full.items() if k not in omit_fields}\n    resp = api_client.post(\"/messages\", json=payload, headers=auth_patient_session)\n    assert resp.status_code == 400\n    assert resp.json().get(\"error_code\") == \"MISSING_REQUIRED_FIELD\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-075",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 2658,
+    "latency_ms": 35063,
+    "wall_ms": 35063,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-075\",\n  \"reasoning\": \"R-HLT-075 requires testing the patient-to-provider messaging flow on /messages with PHI exfiltration scanning for attachments. The suite covers: (1) a positive EP case confirming a valid plain-text message is stored and the provider is notified; (2) a negative NEG case confirming a message with a disallowed PHI attachment pattern is blocked; (3) a boundary BVA case exercising the maximum-length message body exactly at the defined character limit; (4) a state-transition STC case verifying that a message cannot be sent from an unauthenticated/logged-out state; (5) a decision-table DT case combining missing mandatory fields to ensure all disallowed combinations are rejected. Each test is self-contained via fixtures and uses placeholders for helpers that would live in conftest.\",\n  \"tests\": [\n    {\n      \"name\": \"test_send_valid_plain_text_message_to_provider\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated and session token is valid\",\n        \"Provider exists and is assigned to patient\",\n        \"No pending messages in queue\"\n      ],\n      \"actions\": [\n        \"POST /messages with valid subject, body, and recipient provider ID\",\n        \"Assert HTTP 201 response\",\n        \"Assert message ID returned in response body\",\n        \"Assert provider notification event emitted\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response JSON contains 'message_id'\",\n        \"Message status is 'delivered'\",\n        \"Provider notification record created in <notification_store>\"\n      ],\n      \"trace\": [\n        \"R-HLT-075: message stored\",\n        \"R-HLT-075: provider notified\"\n      ],\n      \"executable\": \"def test_send_valid_plain_text_message_to_provider(auth_patient_session, provider_fixture, api_client):\\n    payload = {\\n        \\\"recipient_id\\\": provider_fixture[\\\"id\\\"],\\n        \\\"subject\\\": \\\"Appointment follow-up\\\",\\n        \\\"body\\\": \\\"Hello, I have a question about my prescription.\\\"\\n    }\\n    resp = api_client.post(\\\"/messages\\\", json=payload, headers=auth_patient_session)\\n    assert resp.status_code == 201\\n    data = resp.json()\\n    assert \\\"message_id\\\" in data\\n    assert data.get(\\\"status\\\") == \\\"delivered\\\"\\n    note = <get_notification>(data[\\\"message_id\\\"])\\n    assert note[\\\"recipient_id\\\"] == provider_fixture[\\\"id\\\"]\"\n    },\n    {\n      \"name\": \"test_send_message_with_phi_attachment_is_blocked\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated and session token is valid\",\n        \"Attachment file contains disallowed PHI exfiltration pattern (SSN regex match)\",\n        \"PHI scan service is running and reachable\"\n      ],\n      \"actions\": [\n        \"POST /messages with valid subject and body but attach file containing '123-45-6789' SSN pattern\",\n        \"Assert HTTP 422 or 400 response\",\n        \"Assert error code indicates PHI scan failure\",\n        \"Assert no message record persisted in store\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response JSON error code is 'PHI_ATTACHMENT_BLOCKED'\",\n        \"Message is NOT stored in message store\",\n        \"No provider notification is emitted\"\n      ],\n      \"trace\": [\n        \"R-HLT-075: blocked when disallowed attachment detected\"\n      ],\n      \"executable\": \"def test_send_message_with_phi_attachment_is_blocked(auth_patient_session, provider_fixture, api_client, phi_attachment_fixture):\\n    payload = {\\n        \\\"recipient_id\\\": provider_fixture[\\\"id\\\"],\\n        \\\"subject\\\": \\\"Test\\\",\\n        \\\"body\\\": \\\"See attached.\\\"\\n    }\\n    files = {\\\"attachment\\\": phi_attachment_fixture}\\n    resp = api_client.post(\\\"/messages\\\", data=payload, files=files, headers=auth_patient_session)\\n    assert resp.status_code == 422\\n    err = resp.json()\\n    assert err.get(\\\"error_code\\\") == \\\"PHI_ATTACHMENT_BLOCKED\\\"\\n    exists = <message_exists_in_sto"
+  }
+}

@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-FIN-017",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Account-level transaction limits",
+    "statement": "A customer shall configure daily per-channel limits within regulatory caps; changes take effect after a 2-hour cool-down.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer submits limits"
+    ],
+    "expected_outcomes": [
+      "pending limit stored",
+      "effective after cool-down"
+    ],
+    "error_pathways": [
+      "422 when over regulatory cap"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/limits"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-017",
+    "reasoning": "R-FIN-017 requires testing account-level transaction limit configuration with regulatory enforcement, cool-down state management, and error handling. The test suite applies EP (limit types/channels), BVA (regulatory cap boundaries), STC (pending\u2192effective state), and NEG (422 over-cap) heuristics to ensure deterministic, traceable coverage of the /accounts/{id}/limits endpoint.",
+    "tests": [
+      {
+        "name": "test_set_limit_within_cap_returns_202_pending",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with valid auth token",
+          "Account {account_id} exists and belongs to authenticated user",
+          "No pending limit change exists for this account"
+        ],
+        "actions": [
+          "POST /accounts/{account_id}/limits with body {\"daily_limit\": 5000, \"channel\": \"online\"}",
+          "Assert response status code"
+        ],
+        "expected": [
+          "Response status is 202 Accepted",
+          "Response body contains {\"status\": \"pending\", \"effective_at\": <future_timestamp>}",
+          "effective_at is approximately 2 hours from now (\u00b15 min tolerance)"
+        ],
+        "trace": [
+          "R-FIN-017: customer submits limits",
+          "R-FIN-017: pending limit stored",
+          "R-FIN-017: Expected outcomes: pending limit stored; effective after cool-down"
+        ],
+        "executable": "def test_set_limit_within_cap_returns_202_pending(auth_token, account_id):\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'daily_limit': 5000, 'channel': 'online'}\n    resp = <requests_post>(url, json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body['status'] == 'pending'\n    assert 'effective_at' in body\n    effective = <parse_iso_timestamp>(body['effective_at'])\n    now = <utc_now>()\n    delta = (effective - now).total_seconds()\n    assert 7100 < delta < 7300, f'Cool-down {delta}s not ~2h'"
+      },
+      {
+        "name": "test_set_limit_over_regulatory_cap_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated with valid auth token",
+          "Account {account_id} exists and belongs to authenticated user",
+          "Regulatory cap for channel 'online' is known to be 50000"
+        ],
+        "actions": [
+          "POST /accounts/{account_id}/limits with body {\"daily_limit\": 75000, \"channel\": \"online\"}",
+          "Assert response status code and error details"
+        ],
+        "expected": [
+          "Response status is 422 Unprocessable Entity",
+          "Response body contains {\"error\": \"LIMIT_EXCEEDS_CAP\", \"cap\": 50000}",
+          "No pending limit is created in database"
+        ],
+        "trace": [
+          "R-FIN-017: Error pathways: 422 when over regulatory cap",
+          "R-FIN-017: changes take effect after a 2-hour cool-down (implies validation before storage)"
+        ],
+        "executable": "def test_set_limit_over_regulatory_cap_returns_422(auth_token, account_id):\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'daily_limit': 75000, 'channel': 'online'}\n    resp = <requests_post>(url, json=payload, headers=headers)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body['error'] == 'LIMIT_EXCEEDS_CAP'\n    assert body['cap'] == 50000\n    pending = <query_pending_limits>(account_id)\n    assert len(pending) == 0"
+      },
+      {
+        "name": "test_set_limit_at_exact_regulatory_cap_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with valid auth token",
+          "Account {account_id} exists and belongs to authenticated user",
+          "Regulatory cap for channel 'atm' is exactly 10000"
+        ],
+        "actions": [
+          "POST /accounts/{account_id}/limits with body {\"daily_limit\": 10000, \"channel\": \"atm\"}",
+          "Assert response indicates acceptance at boundary"
+        ],
+        "expected": [
+          "Response status is 202 Accepted",
+          "Pending limit is stored with daily_limit = 10000",
+          "No 422 error (boundary is inclusive)"
+        ],
+        "trace": [
+          "R-FIN-017: A customer shall configure daily per-channel limits within regulatory caps",
+          "BVA: Test at exact boundary (cap value)",
+          "R-FIN-017: pending limit stored"
+        ],
+        "executable": "def test_set_limit_at_exact_regulatory_cap_boundary(auth_token, account_id):\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    payload = {'daily_limit': 10000, 'channel': 'atm'}\n    resp = <requests_post>(url, json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body['daily_limit'] == 10000\n    assert body['channel'] == 'atm'"
+      },
+      {
+        "name": "test_limit_becomes_effective_after_cooldown_transition",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated with valid auth token",
+          "Account {account_id} exists and belongs to authenticated user",
+          "A pending limit with effective_at = now + 2 hours exists in database"
+        ],
+        "actions": [
+          "GET /accounts/{account_id}/limits to retrieve pending state",
+          "Advance system time by 2 hours 1 minute (or query after that interval)",
+          "GET /accounts/{account_id}/limits to retrieve effective state"
+        ],
+        "expected": [
+          "Initial GET returns {\"status\": \"pending\"}",
+          "After cool-down, GET returns {\"status\": \"effective\"}",
+          "Limit value remains consistent across state transition"
+        ],
+        "trace": [
+          "R-FIN-017: changes take effect after a 2-hour cool-down",
+          "STC: State Transition pending \u2192 effective",
+          "R-FIN-017: Expected outcomes: pending limit stored; effective after cool-down"
+        ],
+        "executable": "def test_limit_becomes_effective_after_cooldown_transition(auth_token, account_id):\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp1 = <requests_get>(url, headers=headers)\n    assert resp1.json()['status'] == 'pending'\n    initial_limit = resp1.json()['daily_limit']\n    <wait_or_mock_time_advance>(121 * 60)\n    resp2 = <requests_get>(url, headers=headers)\n    assert resp2.json()['status'] == 'effective'\n    assert resp2.json()['daily_limit'] == initial_limit"
+      },
+      {
+        "name": "test_set_limit_multiple_channels_isolation",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with valid auth token",
+          "Account {account_id} exists and belongs to authenticated user"
+        ],
+        "actions": [
+          "POST /accounts/{account_id}/limits with channel='online', daily_limit=5000",
+          "POST /accounts/{account_id}/limits with channel='mobile', daily_limit=3000",
+          "GET /accounts/{account_id}/limits to retrieve all limits"
+        ],
+        "expected": [
+          "Both POSTs return 202 Accepted",
+          "GET returns array with both online and mobile entries",
+          "Each entry maintains independent status and effective_at"
+        ],
+        "trace": [
+          "R-FIN-017: daily per-channel limits",
+          "EP: Different channels are distinct equivalence classes"
+        ],
+        "executable": "def test_set_limit_multiple_channels_isolation(auth_token, account_id):\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\n    headers = {'Authorization': f'Bearer {auth_token}'}\n    resp1 = <requests_post>(url, json={'daily_limit': 5000, 'channel': 'online'}, headers=headers)\n    resp2 = <requests_post>(url, json={'daily_limit': 3000, 'channel': 'mobile'}, headers=headers)\n    assert resp1.status_code == 202\n    assert resp2.status_code == 202\n    resp_get = <requests_get>(url, headers=headers)\n    limits = resp_get.json()['limits']\n    assert len(limits) >= 2\n    channels = {l['channel'] for l in limits}\n    assert 'online' in channels and 'mobile' in channels"
+      }
+    ]
+  },
+  "req_id": "R-FIN-017",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1027,
+    "output_tokens": 2497,
+    "latency_ms": 14504,
+    "wall_ms": 14504,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-017\",\n  \"reasoning\": \"R-FIN-017 requires testing account-level transaction limit configuration with regulatory enforcement, cool-down state management, and error handling. The test suite applies EP (limit types/channels), BVA (regulatory cap boundaries), STC (pending\u2192effective state), and NEG (422 over-cap) heuristics to ensure deterministic, traceable coverage of the /accounts/{id}/limits endpoint.\",\n  \"tests\": [\n    {\n      \"name\": \"test_set_limit_within_cap_returns_202_pending\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated with valid auth token\",\n        \"Account {account_id} exists and belongs to authenticated user\",\n        \"No pending limit change exists for this account\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{account_id}/limits with body {\\\"daily_limit\\\": 5000, \\\"channel\\\": \\\"online\\\"}\",\n        \"Assert response status code\"\n      ],\n      \"expected\": [\n        \"Response status is 202 Accepted\",\n        \"Response body contains {\\\"status\\\": \\\"pending\\\", \\\"effective_at\\\": <future_timestamp>}\",\n        \"effective_at is approximately 2 hours from now (\u00b15 min tolerance)\"\n      ],\n      \"trace\": [\n        \"R-FIN-017: customer submits limits\",\n        \"R-FIN-017: pending limit stored\",\n        \"R-FIN-017: Expected outcomes: pending limit stored; effective after cool-down\"\n      ],\n      \"executable\": \"def test_set_limit_within_cap_returns_202_pending(auth_token, account_id):\\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {'daily_limit': 5000, 'channel': 'online'}\\n    resp = <requests_post>(url, json=payload, headers=headers)\\n    assert resp.status_code == 202\\n    body = resp.json()\\n    assert body['status'] == 'pending'\\n    assert 'effective_at' in body\\n    effective = <parse_iso_timestamp>(body['effective_at'])\\n    now = <utc_now>()\\n    delta = (effective - now).total_seconds()\\n    assert 7100 < delta < 7300, f'Cool-down {delta}s not ~2h'\"\n    },\n    {\n      \"name\": \"test_set_limit_over_regulatory_cap_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated with valid auth token\",\n        \"Account {account_id} exists and belongs to authenticated user\",\n        \"Regulatory cap for channel 'online' is known to be 50000\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{account_id}/limits with body {\\\"daily_limit\\\": 75000, \\\"channel\\\": \\\"online\\\"}\",\n        \"Assert response status code and error details\"\n      ],\n      \"expected\": [\n        \"Response status is 422 Unprocessable Entity\",\n        \"Response body contains {\\\"error\\\": \\\"LIMIT_EXCEEDS_CAP\\\", \\\"cap\\\": 50000}\",\n        \"No pending limit is created in database\"\n      ],\n      \"trace\": [\n        \"R-FIN-017: Error pathways: 422 when over regulatory cap\",\n        \"R-FIN-017: changes take effect after a 2-hour cool-down (implies validation before storage)\"\n      ],\n      \"executable\": \"def test_set_limit_over_regulatory_cap_returns_422(auth_token, account_id):\\n    url = f'http://localhost:8000/accounts/{account_id}/limits'\\n    headers = {'Authorization': f'Bearer {auth_token}'}\\n    payload = {'daily_limit': 75000, 'channel': 'online'}\\n    resp = <requests_post>(url, json=payload, headers=headers)\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert body['error'] == 'LIMIT_EXCEEDS_CAP'\\n    assert body['cap'] == 50000\\n    pending = <query_pending_limits>(account_id)\\n    assert len(pending) == 0\"\n    },\n    {\n      \"name\": \"test_set_limit_at_exact_regulatory_cap_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated with valid auth token\",\n        \"Account {account_id} exists and belongs to authenticated user\",\n        \"Regulatory cap for channel 'atm' is exactly 10000\"\n      ],\n      \"actions\": [\n        \"POST /ac"
+  }
+}

@@ -1,0 +1,173 @@
+{
+  "req": {
+    "id": "R-FIN-041",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual (boundary variant)",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-041",
+    "reasoning": "R-FIN-041 mandates daily tier-rate interest accrual credited on the last business day of the month via /cron/interest. Four test cases cover: (1) EP positive \u2013 a mid-tier balance accrues and credits correctly; (2) NEG negative \u2013 a reconciliation variance is reported when ledger totals mismatch; (3) BVA boundary-min \u2013 a balance exactly at the minimum tier threshold accrues at the lowest tier rate; (4) BVA boundary-max \u2013 a balance exactly at the maximum tier threshold accrues at the highest tier rate without overflow. Each test seeds its own account, triggers the cron endpoint, then tears down, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_interest_credited_standard_tier_balance",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "A savings account with a mid-tier balance (e.g. 5000.00) exists and has accrued daily interest for the full month",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed a savings account via <fixture: seed_account> with balance 5000.00",
+          "Simulate N daily accrual records via <helper_fn: seed_daily_accruals>",
+          "POST /cron/interest with valid cron auth header",
+          "GET /accounts/{account_id}/transactions to fetch ledger entries",
+          "DELETE seeded account via <helper_fn: teardown_account>"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200",
+          "Response body contains 'credited_count' >= 1",
+          "A ledger entry of type 'INTEREST_CREDIT' exists for the account",
+          "Credited amount equals sum of daily accruals rounded to 2 decimal places"
+        ],
+        "trace": [
+          "R-FIN-041: interest credited monthly on last business day",
+          "R-FIN-041: tier rate applied",
+          "R-FIN-041: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport requests\nfrom decimal import Decimal, ROUND_HALF_UP\n\nBASE_URL = \"http://localhost:8080\"\nCRON_AUTH = {\"X-Cron-Secret\": \"<cron_secret>\"}\n\ndef test_interest_credited_standard_tier_balance():\n    account_id, tier_rate = <helper_fn: seed_account>(balance=\"5000.00\", tier=\"MID\")\n    days_in_month = 30\n    expected = (Decimal(\"5000.00\") * Decimal(str(tier_rate)) / 365 * days_in_month).quantize(\n        Decimal(\"0.01\"), rounding=ROUND_HALF_UP\n    )\n    <helper_fn: seed_daily_accruals>(account_id, days=days_in_month)\n    try:\n        r = requests.post(f\"{BASE_URL}/cron/interest\", headers=CRON_AUTH, timeout=10)\n        assert r.status_code == 200\n        body = r.json()\n        assert body.get(\"credited_count\", 0) >= 1\n        txns = requests.get(\n            f\"{BASE_URL}/accounts/{account_id}/transactions\",\n            headers=CRON_AUTH, timeout=10\n        ).json()\n        credits = [t for t in txns if t[\"type\"] == \"INTEREST_CREDIT\"]\n        assert len(credits) == 1\n        actual = Decimal(str(credits[0][\"amount\"]))\n        assert actual == expected\n    finally:\n        <helper_fn: teardown_account>(account_id)"
+      },
+      {
+        "name": "test_reconciliation_variance_reported_on_ledger_mismatch",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "A savings account exists whose accrual records have been tampered to introduce a variance",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed a savings account via <fixture: seed_account> with balance 3000.00",
+          "Seed corrupted daily accruals with an intentional variance via <helper_fn: seed_corrupt_accruals>",
+          "POST /cron/interest with valid cron auth header",
+          "GET /reconciliation/variances to fetch variance report",
+          "DELETE seeded account via <helper_fn: teardown_account>"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200 or 207",
+          "Response body contains 'variance_count' >= 1 OR 'errors' list is non-empty",
+          "GET /reconciliation/variances returns at least one entry referencing the account_id",
+          "Variance entry includes 'expected_amount' and 'actual_amount' fields"
+        ],
+        "trace": [
+          "R-FIN-041: reconciliation variance reported (error pathway)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://localhost:8080\"\nCRON_AUTH = {\"X-Cron-Secret\": \"<cron_secret>\"}\n\ndef test_reconciliation_variance_reported_on_ledger_mismatch():\n    account_id = <helper_fn: seed_account>(balance=\"3000.00\", tier=\"MID\")\n    <helper_fn: seed_corrupt_accruals>(account_id, corrupt_delta=\"9999.99\")\n    try:\n        r = requests.post(f\"{BASE_URL}/cron/interest\", headers=CRON_AUTH, timeout=10)\n        assert r.status_code in (200, 207)\n        body = r.json()\n        has_variance = (\n            body.get(\"variance_count\", 0) >= 1\n            or len(body.get(\"errors\", [])) >= 1\n        )\n        assert has_variance, f\"Expected variance signal, got: {body}\"\n        variances = requests.get(\n            f\"{BASE_URL}/reconciliation/variances\",\n            headers=CRON_AUTH, timeout=10\n        ).json()\n        account_variances = [v for v in variances if v.get(\"account_id\") == account_id]\n        assert len(account_variances) >= 1\n        v = account_variances[0]\n        assert \"expected_amount\" in v and \"actual_amount\" in v\n    finally:\n        <helper_fn: teardown_account>(account_id)"
+      },
+      {
+        "name": "test_interest_accrual_at_minimum_tier_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "Minimum tier threshold is known (e.g. 1.00)",
+          "A savings account exists with balance exactly equal to the minimum tier threshold",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed a savings account with balance exactly MIN_TIER_THRESHOLD via <fixture: seed_account>",
+          "Seed daily accruals for 30 days using the minimum tier rate via <helper_fn: seed_daily_accruals>",
+          "POST /cron/interest with valid cron auth header",
+          "GET /accounts/{account_id}/transactions and filter for INTEREST_CREDIT",
+          "DELETE seeded account via <helper_fn: teardown_account>"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200",
+          "Exactly one INTEREST_CREDIT ledger entry exists for the account",
+          "Credited amount equals floor calculation of MIN_TIER_RATE applied to MIN_TIER_THRESHOLD for 30 days",
+          "No overdraft or zero-credit ledger entry is created"
+        ],
+        "trace": [
+          "R-FIN-041: boundary behaviour at exact min threshold must be tested",
+          "R-FIN-041: tier rate applied",
+          "R-FIN-041: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport requests\nfrom decimal import Decimal, ROUND_HALF_UP\n\nBASE_URL = \"http://localhost:8080\"\nCRON_AUTH = {\"X-Cron-Secret\": \"<cron_secret>\"}\nMIN_TIER_THRESHOLD = Decimal(\"1.00\")\nMIN_TIER_RATE = Decimal(\"<min_tier_rate>\")\n\ndef test_interest_accrual_at_minimum_tier_boundary():\n    account_id = <helper_fn: seed_account>(\n        balance=str(MIN_TIER_THRESHOLD), tier=\"MIN\"\n    )\n    days = 30\n    expected = (\n        MIN_TIER_THRESHOLD * MIN_TIER_RATE / 365 * days\n    ).quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)\n    <helper_fn: seed_daily_accruals>(account_id, days=days)\n    try:\n        r = requests.post(f\"{BASE_URL}/cron/interest\", headers=CRON_AUTH, timeout=10)\n        assert r.status_code == 200\n        txns = requests.get(\n            f\"{BASE_URL}/accounts/{account_id}/transactions\",\n            headers=CRON_AUTH, timeout=10\n        ).json()\n        credits = [t for t in txns if t[\"type\"] == \"INTEREST_CREDIT\"]\n        assert len(credits) == 1, f\"Expected 1 credit entry, got {len(credits)}\"\n        actual = Decimal(str(credits[0][\"amount\"]))\n        assert actual == expected, f\"Expected {expected}, got {actual}\"\n        assert actual > Decimal(\"0.00\"), \"Interest must be positive at min boundary\"\n    finally:\n        <helper_fn: teardown_account>(account_id)"
+      },
+      {
+        "name": "test_interest_accrual_at_maximum_tier_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Banking API is reachable at BASE_URL",
+          "Maximum tier threshold is known (e.g. 999999.99)",
+          "A savings account exists with balance exactly equal to the maximum tier threshold",
+          "Today is the last business day of the month"
+        ],
+        "actions": [
+          "Seed a savings account with balance exactly MAX_TIER_THRESHOLD via <fixture: seed_account>",
+          "Seed daily accruals for 31 days using the maximum tier rate via <helper_fn: seed_daily_accruals>",
+          "POST /cron/interest with valid cron auth header",
+          "GET /accounts/{account_id}/transactions and filter for INTEREST_CREDIT",
+          "DELETE seeded account via <helper_fn: teardown_account>"
+        ],
+        "expected": [
+          "POST /cron/interest returns HTTP 200",
+          "Exactly one INTEREST_CREDIT ledger entry exists for the account",
+          "Credited amount equals calculation of MAX_TIER_RATE applied to MAX_TIER_THRESHOLD for 31 days without numeric overflow",
+          "No reconciliation variance entry is created for this account"
+        ],
+        "trace": [
+          "R-FIN-041: boundary behaviour at exact max threshold must be tested",
+          "R-FIN-041: tier rate applied",
+          "R-FIN-041: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport requests\nfrom decimal import Decimal, ROUND_HALF_UP\n\nBASE_URL = \"http://localhost:8080\"\nCRON_AUTH = {\"X-Cron-Secret\": \"<cron_secret>\"}\nMAX_TIER_THRESHOLD = Decimal(\"999999.99\")\nMAX_TIER_RATE = Decimal(\"<max_tier_rate>\")\n\ndef test_interest_accrual_at_maximum_tier_boundary():\n    account_id = <helper_fn: seed_account>(\n        balance=str(MAX_TIER_THRESHOLD), tier=\"MAX\"\n    )\n    days = 31\n    expected = (\n        MAX_TIER_THRESHOLD * MAX_TIER_RATE / 365 * days\n    ).quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)\n    <helper_fn: seed_daily_accruals>(account_id, days=days)\n    try:\n        r = requests.post(f\"{BASE_URL}/cron/interest\", headers=CRON_AUTH, timeout=10)\n        assert r.status_code == 200\n        txns = requests.get(\n            f\"{BASE_URL}/accounts/{account_id}/transactions\",\n            headers=CRON_AUTH, timeout=10\n        ).json()\n        credits = [t for t in txns if t[\"type\"] == \"INTEREST_CREDIT\"]\n        assert len(credits) == 1, f\"Expected 1 credit entry, got {len(credits)}\"\n        actual = Decimal(str(credits[0][\"amount\"]))\n        assert actual == expected, f\"Expected {expected}, got {actual}\"\n        variances = requests.get(\n            f\"{BASE_URL}/reconciliation/variances\",\n            headers=CRON_AUTH, timeout=10\n        ).json()\n        assert not any(v.get(\"account_id\") == account_id for v in variances)\n    finally:\n        <helper_fn: teardown_account>(account_id)"
+      }
+    ]
+  },
+  "req_id": "R-FIN-041",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 995,
+    "output_tokens": 3584,
+    "latency_ms": 35490,
+    "wall_ms": 35490,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-041\",\n  \"reasoning\": \"R-FIN-041 mandates daily tier-rate interest accrual credited on the last business day of the month via /cron/interest. Four test cases cover: (1) EP positive \u2013 a mid-tier balance accrues and credits correctly; (2) NEG negative \u2013 a reconciliation variance is reported when ledger totals mismatch; (3) BVA boundary-min \u2013 a balance exactly at the minimum tier threshold accrues at the lowest tier rate; (4) BVA boundary-max \u2013 a balance exactly at the maximum tier threshold accrues at the highest tier rate without overflow. Each test seeds its own account, triggers the cron endpoint, then tears down, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_interest_credited_standard_tier_balance\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Banking API is reachable at BASE_URL\",\n        \"A savings account with a mid-tier balance (e.g. 5000.00) exists and has accrued daily interest for the full month\",\n        \"Today is the last business day of the month\"\n      ],\n      \"actions\": [\n        \"Seed a savings account via <fixture: seed_account> with balance 5000.00\",\n        \"Simulate N daily accrual records via <helper_fn: seed_daily_accruals>\",\n        \"POST /cron/interest with valid cron auth header\",\n        \"GET /accounts/{account_id}/transactions to fetch ledger entries\",\n        \"DELETE seeded account via <helper_fn: teardown_account>\"\n      ],\n      \"expected\": [\n        \"POST /cron/interest returns HTTP 200\",\n        \"Response body contains 'credited_count' >= 1\",\n        \"A ledger entry of type 'INTEREST_CREDIT' exists for the account\",\n        \"Credited amount equals sum of daily accruals rounded to 2 decimal places\"\n      ],\n      \"trace\": [\n        \"R-FIN-041: interest credited monthly on last business day\",\n        \"R-FIN-041: tier rate applied\",\n        \"R-FIN-041: ledger entry per account\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom decimal import Decimal, ROUND_HALF_UP\\n\\nBASE_URL = \\\"http://localhost:8080\\\"\\nCRON_AUTH = {\\\"X-Cron-Secret\\\": \\\"<cron_secret>\\\"}\\n\\ndef test_interest_credited_standard_tier_balance():\\n    account_id, tier_rate = <helper_fn: seed_account>(balance=\\\"5000.00\\\", tier=\\\"MID\\\")\\n    days_in_month = 30\\n    expected = (Decimal(\\\"5000.00\\\") * Decimal(str(tier_rate)) / 365 * days_in_month).quantize(\\n        Decimal(\\\"0.01\\\"), rounding=ROUND_HALF_UP\\n    )\\n    <helper_fn: seed_daily_accruals>(account_id, days=days_in_month)\\n    try:\\n        r = requests.post(f\\\"{BASE_URL}/cron/interest\\\", headers=CRON_AUTH, timeout=10)\\n        assert r.status_code == 200\\n        body = r.json()\\n        assert body.get(\\\"credited_count\\\", 0) >= 1\\n        txns = requests.get(\\n            f\\\"{BASE_URL}/accounts/{account_id}/transactions\\\",\\n            headers=CRON_AUTH, timeout=10\\n        ).json()\\n        credits = [t for t in txns if t[\\\"type\\\"] == \\\"INTEREST_CREDIT\\\"]\\n        assert len(credits) == 1\\n        actual = Decimal(str(credits[0][\\\"amount\\\"]))\\n        assert actual == expected\\n    finally:\\n        <helper_fn: teardown_account>(account_id)\"\n    },\n    {\n      \"name\": \"test_reconciliation_variance_reported_on_ledger_mismatch\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Banking API is reachable at BASE_URL\",\n        \"A savings account exists whose accrual records have been tampered to introduce a variance\",\n        \"Today is the last business day of the month\"\n      ],\n      \"actions\": [\n        \"Seed a savings account via <fixture: seed_account> with balance 3000.00\",\n        \"Seed corrupted daily accruals with an intentional variance via <helper_fn: seed_corrupt_accruals>\",\n        \"POST /cron/interest with valid cron auth header\",\n        \"GET /reconciliation/variances to fetch variance report\",\n        \"DELETE seeded account via <helper_fn: teardown_account>\"\n      ],\n      \"expected\": [\n        \"POST /cron/interest returns"
+  }
+}

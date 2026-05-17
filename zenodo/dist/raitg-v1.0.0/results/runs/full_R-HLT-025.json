@@ -1,0 +1,169 @@
+{
+  "req": {
+    "id": "R-HLT-025",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-025",
+    "reasoning": "The requirement covers three testable dimensions: (1) happy-path message delivery with no attachment (EP \u2013 valid partition), (2) blocked submission when an attachment contains disallowed PHI exfiltration patterns (NEG / DT \u2013 blocked branch of the decision table), and (3) a boundary case for an attachment at exactly the maximum allowed size with no PHI, which should still succeed (BVA). A fourth test covers the state transition from 'draft \u2192 sent \u2192 provider-notified' to verify the full lifecycle (STC). Together these four cases satisfy the minimum three required and give traceability across all expected outcomes and error pathways stated in R-HLT-025.",
+    "tests": [
+      {
+        "name": "test_send_plain_message_no_attachment_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists in the system and is assigned to the patient",
+          "No pre-existing unread messages in the thread"
+        ],
+        "actions": [
+          "Navigate to /messages",
+          "Select the assigned provider from the recipient list",
+          "Enter a plain-text message body with no attachment",
+          "Submit the message form"
+        ],
+        "expected": [
+          "HTTP 201 or UI success toast is displayed",
+          "Message appears in the sent thread with correct timestamp",
+          "Provider notification event is recorded in the audit log"
+        ],
+        "trace": [
+          "R-HLT-025: message stored",
+          "R-HLT-025: provider notified"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_send_plain_message_no_attachment_succeeds(authenticated_patient_page, api_client, provider_id):\n    page = authenticated_patient_page\n    page.goto(\"/messages\")\n    page.locator(\"[data-testid='recipient-select']\").select_option(provider_id)\n    page.locator(\"[data-testid='message-body']\").fill(\"Hello, I have a question about my prescription.\")\n    with page.expect_response(lambda r: \"/api/messages\" in r.url and r.request.method == \"POST\") as resp_info:\n        page.locator(\"[data-testid='send-btn']\").click()\n    response = resp_info.value\n    assert response.status == 201, f\"Expected 201, got {response.status}\"\n    body = response.json()\n    message_id = body[\"id\"]\n    expect(page.locator(\"[data-testid='success-toast']\")).to_be_visible()\n    thread_item = page.locator(f\"[data-message-id='{message_id}']\")\n    expect(thread_item).to_be_visible()\n    audit = api_client.get(f\"/api/audit?event=provider_notified&message_id={message_id}\")\n    assert audit.status_code == 200\n    assert audit.json()[\"count\"] >= 1\n"
+      },
+      {
+        "name": "test_message_with_phi_attachment_is_blocked",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists in the system and is assigned to the patient",
+          "A fixture PDF containing disallowed PHI patterns (SSN, MRN) is available at <phi_attachment_fixture>"
+        ],
+        "actions": [
+          "Navigate to /messages",
+          "Select the assigned provider from the recipient list",
+          "Enter a message body",
+          "Attach the PHI-containing PDF via the file input",
+          "Submit the message form"
+        ],
+        "expected": [
+          "HTTP 422 or UI error banner is displayed indicating PHI detected",
+          "Message is NOT stored (no message ID returned)",
+          "No provider notification event is recorded",
+          "Audit log records a blocked PHI exfiltration attempt"
+        ],
+        "trace": [
+          "R-HLT-025: blocked when disallowed attachment detected",
+          "R-HLT-025: messages containing attachments shall scan for disallowed PHI exfiltration patterns"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_message_with_phi_attachment_is_blocked(authenticated_patient_page, api_client, provider_id, phi_attachment_fixture):\n    page = authenticated_patient_page\n    page.goto(\"/messages\")\n    page.locator(\"[data-testid='recipient-select']\").select_option(provider_id)\n    page.locator(\"[data-testid='message-body']\").fill(\"Please see attached file.\")\n    page.locator(\"[data-testid='attachment-input']\").set_input_files(phi_attachment_fixture)\n    with page.expect_response(lambda r: \"/api/messages\" in r.url and r.request.method == \"POST\") as resp_info:\n        page.locator(\"[data-testid='send-btn']\").click()\n    response = resp_info.value\n    assert response.status == 422, f\"Expected 422, got {response.status}\"\n    body = response.json()\n    assert \"phi\" in body.get(\"error\", \"\").lower(), \"Error should reference PHI detection\"\n    assert \"id\" not in body, \"No message ID should be returned for blocked messages\"\n    expect(page.locator(\"[data-testid='error-banner']\")).to_be_visible()\n    audit = api_client.get(\"/api/audit?event=phi_blocked\")\n    assert audit.status_code == 200\n    assert audit.json()[\"count\"] >= 1\n"
+      },
+      {
+        "name": "test_message_with_max_size_clean_attachment_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists in the system and is assigned to the patient",
+          "A clean (no PHI) attachment fixture at exactly the maximum allowed size (e.g. 10 MB) is available at <max_size_clean_attachment_fixture>",
+          "System maximum attachment size is known and set in <MAX_ATTACHMENT_BYTES>"
+        ],
+        "actions": [
+          "Navigate to /messages",
+          "Select the assigned provider from the recipient list",
+          "Enter a message body",
+          "Attach the maximum-size clean file via the file input",
+          "Submit the message form"
+        ],
+        "expected": [
+          "HTTP 201 is returned",
+          "Message and attachment are stored successfully",
+          "Provider notification event is recorded",
+          "No PHI-blocked audit entry is created for this submission"
+        ],
+        "trace": [
+          "R-HLT-025: message stored",
+          "R-HLT-025: messages containing attachments shall scan for disallowed PHI exfiltration patterns",
+          "R-HLT-025: provider notified"
+        ],
+        "executable": "import os\nimport pytest\nfrom playwright.sync_api import expect\n\nMAX_ATTACHMENT_BYTES = int(os.getenv(\"MAX_ATTACHMENT_BYTES\", str(10 * 1024 * 1024)))\n\ndef test_message_with_max_size_clean_attachment_succeeds(\n    authenticated_patient_page, api_client, provider_id, max_size_clean_attachment_fixture\n):\n    actual_size = os.path.getsize(max_size_clean_attachment_fixture)\n    assert actual_size == MAX_ATTACHMENT_BYTES, (\n        f\"Fixture size {actual_size} != boundary size {MAX_ATTACHMENT_BYTES}\"\n    )\n    page = authenticated_patient_page\n    page.goto(\"/messages\")\n    page.locator(\"[data-testid='recipient-select']\").select_option(provider_id)\n    page.locator(\"[data-testid='message-body']\").fill(\"Boundary attachment test message.\")\n    page.locator(\"[data-testid='attachment-input']\").set_input_files(max_size_clean_attachment_fixture)\n    with page.expect_response(lambda r: \"/api/messages\" in r.url and r.request.method == \"POST\") as resp_info:\n        page.locator(\"[data-testid='send-btn']\").click()\n    response = resp_info.value\n    assert response.status == 201, f\"Expected 201, got {response.status}\"\n    message_id = response.json()[\"id\"]\n    expect(page.locator(\"[data-testid='success-toast']\")).to_be_visible()\n    audit = api_client.get(f\"/api/audit?event=provider_notified&message_id={message_id}\")\n    assert audit.json()[\"count\"] >= 1\n    phi_audit = api_client.get(f\"/api/audit?event=phi_blocked&message_id={message_id}\")\n    assert phi_audit.json()[\"count\"] == 0, \"Clean attachment should not trigger PHI block\"\n"
+      },
+      {
+        "name": "test_message_state_transitions_draft_to_sent_to_notified",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists in the system and is assigned to the patient",
+          "Message API supports observable state field: draft -> sent -> notified"
+        ],
+        "actions": [
+          "POST to /api/messages with status=draft to create a draft",
+          "PATCH /api/messages/{id} with status=sent to transition to sent state",
+          "Poll /api/audit until provider_notified event appears for the message",
+          "GET /api/messages/{id} and assert final state is 'notified'"
+        ],
+        "expected": [
+          "Draft creation returns HTTP 201 with state=draft",
+          "Send transition returns HTTP 200 with state=sent",
+          "Audit log records provider_notified within timeout",
+          "Final message state is 'notified'"
+        ],
+        "trace": [
+          "R-HLT-025: message stored",
+          "R-HLT-025: provider notified",
+          "State transition: draft -> sent -> notified"
+        ],
+        "executable": "import time\nimport pytest\n\nPOLL_TIMEOUT = 10\nPOLL_INTERVAL = 1\n\ndef test_message_state_transitions_draft_to_sent_to_notified(api_client, provider_id, auth_headers):\n    draft_payload = {\"recipient_id\": provider_id, \"body\": \"State transition test.\", \"status\": \"draft\"}\n    draft_resp = api_client.post(\"/api/messages\", json=draft_payload, headers=auth_headers)\n    assert draft_resp.status_code == 201, f\"Draft creation failed: {draft_resp.status_code}\"\n    draft_body = draft_resp.json()\n    assert draft_body[\"status\"] == \"draft\"\n    message_id = draft_body[\"id\"]\n    send_resp = api_client.patch(f\"/api/messages/{message_id}\", json={\"status\": \"sent\"}, headers=auth_headers)\n    assert send_resp.status_code == 200, f\"Send transition failed: {send_resp.status_code}\"\n    assert send_resp.json()[\"status\"] == \"sent\"\n    notified = False\n    deadline = time.time() + POLL_TIMEOUT\n    while time.time() < deadline:\n        audit = api_client.get(f\"/api/audit?event=provider_notified&message_id={message_id}\", headers=auth_headers)\n        if audit.status_code == 200 and audit.json().get(\"count\", 0) >= 1:\n            notified = True\n            break\n        time.sleep(POLL_INTERVAL)\n    assert notified, \"Provider notification event not recorded within timeout\"\n    final_resp = api_client.get(f\"/api/messages/{message_id}\", headers=auth_headers)\n    assert final_resp.status_code == 200\n    assert final_resp.json()[\"status\"] == \"notified\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-025",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 978,
+    "output_tokens": 3214,
+    "latency_ms": 40078,
+    "wall_ms": 40078,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-025\",\n  \"reasoning\": \"The requirement covers three testable dimensions: (1) happy-path message delivery with no attachment (EP \u2013 valid partition), (2) blocked submission when an attachment contains disallowed PHI exfiltration patterns (NEG / DT \u2013 blocked branch of the decision table), and (3) a boundary case for an attachment at exactly the maximum allowed size with no PHI, which should still succeed (BVA). A fourth test covers the state transition from 'draft \u2192 sent \u2192 provider-notified' to verify the full lifecycle (STC). Together these four cases satisfy the minimum three required and give traceability across all expected outcomes and error pathways stated in R-HLT-025.\",\n  \"tests\": [\n    {\n      \"name\": \"test_send_plain_message_no_attachment_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated and session token is valid\",\n        \"Provider exists in the system and is assigned to the patient\",\n        \"No pre-existing unread messages in the thread\"\n      ],\n      \"actions\": [\n        \"Navigate to /messages\",\n        \"Select the assigned provider from the recipient list\",\n        \"Enter a plain-text message body with no attachment\",\n        \"Submit the message form\"\n      ],\n      \"expected\": [\n        \"HTTP 201 or UI success toast is displayed\",\n        \"Message appears in the sent thread with correct timestamp\",\n        \"Provider notification event is recorded in the audit log\"\n      ],\n      \"trace\": [\n        \"R-HLT-025: message stored\",\n        \"R-HLT-025: provider notified\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_send_plain_message_no_attachment_succeeds(authenticated_patient_page, api_client, provider_id):\\n    page = authenticated_patient_page\\n    page.goto(\\\"/messages\\\")\\n    page.locator(\\\"[data-testid='recipient-select']\\\").select_option(provider_id)\\n    page.locator(\\\"[data-testid='message-body']\\\").fill(\\\"Hello, I have a question about my prescription.\\\")\\n    with page.expect_response(lambda r: \\\"/api/messages\\\" in r.url and r.request.method == \\\"POST\\\") as resp_info:\\n        page.locator(\\\"[data-testid='send-btn']\\\").click()\\n    response = resp_info.value\\n    assert response.status == 201, f\\\"Expected 201, got {response.status}\\\"\\n    body = response.json()\\n    message_id = body[\\\"id\\\"]\\n    expect(page.locator(\\\"[data-testid='success-toast']\\\")).to_be_visible()\\n    thread_item = page.locator(f\\\"[data-message-id='{message_id}']\\\")\\n    expect(thread_item).to_be_visible()\\n    audit = api_client.get(f\\\"/api/audit?event=provider_notified&message_id={message_id}\\\")\\n    assert audit.status_code == 200\\n    assert audit.json()[\\\"count\\\"] >= 1\\n\"\n    },\n    {\n      \"name\": \"test_message_with_phi_attachment_is_blocked\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated and session token is valid\",\n        \"Provider exists in the system and is assigned to the patient\",\n        \"A fixture PDF containing disallowed PHI patterns (SSN, MRN) is available at <phi_attachment_fixture>\"\n      ],\n      \"actions\": [\n        \"Navigate to /messages\",\n        \"Select the assigned provider from the recipient list\",\n        \"Enter a message body\",\n        \"Attach the PHI-containing PDF via the file input\",\n        \"Submit the message form\"\n      ],\n      \"expected\": [\n        \"HTTP 422 or UI error banner is displayed indicating PHI detected\",\n        \"Message is NOT stored (no message ID returned)\",\n        \"No provider notification event is recorded\",\n        \"Audit log records a blocked PHI exfiltration attempt\"\n      ],\n      \"trace\": [\n        \"R-HLT-025: blocked when disallowed attachment detected\",\n        \"R-HLT-025: messages containing attachments shall scan for disallowed PHI exfiltration patterns\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_message"
+  }
+}

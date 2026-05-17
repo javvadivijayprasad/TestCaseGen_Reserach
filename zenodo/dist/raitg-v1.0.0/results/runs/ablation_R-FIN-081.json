@@ -1,0 +1,212 @@
+{
+  "req": {
+    "id": "R-FIN-081",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Wire transfer (idempotency variant)",
+    "statement": "A customer shall initiate a wire transfer requiring two-factor authentication; transfers above $100,000 require manual review. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "2fa verified in last 5 min"
+    ],
+    "triggers": [
+      "customer submits wire"
+    ],
+    "expected_outcomes": [
+      "wire queued",
+      "compliance check started"
+    ],
+    "error_pathways": [
+      "401 when 2fa stale",
+      "202 when manual review required"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/wire"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-081",
+    "reasoning": "R-FIN-081 defines four testable behaviours: (1) happy-path wire under $100k queued immediately with 2FA fresh, (2) wire at/above $100k triggers manual review (202), (3) stale 2FA returns 401, and (4) duplicate Idempotency-Key returns the original result. BVA drives the $100k boundary (exactly $100,000 and $100,001). EP partitions valid vs invalid 2FA state. NEG covers the 401 path. STC models the idempotency re-submission transition. DT captures the combined 2FA-validity \u00d7 amount-threshold decision space for the manual-review path.",
+    "tests": [
+      {
+        "name": "test_wire_transfer_below_threshold_queued",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with sufficient balance",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is $50,000 (well within $100k threshold)"
+        ],
+        "actions": [
+          "Obtain a fresh 2FA token via <fixture: fresh_2fa_token>",
+          "Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>",
+          "POST /transfers/wire with amount=50000, valid auth header, and Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains status 'queued'",
+          "Response body contains a transfer_id",
+          "compliance_check field indicates check has started"
+        ],
+        "trace": [
+          "R-FIN-081: wire queued; compliance check started",
+          "R-FIN-081: transfers above $100,000 require manual review (below threshold \u2014 no manual review)"
+        ],
+        "executable": "def test_wire_transfer_below_threshold_queued(api_client, fresh_2fa_token, new_idempotency_key):\n    headers = {\n        \"Authorization\": f\"Bearer {fresh_2fa_token}\",\n        \"Idempotency-Key\": new_idempotency_key,\n    }\n    payload = {\n        \"amount\": 50000,\n        \"currency\": \"USD\",\n        \"destination_account\": \"<valid_dest_account>\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201), f\"Unexpected status: {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"status\") == \"queued\"\n    assert \"transfer_id\" in body\n    assert body.get(\"compliance_check\") == \"started\""
+      },
+      {
+        "name": "test_wire_transfer_stale_2fa_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists",
+          "2FA token is older than 5 minutes (stale)"
+        ],
+        "actions": [
+          "Obtain a stale 2FA token via <fixture: stale_2fa_token>",
+          "Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>",
+          "POST /transfers/wire with amount=50000, stale auth header, and Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 401 response",
+          "Response body contains error code indicating stale or expired 2FA"
+        ],
+        "trace": [
+          "R-FIN-081: 401 when 2fa stale",
+          "R-FIN-081: Preconditions: 2fa verified in last 5 min"
+        ],
+        "executable": "def test_wire_transfer_stale_2fa_returns_401(api_client, stale_2fa_token, new_idempotency_key):\n    headers = {\n        \"Authorization\": f\"Bearer {stale_2fa_token}\",\n        \"Idempotency-Key\": new_idempotency_key,\n    }\n    payload = {\n        \"amount\": 50000,\n        \"currency\": \"USD\",\n        \"destination_account\": \"<valid_dest_account>\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 401\n    body = resp.json()\n    assert \"2fa\" in body.get(\"error\", \"\").lower() or \"authentication\" in body.get(\"error\", \"\").lower()"
+      },
+      {
+        "name": "test_wire_transfer_at_100k_boundary_requires_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with sufficient balance",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is exactly $100,000 (lower boundary of manual-review tier)"
+        ],
+        "actions": [
+          "Obtain a fresh 2FA token via <fixture: fresh_2fa_token>",
+          "Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>",
+          "POST /transfers/wire with amount=100000, valid auth header, and Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 202 response indicating manual review required",
+          "Response body contains status 'pending_review' or equivalent",
+          "Response body contains a transfer_id"
+        ],
+        "trace": [
+          "R-FIN-081: transfers above $100,000 require manual review",
+          "R-FIN-081: 202 when manual review required",
+          "BVA: exact boundary value $100,000"
+        ],
+        "executable": "def test_wire_transfer_at_100k_boundary_requires_manual_review(api_client, fresh_2fa_token, new_idempotency_key):\n    headers = {\n        \"Authorization\": f\"Bearer {fresh_2fa_token}\",\n        \"Idempotency-Key\": new_idempotency_key,\n    }\n    payload = {\n        \"amount\": 100000,\n        \"currency\": \"USD\",\n        \"destination_account\": \"<valid_dest_account>\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"status\") in (\"pending_review\", \"manual_review\")\n    assert \"transfer_id\" in body"
+      },
+      {
+        "name": "test_wire_transfer_above_threshold_manual_review",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer account exists with sufficient balance",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is $150,000 (above $100k threshold)"
+        ],
+        "actions": [
+          "Obtain a fresh 2FA token via <fixture: fresh_2fa_token>",
+          "Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>",
+          "POST /transfers/wire with amount=150000, valid auth header, and Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 202 response",
+          "Response body status indicates manual review",
+          "compliance_check field indicates check has started"
+        ],
+        "trace": [
+          "R-FIN-081: transfers above $100,000 require manual review",
+          "R-FIN-081: 202 when manual review required",
+          "DT: valid 2FA AND amount > $100k => 202 manual review"
+        ],
+        "executable": "def test_wire_transfer_above_threshold_manual_review(api_client, fresh_2fa_token, new_idempotency_key):\n    headers = {\n        \"Authorization\": f\"Bearer {fresh_2fa_token}\",\n        \"Idempotency-Key\": new_idempotency_key,\n    }\n    payload = {\n        \"amount\": 150000,\n        \"currency\": \"USD\",\n        \"destination_account\": \"<valid_dest_account>\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body.get(\"status\") in (\"pending_review\", \"manual_review\")\n    assert body.get(\"compliance_check\") == \"started\""
+      },
+      {
+        "name": "test_wire_transfer_idempotency_duplicate_returns_original",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with sufficient balance",
+          "2FA was verified within the last 5 minutes",
+          "A prior wire transfer was successfully submitted with a known Idempotency-Key"
+        ],
+        "actions": [
+          "Obtain a fresh 2FA token via <fixture: fresh_2fa_token>",
+          "Fix a single Idempotency-Key value via <helper_fn: new_idempotency_key>",
+          "POST /transfers/wire (first submission) with amount=50000 and the fixed key",
+          "Record the first response body and status code",
+          "POST /transfers/wire (second submission) with identical payload and same key"
+        ],
+        "expected": [
+          "Second response HTTP status matches first response HTTP status",
+          "Second response transfer_id matches first response transfer_id",
+          "Second response status field matches first response status field",
+          "No duplicate transfer is created in the system"
+        ],
+        "trace": [
+          "R-FIN-081: duplicate submission with the same Idempotency-Key must return the original result",
+          "STC: submitted -> re-submitted transition returns cached result"
+        ],
+        "executable": "def test_wire_transfer_idempotency_duplicate_returns_original(api_client, fresh_2fa_token, new_idempotency_key):\n    idem_key = new_idempotency_key\n    headers = {\n        \"Authorization\": f\"Bearer {fresh_2fa_token}\",\n        \"Idempotency-Key\": idem_key,\n    }\n    payload = {\n        \"amount\": 50000,\n        \"currency\": \"USD\",\n        \"destination_account\": \"<valid_dest_account>\",\n    }\n    first = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert first.status_code in (200, 201)\n    first_body = first.json()\n    second = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    second_body = second.json()\n    assert second.status_code == first.status_code\n    assert second_body.get(\"transfer_id\") == first_body.get(\"transfer_id\")\n    assert second_body.get(\"status\") == first_body.get(\"status\")"
+      },
+      {
+        "name": "test_wire_transfer_just_below_100k_not_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with sufficient balance",
+          "2FA was verified within the last 5 minutes",
+          "Transfer amount is $99,999.99 (one cent below manual-review boundary)"
+        ],
+        "actions": [
+          "Obtain a fresh 2FA token via <fixture: fresh_2fa_token>",
+          "Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>",
+          "POST /transfers/wire with amount=99999.99, valid auth header, and Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response (not 202)",
+          "Response body status is 'queued' (not pending_review)",
+          "Response body contains a transfer_id"
+        ],
+        "trace": [
+          "R-FIN-081: transfers above $100,000 require manual review \u2014 $99,999.99 must NOT trigger it",
+          "BVA: one unit below the boundary value"
+        ],
+        "executable": "def test_wire_transfer_just_below_100k_not_manual_review(api_client, fresh_2fa_token, new_idempotency_key):\n    headers = {\n        \"Authorization\": f\"Bearer {fresh_2fa_token}\",\n        \"Idempotency-Key\": new_idempotency_key,\n    }\n    payload = {\n        \"amount\": 99999.99,\n        \"currency\": \"USD\",\n        \"destination_account\": \"<valid_dest_account>\",\n    }\n    resp = api_client.post(\"/transfers/wire\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201), f\"Expected 200/201, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"status\") == \"queued\"\n    assert \"transfer_id\" in body"
+      }
+    ]
+  },
+  "req_id": "R-FIN-081",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1029,
+    "output_tokens": 3522,
+    "latency_ms": 33329,
+    "wall_ms": 33329,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-081\",\n  \"reasoning\": \"R-FIN-081 defines four testable behaviours: (1) happy-path wire under $100k queued immediately with 2FA fresh, (2) wire at/above $100k triggers manual review (202), (3) stale 2FA returns 401, and (4) duplicate Idempotency-Key returns the original result. BVA drives the $100k boundary (exactly $100,000 and $100,001). EP partitions valid vs invalid 2FA state. NEG covers the 401 path. STC models the idempotency re-submission transition. DT captures the combined 2FA-validity \u00d7 amount-threshold decision space for the manual-review path.\",\n  \"tests\": [\n    {\n      \"name\": \"test_wire_transfer_below_threshold_queued\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance\",\n        \"2FA was verified within the last 5 minutes\",\n        \"Transfer amount is $50,000 (well within $100k threshold)\"\n      ],\n      \"actions\": [\n        \"Obtain a fresh 2FA token via <fixture: fresh_2fa_token>\",\n        \"Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>\",\n        \"POST /transfers/wire with amount=50000, valid auth header, and Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body contains status 'queued'\",\n        \"Response body contains a transfer_id\",\n        \"compliance_check field indicates check has started\"\n      ],\n      \"trace\": [\n        \"R-FIN-081: wire queued; compliance check started\",\n        \"R-FIN-081: transfers above $100,000 require manual review (below threshold \u2014 no manual review)\"\n      ],\n      \"executable\": \"def test_wire_transfer_below_threshold_queued(api_client, fresh_2fa_token, new_idempotency_key):\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {fresh_2fa_token}\\\",\\n        \\\"Idempotency-Key\\\": new_idempotency_key,\\n    }\\n    payload = {\\n        \\\"amount\\\": 50000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"destination_account\\\": \\\"<valid_dest_account>\\\",\\n    }\\n    resp = api_client.post(\\\"/transfers/wire\\\", json=payload, headers=headers)\\n    assert resp.status_code in (200, 201), f\\\"Unexpected status: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"status\\\") == \\\"queued\\\"\\n    assert \\\"transfer_id\\\" in body\\n    assert body.get(\\\"compliance_check\\\") == \\\"started\\\"\"\n    },\n    {\n      \"name\": \"test_wire_transfer_stale_2fa_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists\",\n        \"2FA token is older than 5 minutes (stale)\"\n      ],\n      \"actions\": [\n        \"Obtain a stale 2FA token via <fixture: stale_2fa_token>\",\n        \"Generate a unique Idempotency-Key via <helper_fn: new_idempotency_key>\",\n        \"POST /transfers/wire with amount=50000, stale auth header, and Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 401 response\",\n        \"Response body contains error code indicating stale or expired 2FA\"\n      ],\n      \"trace\": [\n        \"R-FIN-081: 401 when 2fa stale\",\n        \"R-FIN-081: Preconditions: 2fa verified in last 5 min\"\n      ],\n      \"executable\": \"def test_wire_transfer_stale_2fa_returns_401(api_client, stale_2fa_token, new_idempotency_key):\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {stale_2fa_token}\\\",\\n        \\\"Idempotency-Key\\\": new_idempotency_key,\\n    }\\n    payload = {\\n        \\\"amount\\\": 50000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"destination_account\\\": \\\"<valid_dest_account>\\\",\\n    }\\n    resp = api_client.post(\\\"/transfers/wire\\\", json=payload, headers=headers)\\n    assert resp.status_code == 401\\n    body = resp.json()\\n    assert \\\"2fa\\\" in body.get(\\\"error\\\", \\\"\\\").lower() or \\\"authentication\\\" in body.get(\\\"error\\\", \\\"\\\").lower()\"\n    },\n    {\n      \"name\": \"test_wire_transfer_at_100k_boundary_requires_manual_review\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer account exists with sufficient balance"
+  }
+}

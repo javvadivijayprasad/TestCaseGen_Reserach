@@ -1,0 +1,154 @@
+{
+  "req": {
+    "id": "R-HLT-032",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Close encounter (boundary)",
+    "statement": "A clinician shall close an Encounter; closed Encounters shall reject further modifications except for addendum Observations. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "encounter open"
+    ],
+    "triggers": [
+      "clinician closes encounter"
+    ],
+    "expected_outcomes": [
+      "encounter.status=finished"
+    ],
+    "error_pathways": [
+      "409 when modifying closed encounter"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-032",
+    "reasoning": "R-HLT-032 defines three orthogonal concerns: (1) the happy-path state transition open\u2192finished, (2) the rejection of modifications on a closed encounter (error pathway), and (3) boundary conditions on timestamps and numeric fields. STC drives the positive test (valid open\u2192close transition), NEG drives the modification-after-close test (409 enforcement), and BVA drives the boundary test (timestamp precision at midnight and numeric field at max/min edge). A fourth DT test covers the addendum-Observation carve-out (the one permitted post-close action), ensuring the decision table of allowed vs. forbidden operations is fully exercised. All tests create their own encounter via a fixture to guarantee isolation and idempotency.",
+    "tests": [
+      {
+        "name": "test_close_open_encounter_sets_status_finished",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "FHIR-lite API is reachable",
+          "An Encounter exists with status=in-progress",
+          "Clinician auth token is valid"
+        ],
+        "actions": [
+          "POST /Encounter to create a new encounter with status=in-progress",
+          "POST /Encounter/{id}/close with clinician credentials"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains status=finished",
+          "Response body contains period.end timestamp"
+        ],
+        "trace": [
+          "R-HLT-032: clinician shall close an Encounter",
+          "R-HLT-032: encounter.status=finished on success"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import create_encounter, close_encounter, get_encounter\n\ndef test_close_open_encounter_sets_status_finished(<auth_headers>, <base_url>):\n    enc = create_encounter(<base_url>, <auth_headers>, status=\"in-progress\")\n    enc_id = enc[\"id\"]\n\n    resp = close_encounter(<base_url>, <auth_headers>, enc_id)\n\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"status\"] == \"finished\"\n    assert \"end\" in body.get(\"period\", {}), \"period.end must be set on close\"\n"
+      },
+      {
+        "name": "test_modify_closed_encounter_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "FHIR-lite API is reachable",
+          "An Encounter exists and has already been closed (status=finished)",
+          "Clinician auth token is valid"
+        ],
+        "actions": [
+          "POST /Encounter to create encounter with status=in-progress",
+          "POST /Encounter/{id}/close to set status=finished",
+          "PUT /Encounter/{id} attempting to change a non-addendum field (e.g. reasonCode)"
+        ],
+        "expected": [
+          "HTTP 409 Conflict returned",
+          "Response body contains an error message referencing closed encounter"
+        ],
+        "trace": [
+          "R-HLT-032: closed Encounters shall reject further modifications",
+          "R-HLT-032: error pathway 409 when modifying closed encounter"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import create_encounter, close_encounter, update_encounter\n\ndef test_modify_closed_encounter_returns_409(<auth_headers>, <base_url>):\n    enc = create_encounter(<base_url>, <auth_headers>, status=\"in-progress\")\n    enc_id = enc[\"id\"]\n    close_resp = close_encounter(<base_url>, <auth_headers>, enc_id)\n    assert close_resp.status_code == 200\n\n    patch_payload = {\"resourceType\": \"Encounter\", \"id\": enc_id,\n                     \"reasonCode\": [{\"text\": \"post-close edit attempt\"}]}\n    resp = update_encounter(<base_url>, <auth_headers>, enc_id, patch_payload)\n\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}\"\n    body = resp.json()\n    assert \"closed\" in body.get(\"issue\", [{}])[0].get(\"diagnostics\", \"\").lower() \\\n        or \"finished\" in str(body).lower()\n"
+      },
+      {
+        "name": "test_close_encounter_boundary_midnight_timestamp_and_numeric_extremes",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "FHIR-lite API is reachable",
+          "An Encounter can be created with an explicit start timestamp",
+          "Clinician auth token is valid"
+        ],
+        "actions": [
+          "POST /Encounter with period.start set to exact midnight UTC (00:00:00Z) and a numeric field at its documented maximum value",
+          "POST /Encounter/{id}/close"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response status=finished",
+          "period.end is a valid ISO-8601 timestamp after or equal to period.start",
+          "Numeric field value is preserved exactly (no truncation or overflow)"
+        ],
+        "trace": [
+          "R-HLT-032: boundary cases on timestamps and numeric elements must be tested",
+          "R-HLT-032: encounter.status=finished on success"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone\nfrom <helper_fn> import create_encounter, close_encounter\n\nMIDNIGHT_UTC = \"2024-03-15T00:00:00Z\"\nMAX_NUMERIC = 2147483647  # INT32_MAX as boundary value\n\ndef test_close_encounter_boundary_midnight_timestamp_and_numeric_extremes(\n        <auth_headers>, <base_url>):\n    enc = create_encounter(\n        <base_url>, <auth_headers>,\n        status=\"in-progress\",\n        period_start=MIDNIGHT_UTC,\n        length_value=MAX_NUMERIC\n    )\n    enc_id = enc[\"id\"]\n\n    resp = close_encounter(<base_url>, <auth_headers>, enc_id)\n\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"status\"] == \"finished\"\n    end_ts = body.get(\"period\", {}).get(\"end\", \"\")\n    assert end_ts, \"period.end must be populated\"\n    end_dt = datetime.fromisoformat(end_ts.replace(\"Z\", \"+00:00\"))\n    start_dt = datetime.fromisoformat(MIDNIGHT_UTC.replace(\"Z\", \"+00:00\"))\n    assert end_dt >= start_dt, \"period.end must not precede period.start\"\n    assert body.get(\"length\", {}).get(\"value\") == MAX_NUMERIC, \\\n        \"Numeric field must survive round-trip at INT32_MAX boundary\"\n"
+      },
+      {
+        "name": "test_addendum_observation_allowed_on_closed_encounter",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "FHIR-lite API is reachable",
+          "An Encounter exists with status=finished",
+          "Clinician auth token is valid"
+        ],
+        "actions": [
+          "POST /Encounter to create encounter with status=in-progress",
+          "POST /Encounter/{id}/close to set status=finished",
+          "POST /Observation with encounter reference and category=addendum"
+        ],
+        "expected": [
+          "Addendum Observation POST returns HTTP 201",
+          "Observation is linked to the closed encounter",
+          "Encounter status remains finished (not changed by addendum)"
+        ],
+        "trace": [
+          "R-HLT-032: closed Encounters shall reject further modifications EXCEPT for addendum Observations",
+          "R-HLT-032: decision table - addendum is permitted post-close"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import create_encounter, close_encounter, create_observation, get_encounter\n\ndef test_addendum_observation_allowed_on_closed_encounter(<auth_headers>, <base_url>):\n    enc = create_encounter(<base_url>, <auth_headers>, status=\"in-progress\")\n    enc_id = enc[\"id\"]\n    close_resp = close_encounter(<base_url>, <auth_headers>, enc_id)\n    assert close_resp.status_code == 200\n\n    obs_payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"code\": \"addendum\"}]}],\n        \"encounter\": {\"reference\": f\"Encounter/{enc_id}\"},\n        \"code\": {\"text\": \"Addendum note\"}\n    }\n    obs_resp = create_observation(<base_url>, <auth_headers>, obs_payload)\n\n    assert obs_resp.status_code == 201, f\"Expected 201, got {obs_resp.status_code}\"\n    obs_body = obs_resp.json()\n    assert f\"Encounter/{enc_id}\" in str(obs_body.get(\"encounter\", \"\"))\n\n    enc_check = get_encounter(<base_url>, <auth_headers>, enc_id)\n    assert enc_check.json()[\"status\"] == \"finished\", \"Encounter must stay finished\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-032",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 993,
+    "output_tokens": 2547,
+    "latency_ms": 36584,
+    "wall_ms": 36584,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-032\",\n  \"reasoning\": \"R-HLT-032 defines three orthogonal concerns: (1) the happy-path state transition open\u2192finished, (2) the rejection of modifications on a closed encounter (error pathway), and (3) boundary conditions on timestamps and numeric fields. STC drives the positive test (valid open\u2192close transition), NEG drives the modification-after-close test (409 enforcement), and BVA drives the boundary test (timestamp precision at midnight and numeric field at max/min edge). A fourth DT test covers the addendum-Observation carve-out (the one permitted post-close action), ensuring the decision table of allowed vs. forbidden operations is fully exercised. All tests create their own encounter via a fixture to guarantee isolation and idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_open_encounter_sets_status_finished\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"FHIR-lite API is reachable\",\n        \"An Encounter exists with status=in-progress\",\n        \"Clinician auth token is valid\"\n      ],\n      \"actions\": [\n        \"POST /Encounter to create a new encounter with status=in-progress\",\n        \"POST /Encounter/{id}/close with clinician credentials\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains status=finished\",\n        \"Response body contains period.end timestamp\"\n      ],\n      \"trace\": [\n        \"R-HLT-032: clinician shall close an Encounter\",\n        \"R-HLT-032: encounter.status=finished on success\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import create_encounter, close_encounter, get_encounter\\n\\ndef test_close_open_encounter_sets_status_finished(<auth_headers>, <base_url>):\\n    enc = create_encounter(<base_url>, <auth_headers>, status=\\\"in-progress\\\")\\n    enc_id = enc[\\\"id\\\"]\\n\\n    resp = close_encounter(<base_url>, <auth_headers>, enc_id)\\n\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"finished\\\"\\n    assert \\\"end\\\" in body.get(\\\"period\\\", {}), \\\"period.end must be set on close\\\"\\n\"\n    },\n    {\n      \"name\": \"test_modify_closed_encounter_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"FHIR-lite API is reachable\",\n        \"An Encounter exists and has already been closed (status=finished)\",\n        \"Clinician auth token is valid\"\n      ],\n      \"actions\": [\n        \"POST /Encounter to create encounter with status=in-progress\",\n        \"POST /Encounter/{id}/close to set status=finished\",\n        \"PUT /Encounter/{id} attempting to change a non-addendum field (e.g. reasonCode)\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict returned\",\n        \"Response body contains an error message referencing closed encounter\"\n      ],\n      \"trace\": [\n        \"R-HLT-032: closed Encounters shall reject further modifications\",\n        \"R-HLT-032: error pathway 409 when modifying closed encounter\"\n      ],\n      \"executable\": \"import pytest\\nfrom <helper_fn> import create_encounter, close_encounter, update_encounter\\n\\ndef test_modify_closed_encounter_returns_409(<auth_headers>, <base_url>):\\n    enc = create_encounter(<base_url>, <auth_headers>, status=\\\"in-progress\\\")\\n    enc_id = enc[\\\"id\\\"]\\n    close_resp = close_encounter(<base_url>, <auth_headers>, enc_id)\\n    assert close_resp.status_code == 200\\n\\n    patch_payload = {\\\"resourceType\\\": \\\"Encounter\\\", \\\"id\\\": enc_id,\\n                     \\\"reasonCode\\\": [{\\\"text\\\": \\\"post-close edit attempt\\\"}]}\\n    resp = update_encounter(<base_url>, <auth_headers>, enc_id, patch_payload)\\n\\n    assert resp.status_code == 409, f\\\"Expected 409, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"closed\\\" in body.get(\\\"issue\\\", [{}])[0].get(\\\"diagnostics\\\", \\\"\\\").lower() \\\\\\n        or \\\"finished\\\" in str(body).lower()\\n\"\n    },\n    {\n      \"name\": \"test_close_encounter_boundary_midnig"
+  }
+}

@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-HLT-016",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Bulk data export",
+    "statement": "A provisioned client shall request a FHIR bulk export; large datasets shall be paginated with NDJSON output.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authorized bulk-client"
+    ],
+    "triggers": [
+      "client requests export"
+    ],
+    "expected_outcomes": [
+      "export job queued",
+      "NDJSON stream produced"
+    ],
+    "error_pathways": [
+      "403 when unauthorised"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/$export"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-016",
+    "reasoning": "R-HLT-016 specifies a FHIR bulk export capability that must be authorized, queue jobs, and stream NDJSON paginated output. Test design applies EP (authorized vs. unauthorized partitions), BVA (payload size boundaries), NEG (403 unauthorized), and STC (job state transitions). Tests are deterministic, idempotent, and traceable to the requirement's actors, triggers, and error pathways.",
+    "tests": [
+      {
+        "name": "test_bulk_export_authorized_client_queues_job",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite endpoint /$export is available",
+          "client holds valid OAuth2 bearer token with bulk:export scope",
+          "test database contains \u22651 FHIR Patient resource"
+        ],
+        "actions": [
+          "POST to /$export with Authorization header (valid token)",
+          "request body: {\"resourceType\": \"Patient\", \"outputFormat\": \"application/fhir+ndjson\"}",
+          "poll Content-Location until job status is 'completed'"
+        ],
+        "expected": [
+          "HTTP 202 Accepted on initial POST",
+          "Content-Location header present and valid",
+          "job queued in system",
+          "export stream contains valid NDJSON records"
+        ],
+        "trace": [
+          "R-HLT-016: actor=user, trigger=client requests export, outcome=export job queued",
+          "R-HLT-016: NDJSON stream produced"
+        ],
+        "executable": "import requests\nimport json\nfrom time import sleep\n\ndef test_bulk_export_authorized_client_queues_job():\n    base_url = '<target_app_base_url>'\n    headers = {\n        'Authorization': 'Bearer <valid_bulk_export_token>',\n        'Content-Type': 'application/fhir+json'\n    }\n    payload = {\n        'resourceType': 'Patient',\n        'outputFormat': 'application/fhir+ndjson'\n    }\n    \n    resp = requests.post(f'{base_url}/$export', json=payload, headers=headers)\n    assert resp.status_code == 202, f'Expected 202, got {resp.status_code}'\n    assert 'Content-Location' in resp.headers\n    content_location = resp.headers['Content-Location']\n    \n    for _ in range(30):\n        poll_resp = requests.get(content_location, headers=headers)\n        if poll_resp.status_code == 200:\n            data = poll_resp.json()\n            assert data.get('status') == 'completed'\n            assert 'output' in data\n            break\n        sleep(0.5)\n    \n    export_resp = requests.get(data['output'][0]['url'], headers=headers)\n    assert export_resp.status_code == 200\n    for line in export_resp.text.strip().split('\\n'):\n        obj = json.loads(line)\n        assert obj.get('resourceType') == 'Patient'"
+      },
+      {
+        "name": "test_bulk_export_unauthorized_client_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite endpoint /$export is available",
+          "client does not hold valid bulk export authorization",
+          "client submits request with invalid/expired token or no Authorization header"
+        ],
+        "actions": [
+          "POST to /$export without Authorization header OR with expired/invalid token",
+          "request body: {\"resourceType\": \"Patient\", \"outputFormat\": \"application/fhir+ndjson\"}"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden response",
+          "error body contains security/authorization violation message",
+          "no job is queued",
+          "no export stream initiated"
+        ],
+        "trace": [
+          "R-HLT-016: error pathway=403 when unauthorised",
+          "R-HLT-016: precondition=authorized bulk-client NOT satisfied"
+        ],
+        "executable": "import requests\n\ndef test_bulk_export_unauthorized_client_returns_403():\n    base_url = '<target_app_base_url>'\n    payload = {\n        'resourceType': 'Patient',\n        'outputFormat': 'application/fhir+ndjson'\n    }\n    \n    resp = requests.post(f'{base_url}/$export', json=payload)\n    assert resp.status_code == 403, f'Expected 403, got {resp.status_code}'\n    assert 'error' in resp.text.lower() or 'unauthorized' in resp.text.lower()\n    \n    headers_invalid = {'Authorization': 'Bearer invalid_token_xyz'}\n    resp2 = requests.post(f'{base_url}/$export', json=payload, headers=headers_invalid)\n    assert resp2.status_code == 403"
+      },
+      {
+        "name": "test_bulk_export_large_dataset_paginated_ndjson",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite endpoint /$export is available",
+          "client holds valid OAuth2 bearer token with bulk:export scope",
+          "test database seeded with exactly 10,000 FHIR Patient resources (boundary: large dataset)",
+          "export system configured with page size = 1,000 records"
+        ],
+        "actions": [
+          "POST to /$export requesting export of 10,000 Patient records",
+          "retrieve Content-Location and poll until completed",
+          "fetch all paginated NDJSON output URLs",
+          "deserialize and count all records across pages"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "output array contains exactly 10 paginated NDJSON files (10,000 \u00f7 1,000)",
+          "each page \u22641,000 records and is valid NDJSON",
+          "total record count across all pages = 10,000",
+          "no duplicate records across pages"
+        ],
+        "trace": [
+          "R-HLT-016: large datasets shall be paginated with NDJSON output",
+          "R-HLT-016: boundary case: dataset size = system page threshold \u00d7 10"
+        ],
+        "executable": "import requests\nimport json\nfrom time import sleep\nfrom collections import defaultdict\n\ndef test_bulk_export_large_dataset_paginated_ndjson():\n    base_url = '<target_app_base_url>'\n    headers = {\n        'Authorization': 'Bearer <valid_bulk_export_token>',\n        'Content-Type': 'application/fhir+json'\n    }\n    payload = {\n        'resourceType': 'Patient',\n        'outputFormat': 'application/fhir+ndjson'\n    }\n    \n    resp = requests.post(f'{base_url}/$export', json=payload, headers=headers)\n    assert resp.status_code == 202\n    content_location = resp.headers['Content-Location']\n    \n    for _ in range(60):\n        poll_resp = requests.get(content_location, headers=headers)\n        if poll_resp.status_code == 200:\n            data = poll_resp.json()\n            assert data.get('status') == 'completed'\n            break\n        sleep(1)\n    \n    assert len(data['output']) == 10, f'Expected 10 pages, got {len(data[\"output\"])}'\n    seen_ids = defaultdict(int)\n    total_records = 0\n    \n    for output_ref in data['output']:\n        page_resp = requests.get(output_ref['url'], headers=headers)\n        assert page_resp.status_code == 200\n        lines = page_resp.text.strip().split('\\n')\n        assert len(lines) <= 1000\n        for line in lines:\n            obj = json.loads(line)\n            seen_ids[obj['id']] += 1\n            total_records += 1\n    \n    assert total_records == 10000\n    assert all(v == 1 for v in seen_ids.values()), 'Duplicate records found'"
+      },
+      {
+        "name": "test_bulk_export_empty_dataset_returns_valid_structure",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite endpoint /$export is available",
+          "client holds valid OAuth2 bearer token",
+          "test database contains zero Patient resources (boundary: empty dataset)"
+        ],
+        "actions": [
+          "POST to /$export requesting Patient export",
+          "poll until job completion",
+          "inspect output array and any returned NDJSON"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "job completes with status=completed",
+          "output array is empty array [] OR contains no records",
+          "no error returned for empty result set"
+        ],
+        "trace": [
+          "R-HLT-016: boundary case: dataset size = 0 (empty partition)"
+        ],
+        "executable": "import requests\nfrom time import sleep\n\ndef test_bulk_export_empty_dataset_returns_valid_structure():\n    base_url = '<target_app_base_url>'\n    headers = {\n        'Authorization': 'Bearer <valid_bulk_export_token>',\n        'Content-Type': 'application/fhir+json'\n    }\n    payload = {\n        'resourceType': 'Patient',\n        'outputFormat': 'application/fhir+ndjson'\n    }\n    \n    resp = requests.post(f'{base_url}/$export', json=payload, headers=headers)\n    assert resp.status_code == 202\n    content_location = resp.headers['Content-Location']\n    \n    for _ in range(30):\n        poll_resp = requests.get(content_location, headers=headers)\n        if poll_resp.status_code == 200:\n            data = poll_resp.json()\n            assert data.get('status') == 'completed'\n            assert isinstance(data.get('output', []), list)\n            assert len(data['output']) == 0\n            break\n        sleep(0.5)\n    else:\n        raise AssertionError('Job did not complete')"
+      },
+      {
+        "name": "test_bulk_export_malformed_request_returns_400",
+        "kind": "negative",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite endpoint /$export is available",
+          "client holds valid authorization token",
+          "client submits request with malformed JSON or missing required fields"
+        ],
+        "actions": [
+          "POST to /$export with invalid JSON (missing closing brace)",
+          "POST to /$export with empty body",
+          "POST to /$export with unsupported outputFormat value"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request for each malformed request",
+          "error response describes validation failure",
+          "no job is queued"
+        ],
+        "trace": [
+          "R-HLT-016: negative path - invalid input handling"
+        ],
+        "executable": "import requests\n\ndef test_bulk_export_malformed_request_returns_400():\n    base_url = '<target_app_base_url>'\n    headers = {\n        'Authorization': 'Bearer <valid_bulk_export_token>',\n        'Content-Type': 'application/fhir+json'\n    }\n    \n    resp1 = requests.post(f'{base_url}/$export', data='{\"resourceType\": \"Patient\"', headers=headers)\n    assert resp1.status_code == 400\n    \n    resp2 = requests.post(f'{base_url}/$export', data='', headers=headers)\n    assert resp2.status_code in [400, 415]\n    \n    bad_format_payload = {\n        'resourceType': 'Patient',\n        'outputFormat': 'application/xml'\n    }\n    resp3 = requests.post(f'{base_url}/$export', json=bad_format_payload, headers=headers)\n    assert resp3.status_code == 400"
+      }
+    ]
+  },
+  "req_id": "R-HLT-016",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=EP"
+  ],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1029,
+    "output_tokens": 3212,
+    "latency_ms": 18606,
+    "wall_ms": 18606,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-016\",\n  \"reasoning\": \"R-HLT-016 specifies a FHIR bulk export capability that must be authorized, queue jobs, and stream NDJSON paginated output. Test design applies EP (authorized vs. unauthorized partitions), BVA (payload size boundaries), NEG (403 unauthorized), and STC (job state transitions). Tests are deterministic, idempotent, and traceable to the requirement's actors, triggers, and error pathways.\",\n  \"tests\": [\n    {\n      \"name\": \"test_bulk_export_authorized_client_queues_job\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite endpoint /$export is available\",\n        \"client holds valid OAuth2 bearer token with bulk:export scope\",\n        \"test database contains \u22651 FHIR Patient resource\"\n      ],\n      \"actions\": [\n        \"POST to /$export with Authorization header (valid token)\",\n        \"request body: {\\\"resourceType\\\": \\\"Patient\\\", \\\"outputFormat\\\": \\\"application/fhir+ndjson\\\"}\",\n        \"poll Content-Location until job status is 'completed'\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted on initial POST\",\n        \"Content-Location header present and valid\",\n        \"job queued in system\",\n        \"export stream contains valid NDJSON records\"\n      ],\n      \"trace\": [\n        \"R-HLT-016: actor=user, trigger=client requests export, outcome=export job queued\",\n        \"R-HLT-016: NDJSON stream produced\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom time import sleep\\n\\ndef test_bulk_export_authorized_client_queues_job():\\n    base_url = '<target_app_base_url>'\\n    headers = {\\n        'Authorization': 'Bearer <valid_bulk_export_token>',\\n        'Content-Type': 'application/fhir+json'\\n    }\\n    payload = {\\n        'resourceType': 'Patient',\\n        'outputFormat': 'application/fhir+ndjson'\\n    }\\n    \\n    resp = requests.post(f'{base_url}/$export', json=payload, headers=headers)\\n    assert resp.status_code == 202, f'Expected 202, got {resp.status_code}'\\n    assert 'Content-Location' in resp.headers\\n    content_location = resp.headers['Content-Location']\\n    \\n    for _ in range(30):\\n        poll_resp = requests.get(content_location, headers=headers)\\n        if poll_resp.status_code == 200:\\n            data = poll_resp.json()\\n            assert data.get('status') == 'completed'\\n            assert 'output' in data\\n            break\\n        sleep(0.5)\\n    \\n    export_resp = requests.get(data['output'][0]['url'], headers=headers)\\n    assert export_resp.status_code == 200\\n    for line in export_resp.text.strip().split('\\\\n'):\\n        obj = json.loads(line)\\n        assert obj.get('resourceType') == 'Patient'\"\n    },\n    {\n      \"name\": \"test_bulk_export_unauthorized_client_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite endpoint /$export is available\",\n        \"client does not hold valid bulk export authorization\",\n        \"client submits request with invalid/expired token or no Authorization header\"\n      ],\n      \"actions\": [\n        \"POST to /$export without Authorization header OR with expired/invalid token\",\n        \"request body: {\\\"resourceType\\\": \\\"Patient\\\", \\\"outputFormat\\\": \\\"application/fhir+ndjson\\\"}\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden response\",\n        \"error body contains security/authorization violation message\",\n        \"no job is queued\",\n        \"no export stream initiated\"\n      ],\n      \"trace\": [\n        \"R-HLT-016: error pathway=403 when unauthorised\",\n        \"R-HLT-016: precondition=authorized bulk-client NOT satisfied\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_bulk_export_unauthorized_client_returns_403():\\n    base_url = '<target_app_base_url>'\\n    payload = {\\n        'resourceType': 'Patient',\\n        'outputFormat': 'application/fhir+ndjson'\\n    }\\n    \\n    resp = requests.post(f'{base_url}/$export', json=payload)\\n    assert resp.status_code == 403, f'Expec"
+  }
+}

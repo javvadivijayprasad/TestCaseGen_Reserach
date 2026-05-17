@@ -1,0 +1,141 @@
+{
+  "req": {
+    "id": "R-HLT-088",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients (audit)",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-088",
+    "reasoning": "R-HLT-088 mandates three orthogonal concerns: (1) correct patient-scoping \u2014 only care-team patients returned; (2) audit emission \u2014 an AuditEvent must exist after every search; (3) input validation \u2014 malformed queries yield HTTP 400. EP drives the happy-path search by each supported param (name/MRN/DOB). BVA targets the single-character name query, the minimal valid input boundary. NEG covers the malformed query string that must produce 400. DT would cover multi-param combinations; STC covers the state of AuditEvent records growing monotonically. To stay within the 5-test budget while honouring the 3-minimum rule, I include: positive/EP (name search + audit), boundary/BVA (single-char name), and negative/NEG (malformed query). Each test is idempotent: fixtures create and tear down their own data; audit checks use a count delta rather than a global assertion.",
+    "tests": [
+      {
+        "name": "test_search_by_name_returns_scoped_patients_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "At least one patient assigned to the clinician exists (seeded by <patient_fixture>)",
+          "At least one patient NOT assigned to the clinician exists (seeded by <other_patient_fixture>)",
+          "FHIR server reachable at BASE_URL"
+        ],
+        "actions": [
+          "Record current AuditEvent count for this clinician via GET /AuditEvent",
+          "GET /Patient?name=<seeded_patient_family_name> with clinician Bearer token",
+          "Record new AuditEvent count"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response is a FHIR Bundle with resourceType=='Bundle'",
+          "All returned Patient resources are in the clinician's care team",
+          "Out-of-scope patient is NOT present in the bundle",
+          "AuditEvent count increased by exactly 1",
+          "New AuditEvent.agent references the clinician",
+          "New AuditEvent.entity references the search query"
+        ],
+        "trace": [
+          "R-HLT-088: filtered bundle returned",
+          "R-HLT-088: access logged",
+          "R-HLT-088: search by name"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_by_name_returns_scoped_patients_and_emits_audit(\n    base_url, clinician_headers, seeded_patient, other_patient, audit_count\n):\n    family = seeded_patient[\"name\"][0][\"family\"]\n    scoped_id = seeded_patient[\"id\"]\n    alien_id = other_patient[\"id\"]\n\n    before = audit_count(clinician_headers)\n\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"name\": family},\n        headers=clinician_headers,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n\n    ids = [e[\"resource\"][\"id\"] for e in bundle.get(\"entry\", [])]\n    assert scoped_id in ids, \"Care-team patient missing from results\"\n    assert alien_id not in ids, \"Out-of-scope patient leaked\"\n\n    after = audit_count(clinician_headers)\n    assert after - before == 1, \"Expected exactly one new AuditEvent\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"agent\": clinician_headers.get(\"X-Clinician-Id\"), \"_sort\": \"-date\", \"_count\": 1},\n        headers=clinician_headers,\n    )\n    latest = audit_resp.json()[\"entry\"][0][\"resource\"]\n    assert latest[\"action\"] in (\"E\", \"R\"), \"AuditEvent action unexpected\"\n    query_text = str(latest.get(\"entity\", []))\n    assert family in query_text or \"Patient\" in query_text\n"
+      },
+      {
+        "name": "test_search_by_single_character_name_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "Patient with family name starting with 'A' assigned to clinician (seeded by <patient_fixture>)",
+          "FHIR server reachable at BASE_URL"
+        ],
+        "actions": [
+          "Record AuditEvent count before search",
+          "GET /Patient?name=A with clinician Bearer token (single character \u2014 minimum valid input boundary)",
+          "Record AuditEvent count after search"
+        ],
+        "expected": [
+          "HTTP 200 returned (single-char is valid per FHIR spec prefix match)",
+          "Bundle resourceType is 'Bundle'",
+          "Bundle contains at least the seeded patient whose name starts with 'A'",
+          "No out-of-scope patients present",
+          "AuditEvent count increased by exactly 1"
+        ],
+        "trace": [
+          "R-HLT-088: search by name \u2014 boundary at minimum query length",
+          "R-HLT-088: filtered bundle returned",
+          "R-HLT-088: access logged"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_search_by_single_character_name_boundary(\n    base_url, clinician_headers, seeded_patient_name_a, audit_count\n):\n    scoped_id = seeded_patient_name_a[\"id\"]\n\n    before = audit_count(clinician_headers)\n\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"name\": \"A\"},\n        headers=clinician_headers,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n\n    ids = [e[\"resource\"][\"id\"] for e in bundle.get(\"entry\", [])]\n    assert scoped_id in ids, \"Boundary patient with name starting 'A' not returned\"\n\n    for entry in bundle.get(\"entry\", []):\n        pid = entry[\"resource\"][\"id\"]\n        assert pid in <clinician_care_team_ids>(clinician_headers, base_url), \\\n            f\"Out-of-scope patient {pid} returned\"\n\n    after = audit_count(clinician_headers)\n    assert after - before == 1, \"AuditEvent not emitted for single-char search\"\n"
+      },
+      {
+        "name": "test_malformed_search_query_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "FHIR server reachable at BASE_URL"
+        ],
+        "actions": [
+          "Record AuditEvent count before request",
+          "GET /Patient?search=%%INVALID%% with clinician Bearer token (percent-encoding error makes query malformed)",
+          "Record AuditEvent count after request"
+        ],
+        "expected": [
+          "HTTP 400 returned",
+          "Response body contains an OperationOutcome with issue severity 'error'",
+          "AuditEvent is still emitted (audit on failure is required by R-HLT-088)",
+          "AuditEvent outcome code indicates failure (e.g. '8' or 'error')"
+        ],
+        "trace": [
+          "R-HLT-088: error pathway \u2014 400 when query malformed",
+          "R-HLT-088: access logged even on error"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_malformed_search_query_returns_400(\n    base_url, clinician_headers, audit_count\n):\n    before = audit_count(clinician_headers)\n\n    resp = requests.get(\n        f\"{base_url}/Patient\",\n        params={\"name\": \"%%INVALID%%\"},\n        headers=clinician_headers,\n    )\n    assert resp.status_code == 400, (\n        f\"Expected 400 for malformed query, got {resp.status_code}\"\n    )\n\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\", \\\n        \"400 body must be OperationOutcome\"\n    severities = [i[\"severity\"] for i in body.get(\"issue\", [])]\n    assert \"error\" in severities or \"fatal\" in severities\n\n    after = audit_count(clinician_headers)\n    assert after - before == 1, \"AuditEvent must be emitted even for failed searches\"\n\n    audit_resp = requests.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"agent\": clinician_headers.get(\"X-Clinician-Id\"), \"_sort\": \"-date\", \"_count\": 1},\n        headers=clinician_headers,\n    )\n    latest = audit_resp.json()[\"entry\"][0][\"resource\"]\n    assert latest.get(\"outcome\") in (\"4\", \"8\", \"12\", \"error\"), \\\n        \"AuditEvent outcome must reflect search failure\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-088",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 2540,
+    "latency_ms": 36224,
+    "wall_ms": 36224,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-088\",\n  \"reasoning\": \"R-HLT-088 mandates three orthogonal concerns: (1) correct patient-scoping \u2014 only care-team patients returned; (2) audit emission \u2014 an AuditEvent must exist after every search; (3) input validation \u2014 malformed queries yield HTTP 400. EP drives the happy-path search by each supported param (name/MRN/DOB). BVA targets the single-character name query, the minimal valid input boundary. NEG covers the malformed query string that must produce 400. DT would cover multi-param combinations; STC covers the state of AuditEvent records growing monotonically. To stay within the 5-test budget while honouring the 3-minimum rule, I include: positive/EP (name search + audit), boundary/BVA (single-char name), and negative/NEG (malformed query). Each test is idempotent: fixtures create and tear down their own data; audit checks use a count delta rather than a global assertion.\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_by_name_returns_scoped_patients_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\",\n        \"At least one patient assigned to the clinician exists (seeded by <patient_fixture>)\",\n        \"At least one patient NOT assigned to the clinician exists (seeded by <other_patient_fixture>)\",\n        \"FHIR server reachable at BASE_URL\"\n      ],\n      \"actions\": [\n        \"Record current AuditEvent count for this clinician via GET /AuditEvent\",\n        \"GET /Patient?name=<seeded_patient_family_name> with clinician Bearer token\",\n        \"Record new AuditEvent count\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response is a FHIR Bundle with resourceType=='Bundle'\",\n        \"All returned Patient resources are in the clinician's care team\",\n        \"Out-of-scope patient is NOT present in the bundle\",\n        \"AuditEvent count increased by exactly 1\",\n        \"New AuditEvent.agent references the clinician\",\n        \"New AuditEvent.entity references the search query\"\n      ],\n      \"trace\": [\n        \"R-HLT-088: filtered bundle returned\",\n        \"R-HLT-088: access logged\",\n        \"R-HLT-088: search by name\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_search_by_name_returns_scoped_patients_and_emits_audit(\\n    base_url, clinician_headers, seeded_patient, other_patient, audit_count\\n):\\n    family = seeded_patient[\\\"name\\\"][0][\\\"family\\\"]\\n    scoped_id = seeded_patient[\\\"id\\\"]\\n    alien_id = other_patient[\\\"id\\\"]\\n\\n    before = audit_count(clinician_headers)\\n\\n    resp = requests.get(\\n        f\\\"{base_url}/Patient\\\",\\n        params={\\\"name\\\": family},\\n        headers=clinician_headers,\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n\\n    ids = [e[\\\"resource\\\"][\\\"id\\\"] for e in bundle.get(\\\"entry\\\", [])]\\n    assert scoped_id in ids, \\\"Care-team patient missing from results\\\"\\n    assert alien_id not in ids, \\\"Out-of-scope patient leaked\\\"\\n\\n    after = audit_count(clinician_headers)\\n    assert after - before == 1, \\\"Expected exactly one new AuditEvent\\\"\\n\\n    audit_resp = requests.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"agent\\\": clinician_headers.get(\\\"X-Clinician-Id\\\"), \\\"_sort\\\": \\\"-date\\\", \\\"_count\\\": 1},\\n        headers=clinician_headers,\\n    )\\n    latest = audit_resp.json()[\\\"entry\\\"][0][\\\"resource\\\"]\\n    assert latest[\\\"action\\\"] in (\\\"E\\\", \\\"R\\\"), \\\"AuditEvent action unexpected\\\"\\n    query_text = str(latest.get(\\\"entity\\\", []))\\n    assert family in query_text or \\\"Patient\\\" in query_text\\n\"\n    },\n    {\n      \"name\": \"test_search_by_single_character_name_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\",\n        \"Patient with family name starting with 'A' assigned to clinician (seed"
+  }
+}

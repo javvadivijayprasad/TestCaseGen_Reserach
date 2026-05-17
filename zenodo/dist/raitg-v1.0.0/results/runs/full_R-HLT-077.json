@@ -1,0 +1,192 @@
+{
+  "req": {
+    "id": "R-HLT-077",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient (audit)",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-077",
+    "reasoning": "R-HLT-077 requires: (1) a clinician assigned to a patient receives the resource and triggers an AuditEvent, (2) a clinician NOT assigned is denied with HTTP 403 and an AuditEvent is still emitted, (3) boundary conditions around assignment edges (e.g., a patient ID that exists but the clinician was just removed from the care team). EP partitions the assigned/unassigned clinician space; NEG covers the forbidden access path; BVA targets the edge where assignment is revoked immediately before the read; STC models the state change of assignment -> revoked -> read; DT captures all combinations of assignment x patient-exists.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_reads_patient_returns_200_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists in fhir-lite",
+          "Clinician is assigned to the patient's care team"
+        ],
+        "actions": [
+          "Obtain a valid bearer token for the assigned clinician via <get_auth_token>",
+          "HTTP GET /Patient/{assigned_patient_id} with Authorization header",
+          "Poll AuditEvent endpoint for an event referencing this patient read"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body resourceType equals 'Patient'",
+          "Response body id equals assigned_patient_id",
+          "At least one AuditEvent exists with outcome '0' (success) referencing the patient id and clinician id"
+        ],
+        "trace": [
+          "R-HLT-077: resource returned for assigned clinician",
+          "R-HLT-077: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\n    fhir_base_url, assigned_clinician_credentials, assigned_patient_id, audit_poller\n):\n    token = <get_auth_token>(assigned_clinician_credentials)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Accept\": \"application/fhir+json\"}\n\n    resp = requests.get(f\"{fhir_base_url}/Patient/{assigned_patient_id}\", headers=headers)\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Patient\"\n    assert body[\"id\"] == assigned_patient_id\n\n    audit = audit_poller(\n        criteria={\n            \"entity\": assigned_patient_id,\n            \"agent\": assigned_clinician_credentials[\"user_id\"],\n            \"outcome\": \"0\"\n        }\n    )\n    assert audit is not None, \"AuditEvent with outcome=0 not found\"\n    assert audit[\"outcome\"] == \"0\"\n"
+      },
+      {
+        "name": "test_unassigned_clinician_reads_patient_returns_403_and_audit",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists in fhir-lite",
+          "Clinician is NOT assigned to the patient's care team"
+        ],
+        "actions": [
+          "Obtain a valid bearer token for the unassigned clinician via <get_auth_token>",
+          "HTTP GET /Patient/{unassigned_patient_id} with Authorization header",
+          "Poll AuditEvent endpoint for a denial event referencing this attempt"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains OperationOutcome with issue severity 'error'",
+          "At least one AuditEvent exists with outcome '8' (serious failure/denied) referencing the patient id and clinician id"
+        ],
+        "trace": [
+          "R-HLT-077: 403 when clinician not assigned",
+          "R-HLT-077: AuditEvent emitted for every operation including denials"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unassigned_clinician_reads_patient_returns_403_and_audit(\n    fhir_base_url, unassigned_clinician_credentials, unassigned_patient_id, audit_poller\n):\n    token = <get_auth_token>(unassigned_clinician_credentials)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Accept\": \"application/fhir+json\"}\n\n    resp = requests.get(f\"{fhir_base_url}/Patient/{unassigned_patient_id}\", headers=headers)\n\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i[\"severity\"] == \"error\" for i in issues)\n\n    audit = audit_poller(\n        criteria={\n            \"entity\": unassigned_patient_id,\n            \"agent\": unassigned_clinician_credentials[\"user_id\"],\n            \"outcome\": \"8\"\n        }\n    )\n    assert audit is not None, \"AuditEvent with outcome=8 (denied) not found\"\n    assert audit[\"outcome\"] == \"8\"\n"
+      },
+      {
+        "name": "test_clinician_reads_patient_immediately_after_care_team_removal_returns_403",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists in fhir-lite",
+          "Clinician WAS assigned to the patient's care team",
+          "Admin removes the clinician from the care team immediately before the read"
+        ],
+        "actions": [
+          "Obtain a valid bearer token for the now-removed clinician via <get_auth_token>",
+          "Admin call removes clinician from care team via <remove_care_team_member>",
+          "HTTP GET /Patient/{boundary_patient_id} with the clinician's token immediately after removal",
+          "Poll AuditEvent endpoint for a denial event referencing this attempt"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden (assignment no longer valid)",
+          "Response body contains OperationOutcome",
+          "AuditEvent emitted with outcome '8' reflecting the post-removal denial"
+        ],
+        "trace": [
+          "R-HLT-077: 403 when clinician not assigned (boundary: assignment just revoked)",
+          "R-HLT-077: AuditEvent emitted for every operation",
+          "BVA: boundary between assigned and unassigned states"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_clinician_reads_patient_immediately_after_care_team_removal_returns_403(\n    fhir_base_url, boundary_clinician_credentials, boundary_patient_id,\n    admin_credentials, audit_poller\n):\n    admin_token = <get_auth_token>(admin_credentials)\n    <remove_care_team_member>(\n        fhir_base_url,\n        admin_token,\n        patient_id=boundary_patient_id,\n        clinician_id=boundary_clinician_credentials[\"user_id\"]\n    )\n\n    token = <get_auth_token>(boundary_clinician_credentials)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Accept\": \"application/fhir+json\"}\n\n    resp = requests.get(f\"{fhir_base_url}/Patient/{boundary_patient_id}\", headers=headers)\n\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n\n    audit = audit_poller(\n        criteria={\n            \"entity\": boundary_patient_id,\n            \"agent\": boundary_clinician_credentials[\"user_id\"],\n            \"outcome\": \"8\"\n        }\n    )\n    assert audit is not None, \"AuditEvent for post-removal denial not found\"\n"
+      },
+      {
+        "name": "test_decision_table_assigned_and_unassigned_clinicians_audit_outcomes",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Two clinician accounts exist: one assigned, one unassigned",
+          "A single patient resource exists in fhir-lite"
+        ],
+        "actions": [
+          "For each (clinician, expected_http_status, expected_audit_outcome) row in decision table:",
+          "Obtain bearer token for clinician",
+          "HTTP GET /Patient/{patient_id}",
+          "Assert HTTP status matches expected",
+          "Assert AuditEvent outcome matches expected"
+        ],
+        "expected": [
+          "Assigned clinician: HTTP 200, AuditEvent outcome='0'",
+          "Unassigned clinician: HTTP 403, AuditEvent outcome='8'",
+          "All four decision table rows produce correct HTTP and audit outcomes"
+        ],
+        "trace": [
+          "R-HLT-077: resource returned for assigned clinician",
+          "R-HLT-077: 403 when clinician not assigned",
+          "R-HLT-077: AuditEvent emitted for every operation",
+          "DT: cartesian product of assignment x patient-exists conditions"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"cred_fixture,patient_fixture,exp_status,exp_audit\", [\n    (\"assigned_clinician_credentials\", \"assigned_patient_id\", 200, \"0\"),\n    (\"unassigned_clinician_credentials\", \"assigned_patient_id\", 403, \"8\"),\n])\ndef test_decision_table_assigned_and_unassigned_clinicians_audit_outcomes(\n    request, fhir_base_url, cred_fixture, patient_fixture, exp_status, exp_audit, audit_poller\n):\n    creds = request.getfixturevalue(cred_fixture)\n    patient_id = request.getfixturevalue(patient_fixture)\n    token = <get_auth_token>(creds)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Accept\": \"application/fhir+json\"}\n\n    resp = requests.get(f\"{fhir_base_url}/Patient/{patient_id}\", headers=headers)\n\n    assert resp.status_code == exp_status\n\n    audit = audit_poller(\n        criteria={\"entity\": patient_id, \"agent\": creds[\"user_id\"], \"outcome\": exp_audit}\n    )\n    assert audit is not None, f\"AuditEvent outcome={exp_audit} not found for {creds['user_id']}\"\n    assert audit[\"outcome\"] == exp_audit\n"
+      },
+      {
+        "name": "test_state_transition_assigned_read_revoke_read_yields_403",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician account exists with role:clinician",
+          "Patient resource exists in fhir-lite",
+          "Clinician is initially assigned to the patient's care team"
+        ],
+        "actions": [
+          "State S1 (assigned): GET /Patient/{id} -> expect 200 + AuditEvent outcome=0",
+          "Transition: Admin revokes care team assignment via <remove_care_team_member>",
+          "State S2 (unassigned): GET /Patient/{id} -> expect 403 + AuditEvent outcome=8"
+        ],
+        "expected": [
+          "S1 read returns HTTP 200 with correct Patient resource",
+          "AuditEvent outcome='0' exists for S1 read",
+          "S2 read returns HTTP 403 after revocation",
+          "AuditEvent outcome='8' exists for S2 read"
+        ],
+        "trace": [
+          "R-HLT-077: resource returned for assigned clinician (S1)",
+          "R-HLT-077: 403 when clinician not assigned (S2)",
+          "R-HLT-077: AuditEvent emitted for every operation in both states",
+          "STC: assigned -> revoked state transition covered"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_state_transition_assigned_read_revoke_read_yields_403(\n    fhir_base_url, stc_clinician_credentials, stc_patient_id, admin_credentials, audit_poller\n):\n    token = <get_auth_token>(stc_clinician_credentials)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Accept\": \"application/fhir+json\"}\n    agent_id = stc_clinician_credentials[\"user_id\"]\n\n    resp_s1 = requests.get(f\"{fhir_base_url}/Patient/{stc_patient_id}\", headers=headers)\n    assert resp_s1.status_code == 200\n    audit_s1 = audit_poller(criteria={\"entity\": stc_patient_id, \"agent\": agent_id, \"outcome\": \"0\"})\n    assert audit_s1 is not None, \"S1 AuditEvent outcome=0 not found\"\n\n    admin_token = <get_auth_token>(admin_credentials)\n    <remove_care_team_member>(fhir_base_url, admin_token, stc_patient_id, agent_id)\n\n    resp_s2 = requests.get(f\"{fhir_base_url}/Patient/{stc_patient_id}\", headers=headers)\n    assert resp_s2.status_code == 403\n    audit_s2 = audit_poller(criteria={\"entity\": stc_patient_id, \"agent\": agent_id, \"outcome\": \"8\"})\n    assert audit_s2 is not None, \"S2 AuditEvent outcome=8 not found\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-077",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 3705,
+    "latency_ms": 36442,
+    "wall_ms": 36442,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-077\",\n  \"reasoning\": \"R-HLT-077 requires: (1) a clinician assigned to a patient receives the resource and triggers an AuditEvent, (2) a clinician NOT assigned is denied with HTTP 403 and an AuditEvent is still emitted, (3) boundary conditions around assignment edges (e.g., a patient ID that exists but the clinician was just removed from the care team). EP partitions the assigned/unassigned clinician space; NEG covers the forbidden access path; BVA targets the edge where assignment is revoked immediately before the read; STC models the state change of assignment -> revoked -> read; DT captures all combinations of assignment x patient-exists.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_returns_200_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician account exists with role:clinician\",\n        \"Patient resource exists in fhir-lite\",\n        \"Clinician is assigned to the patient's care team\"\n      ],\n      \"actions\": [\n        \"Obtain a valid bearer token for the assigned clinician via <get_auth_token>\",\n        \"HTTP GET /Patient/{assigned_patient_id} with Authorization header\",\n        \"Poll AuditEvent endpoint for an event referencing this patient read\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body resourceType equals 'Patient'\",\n        \"Response body id equals assigned_patient_id\",\n        \"At least one AuditEvent exists with outcome '0' (success) referencing the patient id and clinician id\"\n      ],\n      \"trace\": [\n        \"R-HLT-077: resource returned for assigned clinician\",\n        \"R-HLT-077: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\\n    fhir_base_url, assigned_clinician_credentials, assigned_patient_id, audit_poller\\n):\\n    token = <get_auth_token>(assigned_clinician_credentials)\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\", \\\"Accept\\\": \\\"application/fhir+json\\\"}\\n\\n    resp = requests.get(f\\\"{fhir_base_url}/Patient/{assigned_patient_id}\\\", headers=headers)\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Patient\\\"\\n    assert body[\\\"id\\\"] == assigned_patient_id\\n\\n    audit = audit_poller(\\n        criteria={\\n            \\\"entity\\\": assigned_patient_id,\\n            \\\"agent\\\": assigned_clinician_credentials[\\\"user_id\\\"],\\n            \\\"outcome\\\": \\\"0\\\"\\n        }\\n    )\\n    assert audit is not None, \\\"AuditEvent with outcome=0 not found\\\"\\n    assert audit[\\\"outcome\\\"] == \\\"0\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_reads_patient_returns_403_and_audit\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician account exists with role:clinician\",\n        \"Patient resource exists in fhir-lite\",\n        \"Clinician is NOT assigned to the patient's care team\"\n      ],\n      \"actions\": [\n        \"Obtain a valid bearer token for the unassigned clinician via <get_auth_token>\",\n        \"HTTP GET /Patient/{unassigned_patient_id} with Authorization header\",\n        \"Poll AuditEvent endpoint for a denial event referencing this attempt\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome with issue severity 'error'\",\n        \"At least one AuditEvent exists with outcome '8' (serious failure/denied) referencing the patient id and clinician id\"\n      ],\n      \"trace\": [\n        \"R-HLT-077: 403 when clinician not assigned\",\n        \"R-HLT-077: AuditEvent emitted for every operation including denials\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_unassigned_clinician_reads_patient_returns_403_and_audit(\\n    fhir_base_url, unassigned_clinician_credentials, unassigned_patient_id, audit_poller\\n):\\n    token = <get_auth_token>(unassigned_clinician_credentials)\\n"
+  }
+}

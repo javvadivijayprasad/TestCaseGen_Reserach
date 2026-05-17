@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-WEB-063",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Approve leave request \u2014 variant 2",
+    "statement": "A manager shall approve or reject leave requests assigned to them within 5 business days; unactioned requests auto-escalate to hr-admin. Additionally, the action must be idempotent under retry.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager",
+      "request assigned to manager"
+    ],
+    "triggers": [
+      "manager clicks approve"
+    ],
+    "expected_outcomes": [
+      "request state=approved",
+      "employee notified",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if manager not the assignee",
+      "409 if already actioned"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/{id}/approve"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-063",
+    "reasoning": "The requirement covers four testable concerns: (1) a manager successfully approving an assigned leave request (EP positive path), (2) a non-assignee manager being rejected with 403 (NEG/DT error path), (3) a duplicate approval being idempotent or returning 409 (STC already-actioned state), (4) approval exactly at the 5-business-day boundary before auto-escalation (BVA). Tests are scoped to the UI layer via Playwright wrapped in pytest, with API-level assertions for state, notification, and audit entries. Fixtures provide authenticated sessions and seeded leave requests.",
+    "tests": [
+      {
+        "name": "test_manager_approves_assigned_leave_request",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated manager session exists (role:manager)",
+          "Leave request exists in state=pending and is assigned to the authenticated manager",
+          "Employee notification service is reachable"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/approve",
+          "Click the Approve button",
+          "Confirm the approval dialog if present"
+        ],
+        "expected": [
+          "HTTP response status is 200",
+          "Leave request state transitions to approved",
+          "Employee receives a notification",
+          "Audit log contains an entry for the approval action"
+        ],
+        "trace": [
+          "R-WEB-063: expected outcome \u2014 request state=approved",
+          "R-WEB-063: expected outcome \u2014 employee notified",
+          "R-WEB-063: expected outcome \u2014 audit entry created"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_manager_approves_assigned_leave_request(\n    manager_page,          # <fixture>: authenticated Playwright page for manager\n    pending_leave_request, # <fixture>: creates pending request assigned to manager, yields {id, employee_id}\n    api_client,            # <fixture>: authenticated HTTP client for assertions\n):\n    req_id = pending_leave_request[\"id\"]\n    url = f\"/leave-requests/{req_id}/approve\"\n\n    manager_page.goto(url)\n    manager_page.get_by_role(\"button\", name=\"Approve\").click()\n    confirm = manager_page.get_by_role(\"button\", name=\"Confirm\")\n    if confirm.is_visible():\n        confirm.click()\n\n    expect(manager_page.get_by_text(\"Approved\")).to_be_visible()\n\n    state_resp = api_client.get(f\"/api/leave-requests/{req_id}\")\n    assert state_resp.status_code == 200\n    assert state_resp.json()[\"state\"] == \"approved\"\n\n    notif_resp = api_client.get(\n        f\"/api/notifications\",\n        params={\"employee_id\": pending_leave_request[\"employee_id\"], \"type\": \"leave_approved\"}\n    )\n    assert notif_resp.status_code == 200\n    assert len(notif_resp.json()[\"items\"]) >= 1\n\n    audit_resp = api_client.get(f\"/api/audit\", params={\"resource_id\": req_id, \"action\": \"approve\"})\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json()[\"entries\"]) >= 1\n"
+      },
+      {
+        "name": "test_non_assignee_manager_gets_403_on_approve",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Two manager accounts exist: manager_A (assignee) and manager_B (non-assignee)",
+          "Leave request exists in state=pending assigned to manager_A",
+          "manager_B is authenticated"
+        ],
+        "actions": [
+          "Authenticate as manager_B",
+          "Navigate to /leave-requests/{id}/approve for the request assigned to manager_A",
+          "Attempt to click Approve"
+        ],
+        "expected": [
+          "HTTP response status is 403 Forbidden",
+          "Error message indicates manager is not the assignee",
+          "Leave request state remains pending"
+        ],
+        "trace": [
+          "R-WEB-063: error pathway \u2014 403 if manager not the assignee"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_non_assignee_manager_gets_403_on_approve(\n    other_manager_page,    # <fixture>: authenticated page for manager_B (non-assignee)\n    pending_leave_request, # <fixture>: request assigned to manager_A, yields {id}\n    api_client_manager_b,  # <fixture>: HTTP client authenticated as manager_B\n):\n    req_id = pending_leave_request[\"id\"]\n    url = f\"/leave-requests/{req_id}/approve\"\n\n    with other_manager_page.expect_response(\n        lambda r: f\"/leave-requests/{req_id}/approve\" in r.url\n    ) as resp_info:\n        other_manager_page.goto(url)\n        approve_btn = other_manager_page.get_by_role(\"button\", name=\"Approve\")\n        if approve_btn.is_visible():\n            approve_btn.click()\n\n    response = resp_info.value\n    assert response.status == 403, f\"Expected 403, got {response.status}\"\n\n    error_text = other_manager_page.get_by_role(\"alert\")\n    expect(error_text).to_contain_text(\"not the assignee\", ignore_case=True)\n\n    state_resp = api_client_manager_b.get(f\"/api/leave-requests/{req_id}\")\n    assert state_resp.json()[\"state\"] == \"pending\"\n"
+      },
+      {
+        "name": "test_duplicate_approval_is_idempotent_or_returns_409",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated manager session exists (role:manager)",
+          "Leave request exists in state=approved (already actioned by the same manager)"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/approve",
+          "Attempt to click Approve a second time on an already-approved request"
+        ],
+        "expected": [
+          "HTTP response status is either 200 (idempotent) or 409 (conflict)",
+          "If 200: leave request state remains approved with no duplicate audit entries",
+          "If 409: error message indicates request already actioned"
+        ],
+        "trace": [
+          "R-WEB-063: error pathway \u2014 409 if already actioned",
+          "R-WEB-063: idempotency under retry"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_duplicate_approval_is_idempotent_or_returns_409(\n    manager_page,           # <fixture>: authenticated Playwright page for manager\n    approved_leave_request, # <fixture>: request already in state=approved by this manager, yields {id}\n    api_client,             # <fixture>: authenticated HTTP client\n):\n    req_id = approved_leave_request[\"id\"]\n    url = f\"/leave-requests/{req_id}/approve\"\n\n    with manager_page.expect_response(\n        lambda r: f\"/leave-requests/{req_id}/approve\" in r.url\n    ) as resp_info:\n        manager_page.goto(url)\n        approve_btn = manager_page.get_by_role(\"button\", name=\"Approve\")\n        if approve_btn.is_visible():\n            approve_btn.click()\n\n    status = resp_info.value.status\n    assert status in (200, 409), f\"Expected 200 or 409, got {status}\"\n\n    state_resp = api_client.get(f\"/api/leave-requests/{req_id}\")\n    assert state_resp.json()[\"state\"] == \"approved\"\n\n    if status == 409:\n        alert = manager_page.get_by_role(\"alert\")\n        expect(alert).to_contain_text(\"already actioned\", ignore_case=True)\n    else:\n        audit_resp = api_client.get(f\"/api/audit\", params={\"resource_id\": req_id, \"action\": \"approve\"})\n        entries = audit_resp.json()[\"entries\"]\n        assert len(entries) == 1, \"Idempotent retry must not create duplicate audit entries\"\n"
+      },
+      {
+        "name": "test_approval_on_day5_before_auto_escalation",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated manager session exists (role:manager)",
+          "Leave request exists in state=pending, assigned exactly 5 business days ago (boundary: last valid day for action)",
+          "Auto-escalation job has NOT yet run for this cycle"
+        ],
+        "actions": [
+          "Navigate to /leave-requests/{id}/approve",
+          "Click Approve before the escalation job executes"
+        ],
+        "expected": [
+          "HTTP response status is 200",
+          "Leave request state is approved (not escalated)",
+          "No escalation record exists for this request",
+          "Audit entry is created"
+        ],
+        "trace": [
+          "R-WEB-063: 5-business-day window \u2014 upper boundary of valid approval window",
+          "R-WEB-063: expected outcome \u2014 request state=approved"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\nfrom datetime import datetime, timezone\n\ndef test_approval_on_day5_before_auto_escalation(\n    manager_page,                    # <fixture>: authenticated Playwright page\n    leave_request_at_day5_boundary,  # <fixture>: request created exactly 5 biz days ago, yields {id}\n    api_client,                      # <fixture>: authenticated HTTP client\n    freeze_escalation_job,           # <fixture>: context manager that pauses the escalation scheduler\n):\n    req_id = leave_request_at_day5_boundary[\"id\"]\n    url = f\"/leave-requests/{req_id}/approve\"\n\n    with freeze_escalation_job():\n        manager_page.goto(url)\n        manager_page.get_by_role(\"button\", name=\"Approve\").click()\n        confirm = manager_page.get_by_role(\"button\", name=\"Confirm\")\n        if confirm.is_visible():\n            confirm.click()\n        expect(manager_page.get_by_text(\"Approved\")).to_be_visible()\n\n    state_resp = api_client.get(f\"/api/leave-requests/{req_id}\")\n    data = state_resp.json()\n    assert data[\"state\"] == \"approved\", f\"Expected approved, got {data['state']}\"\n    assert data.get(\"escalated_to\") is None, \"Request must not have been escalated\"\n\n    audit_resp = api_client.get(f\"/api/audit\", params={\"resource_id\": req_id, \"action\": \"approve\"})\n    assert len(audit_resp.json()[\"entries\"]) >= 1\n"
+      },
+      {
+        "name": "test_approve_reject_decision_table_all_role_states",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Three actors available: manager (assignee), other_manager (non-assignee), hr-admin",
+          "Leave request in state=pending assigned to manager",
+          "All actors have valid sessions"
+        ],
+        "actions": [
+          "Attempt approval as manager (assignee) \u2014 expect 200",
+          "Attempt approval as other_manager (non-assignee) \u2014 expect 403",
+          "Attempt approval as hr-admin (not manager role) \u2014 expect 403"
+        ],
+        "expected": [
+          "manager (assignee): 200, state=approved",
+          "other_manager (non-assignee): 403, state unchanged",
+          "hr-admin: 403, state unchanged"
+        ],
+        "trace": [
+          "R-WEB-063: error pathway \u2014 403 if manager not the assignee",
+          "R-WEB-063: actors \u2014 manager only"
+        ],
+        "executable": "import pytest\n\ndef test_approve_reject_decision_table_all_role_states(\n    pending_leave_request,   # <fixture>: yields {id} assigned to manager_A\n    get_api_client,          # <fixture>: factory fn(role) -> authenticated HTTP client\n):\n    req_id = pending_leave_request[\"id\"]\n    endpoint = f\"/api/leave-requests/{req_id}/approve\"\n\n    cases = [\n        (\"manager_assignee\", 200, \"approved\"),\n        (\"manager_other\",    403, \"pending\"),\n        (\"hr_admin\",         403, \"pending\"),\n    ]\n\n    for role, expected_status, expected_state in cases:\n        client = get_api_client(role)\n        resp = client.post(endpoint)\n        assert resp.status_code == expected_status, (\n            f\"Role={role}: expected HTTP {expected_status}, got {resp.status_code}\"\n        )\n\n        if expected_status != 200:\n            state_resp = get_api_client(\"manager_assignee\").get(\n                f\"/api/leave-requests/{req_id}\"\n            )\n            assert state_resp.json()[\"state\"] == expected_state, (\n                f\"Role={role}: state should remain {expected_state}\"\n            )\n        else:\n            assert resp.json()[\"state\"] == \"approved\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-063",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1032,
+    "output_tokens": 3630,
+    "latency_ms": 60359,
+    "wall_ms": 60359,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-063\",\n  \"reasoning\": \"The requirement covers four testable concerns: (1) a manager successfully approving an assigned leave request (EP positive path), (2) a non-assignee manager being rejected with 403 (NEG/DT error path), (3) a duplicate approval being idempotent or returning 409 (STC already-actioned state), (4) approval exactly at the 5-business-day boundary before auto-escalation (BVA). Tests are scoped to the UI layer via Playwright wrapped in pytest, with API-level assertions for state, notification, and audit entries. Fixtures provide authenticated sessions and seeded leave requests.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_approves_assigned_leave_request\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated manager session exists (role:manager)\",\n        \"Leave request exists in state=pending and is assigned to the authenticated manager\",\n        \"Employee notification service is reachable\"\n      ],\n      \"actions\": [\n        \"Navigate to /leave-requests/{id}/approve\",\n        \"Click the Approve button\",\n        \"Confirm the approval dialog if present\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 200\",\n        \"Leave request state transitions to approved\",\n        \"Employee receives a notification\",\n        \"Audit log contains an entry for the approval action\"\n      ],\n      \"trace\": [\n        \"R-WEB-063: expected outcome \u2014 request state=approved\",\n        \"R-WEB-063: expected outcome \u2014 employee notified\",\n        \"R-WEB-063: expected outcome \u2014 audit entry created\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_manager_approves_assigned_leave_request(\\n    manager_page,          # <fixture>: authenticated Playwright page for manager\\n    pending_leave_request, # <fixture>: creates pending request assigned to manager, yields {id, employee_id}\\n    api_client,            # <fixture>: authenticated HTTP client for assertions\\n):\\n    req_id = pending_leave_request[\\\"id\\\"]\\n    url = f\\\"/leave-requests/{req_id}/approve\\\"\\n\\n    manager_page.goto(url)\\n    manager_page.get_by_role(\\\"button\\\", name=\\\"Approve\\\").click()\\n    confirm = manager_page.get_by_role(\\\"button\\\", name=\\\"Confirm\\\")\\n    if confirm.is_visible():\\n        confirm.click()\\n\\n    expect(manager_page.get_by_text(\\\"Approved\\\")).to_be_visible()\\n\\n    state_resp = api_client.get(f\\\"/api/leave-requests/{req_id}\\\")\\n    assert state_resp.status_code == 200\\n    assert state_resp.json()[\\\"state\\\"] == \\\"approved\\\"\\n\\n    notif_resp = api_client.get(\\n        f\\\"/api/notifications\\\",\\n        params={\\\"employee_id\\\": pending_leave_request[\\\"employee_id\\\"], \\\"type\\\": \\\"leave_approved\\\"}\\n    )\\n    assert notif_resp.status_code == 200\\n    assert len(notif_resp.json()[\\\"items\\\"]) >= 1\\n\\n    audit_resp = api_client.get(f\\\"/api/audit\\\", params={\\\"resource_id\\\": req_id, \\\"action\\\": \\\"approve\\\"})\\n    assert audit_resp.status_code == 200\\n    assert len(audit_resp.json()[\\\"entries\\\"]) >= 1\\n\"\n    },\n    {\n      \"name\": \"test_non_assignee_manager_gets_403_on_approve\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Two manager accounts exist: manager_A (assignee) and manager_B (non-assignee)\",\n        \"Leave request exists in state=pending assigned to manager_A\",\n        \"manager_B is authenticated\"\n      ],\n      \"actions\": [\n        \"Authenticate as manager_B\",\n        \"Navigate to /leave-requests/{id}/approve for the request assigned to manager_A\",\n        \"Attempt to click Approve\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 403 Forbidden\",\n        \"Error message indicates manager is not the assignee\",\n        \"Leave request state remains pending\"\n      ],\n      \"trace\": [\n        \"R-WEB-063: error pathway \u2014 403 if manager not the assignee\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_non_assignee_manage"
+  }
+}

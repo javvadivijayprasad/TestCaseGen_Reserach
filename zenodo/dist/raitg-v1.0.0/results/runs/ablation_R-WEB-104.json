@@ -1,0 +1,189 @@
+{
+  "req": {
+    "id": "R-WEB-104",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Reset employee password \u2014 variant 3",
+    "statement": "An employee shall reset their password via an email link that expires after 30 minutes; expired links must be rejected. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "valid reset token"
+    ],
+    "preconditions": [
+      "valid reset token"
+    ],
+    "triggers": [
+      "employee submits new password"
+    ],
+    "expected_outcomes": [
+      "password updated",
+      "all sessions invalidated",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "410 when token expired",
+      "422 when password fails policy"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/password/reset"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-104",
+    "reasoning": "R-WEB-104 defines four distinct observable outcomes: (1) successful password reset with session invalidation and webhook emission, (2) rejection of an expired token (410), (3) rejection of a policy-violating password (422), and (4) boundary behaviour at the 30-minute expiry window. EP covers the happy-path valid-token partition. BVA targets the 30-minute expiry edge (token at exactly 30 min is still valid; token at 30 min + 1 s is expired). STC models the token state machine: PENDING -> USED (success) and PENDING -> EXPIRED (rejection). NEG covers the invalid-password-policy branch. DT captures the combined condition table (token validity x password policy). Together these five tests satisfy the minimum three required cases (positive, negative, boundary) while achieving multi-dimensional coverage of the requirement.",
+    "tests": [
+      {
+        "name": "test_reset_password_valid_token_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A valid, non-expired reset token exists for employee test_employee@example.com",
+          "The employee has at least one active session",
+          "Webhook endpoint is reachable and recorded by <webhook_capture_fixture>"
+        ],
+        "actions": [
+          "POST /password/reset with valid token and policy-compliant new password",
+          "Assert HTTP 200 response",
+          "Assert all prior sessions are invalidated",
+          "Assert webhook event 'password.reset' was emitted"
+        ],
+        "expected": [
+          "HTTP 200 with body confirming password updated",
+          "All prior sessions for the employee are invalidated",
+          "Webhook event 'password.reset' received by external consumer"
+        ],
+        "trace": [
+          "R-WEB-104: password updated",
+          "R-WEB-104: all sessions invalidated",
+          "R-WEB-104: webhook event emitted"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_valid_token_success(valid_reset_token, active_session_ids, webhook_capture_fixture, api_base_url):\n    payload = {\n        \"token\": valid_reset_token,\n        \"password\": \"V@lidP@ssw0rd123!\"\n    }\n    resp = requests.post(f\"{api_base_url}/password/reset\", json=payload)\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n\n    # Verify all prior sessions invalidated\n    for session_id in active_session_ids:\n        session_resp = <check_session_fn>(session_id)\n        assert session_resp.status_code in (401, 403), (\n            f\"Session {session_id} should be invalidated\"\n        )\n\n    # Verify webhook event emitted\n    events = webhook_capture_fixture.get_events(event_type=\"password.reset\")\n    assert len(events) >= 1, \"Expected at least one password.reset webhook event\"\n    assert events[-1][\"employee_token\"] == valid_reset_token or \\\n           events[-1].get(\"event\") == \"password.reset\"\n"
+      },
+      {
+        "name": "test_reset_password_expired_token_rejected_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A reset token exists that was issued more than 30 minutes ago (expired)",
+          "Token has not been used"
+        ],
+        "actions": [
+          "POST /password/reset with expired token and policy-compliant new password",
+          "Assert HTTP 410 response",
+          "Assert password was NOT changed",
+          "Assert no webhook event was emitted"
+        ],
+        "expected": [
+          "HTTP 410 Gone",
+          "Response body indicates token has expired",
+          "Employee password remains unchanged",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-104: expired links must be rejected",
+          "R-WEB-104: 410 when token expired"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_expired_token_rejected_410(expired_reset_token, webhook_capture_fixture, api_base_url):\n    payload = {\n        \"token\": expired_reset_token,\n        \"password\": \"V@lidP@ssw0rd123!\"\n    }\n    resp = requests.post(f\"{api_base_url}/password/reset\", json=payload)\n    assert resp.status_code == 410, f\"Expected 410, got {resp.status_code}\"\n\n    body = resp.json()\n    assert \"expired\" in body.get(\"error\", \"\").lower() or \\\n           body.get(\"code\") == \"TOKEN_EXPIRED\", \\\n           f\"Expected expiry error, got: {body}\"\n\n    # No webhook should have fired\n    events = webhook_capture_fixture.get_events(event_type=\"password.reset\")\n    assert len(events) == 0, f\"Unexpected webhook events: {events}\"\n"
+      },
+      {
+        "name": "test_reset_password_at_exactly_30_minutes_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A reset token exists that was issued exactly 30 minutes ago (at boundary, still valid)",
+          "System clock is controlled via <freeze_time_fixture> or token issued_at is set to now()-30min"
+        ],
+        "actions": [
+          "POST /password/reset with a token aged exactly 30 minutes and a valid password",
+          "Assert HTTP 200 \u2014 boundary is inclusive (token at 30 min is still valid)",
+          "POST /password/reset with a token aged 30 min + 1 second and a valid password",
+          "Assert HTTP 410 \u2014 one second past boundary is expired"
+        ],
+        "expected": [
+          "Token at exactly 30 minutes returns HTTP 200",
+          "Token at 30 minutes + 1 second returns HTTP 410"
+        ],
+        "trace": [
+          "R-WEB-104: email link expires after 30 minutes",
+          "R-WEB-104: expired links must be rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_at_exactly_30_minutes_accepted(api_base_url, create_token_aged_fn):\n    # Token issued exactly 1800 seconds ago \u2014 inclusive boundary, still valid\n    token_at_boundary = create_token_aged_fn(age_seconds=1800)\n    payload = {\"token\": token_at_boundary, \"password\": \"V@lidP@ssw0rd123!\"}\n    resp = requests.post(f\"{api_base_url}/password/reset\", json=payload)\n    assert resp.status_code == 200, (\n        f\"Token at 30 min boundary should be accepted, got {resp.status_code}\"\n    )\n\n    # Token issued 1801 seconds ago \u2014 one second past boundary, must be expired\n    token_past_boundary = create_token_aged_fn(age_seconds=1801)\n    payload2 = {\"token\": token_past_boundary, \"password\": \"V@lidP@ssw0rd123!\"}\n    resp2 = requests.post(f\"{api_base_url}/password/reset\", json=payload2)\n    assert resp2.status_code == 410, (\n        f\"Token 1 second past 30 min boundary must be rejected, got {resp2.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_reset_password_policy_violation_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A valid, non-expired reset token exists",
+          "Password policy requires minimum 12 characters, at least one uppercase, one digit, one special character"
+        ],
+        "actions": [
+          "POST /password/reset with valid token and password 'short' (fails all policy rules)",
+          "Assert HTTP 422 with field-level validation error",
+          "Assert employee password was NOT changed",
+          "Assert no webhook event was emitted"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body lists password policy violations",
+          "Employee password unchanged",
+          "No webhook event emitted"
+        ],
+        "trace": [
+          "R-WEB-104: 422 when password fails policy"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"bad_password,reason\", [\n    (\"short\", \"too_short\"),\n    (\"alllowercasenumbers123\", \"no_special_or_upper\"),\n    (\"NoDigitsOrSpecial!\", \"no_digit\"),\n])\ndef test_reset_password_policy_violation_returns_422(\n    valid_reset_token_factory, webhook_capture_fixture, api_base_url,\n    bad_password, reason\n):\n    token = valid_reset_token_factory()\n    payload = {\"token\": token, \"password\": bad_password}\n    resp = requests.post(f\"{api_base_url}/password/reset\", json=payload)\n    assert resp.status_code == 422, (\n        f\"[{reason}] Expected 422, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"password\" in str(body).lower(), (\n        f\"[{reason}] Expected password field error in body: {body}\"\n    )\n    events = webhook_capture_fixture.get_events(event_type=\"password.reset\")\n    assert len(events) == 0, f\"[{reason}] Unexpected webhook events: {events}\"\n"
+      },
+      {
+        "name": "test_reset_password_token_state_transition_used_then_reuse_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "A valid, non-expired reset token exists in PENDING state",
+          "First use will transition token state to USED/CONSUMED"
+        ],
+        "actions": [
+          "POST /password/reset with valid token and compliant password \u2014 first use (PENDING -> USED)",
+          "Assert HTTP 200",
+          "POST /password/reset with the same token again \u2014 second use attempt (USED -> rejected)",
+          "Assert HTTP 410 or 400 indicating token already consumed"
+        ],
+        "expected": [
+          "First request returns HTTP 200 and transitions token to USED state",
+          "Second request with same token returns HTTP 410 or 400",
+          "Webhook event emitted exactly once (for the first request only)"
+        ],
+        "trace": [
+          "R-WEB-104: expired links must be rejected",
+          "R-WEB-104: password updated",
+          "R-WEB-104: webhook event emitted"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_token_state_transition_used_then_reuse_rejected(\n    valid_reset_token, webhook_capture_fixture, api_base_url\n):\n    payload = {\"token\": valid_reset_token, \"password\": \"V@lidP@ssw0rd123!\"}\n\n    # First use: PENDING -> USED\n    resp1 = requests.post(f\"{api_base_url}/password/reset\", json=payload)\n    assert resp1.status_code == 200, f\"First use expected 200, got {resp1.status_code}\"\n\n    events_after_first = webhook_capture_fixture.get_events(event_type=\"password.reset\")\n    assert len(events_after_first) == 1, \"Expected exactly 1 webhook event after first use\"\n\n    # Second use: USED -> rejected\n    payload2 = {\"token\": valid_reset_token, \"password\": \"An0therV@lid#99\"}\n    resp2 = requests.post(f\"{api_base_url}/password/reset\", json=payload2)\n    assert resp2.status_code in (400, 410), (\n        f\"Reuse of consumed token expected 400 or 410, got {resp2.status_code}\"\n    )\n\n    events_after_second = webhook_capture_fixture.get_events(event_type=\"password.reset\")\n    assert len(events_after_second) == 1, \"Webhook must not fire on rejected reuse\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-104",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1012,
+    "output_tokens": 3268,
+    "latency_ms": 36051,
+    "wall_ms": 36051,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-104\",\n  \"reasoning\": \"R-WEB-104 defines four distinct observable outcomes: (1) successful password reset with session invalidation and webhook emission, (2) rejection of an expired token (410), (3) rejection of a policy-violating password (422), and (4) boundary behaviour at the 30-minute expiry window. EP covers the happy-path valid-token partition. BVA targets the 30-minute expiry edge (token at exactly 30 min is still valid; token at 30 min + 1 s is expired). STC models the token state machine: PENDING -> USED (success) and PENDING -> EXPIRED (rejection). NEG covers the invalid-password-policy branch. DT captures the combined condition table (token validity x password policy). Together these five tests satisfy the minimum three required cases (positive, negative, boundary) while achieving multi-dimensional coverage of the requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reset_password_valid_token_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A valid, non-expired reset token exists for employee test_employee@example.com\",\n        \"The employee has at least one active session\",\n        \"Webhook endpoint is reachable and recorded by <webhook_capture_fixture>\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with valid token and policy-compliant new password\",\n        \"Assert HTTP 200 response\",\n        \"Assert all prior sessions are invalidated\",\n        \"Assert webhook event 'password.reset' was emitted\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body confirming password updated\",\n        \"All prior sessions for the employee are invalidated\",\n        \"Webhook event 'password.reset' received by external consumer\"\n      ],\n      \"trace\": [\n        \"R-WEB-104: password updated\",\n        \"R-WEB-104: all sessions invalidated\",\n        \"R-WEB-104: webhook event emitted\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_reset_password_valid_token_success(valid_reset_token, active_session_ids, webhook_capture_fixture, api_base_url):\\n    payload = {\\n        \\\"token\\\": valid_reset_token,\\n        \\\"password\\\": \\\"V@lidP@ssw0rd123!\\\"\\n    }\\n    resp = requests.post(f\\\"{api_base_url}/password/reset\\\", json=payload)\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n\\n    # Verify all prior sessions invalidated\\n    for session_id in active_session_ids:\\n        session_resp = <check_session_fn>(session_id)\\n        assert session_resp.status_code in (401, 403), (\\n            f\\\"Session {session_id} should be invalidated\\\"\\n        )\\n\\n    # Verify webhook event emitted\\n    events = webhook_capture_fixture.get_events(event_type=\\\"password.reset\\\")\\n    assert len(events) >= 1, \\\"Expected at least one password.reset webhook event\\\"\\n    assert events[-1][\\\"employee_token\\\"] == valid_reset_token or \\\\\\n           events[-1].get(\\\"event\\\") == \\\"password.reset\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reset_password_expired_token_rejected_410\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A reset token exists that was issued more than 30 minutes ago (expired)\",\n        \"Token has not been used\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with expired token and policy-compliant new password\",\n        \"Assert HTTP 410 response\",\n        \"Assert password was NOT changed\",\n        \"Assert no webhook event was emitted\"\n      ],\n      \"expected\": [\n        \"HTTP 410 Gone\",\n        \"Response body indicates token has expired\",\n        \"Employee password remains unchanged\",\n        \"No webhook event emitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-104: expired links must be rejected\",\n        \"R-WEB-104: 410 when token expired\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_reset_password_expired_token_rejected_410(expired_reset_token, webhook_capture_fixture, api_base_url):\\n    payload = {\\n        \\\"token\\\": "
+  }
+}

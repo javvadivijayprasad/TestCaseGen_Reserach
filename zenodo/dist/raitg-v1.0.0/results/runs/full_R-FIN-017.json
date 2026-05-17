@@ -1,0 +1,186 @@
+{
+  "req": {
+    "id": "R-FIN-017",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Account-level transaction limits",
+    "statement": "A customer shall configure daily per-channel limits within regulatory caps; changes take effect after a 2-hour cool-down.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer submits limits"
+    ],
+    "expected_outcomes": [
+      "pending limit stored",
+      "effective after cool-down"
+    ],
+    "error_pathways": [
+      "422 when over regulatory cap"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/limits"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-017",
+    "reasoning": "The requirement has three testable dimensions: (1) a valid limit submission stores a pending limit and schedules activation after 2 hours (positive/EP), (2) a limit exceeding the regulatory cap is rejected with HTTP 422 (negative/NEG), (3) a limit exactly at the regulatory cap is accepted (boundary/BVA), and (4) the state transition from pending to active after the cool-down elapses (STC). A decision-table case covering multi-channel submissions is also included. Tests are written against the /accounts/{id}/limits endpoint with a mock-clock or time-travel helper to keep them deterministic.",
+    "tests": [
+      {
+        "name": "test_valid_limit_submission_stores_pending_limit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid JWT in auth_headers fixture)",
+          "Account <ACCOUNT_ID> exists and belongs to the authenticated customer",
+          "Requested daily limit (5000) is below the regulatory cap"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits with channel=web, daily_limit=5000",
+          "Inspect response status and body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status=pending",
+          "Response body contains effective_at timestamp approximately 2 hours in the future",
+          "Subsequent GET /accounts/{id}/limits returns the pending record"
+        ],
+        "trace": [
+          "R-FIN-017: customer configures daily per-channel limit",
+          "R-FIN-017: pending limit stored",
+          "R-FIN-017: effective after cool-down"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_valid_limit_submission_stores_pending_limit(api_client, auth_headers, test_account_id):\n    payload = {\"channel\": \"web\", \"daily_limit\": 5000}\n    resp = api_client.post(\n        f\"/accounts/{test_account_id}/limits\",\n        json=payload,\n        headers=auth_headers,\n    )\n    assert resp.status_code == 202, resp.text\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    effective_at = datetime.fromisoformat(body[\"effective_at\"])\n    now_utc = datetime.now(timezone.utc)\n    delta = effective_at - now_utc\n    assert timedelta(hours=1, minutes=55) <= delta <= timedelta(hours=2, minutes=5), (\n        f\"effective_at out of expected range: {delta}\"\n    )\n    get_resp = api_client.get(\n        f\"/accounts/{test_account_id}/limits\",\n        headers=auth_headers,\n    )\n    assert get_resp.status_code == 200\n    pending = [r for r in get_resp.json()[\"limits\"] if r[\"status\"] == \"pending\"]\n    assert any(r[\"daily_limit\"] == 5000 and r[\"channel\"] == \"web\" for r in pending)"
+      },
+      {
+        "name": "test_limit_over_regulatory_cap_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account <ACCOUNT_ID> exists",
+          "Regulatory cap for channel=web is known (REGULATORY_CAP fixture)",
+          "Requested daily limit exceeds REGULATORY_CAP by 1"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits with channel=web, daily_limit=REGULATORY_CAP+1",
+          "Inspect response status and error body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code LIMIT_EXCEEDS_REGULATORY_CAP",
+          "No pending limit record created for this channel"
+        ],
+        "trace": [
+          "R-FIN-017: error pathway - 422 when over regulatory cap"
+        ],
+        "executable": "import pytest\n\ndef test_limit_over_regulatory_cap_returns_422(api_client, auth_headers, test_account_id, regulatory_cap):\n    over_cap = regulatory_cap + 1\n    resp = api_client.post(\n        f\"/accounts/{test_account_id}/limits\",\n        json={\"channel\": \"web\", \"daily_limit\": over_cap},\n        headers=auth_headers,\n    )\n    assert resp.status_code == 422, resp.text\n    body = resp.json()\n    assert body.get(\"error\") == \"LIMIT_EXCEEDS_REGULATORY_CAP\", body\n    get_resp = api_client.get(\n        f\"/accounts/{test_account_id}/limits\",\n        headers=auth_headers,\n    )\n    assert get_resp.status_code == 200\n    pending = [\n        r for r in get_resp.json()[\"limits\"]\n        if r[\"status\"] == \"pending\" and r[\"channel\"] == \"web\" and r[\"daily_limit\"] == over_cap\n    ]\n    assert len(pending) == 0, \"No pending record should exist for over-cap limit\""
+      },
+      {
+        "name": "test_limit_exactly_at_regulatory_cap_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account <ACCOUNT_ID> exists",
+          "Regulatory cap for channel=mobile is known (REGULATORY_CAP fixture)",
+          "Requested daily limit equals REGULATORY_CAP exactly"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits with channel=mobile, daily_limit=REGULATORY_CAP",
+          "Inspect response status and body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status=pending",
+          "daily_limit in response equals REGULATORY_CAP"
+        ],
+        "trace": [
+          "R-FIN-017: boundary - limit exactly at regulatory cap must be accepted",
+          "R-FIN-017: pending limit stored"
+        ],
+        "executable": "import pytest\n\ndef test_limit_exactly_at_regulatory_cap_is_accepted(api_client, auth_headers, test_account_id, regulatory_cap):\n    resp = api_client.post(\n        f\"/accounts/{test_account_id}/limits\",\n        json={\"channel\": \"mobile\", \"daily_limit\": regulatory_cap},\n        headers=auth_headers,\n    )\n    assert resp.status_code == 202, resp.text\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body[\"daily_limit\"] == regulatory_cap\n    assert body[\"channel\"] == \"mobile\""
+      },
+      {
+        "name": "test_pending_limit_becomes_active_after_cooldown",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account <ACCOUNT_ID> exists",
+          "A pending limit for channel=atm has been submitted (via fixture or setup call)",
+          "Mock clock or time-travel helper <advance_clock_fn> is available"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits with channel=atm, daily_limit=3000 (creates pending state)",
+          "Verify status=pending immediately",
+          "Advance server clock by 2 hours using <advance_clock_fn>",
+          "GET /accounts/{id}/limits and inspect status"
+        ],
+        "expected": [
+          "Before clock advance: status=pending",
+          "After clock advance: status=active for the submitted limit",
+          "active daily_limit equals 3000 for channel=atm"
+        ],
+        "trace": [
+          "R-FIN-017: changes take effect after 2-hour cool-down",
+          "R-FIN-017: state transition pending -> active"
+        ],
+        "executable": "import pytest\n\ndef test_pending_limit_becomes_active_after_cooldown(\n    api_client, auth_headers, test_account_id, advance_clock\n):\n    post_resp = api_client.post(\n        f\"/accounts/{test_account_id}/limits\",\n        json={\"channel\": \"atm\", \"daily_limit\": 3000},\n        headers=auth_headers,\n    )\n    assert post_resp.status_code == 202, post_resp.text\n    limit_id = post_resp.json()[\"limit_id\"]\n    get_before = api_client.get(\n        f\"/accounts/{test_account_id}/limits/{limit_id}\",\n        headers=auth_headers,\n    )\n    assert get_before.json()[\"status\"] == \"pending\"\n    advance_clock(hours=2)\n    get_after = api_client.get(\n        f\"/accounts/{test_account_id}/limits/{limit_id}\",\n        headers=auth_headers,\n    )\n    body = get_after.json()\n    assert body[\"status\"] == \"active\", f\"Expected active, got: {body['status']}\"\n    assert body[\"daily_limit\"] == 3000\n    assert body[\"channel\"] == \"atm\""
+      },
+      {
+        "name": "test_multichannel_limit_decision_table",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account <ACCOUNT_ID> exists",
+          "Regulatory caps per channel available via regulatory_caps fixture (dict keyed by channel)",
+          "Test covers three channels: web, mobile, atm with distinct valid limits"
+        ],
+        "actions": [
+          "POST /accounts/{id}/limits for channel=web with daily_limit=4000",
+          "POST /accounts/{id}/limits for channel=mobile with daily_limit=2000",
+          "POST /accounts/{id}/limits for channel=atm with daily_limit=1000",
+          "Assert all three return 202 and status=pending"
+        ],
+        "expected": [
+          "All three POST calls return HTTP 202",
+          "All three response bodies contain status=pending",
+          "GET /accounts/{id}/limits returns three distinct pending records"
+        ],
+        "trace": [
+          "R-FIN-017: customer configures daily per-channel limits (multiple channels)",
+          "R-FIN-017: pending limit stored for each channel"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"channel,daily_limit\", [\n    (\"web\", 4000),\n    (\"mobile\", 2000),\n    (\"atm\", 1000),\n])\ndef test_multichannel_limit_decision_table(\n    api_client, auth_headers, test_account_id, channel, daily_limit\n):\n    resp = api_client.post(\n        f\"/accounts/{test_account_id}/limits\",\n        json={\"channel\": channel, \"daily_limit\": daily_limit},\n        headers=auth_headers,\n    )\n    assert resp.status_code == 202, f\"[{channel}] Unexpected status: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\", f\"[{channel}] Expected pending, got: {body['status']}\"\n    assert body[\"channel\"] == channel\n    assert body[\"daily_limit\"] == daily_limit"
+      }
+    ]
+  },
+  "req_id": "R-FIN-017",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 984,
+    "output_tokens": 3040,
+    "latency_ms": 37244,
+    "wall_ms": 37244,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-017\",\n  \"reasoning\": \"The requirement has three testable dimensions: (1) a valid limit submission stores a pending limit and schedules activation after 2 hours (positive/EP), (2) a limit exceeding the regulatory cap is rejected with HTTP 422 (negative/NEG), (3) a limit exactly at the regulatory cap is accepted (boundary/BVA), and (4) the state transition from pending to active after the cool-down elapses (STC). A decision-table case covering multi-channel submissions is also included. Tests are written against the /accounts/{id}/limits endpoint with a mock-clock or time-travel helper to keep them deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_limit_submission_stores_pending_limit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT in auth_headers fixture)\",\n        \"Account <ACCOUNT_ID> exists and belongs to the authenticated customer\",\n        \"Requested daily limit (5000) is below the regulatory cap\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/limits with channel=web, daily_limit=5000\",\n        \"Inspect response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains status=pending\",\n        \"Response body contains effective_at timestamp approximately 2 hours in the future\",\n        \"Subsequent GET /accounts/{id}/limits returns the pending record\"\n      ],\n      \"trace\": [\n        \"R-FIN-017: customer configures daily per-channel limit\",\n        \"R-FIN-017: pending limit stored\",\n        \"R-FIN-017: effective after cool-down\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_valid_limit_submission_stores_pending_limit(api_client, auth_headers, test_account_id):\\n    payload = {\\\"channel\\\": \\\"web\\\", \\\"daily_limit\\\": 5000}\\n    resp = api_client.post(\\n        f\\\"/accounts/{test_account_id}/limits\\\",\\n        json=payload,\\n        headers=auth_headers,\\n    )\\n    assert resp.status_code == 202, resp.text\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    effective_at = datetime.fromisoformat(body[\\\"effective_at\\\"])\\n    now_utc = datetime.now(timezone.utc)\\n    delta = effective_at - now_utc\\n    assert timedelta(hours=1, minutes=55) <= delta <= timedelta(hours=2, minutes=5), (\\n        f\\\"effective_at out of expected range: {delta}\\\"\\n    )\\n    get_resp = api_client.get(\\n        f\\\"/accounts/{test_account_id}/limits\\\",\\n        headers=auth_headers,\\n    )\\n    assert get_resp.status_code == 200\\n    pending = [r for r in get_resp.json()[\\\"limits\\\"] if r[\\\"status\\\"] == \\\"pending\\\"]\\n    assert any(r[\\\"daily_limit\\\"] == 5000 and r[\\\"channel\\\"] == \\\"web\\\" for r in pending)\"\n    },\n    {\n      \"name\": \"test_limit_over_regulatory_cap_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"Account <ACCOUNT_ID> exists\",\n        \"Regulatory cap for channel=web is known (REGULATORY_CAP fixture)\",\n        \"Requested daily limit exceeds REGULATORY_CAP by 1\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/limits with channel=web, daily_limit=REGULATORY_CAP+1\",\n        \"Inspect response status and error body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains error code LIMIT_EXCEEDS_REGULATORY_CAP\",\n        \"No pending limit record created for this channel\"\n      ],\n      \"trace\": [\n        \"R-FIN-017: error pathway - 422 when over regulatory cap\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_limit_over_regulatory_cap_returns_422(api_client, auth_headers, test_account_id, regulatory_cap):\\n    over_cap = regulatory_cap + 1\\n    resp = api_client.post(\\n        f\\\"/accounts/{test_account_id}/limits\\\",\\n        json={\\\"channel\\\": \\\"web\\\", \\\"daily_limit\\\": over_cap},\\n        headers=auth_headers,\\n    )\\n    assert resp.sta"
+  }
+}

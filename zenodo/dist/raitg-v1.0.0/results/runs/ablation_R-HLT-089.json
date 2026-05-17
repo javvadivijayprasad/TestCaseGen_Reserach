@@ -1,0 +1,189 @@
+{
+  "req": {
+    "id": "R-HLT-089",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Audit log access (audit)",
+    "statement": "A privacy-officer shall access audit logs scoped to their organisation; cross-organisation access shall be forbidden. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "privacy-officer"
+    ],
+    "preconditions": [
+      "role:privacy-officer"
+    ],
+    "triggers": [
+      "officer queries logs"
+    ],
+    "expected_outcomes": [
+      "records returned within org"
+    ],
+    "error_pathways": [
+      "403 when crossing org boundary"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AuditEvent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-089",
+    "reasoning": "The requirement mandates three distinct test concerns: (1) a privacy-officer can retrieve AuditEvent records scoped to their own organisation (positive/EP), (2) a privacy-officer is forbidden from accessing another organisation's audit logs (negative/NEG), and (3) a boundary case where the officer queries exactly at the org-scope boundary \u2014 i.e., a single AuditEvent record belonging to their org versus zero records when the filter yields nothing outside it (BVA). A fourth test verifies the end-to-end emission of an AuditEvent for the query operation itself (STC \u2014 the system must transition from 'operation performed' to 'audit record created'). A fifth test uses a Decision Table to cover the combined effect of role + org-scope on access.",
+    "tests": [
+      {
+        "name": "test_privacy_officer_can_read_own_org_audit_events",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User with role:privacy-officer exists for org_id=ORG_A",
+          "At least one AuditEvent record exists scoped to ORG_A",
+          "FHIR-Lite /AuditEvent endpoint is reachable"
+        ],
+        "actions": [
+          "Authenticate as privacy-officer of ORG_A to obtain bearer token",
+          "GET /AuditEvent?organization=ORG_A with Authorization header",
+          "Assert HTTP 200 and parse response bundle"
+        ],
+        "expected": [
+          "HTTP status 200",
+          "Response bundle resourceType equals Bundle",
+          "Every returned AuditEvent.agent[].who.reference contains ORG_A",
+          "bundle.total >= 1"
+        ],
+        "trace": [
+          "R-HLT-089: privacy-officer shall access audit logs scoped to their organisation",
+          "R-HLT-089: records returned within org"
+        ],
+        "executable": "import pytest\n\ndef test_privacy_officer_can_read_own_org_audit_events(\n    api_client,           # <fixture> returns authenticated httpx.Client\n    officer_token_org_a,  # <fixture> bearer token for privacy-officer of ORG_A\n    seed_audit_event_org_a,  # <fixture> ensures >=1 AuditEvent for ORG_A\n    base_url,             # <fixture> e.g. \"https://fhir-lite.internal\"\n    ORG_A,                # <fixture> org identifier string\n):\n    headers = {\"Authorization\": f\"Bearer {officer_token_org_a}\"}\n    resp = api_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"organization\": ORG_A},\n        headers=headers,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    assert bundle.get(\"total\", 0) >= 1\n    for entry in bundle.get(\"entry\", []):\n        resource = entry[\"resource\"]\n        agents = resource.get(\"agent\", [])\n        org_refs = [\n            a.get(\"who\", {}).get(\"reference\", \"\")\n            for a in agents\n        ]\n        assert any(ORG_A in ref for ref in org_refs), (\n            f\"AuditEvent {resource.get('id')} not scoped to {ORG_A}\"\n        )\n"
+      },
+      {
+        "name": "test_privacy_officer_forbidden_from_cross_org_audit_events",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User with role:privacy-officer exists for org_id=ORG_A",
+          "At least one AuditEvent record exists scoped to ORG_B",
+          "ORG_A != ORG_B"
+        ],
+        "actions": [
+          "Authenticate as privacy-officer of ORG_A to obtain bearer token",
+          "GET /AuditEvent?organization=ORG_B with ORG_A bearer token",
+          "Assert HTTP 403 and inspect error body"
+        ],
+        "expected": [
+          "HTTP status 403",
+          "Response body contains OperationOutcome or error code indicating forbidden",
+          "No AuditEvent data for ORG_B is disclosed"
+        ],
+        "trace": [
+          "R-HLT-089: cross-organisation access shall be forbidden",
+          "R-HLT-089: 403 when crossing org boundary"
+        ],
+        "executable": "import pytest\n\ndef test_privacy_officer_forbidden_from_cross_org_audit_events(\n    api_client,\n    officer_token_org_a,\n    seed_audit_event_org_b,  # <fixture> ensures >=1 AuditEvent for ORG_B\n    base_url,\n    ORG_B,\n):\n    headers = {\"Authorization\": f\"Bearer {officer_token_org_a}\"}\n    resp = api_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"organization\": ORG_B},\n        headers=headers,\n    )\n    assert resp.status_code == 403, (\n        f\"Expected 403 for cross-org access, got {resp.status_code}\"\n    )\n    body = resp.json()\n    # Must not leak any resource data\n    assert \"entry\" not in body or body.get(\"entry\") == []\n    # Should return an OperationOutcome\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n"
+      },
+      {
+        "name": "test_audit_event_emitted_after_query_operation",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User with role:privacy-officer exists for org_id=ORG_A",
+          "System can emit AuditEvent upon successful /AuditEvent query",
+          "A known correlation_id can be injected via X-Request-ID header"
+        ],
+        "actions": [
+          "Authenticate as privacy-officer of ORG_A",
+          "GET /AuditEvent?organization=ORG_A with unique X-Request-ID header",
+          "Assert HTTP 200",
+          "GET /AuditEvent?entity=<correlation_id> to retrieve the emitted audit record",
+          "Assert the system-emitted AuditEvent exists and references the operation"
+        ],
+        "expected": [
+          "Initial GET returns HTTP 200",
+          "A subsequent AuditEvent exists whose entity.what matches the correlation_id",
+          "AuditEvent.action is R (Read) or equivalent",
+          "AuditEvent.outcome is 0 (success)"
+        ],
+        "trace": [
+          "R-HLT-089: An AuditEvent must be emitted for every operation",
+          "R-HLT-089: tested end-to-end"
+        ],
+        "executable": "import uuid, time, pytest\n\ndef test_audit_event_emitted_after_query_operation(\n    api_client,\n    officer_token_org_a,\n    base_url,\n    ORG_A,\n):\n    correlation_id = str(uuid.uuid4())\n    headers = {\n        \"Authorization\": f\"Bearer {officer_token_org_a}\",\n        \"X-Request-ID\": correlation_id,\n    }\n    resp = api_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"organization\": ORG_A},\n        headers=headers,\n    )\n    assert resp.status_code == 200\n\n    # Allow async audit write to propagate\n    time.sleep(1)\n\n    audit_resp = api_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"entity\": correlation_id},\n        headers=headers,\n    )\n    assert audit_resp.status_code == 200\n    bundle = audit_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"No AuditEvent emitted for operation\"\n    event = bundle[\"entry\"][0][\"resource\"]\n    assert event.get(\"action\") == \"R\"\n    assert str(event.get(\"outcome\", \"\")) == \"0\"\n"
+      },
+      {
+        "name": "test_single_boundary_audit_event_within_org_scope",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User with role:privacy-officer exists for org_id=ORG_A",
+          "Exactly one AuditEvent record exists scoped to ORG_A (boundary minimum)",
+          "No additional records exist for ORG_A beyond that one"
+        ],
+        "actions": [
+          "Ensure exactly 1 AuditEvent exists for ORG_A using setup fixture",
+          "GET /AuditEvent?organization=ORG_A&_count=1 with ORG_A officer token",
+          "Assert exactly 1 record is returned"
+        ],
+        "expected": [
+          "HTTP status 200",
+          "bundle.total == 1",
+          "Exactly one entry in bundle.entry",
+          "Returned AuditEvent is scoped to ORG_A"
+        ],
+        "trace": [
+          "R-HLT-089: records returned within org (boundary: minimum one record)",
+          "R-HLT-089: privacy-officer shall access audit logs scoped to their organisation"
+        ],
+        "executable": "import pytest\n\ndef test_single_boundary_audit_event_within_org_scope(\n    api_client,\n    officer_token_org_a,\n    ensure_exactly_one_audit_event_org_a,  # <fixture> idempotently seeds exactly 1 record\n    base_url,\n    ORG_A,\n):\n    headers = {\"Authorization\": f\"Bearer {officer_token_org_a}\"}\n    resp = api_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"organization\": ORG_A, \"_count\": \"1\"},\n        headers=headers,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    assert bundle.get(\"total\") == 1, (\n        f\"Expected exactly 1 AuditEvent, got {bundle.get('total')}\"\n    )\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 1\n    resource = entries[0][\"resource\"]\n    agents = resource.get(\"agent\", [])\n    org_refs = [a.get(\"who\", {}).get(\"reference\", \"\") for a in agents]\n    assert any(ORG_A in ref for ref in org_refs)\n"
+      },
+      {
+        "name": "test_decision_table_role_and_org_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "privacy-officer for ORG_A exists",
+          "standard user (non-officer) for ORG_A exists",
+          "unauthenticated caller available",
+          "AuditEvent records exist for ORG_A"
+        ],
+        "actions": [
+          "For each (role, org_param, expected_status) combination in decision table:",
+          "  Send GET /AuditEvent?organization=<org_param> with appropriate credentials",
+          "  Assert response status matches expected_status"
+        ],
+        "expected": [
+          "privacy-officer + own org => 200",
+          "privacy-officer + foreign org => 403",
+          "non-officer authenticated + own org => 403",
+          "unauthenticated + own org => 401"
+        ],
+        "trace": [
+          "R-HLT-089: cross-organisation access shall be forbidden",
+          "R-HLT-089: 403 when crossing org boundary",
+          "R-HLT-089: role:privacy-officer precondition"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"token_fixture,org_param,expected_status\", [\n    (\"officer_token_org_a\",  \"ORG_A\", 200),\n    (\"officer_token_org_a\",  \"ORG_B\", 403),\n    (\"user_token_org_a\",     \"ORG_A\", 403),\n    (None,                   \"ORG_A\", 401),\n])\ndef test_decision_table_role_and_org_combinations(\n    request,\n    api_client,\n    base_url,\n    token_fixture,\n    org_param,\n    expected_status,\n    ORG_A,\n    ORG_B,\n):\n    token = request.getfixturevalue(token_fixture) if token_fixture else None\n    headers = {\"Authorization\": f\"Bearer {token}\"} if token else {}\n    resolved_org = ORG_A if org_param == \"ORG_A\" else ORG_B\n    resp = api_client.get(\n        f\"{base_url}/AuditEvent\",\n        params={\"organization\": resolved_org},\n        headers=headers,\n    )\n    assert resp.status_code == expected_status, (\n        f\"token={token_fixture} org={org_param}: \"\n        f\"expected {expected_status}, got {resp.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-089",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 3613,
+    "latency_ms": 37817,
+    "wall_ms": 37817,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-089\",\n  \"reasoning\": \"The requirement mandates three distinct test concerns: (1) a privacy-officer can retrieve AuditEvent records scoped to their own organisation (positive/EP), (2) a privacy-officer is forbidden from accessing another organisation's audit logs (negative/NEG), and (3) a boundary case where the officer queries exactly at the org-scope boundary \u2014 i.e., a single AuditEvent record belonging to their org versus zero records when the filter yields nothing outside it (BVA). A fourth test verifies the end-to-end emission of an AuditEvent for the query operation itself (STC \u2014 the system must transition from 'operation performed' to 'audit record created'). A fifth test uses a Decision Table to cover the combined effect of role + org-scope on access.\",\n  \"tests\": [\n    {\n      \"name\": \"test_privacy_officer_can_read_own_org_audit_events\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User with role:privacy-officer exists for org_id=ORG_A\",\n        \"At least one AuditEvent record exists scoped to ORG_A\",\n        \"FHIR-Lite /AuditEvent endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"Authenticate as privacy-officer of ORG_A to obtain bearer token\",\n        \"GET /AuditEvent?organization=ORG_A with Authorization header\",\n        \"Assert HTTP 200 and parse response bundle\"\n      ],\n      \"expected\": [\n        \"HTTP status 200\",\n        \"Response bundle resourceType equals Bundle\",\n        \"Every returned AuditEvent.agent[].who.reference contains ORG_A\",\n        \"bundle.total >= 1\"\n      ],\n      \"trace\": [\n        \"R-HLT-089: privacy-officer shall access audit logs scoped to their organisation\",\n        \"R-HLT-089: records returned within org\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_privacy_officer_can_read_own_org_audit_events(\\n    api_client,           # <fixture> returns authenticated httpx.Client\\n    officer_token_org_a,  # <fixture> bearer token for privacy-officer of ORG_A\\n    seed_audit_event_org_a,  # <fixture> ensures >=1 AuditEvent for ORG_A\\n    base_url,             # <fixture> e.g. \\\"https://fhir-lite.internal\\\"\\n    ORG_A,                # <fixture> org identifier string\\n):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {officer_token_org_a}\\\"}\\n    resp = api_client.get(\\n        f\\\"{base_url}/AuditEvent\\\",\\n        params={\\\"organization\\\": ORG_A},\\n        headers=headers,\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n    assert bundle.get(\\\"total\\\", 0) >= 1\\n    for entry in bundle.get(\\\"entry\\\", []):\\n        resource = entry[\\\"resource\\\"]\\n        agents = resource.get(\\\"agent\\\", [])\\n        org_refs = [\\n            a.get(\\\"who\\\", {}).get(\\\"reference\\\", \\\"\\\")\\n            for a in agents\\n        ]\\n        assert any(ORG_A in ref for ref in org_refs), (\\n            f\\\"AuditEvent {resource.get('id')} not scoped to {ORG_A}\\\"\\n        )\\n\"\n    },\n    {\n      \"name\": \"test_privacy_officer_forbidden_from_cross_org_audit_events\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User with role:privacy-officer exists for org_id=ORG_A\",\n        \"At least one AuditEvent record exists scoped to ORG_B\",\n        \"ORG_A != ORG_B\"\n      ],\n      \"actions\": [\n        \"Authenticate as privacy-officer of ORG_A to obtain bearer token\",\n        \"GET /AuditEvent?organization=ORG_B with ORG_A bearer token\",\n        \"Assert HTTP 403 and inspect error body\"\n      ],\n      \"expected\": [\n        \"HTTP status 403\",\n        \"Response body contains OperationOutcome or error code indicating forbidden\",\n        \"No AuditEvent data for ORG_B is disclosed\"\n      ],\n      \"trace\": [\n        \"R-HLT-089: cross-organisation access shall be forbidden\",\n        \"R-HLT-089: 403 when crossing org boundary\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_privacy_officer_forbidden_from_cross_org_audit_events(\\n    api_clie"
+  }
+}

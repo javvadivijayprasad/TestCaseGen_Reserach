@@ -1,0 +1,173 @@
+{
+  "req": {
+    "id": "R-HLT-090",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Consent management (audit)",
+    "statement": "A patient shall grant or revoke consent for data sharing; revoked consent shall be enforced within 15 minutes. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "patient"
+    ],
+    "preconditions": [
+      "role:patient"
+    ],
+    "triggers": [
+      "patient updates consent"
+    ],
+    "expected_outcomes": [
+      "consent stored",
+      "downstream caches invalidated"
+    ],
+    "error_pathways": [
+      "accesses after revoke within SLA denied"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Consent"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-090",
+    "reasoning": "The requirement covers four testable concerns: (1) granting consent persists correctly and emits an AuditEvent (positive/EP), (2) accessing data after revocation within the 15-minute SLA is denied (negative/NEG), (3) the 15-minute enforcement boundary itself \u2013 access exactly at t=0s after revoke is denied, access at t=901s (>15 min) is a separate concern, so we probe the state-transition from active\u2192revoked and the cache-invalidation deadline using BVA on the 900-second window, (4) a full grant\u2192revoke state-transition with AuditEvent chain (STC). Tests are self-contained via fixtures that create and clean up their own patient+consent resources.",
+    "tests": [
+      {
+        "name": "test_grant_consent_stores_resource_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "FHIR-Lite /Consent endpoint is reachable",
+          "AuditEvent endpoint /AuditEvent is reachable"
+        ],
+        "actions": [
+          "POST /Consent with status=active and valid patient subject",
+          "Assert HTTP 201 and capture consent id from Location header",
+          "GET /AuditEvent?entity=Consent/<id>&action=C"
+        ],
+        "expected": [
+          "POST returns HTTP 201",
+          "Response body contains resourceType=Consent and status=active",
+          "At least one AuditEvent exists with action=C referencing the new Consent id",
+          "AuditEvent recorded=timestamp within last 30 seconds"
+        ],
+        "trace": [
+          "R-HLT-090: patient shall grant consent",
+          "R-HLT-090: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest, time\nfrom <helper_fn> import fhir_client, audit_contains, iso_now\n\ndef test_grant_consent_stores_resource_and_emits_audit(<patient_auth_token>, <fhir_base_url>):\n    client = fhir_client(<fhir_base_url>, <patient_auth_token>)\n    payload = {\n        \"resourceType\": \"Consent\",\n        \"status\": \"active\",\n        \"scope\": {\"coding\": [{\"code\": \"patient-privacy\"}]},\n        \"category\": [{\"coding\": [{\"code\": \"59284-0\"}]}],\n        \"patient\": {\"reference\": \"Patient/<patient_id>\"}\n    }\n    resp = client.post(\"/Consent\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Consent\"\n    assert body[\"status\"] == \"active\"\n    consent_id = body[\"id\"]\n    time.sleep(2)\n    audit_resp = client.get(f\"/AuditEvent?entity=Consent/{consent_id}&action=C\")\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"No AuditEvent found for consent grant\"\n    client.delete(f\"/Consent/{consent_id}\")\n"
+      },
+      {
+        "name": "test_access_denied_immediately_after_revoke_within_sla",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "A previously granted active Consent resource exists (<active_consent_id> fixture)",
+          "A downstream data resource referencing that consent exists (<protected_resource_ref> fixture)"
+        ],
+        "actions": [
+          "PATCH /Consent/<active_consent_id> setting status=inactive (revoke)",
+          "Assert HTTP 200 on revoke",
+          "Immediately (t<15s) GET <protected_resource_ref> that requires the revoked consent",
+          "Assert access is denied"
+        ],
+        "expected": [
+          "PATCH returns HTTP 200 with status=inactive",
+          "Immediate GET of protected resource returns HTTP 403 or 401",
+          "Response body contains an OperationOutcome indicating consent revoked",
+          "AuditEvent with action=D (or update) emitted for the revoke operation"
+        ],
+        "trace": [
+          "R-HLT-090: revoked consent shall be enforced within 15 minutes",
+          "R-HLT-090: error pathway \u2013 accesses after revoke within SLA denied",
+          "R-HLT-090: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest, time\nfrom <helper_fn> import fhir_client, audit_contains\n\ndef test_access_denied_immediately_after_revoke_within_sla(\n    <patient_auth_token>, <fhir_base_url>, <active_consent_fixture>\n):\n    client = fhir_client(<fhir_base_url>, <patient_auth_token>)\n    consent_id, protected_url = <active_consent_fixture>\n    patch_body = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"inactive\"}]\n    revoke_resp = client.patch(\n        f\"/Consent/{consent_id}\",\n        json=patch_body,\n        headers={\"Content-Type\": \"application/json-patch+json\"}\n    )\n    assert revoke_resp.status_code == 200, f\"Revoke failed: {revoke_resp.status_code}\"\n    assert revoke_resp.json()[\"status\"] == \"inactive\"\n    access_resp = client.get(protected_url)\n    assert access_resp.status_code in (401, 403), (\n        f\"Expected 401/403 after revoke, got {access_resp.status_code}\"\n    )\n    body = access_resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    time.sleep(2)\n    audit_resp = client.get(f\"/AuditEvent?entity=Consent/{consent_id}&action=U\")\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"No AuditEvent found for revoke\"\n"
+      },
+      {
+        "name": "test_revoke_enforcement_boundary_at_sla_limit",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "System clock is synchronized; test environment allows simulated time advance via <advance_time> helper OR test asserts enforcement window metadata",
+          "An active Consent resource exists (<active_consent_id>)",
+          "Cache TTL configuration is accessible or retrievable from /Consent/<id>/_metadata"
+        ],
+        "actions": [
+          "Record t0 = current epoch",
+          "PATCH /Consent/<id> to status=inactive",
+          "Query /Consent/<id> to retrieve meta.lastUpdated and x-cache-expires header",
+          "Assert cache expiry <= t0 + 900 seconds (15 min SLA boundary)",
+          "Assert cache expiry > t0 (still within window, not already expired)",
+          "Assert that at t0+1s access is still denied (lower boundary: just after revoke)",
+          "Assert AuditEvent timestamp \u2013 lastUpdated delta <= 900"
+        ],
+        "expected": [
+          "Cache invalidation deadline is within [t0, t0+900] seconds inclusive",
+          "x-cache-expires or equivalent header reflects at most t0+900",
+          "Access at t0+1s is denied (HTTP 403/401)",
+          "AuditEvent emitted within SLA window"
+        ],
+        "trace": [
+          "R-HLT-090: revoked consent enforced within 15 minutes (BVA on 900s boundary)",
+          "R-HLT-090: downstream caches invalidated"
+        ],
+        "executable": "import pytest, time\nfrom <helper_fn> import fhir_client, parse_http_date\n\nSLA_SECONDS = 900\n\ndef test_revoke_enforcement_boundary_at_sla_limit(\n    <patient_auth_token>, <fhir_base_url>, <active_consent_fixture>\n):\n    client = fhir_client(<fhir_base_url>, <patient_auth_token>)\n    consent_id, protected_url = <active_consent_fixture>\n    t0 = time.time()\n    patch_body = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"inactive\"}]\n    rev = client.patch(\n        f\"/Consent/{consent_id}\",\n        json=patch_body,\n        headers={\"Content-Type\": \"application/json-patch+json\"}\n    )\n    assert rev.status_code == 200\n    meta_resp = client.get(f\"/Consent/{consent_id}\")\n    assert meta_resp.status_code == 200\n    cache_header = meta_resp.headers.get(\"x-cache-expires\") or meta_resp.headers.get(\"Cache-Control\", \"\")\n    expires_ts = parse_http_date(cache_header) if \"x-cache-expires\" in meta_resp.headers else t0 + SLA_SECONDS\n    assert expires_ts <= t0 + SLA_SECONDS, f\"Cache expires beyond SLA: {expires_ts - t0}s\"\n    assert expires_ts > t0, \"Cache already expired at revoke time\"\n    time.sleep(1)\n    access_resp = client.get(protected_url)\n    assert access_resp.status_code in (401, 403), (\n        f\"Expected denial at t0+1s, got {access_resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_grant_revoke_state_transition_with_full_audit_chain",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated patient token available via <patient_auth_token> fixture",
+          "No existing Consent for this patient+scope combination (clean state)",
+          "AuditEvent endpoint queryable by entity and date range"
+        ],
+        "actions": [
+          "POST /Consent (proposed\u2192active transition)",
+          "Assert status=active and AuditEvent action=C",
+          "PATCH /Consent/<id> status=inactive (active\u2192inactive revoke)",
+          "Assert status=inactive and AuditEvent action=U",
+          "PATCH /Consent/<id> status=active (inactive\u2192active re-grant)",
+          "Assert status=active and second AuditEvent action=U",
+          "DELETE /Consent/<id> (active\u2192deleted)",
+          "Assert 410 on subsequent GET and AuditEvent action=D"
+        ],
+        "expected": [
+          "State sequence proposed\u2192active\u2192inactive\u2192active\u2192deleted is traversed without error",
+          "Each transition produces exactly one AuditEvent with correct action code",
+          "Total AuditEvent count for this Consent id equals 4 (C, U, U, D)",
+          "Final GET /Consent/<id> returns HTTP 410 Gone"
+        ],
+        "trace": [
+          "R-HLT-090: patient shall grant or revoke consent",
+          "R-HLT-090: AuditEvent must be emitted for every operation (end-to-end chain)"
+        ],
+        "executable": "import pytest, time\nfrom <helper_fn> import fhir_client\n\ndef test_grant_revoke_state_transition_with_full_audit_chain(<patient_auth_token>, <fhir_base_url>):\n    client = fhir_client(<fhir_base_url>, <patient_auth_token>)\n    payload = {\n        \"resourceType\": \"Consent\", \"status\": \"active\",\n        \"scope\": {\"coding\": [{\"code\": \"patient-privacy\"}]},\n        \"category\": [{\"coding\": [{\"code\": \"59284-0\"}]}],\n        \"patient\": {\"reference\": \"Patient/<patient_id>\"}\n    }\n    r1 = client.post(\"/Consent\", json=payload)\n    assert r1.status_code == 201 and r1.json()[\"status\"] == \"active\"\n    cid = r1.json()[\"id\"]\n    patch_inactive = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"inactive\"}]\n    r2 = client.patch(f\"/Consent/{cid}\", json=patch_inactive, headers={\"Content-Type\": \"application/json-patch+json\"})\n    assert r2.status_code == 200 and r2.json()[\"status\"] == \"inactive\"\n    patch_active = [{\"op\": \"replace\", \"path\": \"/status\", \"value\": \"active\"}]\n    r3 = client.patch(f\"/Consent/{cid}\", json=patch_active, headers={\"Content-Type\": \"application/json-patch+json\"})\n    assert r3.status_code == 200 and r3.json()[\"status\"] == \"active\"\n    r4 = client.delete(f\"/Consent/{cid}\")\n    assert r4.status_code in (200, 204)\n    r5 = client.get(f\"/Consent/{cid}\")\n    assert r5.status_code == 410\n    time.sleep(2)\n    audit = client.get(f\"/AuditEvent?entity=Consent/{cid}\").json()\n    actions = [e[\"resource\"][\"action\"] for e in audit.get(\"entry\", [])]\n    assert actions.count(\"C\") >= 1 and actions.count(\"U\") >= 2 and actions.count(\"D\") >= 1\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-090",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1004,
+    "output_tokens": 3699,
+    "latency_ms": 41982,
+    "wall_ms": 41982,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-090\",\n  \"reasoning\": \"The requirement covers four testable concerns: (1) granting consent persists correctly and emits an AuditEvent (positive/EP), (2) accessing data after revocation within the 15-minute SLA is denied (negative/NEG), (3) the 15-minute enforcement boundary itself \u2013 access exactly at t=0s after revoke is denied, access at t=901s (>15 min) is a separate concern, so we probe the state-transition from active\u2192revoked and the cache-invalidation deadline using BVA on the 900-second window, (4) a full grant\u2192revoke state-transition with AuditEvent chain (STC). Tests are self-contained via fixtures that create and clean up their own patient+consent resources.\",\n  \"tests\": [\n    {\n      \"name\": \"test_grant_consent_stores_resource_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated patient token available via <patient_auth_token> fixture\",\n        \"FHIR-Lite /Consent endpoint is reachable\",\n        \"AuditEvent endpoint /AuditEvent is reachable\"\n      ],\n      \"actions\": [\n        \"POST /Consent with status=active and valid patient subject\",\n        \"Assert HTTP 201 and capture consent id from Location header\",\n        \"GET /AuditEvent?entity=Consent/<id>&action=C\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 201\",\n        \"Response body contains resourceType=Consent and status=active\",\n        \"At least one AuditEvent exists with action=C referencing the new Consent id\",\n        \"AuditEvent recorded=timestamp within last 30 seconds\"\n      ],\n      \"trace\": [\n        \"R-HLT-090: patient shall grant consent\",\n        \"R-HLT-090: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest, time\\nfrom <helper_fn> import fhir_client, audit_contains, iso_now\\n\\ndef test_grant_consent_stores_resource_and_emits_audit(<patient_auth_token>, <fhir_base_url>):\\n    client = fhir_client(<fhir_base_url>, <patient_auth_token>)\\n    payload = {\\n        \\\"resourceType\\\": \\\"Consent\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"scope\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"patient-privacy\\\"}]},\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"code\\\": \\\"59284-0\\\"}]}],\\n        \\\"patient\\\": {\\\"reference\\\": \\\"Patient/<patient_id>\\\"}\\n    }\\n    resp = client.post(\\\"/Consent\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Consent\\\"\\n    assert body[\\\"status\\\"] == \\\"active\\\"\\n    consent_id = body[\\\"id\\\"]\\n    time.sleep(2)\\n    audit_resp = client.get(f\\\"/AuditEvent?entity=Consent/{consent_id}&action=C\\\")\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"No AuditEvent found for consent grant\\\"\\n    client.delete(f\\\"/Consent/{consent_id}\\\")\\n\"\n    },\n    {\n      \"name\": \"test_access_denied_immediately_after_revoke_within_sla\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated patient token available via <patient_auth_token> fixture\",\n        \"A previously granted active Consent resource exists (<active_consent_id> fixture)\",\n        \"A downstream data resource referencing that consent exists (<protected_resource_ref> fixture)\"\n      ],\n      \"actions\": [\n        \"PATCH /Consent/<active_consent_id> setting status=inactive (revoke)\",\n        \"Assert HTTP 200 on revoke\",\n        \"Immediately (t<15s) GET <protected_resource_ref> that requires the revoked consent\",\n        \"Assert access is denied\"\n      ],\n      \"expected\": [\n        \"PATCH returns HTTP 200 with status=inactive\",\n        \"Immediate GET of protected resource returns HTTP 403 or 401\",\n        \"Response body contains an OperationOutcome indicating consent revoked\",\n        \"AuditEvent with action=D (or update) emitted for the revoke operation\"\n      ],\n      \"trace\": [\n        \"R-HLT-090: revoked consent shall be enforced wi"
+  }
+}

@@ -1,0 +1,196 @@
+{
+  "req": {
+    "id": "R-HLT-100",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "integration",
+    "title": "Message to provider (audit)",
+    "statement": "A patient shall send a message to their provider; messages containing attachments shall scan for disallowed PHI exfiltration patterns. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient sends message"
+    ],
+    "expected_outcomes": [
+      "message stored",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "blocked when disallowed attachment detected"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/messages"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-100",
+    "reasoning": "The requirement covers three distinct test dimensions: (1) a standard message send with audit emission (positive/EP), (2) blocking of a message with a disallowed PHI attachment (negative/NEG+DT), and (3) a boundary case around the maximum allowed message size with a clean attachment that is exactly at the size limit (boundary/BVA). A fourth state-transition test covers the full lifecycle state: draft \u2192 sent \u2192 provider-notified, verifying each AuditEvent node. Together these satisfy \u22651 positive, \u22651 negative, \u22651 boundary requirement while providing meaningful decision-table and state-transition coverage of the audit pathway.",
+    "tests": [
+      {
+        "name": "test_send_plain_message_emits_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "Provider exists in the system with a known ID",
+          "FHIR-Lite /messages endpoint is reachable"
+        ],
+        "actions": [
+          "POST a plain-text message payload to /messages with no attachment",
+          "Capture the HTTP response and extract the message resource ID",
+          "Query the AuditEvent endpoint filtering by entity reference to the new message ID"
+        ],
+        "expected": [
+          "HTTP 201 Created returned by /messages",
+          "Response body contains a stored message resource with an id field",
+          "At least one AuditEvent exists whose entity.what.reference matches the message id",
+          "AuditEvent.action equals 'C' (create) and outcome equals '0' (success)"
+        ],
+        "trace": [
+          "R-HLT-100: message stored",
+          "R-HLT-100: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\n\ndef test_send_plain_message_emits_audit_event(auth_session, api_base_url, known_provider_id):\n    payload = {\n        \"resourceType\": \"Communication\",\n        \"status\": \"completed\",\n        \"recipient\": [{\"reference\": f\"Practitioner/{known_provider_id}\"}],\n        \"payload\": [{\"contentString\": \"Hello, I have a question about my prescription.\"}]\n    }\n    resp = auth_session.post(f\"{api_base_url}/messages\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n\n    message_id = resp.json()[\"id\"]\n    assert message_id, \"No id returned in message response\"\n\n    audit_resp = auth_session.get(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"entity\": f\"Communication/{message_id}\"}\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"No AuditEvent found for message\"\n\n    event = entries[0][\"resource\"]\n    assert event.get(\"action\") == \"C\"\n    assert event.get(\"outcome\") == \"0\""
+      },
+      {
+        "name": "test_message_with_phi_attachment_is_blocked_and_audit_logged",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "PHI exfiltration pattern detector is active on the server",
+          "A file containing a disallowed PHI pattern (SSN regex match) is available as test fixture"
+        ],
+        "actions": [
+          "Construct a message payload that includes a base64-encoded attachment containing a disallowed SSN pattern",
+          "POST the payload to /messages",
+          "Query AuditEvent for the attempted operation using the patient subject reference"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity or 403 Forbidden returned",
+          "Response body contains an error code referencing PHI exfiltration policy",
+          "Message resource is NOT persisted (GET /messages returns no matching entry)",
+          "An AuditEvent is emitted with outcome != '0' indicating failure/block"
+        ],
+        "trace": [
+          "R-HLT-100: blocked when disallowed attachment detected",
+          "R-HLT-100: AuditEvent emitted for every operation"
+        ],
+        "executable": "import pytest\nimport base64\n\ndef test_message_with_phi_attachment_is_blocked_and_audit_logged(\n    auth_session, api_base_url, known_provider_id, patient_subject_ref\n):\n    phi_content = base64.b64encode(b\"Patient SSN: 123-45-6789\").decode()\n    payload = {\n        \"resourceType\": \"Communication\",\n        \"status\": \"completed\",\n        \"recipient\": [{\"reference\": f\"Practitioner/{known_provider_id}\"}],\n        \"payload\": [{\n            \"contentAttachment\": {\n                \"contentType\": \"text/plain\",\n                \"data\": phi_content,\n                \"title\": \"notes.txt\"\n            }\n        }]\n    }\n    resp = auth_session.post(f\"{api_base_url}/messages\", json=payload)\n    assert resp.status_code in (403, 422), f\"Expected block, got {resp.status_code}\"\n\n    error_body = resp.json()\n    assert \"phi\" in str(error_body).lower() or \"exfiltration\" in str(error_body).lower()\n\n    audit_resp = auth_session.get(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"agent\": patient_subject_ref, \"outcome:not\": \"0\"}\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"No failure AuditEvent found for blocked message\""
+      },
+      {
+        "name": "test_message_attachment_at_maximum_allowed_size_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated and session token is valid",
+          "System-configured maximum attachment size in bytes is retrievable via <get_max_attachment_bytes> helper",
+          "Attachment content at exactly max size contains no PHI patterns"
+        ],
+        "actions": [
+          "Retrieve the configured maximum attachment byte size",
+          "Generate a clean binary payload of exactly that many bytes",
+          "Base64-encode the payload and embed it in a Communication attachment",
+          "POST the message to /messages",
+          "Verify AuditEvent is emitted with success outcome"
+        ],
+        "expected": [
+          "HTTP 201 Created returned",
+          "Message resource id is present in the response",
+          "AuditEvent with outcome '0' (success) is emitted referencing the new message"
+        ],
+        "trace": [
+          "R-HLT-100: message stored",
+          "R-HLT-100: AuditEvent emitted for every operation",
+          "BVA: attachment at exact upper boundary of allowed size"
+        ],
+        "executable": "import pytest\nimport base64\n\ndef test_message_attachment_at_maximum_allowed_size_accepted(\n    auth_session, api_base_url, known_provider_id\n):\n    max_bytes = <get_max_attachment_bytes>(auth_session, api_base_url)\n    clean_data = b\"A\" * max_bytes\n    encoded = base64.b64encode(clean_data).decode()\n\n    payload = {\n        \"resourceType\": \"Communication\",\n        \"status\": \"completed\",\n        \"recipient\": [{\"reference\": f\"Practitioner/{known_provider_id}\"}],\n        \"payload\": [{\n            \"contentAttachment\": {\n                \"contentType\": \"application/octet-stream\",\n                \"data\": encoded,\n                \"title\": \"boundary_file.bin\"\n            }\n        }]\n    }\n    resp = auth_session.post(f\"{api_base_url}/messages\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201 at max boundary, got {resp.status_code}\"\n\n    message_id = resp.json()[\"id\"]\n    audit_resp = auth_session.get(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"entity\": f\"Communication/{message_id}\"}\n    )\n    entries = audit_resp.json().get(\"entry\", [])\n    assert any(e[\"resource\"].get(\"outcome\") == \"0\" for e in entries), \"No success AuditEvent\""
+      },
+      {
+        "name": "test_message_send_state_transitions_draft_to_notified_with_audit_chain",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Patient is authenticated",
+          "Provider is enrolled and notification delivery is enabled",
+          "Message workflow supports draft status before submission"
+        ],
+        "actions": [
+          "POST a Communication resource in status 'preparation' (draft) to /messages",
+          "PATCH the same resource to status 'in-progress' (sending)",
+          "PATCH the resource to status 'completed' (sent)",
+          "Poll GET /messages/{id} until provider-notification flag is set",
+          "Collect all AuditEvents for the message resource id"
+        ],
+        "expected": [
+          "Each PATCH returns HTTP 200",
+          "Final GET shows status 'completed' and notification acknowledged",
+          "Three or more AuditEvents exist covering create, update (\u00d72), and notification states",
+          "AuditEvent sequence reflects chronological state progression"
+        ],
+        "trace": [
+          "R-HLT-100: message stored",
+          "R-HLT-100: provider notified",
+          "R-HLT-100: AuditEvent emitted for every operation",
+          "STC: draft \u2192 sending \u2192 sent \u2192 notified state chain"
+        ],
+        "executable": "import pytest\nimport time\n\ndef test_message_send_state_transitions_draft_to_notified_with_audit_chain(\n    auth_session, api_base_url, known_provider_id\n):\n    create_payload = {\n        \"resourceType\": \"Communication\",\n        \"status\": \"preparation\",\n        \"recipient\": [{\"reference\": f\"Practitioner/{known_provider_id}\"}],\n        \"payload\": [{\"contentString\": \"State transition test message\"}]\n    }\n    r1 = auth_session.post(f\"{api_base_url}/messages\", json=create_payload)\n    assert r1.status_code == 201\n    msg_id = r1.json()[\"id\"]\n\n    r2 = auth_session.patch(\n        f\"{api_base_url}/messages/{msg_id}\",\n        json={\"status\": \"in-progress\"}\n    )\n    assert r2.status_code == 200\n\n    r3 = auth_session.patch(\n        f\"{api_base_url}/messages/{msg_id}\",\n        json={\"status\": \"completed\"}\n    )\n    assert r3.status_code == 200\n\n    final = <poll_until>(\n        lambda: auth_session.get(f\"{api_base_url}/messages/{msg_id}\"),\n        condition=lambda r: r.json().get(\"status\") == \"completed\",\n        timeout=10\n    )\n    assert final.json()[\"status\"] == \"completed\"\n\n    audit_resp = auth_session.get(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"entity\": f\"Communication/{msg_id}\", \"_sort\": \"date\"}\n    )\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 3, f\"Expected >=3 AuditEvents, got {len(entries)}\""
+      },
+      {
+        "name": "test_message_exceeding_max_attachment_size_is_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is authenticated",
+          "System enforces a maximum attachment byte size",
+          "Attachment content one byte above the limit contains no PHI patterns"
+        ],
+        "actions": [
+          "Retrieve the configured maximum attachment byte size",
+          "Generate a clean payload of exactly max_bytes + 1",
+          "Base64-encode and embed in a Communication attachment",
+          "POST the message to /messages",
+          "Query AuditEvent for a failure record"
+        ],
+        "expected": [
+          "HTTP 413 Payload Too Large or 422 Unprocessable Entity returned",
+          "No message resource is persisted",
+          "An AuditEvent with non-zero outcome is recorded for the rejected attempt"
+        ],
+        "trace": [
+          "R-HLT-100: blocked when disallowed attachment detected",
+          "R-HLT-100: AuditEvent emitted for every operation",
+          "DT: rule \u2014 oversized attachment regardless of content type => reject",
+          "BVA: one byte above upper boundary"
+        ],
+        "executable": "import pytest\nimport base64\n\ndef test_message_exceeding_max_attachment_size_is_rejected(\n    auth_session, api_base_url, known_provider_id, patient_subject_ref\n):\n    max_bytes = <get_max_attachment_bytes>(auth_session, api_base_url)\n    oversized_data = b\"B\" * (max_bytes + 1)\n    encoded = base64.b64encode(oversized_data).decode()\n\n    payload = {\n        \"resourceType\": \"Communication\",\n        \"status\": \"completed\",\n        \"recipient\": [{\"reference\": f\"Practitioner/{known_provider_id}\"}],\n        \"payload\": [{\n            \"contentAttachment\": {\n                \"contentType\": \"application/octet-stream\",\n                \"data\": encoded,\n                \"title\": \"oversized.bin\"\n            }\n        }]\n    }\n    resp = auth_session.post(f\"{api_base_url}/messages\", json=payload)\n    assert resp.status_code in (413, 422), f\"Expected rejection, got {resp.status_code}\"\n\n    audit_resp = auth_session.get(\n        f\"{api_base_url}/AuditEvent\",\n        params={\"agent\": patient_subject_ref, \"outcome:not\": \"0\"}\n    )\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"Expected a failure AuditEvent for oversized attachment\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-100",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 3911,
+    "latency_ms": 43860,
+    "wall_ms": 43860,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-100\",\n  \"reasoning\": \"The requirement covers three distinct test dimensions: (1) a standard message send with audit emission (positive/EP), (2) blocking of a message with a disallowed PHI attachment (negative/NEG+DT), and (3) a boundary case around the maximum allowed message size with a clean attachment that is exactly at the size limit (boundary/BVA). A fourth state-transition test covers the full lifecycle state: draft \u2192 sent \u2192 provider-notified, verifying each AuditEvent node. Together these satisfy \u22651 positive, \u22651 negative, \u22651 boundary requirement while providing meaningful decision-table and state-transition coverage of the audit pathway.\",\n  \"tests\": [\n    {\n      \"name\": \"test_send_plain_message_emits_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated and session token is valid\",\n        \"Provider exists in the system with a known ID\",\n        \"FHIR-Lite /messages endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST a plain-text message payload to /messages with no attachment\",\n        \"Capture the HTTP response and extract the message resource ID\",\n        \"Query the AuditEvent endpoint filtering by entity reference to the new message ID\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created returned by /messages\",\n        \"Response body contains a stored message resource with an id field\",\n        \"At least one AuditEvent exists whose entity.what.reference matches the message id\",\n        \"AuditEvent.action equals 'C' (create) and outcome equals '0' (success)\"\n      ],\n      \"trace\": [\n        \"R-HLT-100: message stored\",\n        \"R-HLT-100: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_send_plain_message_emits_audit_event(auth_session, api_base_url, known_provider_id):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Communication\\\",\\n        \\\"status\\\": \\\"completed\\\",\\n        \\\"recipient\\\": [{\\\"reference\\\": f\\\"Practitioner/{known_provider_id}\\\"}],\\n        \\\"payload\\\": [{\\\"contentString\\\": \\\"Hello, I have a question about my prescription.\\\"}]\\n    }\\n    resp = auth_session.post(f\\\"{api_base_url}/messages\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n\\n    message_id = resp.json()[\\\"id\\\"]\\n    assert message_id, \\\"No id returned in message response\\\"\\n\\n    audit_resp = auth_session.get(\\n        f\\\"{api_base_url}/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Communication/{message_id}\\\"}\\n    )\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"No AuditEvent found for message\\\"\\n\\n    event = entries[0][\\\"resource\\\"]\\n    assert event.get(\\\"action\\\") == \\\"C\\\"\\n    assert event.get(\\\"outcome\\\") == \\\"0\\\"\"\n    },\n    {\n      \"name\": \"test_message_with_phi_attachment_is_blocked_and_audit_logged\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated and session token is valid\",\n        \"PHI exfiltration pattern detector is active on the server\",\n        \"A file containing a disallowed PHI pattern (SSN regex match) is available as test fixture\"\n      ],\n      \"actions\": [\n        \"Construct a message payload that includes a base64-encoded attachment containing a disallowed SSN pattern\",\n        \"POST the payload to /messages\",\n        \"Query AuditEvent for the attempted operation using the patient subject reference\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity or 403 Forbidden returned\",\n        \"Response body contains an error code referencing PHI exfiltration policy\",\n        \"Message resource is NOT persisted (GET /messages returns no matching entry)\",\n        \"An AuditEvent is emitted with outcome != '0' indicating failure/block\"\n      ],\n      \"trace\": [\n        \"R-HLT-100: blocked when disallowed attachment detected\",\n        \"R-"
+  }
+}

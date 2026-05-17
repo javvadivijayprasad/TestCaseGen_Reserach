@@ -1,0 +1,137 @@
+{
+  "req": {
+    "id": "R-HLT-016",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Bulk data export",
+    "statement": "A provisioned client shall request a FHIR bulk export; large datasets shall be paginated with NDJSON output.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authorized bulk-client"
+    ],
+    "triggers": [
+      "client requests export"
+    ],
+    "expected_outcomes": [
+      "export job queued",
+      "NDJSON stream produced"
+    ],
+    "error_pathways": [
+      "403 when unauthorised"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/$export"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-016",
+    "reasoning": "R-HLT-016 mandates that a provisioned bulk client can trigger a FHIR $export operation, receive a 202 with a Content-Location poll URL, and ultimately obtain NDJSON output for large datasets paginated across multiple files. Three orthogonal test scenarios are designed: (1) EP positive \u2013 an authorised client gets a 202 and the job eventually yields NDJSON; (2) NEG negative \u2013 an unauthorised client is rejected with 403; (3) BVA boundary \u2013 the last page of a paginated NDJSON export contains exactly zero additional resources (empty sentinel), verifying the boundary between the final page and end-of-stream. Each test uses a shared fixture for the base URL and auth tokens, and delegates polling/parsing to concise helper placeholders to stay within the 40-line limit.",
+    "tests": [
+      {
+        "name": "test_authorised_bulk_export_queued_and_produces_ndjson",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "Client is provisioned with a valid bulk-export OAuth2 token (scope: system/*.read)",
+          "At least one FHIR resource exists in the server"
+        ],
+        "actions": [
+          "Send GET /$export with Accept: application/fhir+json and Prefer: respond-async using the authorised token",
+          "Assert HTTP 202 is returned with a Content-Location header",
+          "Poll the Content-Location URL until status 200 (job complete) or timeout",
+          "Retrieve the first output URL from the manifest",
+          "Fetch the NDJSON output file"
+        ],
+        "expected": [
+          "Initial response status is 202",
+          "Content-Location header is present and is a valid URL",
+          "Completed manifest contains an 'output' array with at least one entry",
+          "Each output entry has type 'ndjson' and a valid url field",
+          "NDJSON file contains at least one valid JSON object per line"
+        ],
+        "trace": [
+          "R-HLT-016: export job queued",
+          "R-HLT-016: NDJSON stream produced"
+        ],
+        "executable": "import pytest\nimport time\n\ndef test_authorised_bulk_export_queued_and_produces_ndjson(\n    bulk_auth_headers, fhir_base_url, poll_until_complete\n):\n    resp = <http_client>.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\n            **bulk_auth_headers,\n            \"Accept\": \"application/fhir+json\",\n            \"Prefer\": \"respond-async\",\n        },\n    )\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}\"\n    content_location = resp.headers.get(\"Content-Location\")\n    assert content_location, \"Content-Location header missing\"\n\n    manifest = poll_until_complete(content_location, bulk_auth_headers)\n    assert \"output\" in manifest, \"Manifest missing 'output' key\"\n    assert len(manifest[\"output\"]) >= 1, \"No output files in manifest\"\n\n    first_url = manifest[\"output\"][0][\"url\"]\n    ndjson_resp = <http_client>.get(first_url, headers=bulk_auth_headers)\n    assert ndjson_resp.status_code == 200\n    lines = [l for l in ndjson_resp.text.splitlines() if l.strip()]\n    assert len(lines) >= 1, \"NDJSON file is empty\"\n    import json\n    for line in lines:\n        obj = json.loads(line)\n        assert \"resourceType\" in obj\n"
+      },
+      {
+        "name": "test_unauthorised_client_receives_403_on_bulk_export",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A token exists that does NOT have the bulk-export scope (or is entirely absent)"
+        ],
+        "actions": [
+          "Send GET /$export with Accept: application/fhir+json and Prefer: respond-async using an invalid/missing token",
+          "Inspect the HTTP response status code and body"
+        ],
+        "expected": [
+          "HTTP response status is 403",
+          "Response body is a FHIR OperationOutcome with severity 'error'",
+          "No Content-Location header is present"
+        ],
+        "trace": [
+          "R-HLT-016: error pathway \u2013 403 when unauthorised"
+        ],
+        "executable": "import json\nimport pytest\n\ndef test_unauthorised_client_receives_403_on_bulk_export(\n    no_auth_headers, fhir_base_url\n):\n    resp = <http_client>.get(\n        f\"{fhir_base_url}/$export\",\n        headers={\n            **no_auth_headers,\n            \"Accept\": \"application/fhir+json\",\n            \"Prefer\": \"respond-async\",\n        },\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n    assert \"Content-Location\" not in resp.headers, \\\n        \"Content-Location must not be present for rejected request\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\", \\\n        \"Body must be an OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"severity\") == \"error\" for i in issues), \\\n        \"OperationOutcome must contain at least one error-severity issue\"\n"
+      },
+      {
+        "name": "test_paginated_export_last_page_is_empty_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "Client is provisioned with a valid bulk-export token",
+          "Server is seeded with exactly N resources where N equals the page-size limit (so page 1 is full and page 2 is empty/absent)"
+        ],
+        "actions": [
+          "Send GET /$export with _count equal to the server page size using the authorised token",
+          "Poll Content-Location until manifest is ready",
+          "Collect all output file URLs from the manifest",
+          "Fetch every output file and count total NDJSON lines",
+          "Attempt to fetch a hypothetical next-page URL (page index = len(output) + 1) to verify no additional page exists"
+        ],
+        "expected": [
+          "Manifest 'output' array length equals the expected number of pages for exact page-size dataset",
+          "Total NDJSON lines across all pages equals exactly the seeded resource count",
+          "Requesting a page beyond the last returns 404 or is absent from the manifest",
+          "No line on the final page is blank or malformed"
+        ],
+        "trace": [
+          "R-HLT-016: large datasets shall be paginated",
+          "R-HLT-016: NDJSON stream produced",
+          "BVA \u2013 boundary between last populated page and end-of-stream"
+        ],
+        "executable": "import json\nimport pytest\n\nPAGE_SIZE = <get_server_page_size>()\nSEEDED_COUNT = PAGE_SIZE\n\ndef test_paginated_export_last_page_is_empty_boundary(\n    bulk_auth_headers, fhir_base_url, poll_until_complete,\n    seed_resources, cleanup_resources\n):\n    seed_resources(count=SEEDED_COUNT, resource_type=\"Patient\")\n    try:\n        resp = <http_client>.get(\n            f\"{fhir_base_url}/$export\",\n            params={\"_type\": \"Patient\", \"_count\": PAGE_SIZE},\n            headers={\n                **bulk_auth_headers,\n                \"Accept\": \"application/fhir+json\",\n                \"Prefer\": \"respond-async\",\n            },\n        )\n        assert resp.status_code == 202\n        manifest = poll_until_complete(\n            resp.headers[\"Content-Location\"], bulk_auth_headers\n        )\n        output_files = manifest.get(\"output\", [])\n        total_lines = 0\n        for entry in output_files:\n            ndjson = <http_client>.get(entry[\"url\"], headers=bulk_auth_headers)\n            assert ndjson.status_code == 200\n            lines = [l for l in ndjson.text.splitlines() if l.strip()]\n            for line in lines:\n                json.loads(line)\n            total_lines += len(lines)\n        assert total_lines == SEEDED_COUNT, \\\n            f\"Expected {SEEDED_COUNT} lines, got {total_lines}\"\n        assert \"next\" not in manifest, \"No next-page link expected at boundary\"\n    finally:\n        cleanup_resources(resource_type=\"Patient\")\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-016",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 986,
+    "output_tokens": 2396,
+    "latency_ms": 34529,
+    "wall_ms": 34529,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-016\",\n  \"reasoning\": \"R-HLT-016 mandates that a provisioned bulk client can trigger a FHIR $export operation, receive a 202 with a Content-Location poll URL, and ultimately obtain NDJSON output for large datasets paginated across multiple files. Three orthogonal test scenarios are designed: (1) EP positive \u2013 an authorised client gets a 202 and the job eventually yields NDJSON; (2) NEG negative \u2013 an unauthorised client is rejected with 403; (3) BVA boundary \u2013 the last page of a paginated NDJSON export contains exactly zero additional resources (empty sentinel), verifying the boundary between the final page and end-of-stream. Each test uses a shared fixture for the base URL and auth tokens, and delegates polling/parsing to concise helper placeholders to stay within the 40-line limit.\",\n  \"tests\": [\n    {\n      \"name\": \"test_authorised_bulk_export_queued_and_produces_ndjson\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"Client is provisioned with a valid bulk-export OAuth2 token (scope: system/*.read)\",\n        \"At least one FHIR resource exists in the server\"\n      ],\n      \"actions\": [\n        \"Send GET /$export with Accept: application/fhir+json and Prefer: respond-async using the authorised token\",\n        \"Assert HTTP 202 is returned with a Content-Location header\",\n        \"Poll the Content-Location URL until status 200 (job complete) or timeout\",\n        \"Retrieve the first output URL from the manifest\",\n        \"Fetch the NDJSON output file\"\n      ],\n      \"expected\": [\n        \"Initial response status is 202\",\n        \"Content-Location header is present and is a valid URL\",\n        \"Completed manifest contains an 'output' array with at least one entry\",\n        \"Each output entry has type 'ndjson' and a valid url field\",\n        \"NDJSON file contains at least one valid JSON object per line\"\n      ],\n      \"trace\": [\n        \"R-HLT-016: export job queued\",\n        \"R-HLT-016: NDJSON stream produced\"\n      ],\n      \"executable\": \"import pytest\\nimport time\\n\\ndef test_authorised_bulk_export_queued_and_produces_ndjson(\\n    bulk_auth_headers, fhir_base_url, poll_until_complete\\n):\\n    resp = <http_client>.get(\\n        f\\\"{fhir_base_url}/$export\\\",\\n        headers={\\n            **bulk_auth_headers,\\n            \\\"Accept\\\": \\\"application/fhir+json\\\",\\n            \\\"Prefer\\\": \\\"respond-async\\\",\\n        },\\n    )\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}\\\"\\n    content_location = resp.headers.get(\\\"Content-Location\\\")\\n    assert content_location, \\\"Content-Location header missing\\\"\\n\\n    manifest = poll_until_complete(content_location, bulk_auth_headers)\\n    assert \\\"output\\\" in manifest, \\\"Manifest missing 'output' key\\\"\\n    assert len(manifest[\\\"output\\\"]) >= 1, \\\"No output files in manifest\\\"\\n\\n    first_url = manifest[\\\"output\\\"][0][\\\"url\\\"]\\n    ndjson_resp = <http_client>.get(first_url, headers=bulk_auth_headers)\\n    assert ndjson_resp.status_code == 200\\n    lines = [l for l in ndjson_resp.text.splitlines() if l.strip()]\\n    assert len(lines) >= 1, \\\"NDJSON file is empty\\\"\\n    import json\\n    for line in lines:\\n        obj = json.loads(line)\\n        assert \\\"resourceType\\\" in obj\\n\"\n    },\n    {\n      \"name\": \"test_unauthorised_client_receives_403_on_bulk_export\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"A token exists that does NOT have the bulk-export scope (or is entirely absent)\"\n      ],\n      \"actions\": [\n        \"Send GET /$export with Accept: application/fhir+json and Prefer: respond-async using an invalid/missing token\",\n        \"Inspect the HTTP response status code and body\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 403\",\n        \"Response body is a FHIR OperationOutcome with severity 'error'\",\n        \"No Content-"
+  }
+}

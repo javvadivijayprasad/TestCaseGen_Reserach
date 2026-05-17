@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-WEB-089",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Announcement rollout \u2014 variant 3",
+    "statement": "A system-admin shall publish an org-wide announcement to employees in chosen departments; publishing without any department selection shall be rejected. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin publishes announcement"
+    ],
+    "expected_outcomes": [
+      "announcement created",
+      "target employees notified",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "422 when no departments selected"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/org-announcements/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-089",
+    "reasoning": "The requirement covers three concerns: (1) successful org-wide announcement publication to selected departments, (2) rejection when no departments are selected (422), and (3) webhook emission. Test design applies EP for the happy path (valid departments selected), NEG for the zero-department error path, BVA for the minimum valid selection (exactly one department), DT for the webhook emission rule, and STC for the state transition from draft to published. We derive at least four tests to cover all mandatory kinds and heuristics. Each test is self-contained using fixtures for auth and cleanup, and assertions are kept concise.",
+    "tests": [
+      {
+        "name": "test_publish_announcement_to_multiple_departments_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "At least two departments exist in the organisation",
+          "No prior announcement with the same title exists"
+        ],
+        "actions": [
+          "Navigate to /org-announcements/new",
+          "Fill in announcement title and body",
+          "Select two or more departments from the department picker",
+          "Click the Publish button"
+        ],
+        "expected": [
+          "HTTP 201 or redirect to announcement detail page",
+          "Announcement record persists in the database with status=published",
+          "All employees in selected departments receive a notification",
+          "A webhook event of type announcement.published is emitted"
+        ],
+        "trace": [
+          "R-WEB-089: announcement created",
+          "R-WEB-089: target employees notified",
+          "R-WEB-089: webhook event emitted"
+        ],
+        "executable": "def test_publish_announcement_to_multiple_departments_succeeds(\n    admin_page,          # <fixture>: authenticated Playwright page as admin\n    dept_factory,        # <fixture>: creates/tears-down departments\n    announcement_cleanup,# <fixture>: deletes announcement after test\n    webhook_sink,        # <fixture>: captures outbound webhook calls\n):\n    depts = dept_factory.create_many(2)\n    dept_ids = [d[\"id\"] for d in depts]\n\n    page = admin_page\n    page.goto(\"/org-announcements/new\")\n    page.fill(\"[data-testid='ann-title']\", \"EP Test Announcement\")\n    page.fill(\"[data-testid='ann-body']\", \"Body text for EP test.\")\n    select_departments(page, dept_ids)  # <helper_fn>\n    page.click(\"[data-testid='btn-publish']\")\n\n    expect_success_state(page)  # <helper_fn>: asserts redirect/success banner\n\n    ann = get_announcement_by_title(\"EP Test Announcement\")  # <helper_fn>\n    assert ann[\"status\"] == \"published\"\n    assert set(ann[\"department_ids\"]) == set(dept_ids)\n\n    events = webhook_sink.received_events(event_type=\"announcement.published\")\n    assert len(events) == 1\n    assert events[0][\"payload\"][\"announcement_id\"] == ann[\"id\"]\n"
+      },
+      {
+        "name": "test_publish_announcement_without_departments_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "No department is selected before submission"
+        ],
+        "actions": [
+          "Navigate to /org-announcements/new",
+          "Fill in announcement title and body",
+          "Leave the department picker empty",
+          "Click the Publish button"
+        ],
+        "expected": [
+          "Form submission is rejected with an error indicator (HTTP 422 or inline validation error)",
+          "Error message references missing department selection",
+          "No announcement record is created in the database",
+          "No webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-089: error pathway \u2014 422 when no departments selected"
+        ],
+        "executable": "def test_publish_announcement_without_departments_returns_422(\n    admin_page,\n    webhook_sink,\n    api_client,          # <fixture>: authenticated HTTP client for assertions\n):\n    page = admin_page\n    page.goto(\"/org-announcements/new\")\n    page.fill(\"[data-testid='ann-title']\", \"NEG No-Dept Announcement\")\n    page.fill(\"[data-testid='ann-body']\", \"Should be rejected.\")\n    # Intentionally skip department selection\n    page.click(\"[data-testid='btn-publish']\")\n\n    error_locator = page.locator(\"[data-testid='dept-error']\")\n    assert error_locator.is_visible(), \"Expected department validation error\"\n    error_text = error_locator.inner_text()\n    assert \"department\" in error_text.lower()\n\n    resp = api_client.get(\n        \"/api/announcements\",\n        params={\"title\": \"NEG No-Dept Announcement\"}\n    )\n    assert resp.status_code == 200\n    assert resp.json()[\"total\"] == 0, \"Announcement must not have been persisted\"\n\n    assert webhook_sink.received_events(event_type=\"announcement.published\") == []\n"
+      },
+      {
+        "name": "test_publish_announcement_to_exactly_one_department_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "Exactly one department exists and is available for selection"
+        ],
+        "actions": [
+          "Navigate to /org-announcements/new",
+          "Fill in announcement title and body",
+          "Select exactly one department (minimum valid boundary)",
+          "Click the Publish button"
+        ],
+        "expected": [
+          "Announcement is accepted and created with status=published",
+          "Only employees in that single department are notified",
+          "A webhook event of type announcement.published is emitted with correct department scope"
+        ],
+        "trace": [
+          "R-WEB-089: announcement created",
+          "R-WEB-089: boundary \u2014 minimum department count of 1 is accepted",
+          "R-WEB-089: webhook event emitted"
+        ],
+        "executable": "def test_publish_announcement_to_exactly_one_department_accepted(\n    admin_page,\n    dept_factory,\n    announcement_cleanup,\n    webhook_sink,\n):\n    dept = dept_factory.create_one()  # <helper_fn> via fixture\n    dept_id = dept[\"id\"]\n\n    page = admin_page\n    page.goto(\"/org-announcements/new\")\n    page.fill(\"[data-testid='ann-title']\", \"BVA Single-Dept Announcement\")\n    page.fill(\"[data-testid='ann-body']\", \"Boundary: one department only.\")\n    select_departments(page, [dept_id])  # <helper_fn>\n    page.click(\"[data-testid='btn-publish']\")\n\n    expect_success_state(page)  # <helper_fn>\n\n    ann = get_announcement_by_title(\"BVA Single-Dept Announcement\")  # <helper_fn>\n    assert ann[\"status\"] == \"published\"\n    assert ann[\"department_ids\"] == [dept_id]\n\n    events = webhook_sink.received_events(event_type=\"announcement.published\")\n    assert len(events) == 1\n    assert events[0][\"payload\"][\"department_ids\"] == [dept_id]\n"
+      },
+      {
+        "name": "test_announcement_state_transitions_from_draft_to_published",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "A saved draft announcement exists with at least one department selected"
+        ],
+        "actions": [
+          "Navigate to the existing draft announcement edit page",
+          "Verify announcement status is draft",
+          "Click the Publish button to trigger the draft \u2192 published transition"
+        ],
+        "expected": [
+          "Announcement status changes from draft to published",
+          "UI reflects the published state (badge, button state change)",
+          "A webhook event of type announcement.published is emitted exactly once",
+          "Attempting to re-publish has no duplicate effect"
+        ],
+        "trace": [
+          "R-WEB-089: announcement created (via state transition)",
+          "R-WEB-089: webhook event emitted on state change",
+          "R-WEB-089: additional variant semantics \u2014 idempotent publish"
+        ],
+        "executable": "def test_announcement_state_transitions_from_draft_to_published(\n    admin_page,\n    draft_announcement,  # <fixture>: creates draft with one dept; yields {id, edit_url}\n    webhook_sink,\n):\n    ann_id = draft_announcement[\"id\"]\n    edit_url = draft_announcement[\"edit_url\"]\n\n    page = admin_page\n    page.goto(edit_url)\n\n    status_badge = page.locator(\"[data-testid='status-badge']\")\n    assert status_badge.inner_text().lower() == \"draft\"\n\n    page.click(\"[data-testid='btn-publish']\")\n    expect_success_state(page)  # <helper_fn>\n\n    assert status_badge.inner_text().lower() == \"published\"\n\n    ann = get_announcement_by_id(ann_id)  # <helper_fn>\n    assert ann[\"status\"] == \"published\"\n\n    events = webhook_sink.received_events(event_type=\"announcement.published\")\n    assert len(events) == 1, \"Webhook must fire exactly once on publish\"\n\n    # Idempotency: second publish attempt must not duplicate the event\n    page.click(\"[data-testid='btn-publish']\")\n    events_after_retry = webhook_sink.received_events(event_type=\"announcement.published\")\n    assert len(events_after_retry) == 1, \"Re-publish must not emit duplicate webhook\"\n"
+      },
+      {
+        "name": "test_publish_decision_table_dept_selected_vs_not_selected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "Two departments exist in the organisation"
+        ],
+        "actions": [
+          "Attempt publish with departments=[dept_a, dept_b] \u2014 expect success",
+          "Attempt publish with departments=[] \u2014 expect 422 / validation error"
+        ],
+        "expected": [
+          "With valid departments: announcement created, webhook fired",
+          "With empty departments: error shown, no announcement created, no webhook"
+        ],
+        "trace": [
+          "R-WEB-089: decision table \u2014 departments selected (Y/N) drives accept/reject outcome",
+          "R-WEB-089: error pathway \u2014 422 when no departments selected"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"dept_count,expect_success\", [\n    (2, True),\n    (0, False),\n])\ndef test_publish_decision_table_dept_selected_vs_not_selected(\n    admin_page,\n    dept_factory,\n    announcement_cleanup,\n    webhook_sink,\n    api_client,\n    dept_count,\n    expect_success,\n):\n    depts = dept_factory.create_many(dept_count) if dept_count > 0 else []\n    dept_ids = [d[\"id\"] for d in depts]\n    title = f\"DT Announcement depts={dept_count}\"\n\n    page = admin_page\n    page.goto(\"/org-announcements/new\")\n    page.fill(\"[data-testid='ann-title']\", title)\n    page.fill(\"[data-testid='ann-body']\", \"Decision table body.\")\n    if dept_ids:\n        select_departments(page, dept_ids)  # <helper_fn>\n    page.click(\"[data-testid='btn-publish']\")\n\n    if expect_success:\n        expect_success_state(page)  # <helper_fn>\n        ann = get_announcement_by_title(title)  # <helper_fn>\n        assert ann[\"status\"] == \"published\"\n        events = webhook_sink.received_events(event_type=\"announcement.published\")\n        assert len(events) == 1\n    else:\n        assert page.locator(\"[data-testid='dept-error']\").is_visible()\n        resp = api_client.get(\"/api/announcements\", params={\"title\": title})\n        assert resp.json()[\"total\"] == 0\n        assert webhook_sink.received_events(event_type=\"announcement.published\") == []\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-089",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1008,
+    "output_tokens": 3384,
+    "latency_ms": 43745,
+    "wall_ms": 43745,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-089\",\n  \"reasoning\": \"The requirement covers three concerns: (1) successful org-wide announcement publication to selected departments, (2) rejection when no departments are selected (422), and (3) webhook emission. Test design applies EP for the happy path (valid departments selected), NEG for the zero-department error path, BVA for the minimum valid selection (exactly one department), DT for the webhook emission rule, and STC for the state transition from draft to published. We derive at least four tests to cover all mandatory kinds and heuristics. Each test is self-contained using fixtures for auth and cleanup, and assertions are kept concise.\",\n  \"tests\": [\n    {\n      \"name\": \"test_publish_announcement_to_multiple_departments_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as system-admin\",\n        \"At least two departments exist in the organisation\",\n        \"No prior announcement with the same title exists\"\n      ],\n      \"actions\": [\n        \"Navigate to /org-announcements/new\",\n        \"Fill in announcement title and body\",\n        \"Select two or more departments from the department picker\",\n        \"Click the Publish button\"\n      ],\n      \"expected\": [\n        \"HTTP 201 or redirect to announcement detail page\",\n        \"Announcement record persists in the database with status=published\",\n        \"All employees in selected departments receive a notification\",\n        \"A webhook event of type announcement.published is emitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-089: announcement created\",\n        \"R-WEB-089: target employees notified\",\n        \"R-WEB-089: webhook event emitted\"\n      ],\n      \"executable\": \"def test_publish_announcement_to_multiple_departments_succeeds(\\n    admin_page,          # <fixture>: authenticated Playwright page as admin\\n    dept_factory,        # <fixture>: creates/tears-down departments\\n    announcement_cleanup,# <fixture>: deletes announcement after test\\n    webhook_sink,        # <fixture>: captures outbound webhook calls\\n):\\n    depts = dept_factory.create_many(2)\\n    dept_ids = [d[\\\"id\\\"] for d in depts]\\n\\n    page = admin_page\\n    page.goto(\\\"/org-announcements/new\\\")\\n    page.fill(\\\"[data-testid='ann-title']\\\", \\\"EP Test Announcement\\\")\\n    page.fill(\\\"[data-testid='ann-body']\\\", \\\"Body text for EP test.\\\")\\n    select_departments(page, dept_ids)  # <helper_fn>\\n    page.click(\\\"[data-testid='btn-publish']\\\")\\n\\n    expect_success_state(page)  # <helper_fn>: asserts redirect/success banner\\n\\n    ann = get_announcement_by_title(\\\"EP Test Announcement\\\")  # <helper_fn>\\n    assert ann[\\\"status\\\"] == \\\"published\\\"\\n    assert set(ann[\\\"department_ids\\\"]) == set(dept_ids)\\n\\n    events = webhook_sink.received_events(event_type=\\\"announcement.published\\\")\\n    assert len(events) == 1\\n    assert events[0][\\\"payload\\\"][\\\"announcement_id\\\"] == ann[\\\"id\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_publish_announcement_without_departments_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as system-admin\",\n        \"No department is selected before submission\"\n      ],\n      \"actions\": [\n        \"Navigate to /org-announcements/new\",\n        \"Fill in announcement title and body\",\n        \"Leave the department picker empty\",\n        \"Click the Publish button\"\n      ],\n      \"expected\": [\n        \"Form submission is rejected with an error indicator (HTTP 422 or inline validation error)\",\n        \"Error message references missing department selection\",\n        \"No announcement record is created in the database\",\n        \"No webhook event is emitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-089: error pathway \u2014 422 when no departments selected\"\n      ],\n      \"executable\": \"def test_publish_announcement_without_departments_returns_422(\\n    admin_page,\\n    webhook_sink,\\n    api_client,          # <fixture>: authen"
+  }
+}

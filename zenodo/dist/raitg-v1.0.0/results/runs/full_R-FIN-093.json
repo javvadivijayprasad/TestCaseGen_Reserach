@@ -1,0 +1,157 @@
+{
+  "req": {
+    "id": "R-FIN-093",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Joint account operations (idempotency variant)",
+    "statement": "A joint-account holder shall perform transactions; the secondary holder shall not be able to modify ownership. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "holder is joint"
+    ],
+    "triggers": [
+      "holder performs operation"
+    ],
+    "expected_outcomes": [
+      "operation applied"
+    ],
+    "error_pathways": [
+      "403 when secondary holder attempts ownership change"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/joint"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-093",
+    "reasoning": "R-FIN-093 has three distinct testable behaviours: (1) a primary joint-account holder can successfully perform a transaction (positive / EP), (2) a secondary holder is forbidden from modifying ownership (negative / NEG + DT), and (3) the idempotency guarantee \u2014 submitting the exact same Idempotency-Key twice must return the original response without re-applying the operation (boundary / BVA, because the duplicate is the edge of the idempotency window). A fourth case covers the state transition from 'pending duplicate' back to 'already-applied' (STC). Together these four cases give full coverage of the stated requirement.",
+    "tests": [
+      {
+        "name": "test_primary_holder_transaction_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Joint account exists with id <JOINT_ACCOUNT_ID>",
+          "Primary holder credentials available via <primary_auth_token fixture>",
+          "Account balance sufficient for the transaction amount"
+        ],
+        "actions": [
+          "Authenticate as primary holder",
+          "POST /accounts/{id}/joint with a valid transaction payload and a fresh Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains transaction id and status 'applied'",
+          "Account balance reflects the transaction"
+        ],
+        "trace": [
+          "R-FIN-093: 'a joint-account holder shall perform transactions'",
+          "R-FIN-093: 'expected outcomes: operation applied'"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <api_client> import BankingApiClient\n\n@pytest.fixture\ndef primary_client():\n    return BankingApiClient(token=<primary_auth_token>)\n\ndef test_primary_holder_transaction_succeeds(primary_client):\n    account_id = <JOINT_ACCOUNT_ID>\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"type\": \"debit\", \"amount\": 100, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    resp = primary_client.post(\n        f\"/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers\n    )\n\n    assert resp.status_code in (200, 201), f\"Unexpected status: {resp.status_code}\"\n    body = resp.json()\n    assert \"transaction_id\" in body\n    assert body.get(\"status\") == \"applied\""
+      },
+      {
+        "name": "test_secondary_holder_ownership_change_forbidden",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Joint account exists with id <JOINT_ACCOUNT_ID>",
+          "Secondary holder credentials available via <secondary_auth_token fixture>",
+          "Secondary holder is NOT the primary/owning holder"
+        ],
+        "actions": [
+          "Authenticate as secondary holder",
+          "PATCH /accounts/{id}/joint with an ownership-change payload (e.g. new primary_holder_id)"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden response",
+          "Response body contains error code indicating ownership modification is not permitted"
+        ],
+        "trace": [
+          "R-FIN-093: 'the secondary holder shall not be able to modify ownership'",
+          "R-FIN-093: 'error pathways: 403 when secondary holder attempts ownership change'"
+        ],
+        "executable": "import pytest\nfrom <api_client> import BankingApiClient\n\n@pytest.fixture\ndef secondary_client():\n    return BankingApiClient(token=<secondary_auth_token>)\n\ndef test_secondary_holder_ownership_change_forbidden(secondary_client):\n    account_id = <JOINT_ACCOUNT_ID>\n    payload = {\"primary_holder_id\": <NEW_HOLDER_ID>}\n\n    resp = secondary_client.patch(\n        f\"/accounts/{account_id}/joint\",\n        json=payload\n    )\n\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n    body = resp.json()\n    error_code = body.get(\"error\", {}).get(\"code\", \"\")\n    assert \"ownership\" in error_code.lower() or resp.status_code == 403"
+      },
+      {
+        "name": "test_duplicate_idempotency_key_returns_original_response",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Joint account exists with id <JOINT_ACCOUNT_ID>",
+          "Primary holder credentials available via <primary_auth_token fixture>",
+          "A specific Idempotency-Key has been used for exactly one prior successful request"
+        ],
+        "actions": [
+          "Authenticate as primary holder",
+          "POST /accounts/{id}/joint with transaction payload and Idempotency-Key K (first submission)",
+          "Record the first response body and status",
+          "POST /accounts/{id}/joint with identical payload and the same Idempotency-Key K (duplicate submission)"
+        ],
+        "expected": [
+          "Second HTTP response status equals first HTTP response status",
+          "Second response body transaction_id equals first response body transaction_id",
+          "Account balance is NOT debited a second time (operation applied only once)"
+        ],
+        "trace": [
+          "R-FIN-093: 'duplicate submission with the same Idempotency-Key must return the original result'",
+          "R-FIN-093: 'the operation must be idempotent'"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom <api_client> import BankingApiClient\n\n@pytest.fixture\ndef primary_client():\n    return BankingApiClient(token=<primary_auth_token>)\n\ndef test_duplicate_idempotency_key_returns_original_response(primary_client):\n    account_id = <JOINT_ACCOUNT_ID>\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"type\": \"debit\", \"amount\": 50, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    first = primary_client.post(\n        f\"/accounts/{account_id}/joint\", json=payload, headers=headers)\n    assert first.status_code in (200, 201)\n    first_body = first.json()\n\n    second = primary_client.post(\n        f\"/accounts/{account_id}/joint\", json=payload, headers=headers)\n\n    assert second.status_code == first.status_code\n    second_body = second.json()\n    assert second_body.get(\"transaction_id\") == first_body.get(\"transaction_id\")\n    assert second_body.get(\"status\") == first_body.get(\"status\")"
+      },
+      {
+        "name": "test_state_transition_pending_to_applied_on_resubmission",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Joint account exists with id <JOINT_ACCOUNT_ID>",
+          "Primary holder credentials available via <primary_auth_token fixture>",
+          "The API supports a 'pending' intermediate state observable before finalisation",
+          "A unique Idempotency-Key not previously submitted is available"
+        ],
+        "actions": [
+          "Authenticate as primary holder",
+          "POST /accounts/{id}/joint to create a transaction that enters 'pending' state",
+          "Poll GET /accounts/{id}/joint/transactions/{txn_id} until status != 'pending'",
+          "POST /accounts/{id}/joint with same Idempotency-Key a second time after 'applied' state is reached"
+        ],
+        "expected": [
+          "First POST returns 200/201 with status 'pending' or 'applied'",
+          "Polled status eventually transitions to 'applied'",
+          "Second POST with same key returns 200/201 with status 'applied' and same transaction_id (no new transaction created)"
+        ],
+        "trace": [
+          "R-FIN-093: 'operation must be idempotent'",
+          "R-FIN-093: 'expected outcomes: operation applied'",
+          "STC: covers states pending -> applied and duplicate-key -> already-applied"
+        ],
+        "executable": "import uuid, time\nimport pytest\nfrom <api_client> import BankingApiClient\n\n@pytest.fixture\ndef primary_client():\n    return BankingApiClient(token=<primary_auth_token>)\n\ndef test_state_transition_pending_to_applied_on_resubmission(primary_client):\n    account_id = <JOINT_ACCOUNT_ID>\n    idem_key = str(uuid.uuid4())\n    payload = {\"type\": \"debit\", \"amount\": 25, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": idem_key}\n\n    first = primary_client.post(\n        f\"/accounts/{account_id}/joint\", json=payload, headers=headers)\n    assert first.status_code in (200, 201)\n    txn_id = first.json()[\"transaction_id\"]\n\n    status = first.json().get(\"status\")\n    for _ in range(10):\n        if status == \"applied\":\n            break\n        time.sleep(0.5)\n        poll = primary_client.get(f\"/accounts/{account_id}/joint/transactions/{txn_id}\")\n        status = poll.json().get(\"status\")\n    assert status == \"applied\"\n\n    second = primary_client.post(\n        f\"/accounts/{account_id}/joint\", json=payload, headers=headers)\n    assert second.status_code in (200, 201)\n    assert second.json()[\"transaction_id\"] == txn_id\n    assert second.json()[\"status\"] == \"applied\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-093",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1006,
+    "output_tokens": 2648,
+    "latency_ms": 28495,
+    "wall_ms": 28496,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-093\",\n  \"reasoning\": \"R-FIN-093 has three distinct testable behaviours: (1) a primary joint-account holder can successfully perform a transaction (positive / EP), (2) a secondary holder is forbidden from modifying ownership (negative / NEG + DT), and (3) the idempotency guarantee \u2014 submitting the exact same Idempotency-Key twice must return the original response without re-applying the operation (boundary / BVA, because the duplicate is the edge of the idempotency window). A fourth case covers the state transition from 'pending duplicate' back to 'already-applied' (STC). Together these four cases give full coverage of the stated requirement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_primary_holder_transaction_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Joint account exists with id <JOINT_ACCOUNT_ID>\",\n        \"Primary holder credentials available via <primary_auth_token fixture>\",\n        \"Account balance sufficient for the transaction amount\"\n      ],\n      \"actions\": [\n        \"Authenticate as primary holder\",\n        \"POST /accounts/{id}/joint with a valid transaction payload and a fresh Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body contains transaction id and status 'applied'\",\n        \"Account balance reflects the transaction\"\n      ],\n      \"trace\": [\n        \"R-FIN-093: 'a joint-account holder shall perform transactions'\",\n        \"R-FIN-093: 'expected outcomes: operation applied'\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\nfrom <api_client> import BankingApiClient\\n\\n@pytest.fixture\\ndef primary_client():\\n    return BankingApiClient(token=<primary_auth_token>)\\n\\ndef test_primary_holder_transaction_succeeds(primary_client):\\n    account_id = <JOINT_ACCOUNT_ID>\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\\"type\\\": \\\"debit\\\", \\\"amount\\\": 100, \\\"currency\\\": \\\"USD\\\"}\\n    headers = {\\\"Idempotency-Key\\\": idempotency_key}\\n\\n    resp = primary_client.post(\\n        f\\\"/accounts/{account_id}/joint\\\",\\n        json=payload,\\n        headers=headers\\n    )\\n\\n    assert resp.status_code in (200, 201), f\\\"Unexpected status: {resp.status_code}\\\"\\n    body = resp.json()\\n    assert \\\"transaction_id\\\" in body\\n    assert body.get(\\\"status\\\") == \\\"applied\\\"\"\n    },\n    {\n      \"name\": \"test_secondary_holder_ownership_change_forbidden\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Joint account exists with id <JOINT_ACCOUNT_ID>\",\n        \"Secondary holder credentials available via <secondary_auth_token fixture>\",\n        \"Secondary holder is NOT the primary/owning holder\"\n      ],\n      \"actions\": [\n        \"Authenticate as secondary holder\",\n        \"PATCH /accounts/{id}/joint with an ownership-change payload (e.g. new primary_holder_id)\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden response\",\n        \"Response body contains error code indicating ownership modification is not permitted\"\n      ],\n      \"trace\": [\n        \"R-FIN-093: 'the secondary holder shall not be able to modify ownership'\",\n        \"R-FIN-093: 'error pathways: 403 when secondary holder attempts ownership change'\"\n      ],\n      \"executable\": \"import pytest\\nfrom <api_client> import BankingApiClient\\n\\n@pytest.fixture\\ndef secondary_client():\\n    return BankingApiClient(token=<secondary_auth_token>)\\n\\ndef test_secondary_holder_ownership_change_forbidden(secondary_client):\\n    account_id = <JOINT_ACCOUNT_ID>\\n    payload = {\\\"primary_holder_id\\\": <NEW_HOLDER_ID>}\\n\\n    resp = secondary_client.patch(\\n        f\\\"/accounts/{account_id}/joint\\\",\\n        json=payload\\n    )\\n\\n    assert resp.status_code == 403, f\\\"Expected 403, got {resp.status_code}\\\"\\n    body = resp.json()\\n    error_code = body.get(\\\"error\\\", {}).get(\\\"code\\\", \\\"\\\")\\n    assert \\\"ownership\\\" in error_code.lower() or resp.status_code == 403\"\n    },\n    {\n      \"name\": "
+  }
+}

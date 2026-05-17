@@ -1,0 +1,164 @@
+{
+  "req": {
+    "id": "R-HLT-020",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "auth",
+    "title": "Data retention",
+    "statement": "Resources shall be retained per policy; expired resources shall be purged on a nightly job with full audit trail.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "nightly job runs"
+    ],
+    "expected_outcomes": [
+      "expired resources purged",
+      "audit log written"
+    ],
+    "error_pathways": [
+      "incident raised on policy mismatch"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/cron/retention"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-020",
+    "reasoning": "R-HLT-020 mandates that expired resources are purged by a nightly cron job and that an audit trail is written. Three primary risk areas emerge: (1) normal expiry path where resources past their retention date are removed and audited (EP positive), (2) a resource exactly at the retention boundary \u2014 expired by exactly one second vs still valid by one second (BVA boundary), and (3) a policy mismatch scenario where the job encounters a resource whose retention metadata is corrupt or missing, triggering an incident (NEG negative). A fourth case covers the state transition from 'active' to 'purged' to confirm the resource is no longer retrievable after the job runs (STC positive). Each test seeds its own data via fixtures, calls /cron/retention, and asserts both the resource state and the audit log entry, ensuring idempotency by cleaning up created resources regardless of outcome.",
+    "tests": [
+      {
+        "name": "test_expired_resource_is_purged_and_audited",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A resource exists whose retention_expires_at is at least 24 hours in the past",
+          "Audit log is accessible via GET /audit"
+        ],
+        "actions": [
+          "Seed an expired resource via <seed_expired_resource> fixture",
+          "POST /cron/retention to trigger the nightly job",
+          "GET /resources/{resource_id} to verify deletion",
+          "GET /audit?resource_id={resource_id} to verify audit entry"
+        ],
+        "expected": [
+          "POST /cron/retention returns HTTP 200",
+          "GET /resources/{resource_id} returns HTTP 404",
+          "Audit log contains an entry with action=PURGED for the resource"
+        ],
+        "trace": [
+          "R-HLT-020: expired resources shall be purged",
+          "R-HLT-020: full audit trail shall be written"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone, timedelta\n\nBASE = \"http://localhost:8080\"\n\n@pytest.fixture()\ndef expired_resource():\n    resource = <seed_expired_resource>(\n        retention_expires_at=datetime.now(timezone.utc) - timedelta(days=2)\n    )\n    yield resource\n    <cleanup_resource>(resource[\"id\"])\n\ndef test_expired_resource_is_purged_and_audited(expired_resource):\n    rid = expired_resource[\"id\"]\n\n    resp = requests.post(f\"{BASE}/cron/retention\",\n                         headers=<auth_headers>())\n    assert resp.status_code == 200\n\n    get_resp = requests.get(f\"{BASE}/resources/{rid}\",\n                            headers=<auth_headers>())\n    assert get_resp.status_code == 404\n\n    audit = requests.get(f\"{BASE}/audit\",\n                         params={\"resource_id\": rid},\n                         headers=<auth_headers>()).json()\n    entries = [e for e in audit[\"entries\"] if e[\"action\"] == \"PURGED\"]\n    assert len(entries) >= 1\n    assert entries[0][\"resource_id\"] == rid"
+      },
+      {
+        "name": "test_resource_expired_by_one_second_is_purged",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A resource exists whose retention_expires_at equals now minus 1 second",
+          "System clock is synchronised (NTP)"
+        ],
+        "actions": [
+          "Seed a resource expiring exactly 1 second before job trigger via <seed_expired_resource>",
+          "POST /cron/retention immediately after seeding",
+          "GET /resources/{resource_id} to confirm deletion",
+          "Seed a second resource expiring exactly 1 second after now (still valid)",
+          "POST /cron/retention again",
+          "GET /resources/{valid_resource_id} to confirm it is retained"
+        ],
+        "expected": [
+          "Resource expired by 1 s is purged (404)",
+          "Resource valid by 1 s is retained (200)",
+          "Audit log contains PURGED only for the expired resource"
+        ],
+        "trace": [
+          "R-HLT-020: resources shall be retained per policy",
+          "R-HLT-020: expired resources shall be purged \u2014 boundary at expiry timestamp"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone, timedelta\n\nBASE = \"http://localhost:8080\"\n\n@pytest.fixture()\ndef boundary_resources():\n    just_expired = <seed_expired_resource>(\n        retention_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)\n    )\n    still_valid = <seed_expired_resource>(\n        retention_expires_at=datetime.now(timezone.utc) + timedelta(seconds=1)\n    )\n    yield just_expired, still_valid\n    <cleanup_resource>(just_expired[\"id\"])\n    <cleanup_resource>(still_valid[\"id\"])\n\ndef test_resource_expired_by_one_second_is_purged(boundary_resources):\n    expired, valid = boundary_resources\n    headers = <auth_headers>()\n\n    requests.post(f\"{BASE}/cron/retention\", headers=headers)\n\n    assert requests.get(\n        f\"{BASE}/resources/{expired['id']}\", headers=headers\n    ).status_code == 404\n\n    assert requests.get(\n        f\"{BASE}/resources/{valid['id']}\", headers=headers\n    ).status_code == 200\n\n    audit = requests.get(\n        f\"{BASE}/audit\",\n        params={\"resource_id\": expired[\"id\"]},\n        headers=headers\n    ).json()\n    purged = [e for e in audit[\"entries\"] if e[\"action\"] == \"PURGED\"]\n    assert len(purged) >= 1"
+      },
+      {
+        "name": "test_missing_retention_policy_raises_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A resource exists with retention_policy field set to null or missing",
+          "Incident management endpoint GET /incidents is accessible"
+        ],
+        "actions": [
+          "Seed a resource with no retention_policy via <seed_resource_no_policy>",
+          "POST /cron/retention to trigger the job",
+          "GET /incidents to confirm an incident was raised for the policy mismatch",
+          "Verify the resource is NOT purged (retained in safe state)"
+        ],
+        "expected": [
+          "POST /cron/retention returns HTTP 200 (job completed with partial errors)",
+          "GET /incidents returns at least one incident referencing the resource and reason=POLICY_MISMATCH",
+          "GET /resources/{resource_id} returns HTTP 200 \u2014 resource is not silently deleted"
+        ],
+        "trace": [
+          "R-HLT-020: incident raised on policy mismatch",
+          "R-HLT-020: audit trail integrity \u2014 missing policy must not silently suppress action"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE = \"http://localhost:8080\"\n\n@pytest.fixture()\ndef no_policy_resource():\n    resource = <seed_resource_no_policy>()\n    yield resource\n    <cleanup_resource>(resource[\"id\"])\n    <cleanup_incident_by_resource>(resource[\"id\"])\n\ndef test_missing_retention_policy_raises_incident(no_policy_resource):\n    rid = no_policy_resource[\"id\"]\n    headers = <auth_headers>()\n\n    cron_resp = requests.post(f\"{BASE}/cron/retention\", headers=headers)\n    assert cron_resp.status_code == 200\n\n    resource_resp = requests.get(\n        f\"{BASE}/resources/{rid}\", headers=headers\n    )\n    assert resource_resp.status_code == 200, \\\n        \"Resource without policy must not be silently purged\"\n\n    incidents = requests.get(\n        f\"{BASE}/incidents\",\n        params={\"resource_id\": rid},\n        headers=headers\n    ).json()\n    matched = [\n        i for i in incidents[\"items\"]\n        if i.get(\"reason\") == \"POLICY_MISMATCH\"\n        and i.get(\"resource_id\") == rid\n    ]\n    assert len(matched) >= 1, \\\n        f\"Expected POLICY_MISMATCH incident for resource {rid}\""
+      },
+      {
+        "name": "test_resource_transitions_active_to_purged_state",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite service is running and reachable",
+          "A resource in ACTIVE state exists with an expired retention date",
+          "Resource lifecycle states are: ACTIVE -> PENDING_PURGE -> PURGED"
+        ],
+        "actions": [
+          "Seed an ACTIVE resource with expired retention via <seed_expired_resource>",
+          "Verify resource state is ACTIVE before job runs",
+          "POST /cron/retention to trigger job",
+          "GET /resources/{resource_id} to confirm final PURGED or 404 state",
+          "GET /audit to confirm state transition entries are present"
+        ],
+        "expected": [
+          "Pre-job: resource state is ACTIVE",
+          "Post-job: GET /resources/{resource_id} returns 404 or state=PURGED",
+          "Audit log contains both PENDING_PURGE and PURGED transition entries in order"
+        ],
+        "trace": [
+          "R-HLT-020: resources shall be purged by nightly job",
+          "R-HLT-020: full audit trail \u2014 state transitions must be recorded"
+        ],
+        "executable": "import pytest\nimport requests\nfrom datetime import datetime, timezone, timedelta\n\nBASE = \"http://localhost:8080\"\n\n@pytest.fixture()\ndef active_expired_resource():\n    resource = <seed_expired_resource>(\n        state=\"ACTIVE\",\n        retention_expires_at=datetime.now(timezone.utc) - timedelta(hours=48)\n    )\n    yield resource\n    <cleanup_resource>(resource[\"id\"])\n\ndef test_resource_transitions_active_to_purged_state(active_expired_resource):\n    rid = active_expired_resource[\"id\"]\n    headers = <auth_headers>()\n\n    pre = requests.get(f\"{BASE}/resources/{rid}\", headers=headers).json()\n    assert pre[\"state\"] == \"ACTIVE\"\n\n    requests.post(f\"{BASE}/cron/retention\", headers=headers)\n\n    post = requests.get(f\"{BASE}/resources/{rid}\", headers=headers)\n    assert post.status_code in (404, 200)\n    if post.status_code == 200:\n        assert post.json()[\"state\"] == \"PURGED\"\n\n    audit = requests.get(\n        f\"{BASE}/audit\", params={\"resource_id\": rid}, headers=headers\n    ).json()\n    actions = [e[\"action\"] for e in audit[\"entries\"]]\n    assert \"PURGED\" in actions\n    purged_idx = actions.index(\"PURGED\")\n    if \"PENDING_PURGE\" in actions:\n        assert actions.index(\"PENDING_PURGE\") < purged_idx"
+      }
+    ]
+  },
+  "req_id": "R-HLT-020",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 979,
+    "output_tokens": 3104,
+    "latency_ms": 35117,
+    "wall_ms": 35117,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-020\",\n  \"reasoning\": \"R-HLT-020 mandates that expired resources are purged by a nightly cron job and that an audit trail is written. Three primary risk areas emerge: (1) normal expiry path where resources past their retention date are removed and audited (EP positive), (2) a resource exactly at the retention boundary \u2014 expired by exactly one second vs still valid by one second (BVA boundary), and (3) a policy mismatch scenario where the job encounters a resource whose retention metadata is corrupt or missing, triggering an incident (NEG negative). A fourth case covers the state transition from 'active' to 'purged' to confirm the resource is no longer retrievable after the job runs (STC positive). Each test seeds its own data via fixtures, calls /cron/retention, and asserts both the resource state and the audit log entry, ensuring idempotency by cleaning up created resources regardless of outcome.\",\n  \"tests\": [\n    {\n      \"name\": \"test_expired_resource_is_purged_and_audited\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"A resource exists whose retention_expires_at is at least 24 hours in the past\",\n        \"Audit log is accessible via GET /audit\"\n      ],\n      \"actions\": [\n        \"Seed an expired resource via <seed_expired_resource> fixture\",\n        \"POST /cron/retention to trigger the nightly job\",\n        \"GET /resources/{resource_id} to verify deletion\",\n        \"GET /audit?resource_id={resource_id} to verify audit entry\"\n      ],\n      \"expected\": [\n        \"POST /cron/retention returns HTTP 200\",\n        \"GET /resources/{resource_id} returns HTTP 404\",\n        \"Audit log contains an entry with action=PURGED for the resource\"\n      ],\n      \"trace\": [\n        \"R-HLT-020: expired resources shall be purged\",\n        \"R-HLT-020: full audit trail shall be written\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom datetime import datetime, timezone, timedelta\\n\\nBASE = \\\"http://localhost:8080\\\"\\n\\n@pytest.fixture()\\ndef expired_resource():\\n    resource = <seed_expired_resource>(\\n        retention_expires_at=datetime.now(timezone.utc) - timedelta(days=2)\\n    )\\n    yield resource\\n    <cleanup_resource>(resource[\\\"id\\\"])\\n\\ndef test_expired_resource_is_purged_and_audited(expired_resource):\\n    rid = expired_resource[\\\"id\\\"]\\n\\n    resp = requests.post(f\\\"{BASE}/cron/retention\\\",\\n                         headers=<auth_headers>())\\n    assert resp.status_code == 200\\n\\n    get_resp = requests.get(f\\\"{BASE}/resources/{rid}\\\",\\n                            headers=<auth_headers>())\\n    assert get_resp.status_code == 404\\n\\n    audit = requests.get(f\\\"{BASE}/audit\\\",\\n                         params={\\\"resource_id\\\": rid},\\n                         headers=<auth_headers>()).json()\\n    entries = [e for e in audit[\\\"entries\\\"] if e[\\\"action\\\"] == \\\"PURGED\\\"]\\n    assert len(entries) >= 1\\n    assert entries[0][\\\"resource_id\\\"] == rid\"\n    },\n    {\n      \"name\": \"test_resource_expired_by_one_second_is_purged\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"fhir-lite service is running and reachable\",\n        \"A resource exists whose retention_expires_at equals now minus 1 second\",\n        \"System clock is synchronised (NTP)\"\n      ],\n      \"actions\": [\n        \"Seed a resource expiring exactly 1 second before job trigger via <seed_expired_resource>\",\n        \"POST /cron/retention immediately after seeding\",\n        \"GET /resources/{resource_id} to confirm deletion\",\n        \"Seed a second resource expiring exactly 1 second after now (still valid)\",\n        \"POST /cron/retention again\",\n        \"GET /resources/{valid_resource_id} to confirm it is retained\"\n      ],\n      \"expected\": [\n        \"Resource expired by 1 s is purged (404)\",\n        \"Resource valid by 1 s is retained (200)\",\n        \"Audit log contains PURGED only for the expired reso"
+  }
+}

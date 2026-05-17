@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-HLT-017",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Inter-facility referral",
+    "statement": "A clinician shall send a referral to another facility; the referral shall trigger a secure message and consent check.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician sends referral"
+    ],
+    "expected_outcomes": [
+      "referral stored",
+      "secure message dispatched"
+    ],
+    "error_pathways": [
+      "403 when consent absent"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ReferralRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-017",
+    "reasoning": "The requirement mandates three verifiable behaviours: (1) a valid referral is stored and a secure message dispatched (happy path, EP), (2) a referral without patient consent is rejected with HTTP 403 (NEG/DT), and (3) a referral payload at the minimum viable boundary\u2014exactly one required field per FHIR ReferralRequest\u2014is accepted (BVA). An additional State Transition test covers the referral lifecycle from 'draft' through 'active' to verify the trigger causes the correct state change. Each test authenticates as a clinician, posts to /ReferralRequest, and asserts HTTP status plus response body fields. Fixtures supply auth tokens and base URL; helpers reset state between runs to ensure idempotency.",
+    "tests": [
+      {
+        "name": "test_valid_referral_stored_and_message_dispatched",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient consent record exists for the target facility",
+          "Target facility is registered in the system"
+        ],
+        "actions": [
+          "Build a well-formed ReferralRequest payload with all required FHIR fields",
+          "POST payload to /ReferralRequest with clinician auth header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'id' field (referral stored)",
+          "Response body contains 'status': 'active'",
+          "Secure message dispatched: message queue or audit log records the event"
+        ],
+        "trace": [
+          "R-HLT-017: referral stored",
+          "R-HLT-017: secure message dispatched"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_valid_referral_stored_and_message_dispatched(\n    clinician_auth_headers,  # <fixture>\n    base_url,                # <fixture>\n    consent_present_patient, # <fixture> returns patient_id with consent\n    target_facility_id,      # <fixture>\n    assert_message_dispatched # <helper_fn>\n):\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{consent_present_patient}\"},\n        \"recipient\": [{\"reference\": f\"Organization/{target_facility_id}\"}],\n        \"requester\": {\"agent\": {\"reference\": \"Practitioner/clinician-001\"}}\n    }\n    resp = requests.post(\n        f\"{base_url}/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"id\" in body, \"Referral ID missing from response\"\n    assert body.get(\"status\") == \"active\"\n    assert_message_dispatched(body[\"id\"])  # <helper_fn> polls audit/message queue\n"
+      },
+      {
+        "name": "test_referral_rejected_when_consent_absent",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient has NO consent record for the target facility",
+          "Target facility is registered in the system"
+        ],
+        "actions": [
+          "Build a ReferralRequest payload referencing a patient without consent",
+          "POST payload to /ReferralRequest with clinician auth header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains error code indicating consent absent",
+          "No referral record created in the datastore",
+          "No secure message dispatched"
+        ],
+        "trace": [
+          "R-HLT-017: error pathway \u2014 403 when consent absent"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_referral_rejected_when_consent_absent(\n    clinician_auth_headers,     # <fixture>\n    base_url,                   # <fixture>\n    no_consent_patient,         # <fixture> returns patient_id WITHOUT consent\n    target_facility_id,         # <fixture>\n    assert_no_record_created,   # <helper_fn>\n    assert_no_message_dispatched # <helper_fn>\n):\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{no_consent_patient}\"},\n        \"recipient\": [{\"reference\": f\"Organization/{target_facility_id}\"}],\n        \"requester\": {\"agent\": {\"reference\": \"Practitioner/clinician-001\"}}\n    }\n    resp = requests.post(\n        f\"{base_url}/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"consent\" in str(body).lower(), \"Error body should mention consent\"\n    assert_no_record_created(no_consent_patient)   # <helper_fn>\n    assert_no_message_dispatched(no_consent_patient) # <helper_fn>\n"
+      },
+      {
+        "name": "test_referral_with_minimum_required_fields_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient consent record exists for the target facility",
+          "Payload contains exactly the FHIR-minimum required fields (no optional fields)"
+        ],
+        "actions": [
+          "Build a ReferralRequest with only mandatory FHIR R4 fields: resourceType, status, subject",
+          "POST minimal payload to /ReferralRequest with clinician auth header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'id' field",
+          "Referral is stored with default values for omitted optional fields",
+          "Secure message dispatched for the minimal referral"
+        ],
+        "trace": [
+          "R-HLT-017: referral stored",
+          "R-HLT-017: boundary \u2014 minimum viable payload accepted"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_referral_with_minimum_required_fields_accepted(\n    clinician_auth_headers,  # <fixture>\n    base_url,                # <fixture>\n    consent_present_patient, # <fixture>\n    assert_message_dispatched # <helper_fn>\n):\n    # BVA: exactly the lower boundary of required fields \u2014 no optional fields included\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{consent_present_patient}\"}\n    }\n    resp = requests.post(\n        f\"{base_url}/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers\n    )\n    assert resp.status_code == 201, (\n        f\"Minimal payload should be accepted; got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"id\" in body, \"Response must include assigned referral ID\"\n    assert body.get(\"status\") == \"active\"\n    assert_message_dispatched(body[\"id\"])  # <helper_fn>\n"
+      },
+      {
+        "name": "test_referral_state_transitions_draft_to_active",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician is authenticated (role:clinician)",
+          "Patient consent record exists for the target facility",
+          "A draft ReferralRequest exists for the patient"
+        ],
+        "actions": [
+          "Retrieve the draft referral to confirm initial state is 'draft'",
+          "PUT/PATCH the referral status to 'active' (submit/send action)",
+          "Capture HTTP response and confirm state changed to 'active'",
+          "Verify secure message is dispatched only after transition to 'active'"
+        ],
+        "expected": [
+          "Initial GET returns status 'draft'",
+          "PUT/PATCH returns HTTP 200",
+          "Subsequent GET returns status 'active'",
+          "Secure message dispatched after state becomes 'active'"
+        ],
+        "trace": [
+          "R-HLT-017: clinician sends referral (trigger causes state change)",
+          "R-HLT-017: secure message dispatched on active state"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_referral_state_transitions_draft_to_active(\n    clinician_auth_headers,  # <fixture>\n    base_url,                # <fixture>\n    draft_referral_id,       # <fixture> pre-creates a draft ReferralRequest, returns id\n    assert_message_dispatched # <helper_fn>\n):\n    # STC: verify draft -> active transition and side-effect\n    get_resp = requests.get(\n        f\"{base_url}/ReferralRequest/{draft_referral_id}\",\n        headers=clinician_auth_headers\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json().get(\"status\") == \"draft\", \"Precondition: must start as draft\"\n\n    patch_resp = requests.patch(\n        f\"{base_url}/ReferralRequest/{draft_referral_id}\",\n        json={\"status\": \"active\"},\n        headers=clinician_auth_headers\n    )\n    assert patch_resp.status_code == 200, f\"PATCH failed: {patch_resp.text}\"\n\n    confirm_resp = requests.get(\n        f\"{base_url}/ReferralRequest/{draft_referral_id}\",\n        headers=clinician_auth_headers\n    )\n    assert confirm_resp.json().get(\"status\") == \"active\"\n    assert_message_dispatched(draft_referral_id)  # <helper_fn>\n"
+      },
+      {
+        "name": "test_referral_decision_table_consent_role_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "System has users with roles: clinician and non-clinician (e.g. patient role)",
+          "Both consent-present and consent-absent patient records exist"
+        ],
+        "actions": [
+          "For each combination of (role, consent) attempt POST to /ReferralRequest",
+          "Assert outcome matches decision table: only clinician+consent yields 201"
+        ],
+        "expected": [
+          "clinician + consent_present -> HTTP 201",
+          "clinician + consent_absent  -> HTTP 403",
+          "non_clinician + consent_present -> HTTP 403 or 401"
+        ],
+        "trace": [
+          "R-HLT-017: preconditions role:clinician enforced",
+          "R-HLT-017: error pathway \u2014 403 when consent absent",
+          "R-HLT-017: decision table covering role x consent matrix"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"auth_fixture,patient_fixture,expected_status\", [\n    (\"clinician_auth_headers\", \"consent_present_patient\", 201),\n    (\"clinician_auth_headers\", \"no_consent_patient\",      403),\n    (\"non_clinician_auth_headers\", \"consent_present_patient\", 403),\n])\ndef test_referral_decision_table_consent_role_combinations(\n    request,\n    auth_fixture,\n    patient_fixture,\n    expected_status,\n    base_url,          # <fixture>\n    target_facility_id # <fixture>\n):\n    headers  = request.getfixturevalue(auth_fixture)   # <fixture>\n    patient  = request.getfixturevalue(patient_fixture) # <fixture>\n    payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"status\": \"active\",\n        \"subject\": {\"reference\": f\"Patient/{patient}\"},\n        \"recipient\": [{\"reference\": f\"Organization/{target_facility_id}\"}]\n    }\n    resp = requests.post(\n        f\"{base_url}/ReferralRequest\",\n        json=payload,\n        headers=headers\n    )\n    assert resp.status_code == expected_status, (\n        f\"[{auth_fixture}+{patient_fixture}] Expected {expected_status}, \"\n        f\"got {resp.status_code}: {resp.text}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-017",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 986,
+    "output_tokens": 3434,
+    "latency_ms": 44600,
+    "wall_ms": 44600,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-017\",\n  \"reasoning\": \"The requirement mandates three verifiable behaviours: (1) a valid referral is stored and a secure message dispatched (happy path, EP), (2) a referral without patient consent is rejected with HTTP 403 (NEG/DT), and (3) a referral payload at the minimum viable boundary\u2014exactly one required field per FHIR ReferralRequest\u2014is accepted (BVA). An additional State Transition test covers the referral lifecycle from 'draft' through 'active' to verify the trigger causes the correct state change. Each test authenticates as a clinician, posts to /ReferralRequest, and asserts HTTP status plus response body fields. Fixtures supply auth tokens and base URL; helpers reset state between runs to ensure idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_referral_stored_and_message_dispatched\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician is authenticated (role:clinician)\",\n        \"Patient consent record exists for the target facility\",\n        \"Target facility is registered in the system\"\n      ],\n      \"actions\": [\n        \"Build a well-formed ReferralRequest payload with all required FHIR fields\",\n        \"POST payload to /ReferralRequest with clinician auth header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains 'id' field (referral stored)\",\n        \"Response body contains 'status': 'active'\",\n        \"Secure message dispatched: message queue or audit log records the event\"\n      ],\n      \"trace\": [\n        \"R-HLT-017: referral stored\",\n        \"R-HLT-017: secure message dispatched\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_valid_referral_stored_and_message_dispatched(\\n    clinician_auth_headers,  # <fixture>\\n    base_url,                # <fixture>\\n    consent_present_patient, # <fixture> returns patient_id with consent\\n    target_facility_id,      # <fixture>\\n    assert_message_dispatched # <helper_fn>\\n):\\n    payload = {\\n        \\\"resourceType\\\": \\\"ReferralRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{consent_present_patient}\\\"},\\n        \\\"recipient\\\": [{\\\"reference\\\": f\\\"Organization/{target_facility_id}\\\"}],\\n        \\\"requester\\\": {\\\"agent\\\": {\\\"reference\\\": \\\"Practitioner/clinician-001\\\"}}\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/ReferralRequest\\\",\\n        json=payload,\\n        headers=clinician_auth_headers\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"id\\\" in body, \\\"Referral ID missing from response\\\"\\n    assert body.get(\\\"status\\\") == \\\"active\\\"\\n    assert_message_dispatched(body[\\\"id\\\"])  # <helper_fn> polls audit/message queue\\n\"\n    },\n    {\n      \"name\": \"test_referral_rejected_when_consent_absent\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician is authenticated (role:clinician)\",\n        \"Patient has NO consent record for the target facility\",\n        \"Target facility is registered in the system\"\n      ],\n      \"actions\": [\n        \"Build a ReferralRequest payload referencing a patient without consent\",\n        \"POST payload to /ReferralRequest with clinician auth header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains error code indicating consent absent\",\n        \"No referral record created in the datastore\",\n        \"No secure message dispatched\"\n      ],\n      \"trace\": [\n        \"R-HLT-017: error pathway \u2014 403 when consent absent\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_referral_rejected_when_consent_absent(\\n    clinician_auth_headers,     # <fixture>\\n    base_url,                   # <fixture>\\n    no_consent_patient,         # <fixture> returns pati"
+  }
+}

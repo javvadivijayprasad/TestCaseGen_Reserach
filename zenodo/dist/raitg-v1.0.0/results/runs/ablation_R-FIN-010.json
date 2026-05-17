@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-FIN-010",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Card freeze / unfreeze",
+    "statement": "A customer shall freeze or unfreeze their card instantly; frozen cards must reject all authorization attempts.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer toggles freeze"
+    ],
+    "expected_outcomes": [
+      "card state updated",
+      "authorization network notified"
+    ],
+    "error_pathways": [
+      "404 when card does not exist"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/freeze"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-010",
+    "reasoning": "The requirement covers three primary test dimensions: (1) happy-path freeze/unfreeze toggling with state verification and authorization rejection (STC, EP), (2) non-existent card returning 404 (NEG), and (3) boundary transition where a card is frozen then immediately re-frozen (idempotency/boundary, BVA). A fifth test covers the full freeze\u2192auth-reject\u2192unfreeze\u2192auth-pass cycle via a Decision Table. Together these give EP, BVA, STC, DT, and NEG coverage. Each test is self-contained via fixtures that create and clean up a fresh card, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_freeze_active_card_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Card belongs to the caller and is in ACTIVE state"
+        ],
+        "actions": [
+          "POST /cards/{id}/freeze with valid auth token",
+          "Assert HTTP 200 and body status == 'frozen'",
+          "Assert authorization network notified via mock/stub"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains {\"status\": \"frozen\"}",
+          "Downstream auth-network notifier called once"
+        ],
+        "trace": [
+          "R-FIN-010: card state updated",
+          "R-FIN-010: authorization network notified"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_active_card_succeeds(active_card, authed_client, mock_auth_network):\n    card_id = active_card[\"id\"]\n\n    resp = authed_client.post(f\"/cards/{card_id}/freeze\")\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"frozen\"\n    mock_auth_network.assert_called_once_with(card_id, \"frozen\")\n"
+      },
+      {
+        "name": "test_freeze_nonexistent_card_returns_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Card ID used does not exist in the system"
+        ],
+        "actions": [
+          "POST /cards/{nonexistent_id}/freeze with valid auth token",
+          "Assert HTTP 404"
+        ],
+        "expected": [
+          "HTTP 404 returned",
+          "Response body contains error indicating card not found"
+        ],
+        "trace": [
+          "R-FIN-010: error pathway \u2013 404 when card does not exist"
+        ],
+        "executable": "import pytest\n\nNONEXISTENT_CARD_ID = \"00000000-0000-0000-0000-000000000000\"\n\ndef test_freeze_nonexistent_card_returns_404(authed_client):\n    resp = authed_client.post(f\"/cards/{NONEXISTENT_CARD_ID}/freeze\")\n\n    assert resp.status_code == 404\n    body = resp.json()\n    assert \"not found\" in body.get(\"error\", \"\").lower() or \"not found\" in body.get(\"message\", \"\").lower()\n"
+      },
+      {
+        "name": "test_freeze_already_frozen_card_is_idempotent",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Card belongs to the caller and is already in FROZEN state"
+        ],
+        "actions": [
+          "POST /cards/{id}/freeze a second time on an already-frozen card",
+          "Assert response indicates frozen state without error"
+        ],
+        "expected": [
+          "HTTP 200 returned (idempotent operation)",
+          "Response body contains {\"status\": \"frozen\"}",
+          "No duplicate auth-network notifications beyond the first freeze"
+        ],
+        "trace": [
+          "R-FIN-010: card state updated (boundary \u2013 freeze at already-frozen boundary)"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_already_frozen_card_is_idempotent(frozen_card, authed_client, mock_auth_network):\n    card_id = frozen_card[\"id\"]\n\n    resp = authed_client.post(f\"/cards/{card_id}/freeze\")\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"frozen\"\n    # idempotent: notifier must not fire a redundant event\n    mock_auth_network.assert_not_called()\n"
+      },
+      {
+        "name": "test_frozen_card_rejects_authorization_attempt",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Card belongs to the caller and transitions from ACTIVE \u2192 FROZEN"
+        ],
+        "actions": [
+          "POST /cards/{id}/freeze to transition card to FROZEN",
+          "Simulate authorization attempt via POST /authorizations",
+          "Assert authorization is declined"
+        ],
+        "expected": [
+          "Freeze returns HTTP 200 with status frozen",
+          "Authorization attempt returns HTTP 402 or body with declined status"
+        ],
+        "trace": [
+          "R-FIN-010: frozen cards must reject all authorization attempts",
+          "R-FIN-010: card state updated (ACTIVE \u2192 FROZEN transition)"
+        ],
+        "executable": "import pytest\n\ndef test_frozen_card_rejects_authorization_attempt(active_card, authed_client, mock_auth_network):\n    card_id = active_card[\"id\"]\n\n    freeze_resp = authed_client.post(f\"/cards/{card_id}/freeze\")\n    assert freeze_resp.status_code == 200\n    assert freeze_resp.json()[\"status\"] == \"frozen\"\n\n    auth_resp = <simulate_authorization>(authed_client, card_id)\n    assert auth_resp.status_code in (402, 200)\n    assert auth_resp.json().get(\"decision\") == \"declined\"\n"
+      },
+      {
+        "name": "test_freeze_then_unfreeze_restores_active_state",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer session exists",
+          "Card belongs to the caller and is in ACTIVE state"
+        ],
+        "actions": [
+          "POST /cards/{id}/freeze \u2192 assert frozen",
+          "POST /cards/{id}/unfreeze \u2192 assert active",
+          "Assert auth-network notified for each state change"
+        ],
+        "expected": [
+          "First call returns {\"status\": \"frozen\"} with HTTP 200",
+          "Second call returns {\"status\": \"active\"} with HTTP 200",
+          "Auth-network notifier called twice: once per state change"
+        ],
+        "trace": [
+          "R-FIN-010: card state updated (ACTIVE \u2192 FROZEN \u2192 ACTIVE)",
+          "R-FIN-010: authorization network notified",
+          "R-FIN-010: customer toggles freeze (both directions)"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_then_unfreeze_restores_active_state(active_card, authed_client, mock_auth_network):\n    card_id = active_card[\"id\"]\n\n    freeze_resp = authed_client.post(f\"/cards/{card_id}/freeze\")\n    assert freeze_resp.status_code == 200\n    assert freeze_resp.json()[\"status\"] == \"frozen\"\n\n    unfreeze_resp = authed_client.post(f\"/cards/{card_id}/unfreeze\")\n    assert unfreeze_resp.status_code == 200\n    assert unfreeze_resp.json()[\"status\"] == \"active\"\n\n    assert mock_auth_network.call_count == 2\n    calls = mock_auth_network.call_args_list\n    assert calls[0][0] == (card_id, \"frozen\")\n    assert calls[1][0] == (card_id, \"active\")\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-010",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 982,
+    "output_tokens": 2169,
+    "latency_ms": 27538,
+    "wall_ms": 27538,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-010\",\n  \"reasoning\": \"The requirement covers three primary test dimensions: (1) happy-path freeze/unfreeze toggling with state verification and authorization rejection (STC, EP), (2) non-existent card returning 404 (NEG), and (3) boundary transition where a card is frozen then immediately re-frozen (idempotency/boundary, BVA). A fifth test covers the full freeze\u2192auth-reject\u2192unfreeze\u2192auth-pass cycle via a Decision Table. Together these give EP, BVA, STC, DT, and NEG coverage. Each test is self-contained via fixtures that create and clean up a fresh card, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_freeze_active_card_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer session exists\",\n        \"Card belongs to the caller and is in ACTIVE state\"\n      ],\n      \"actions\": [\n        \"POST /cards/{id}/freeze with valid auth token\",\n        \"Assert HTTP 200 and body status == 'frozen'\",\n        \"Assert authorization network notified via mock/stub\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains {\\\"status\\\": \\\"frozen\\\"}\",\n        \"Downstream auth-network notifier called once\"\n      ],\n      \"trace\": [\n        \"R-FIN-010: card state updated\",\n        \"R-FIN-010: authorization network notified\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_freeze_active_card_succeeds(active_card, authed_client, mock_auth_network):\\n    card_id = active_card[\\\"id\\\"]\\n\\n    resp = authed_client.post(f\\\"/cards/{card_id}/freeze\\\")\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"frozen\\\"\\n    mock_auth_network.assert_called_once_with(card_id, \\\"frozen\\\")\\n\"\n    },\n    {\n      \"name\": \"test_freeze_nonexistent_card_returns_404\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated customer session exists\",\n        \"Card ID used does not exist in the system\"\n      ],\n      \"actions\": [\n        \"POST /cards/{nonexistent_id}/freeze with valid auth token\",\n        \"Assert HTTP 404\"\n      ],\n      \"expected\": [\n        \"HTTP 404 returned\",\n        \"Response body contains error indicating card not found\"\n      ],\n      \"trace\": [\n        \"R-FIN-010: error pathway \u2013 404 when card does not exist\"\n      ],\n      \"executable\": \"import pytest\\n\\nNONEXISTENT_CARD_ID = \\\"00000000-0000-0000-0000-000000000000\\\"\\n\\ndef test_freeze_nonexistent_card_returns_404(authed_client):\\n    resp = authed_client.post(f\\\"/cards/{NONEXISTENT_CARD_ID}/freeze\\\")\\n\\n    assert resp.status_code == 404\\n    body = resp.json()\\n    assert \\\"not found\\\" in body.get(\\\"error\\\", \\\"\\\").lower() or \\\"not found\\\" in body.get(\\\"message\\\", \\\"\\\").lower()\\n\"\n    },\n    {\n      \"name\": \"test_freeze_already_frozen_card_is_idempotent\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer session exists\",\n        \"Card belongs to the caller and is already in FROZEN state\"\n      ],\n      \"actions\": [\n        \"POST /cards/{id}/freeze a second time on an already-frozen card\",\n        \"Assert response indicates frozen state without error\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned (idempotent operation)\",\n        \"Response body contains {\\\"status\\\": \\\"frozen\\\"}\",\n        \"No duplicate auth-network notifications beyond the first freeze\"\n      ],\n      \"trace\": [\n        \"R-FIN-010: card state updated (boundary \u2013 freeze at already-frozen boundary)\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_freeze_already_frozen_card_is_idempotent(frozen_card, authed_client, mock_auth_network):\\n    card_id = frozen_card[\\\"id\\\"]\\n\\n    resp = authed_client.post(f\\\"/cards/{card_id}/freeze\\\")\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"frozen\\\"\\n    # idempotent: notifier must not fire a redundant event\\n    mock_auth_network.assert_not_cal"
+  }
+}

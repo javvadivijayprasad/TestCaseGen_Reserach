@@ -1,0 +1,139 @@
+{
+  "req": {
+    "id": "R-WEB-109",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Feature flag rollout",
+    "statement": "An admin shall toggle feature flags per environment; toggles shall be audit-logged.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin toggles flag"
+    ],
+    "expected_outcomes": [
+      "flag state changed",
+      "audit entry"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/feature-flags"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-109",
+    "reasoning": "R-WEB-109 mandates three distinct verification concerns: (1) an admin can successfully toggle a feature flag and an audit entry is created (positive/EP), (2) a non-admin user receives HTTP 403 and no state change occurs (negative/NEG), and (3) rapidly toggling the same flag back to its original state leaves the system in a consistent, audited state \u2014 exercising the enabled\u2192disabled\u2192enabled state cycle (boundary/STC). Each test is scoped to a single responsibility, uses fixtures/helpers as placeholders to stay under 40 lines, and resets state via teardown to guarantee idempotency.",
+    "tests": [
+      {
+        "name": "test_admin_toggle_flag_creates_audit_entry",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated session exists for a user with role:admin",
+          "Feature flag 'FEATURE_X' exists in the 'staging' environment with known initial state",
+          "Audit log is accessible via GET /audit-logs"
+        ],
+        "actions": [
+          "Record the current flag state for 'FEATURE_X' in 'staging'",
+          "Send PATCH /feature-flags/FEATURE_X with body {\"environment\":\"staging\",\"enabled\":<toggled_value>} using admin credentials",
+          "Assert HTTP 200 response",
+          "Fetch the latest audit log entry for 'FEATURE_X'"
+        ],
+        "expected": [
+          "Response status is 200",
+          "Response body contains updated flag state",
+          "Audit log contains an entry referencing 'FEATURE_X', the admin user id, old state, and new state"
+        ],
+        "trace": [
+          "R-WEB-109: flag state changed",
+          "R-WEB-109: audit entry created on toggle"
+        ],
+        "executable": "import pytest\n\ndef test_admin_toggle_flag_creates_audit_entry(\n    admin_api_client,       # <fixture>: authenticated HTTP client for admin\n    feature_flag_reset,    # <fixture>: restores flag to original state after test\n    get_audit_log_entry,   # <helper_fn>(flag_name, env) -> latest audit dict\n):\n    flag_name = \"FEATURE_X\"\n    env = \"staging\"\n\n    current = admin_api_client.get(\n        f\"/feature-flags/{flag_name}\",\n        params={\"environment\": env},\n    )\n    assert current.status_code == 200\n    original_state = current.json()[\"enabled\"]\n    new_state = not original_state\n\n    response = admin_api_client.patch(\n        f\"/feature-flags/{flag_name}\",\n        json={\"environment\": env, \"enabled\": new_state},\n    )\n    assert response.status_code == 200\n    assert response.json()[\"enabled\"] == new_state\n\n    audit = get_audit_log_entry(flag_name, env)\n    assert audit[\"flag\"] == flag_name\n    assert audit[\"new_value\"] == new_state\n    assert audit[\"old_value\"] == original_state\n    assert \"admin_user_id\" in audit\n"
+      },
+      {
+        "name": "test_non_admin_toggle_flag_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated session exists for a user with role:viewer (non-admin)",
+          "Feature flag 'FEATURE_X' exists in the 'staging' environment"
+        ],
+        "actions": [
+          "Record the current flag state for 'FEATURE_X' in 'staging' using an admin client",
+          "Send PATCH /feature-flags/FEATURE_X with body {\"environment\":\"staging\",\"enabled\":true} using non-admin credentials",
+          "Assert HTTP 403 response",
+          "Re-read the flag state using the admin client to confirm no change"
+        ],
+        "expected": [
+          "Response status is 403",
+          "Response body contains an error indicating insufficient permissions",
+          "Flag state remains unchanged after the rejected request",
+          "No new audit log entry is created for this attempt"
+        ],
+        "trace": [
+          "R-WEB-109: 403 when not admin",
+          "R-WEB-109: flag state must not change on unauthorized attempt"
+        ],
+        "executable": "import pytest\n\ndef test_non_admin_toggle_flag_returns_403(\n    viewer_api_client,     # <fixture>: authenticated HTTP client for viewer role\n    admin_api_client,      # <fixture>: authenticated HTTP client for admin\n    get_audit_log_entry,   # <helper_fn>(flag_name, env) -> latest audit dict\n):\n    flag_name = \"FEATURE_X\"\n    env = \"staging\"\n\n    before = admin_api_client.get(\n        f\"/feature-flags/{flag_name}\",\n        params={\"environment\": env},\n    )\n    assert before.status_code == 200\n    original_state = before.json()[\"enabled\"]\n    audit_before = get_audit_log_entry(flag_name, env)\n\n    response = viewer_api_client.patch(\n        f\"/feature-flags/{flag_name}\",\n        json={\"environment\": env, \"enabled\": not original_state},\n    )\n    assert response.status_code == 403\n    assert \"permission\" in response.json().get(\"error\", \"\").lower()\n\n    after = admin_api_client.get(\n        f\"/feature-flags/{flag_name}\",\n        params={\"environment\": env},\n    )\n    assert after.json()[\"enabled\"] == original_state\n    assert get_audit_log_entry(flag_name, env) == audit_before\n"
+      },
+      {
+        "name": "test_admin_double_toggle_returns_to_original_state_with_two_audit_entries",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated session exists for a user with role:admin",
+          "Feature flag 'FEATURE_Y' exists in the 'staging' environment",
+          "Audit log endpoint is accessible"
+        ],
+        "actions": [
+          "Read and record the initial state of 'FEATURE_Y'",
+          "Toggle 'FEATURE_Y' to the opposite state (first transition)",
+          "Assert state changed and first audit entry exists",
+          "Toggle 'FEATURE_Y' back to the original state (second transition)",
+          "Assert state restored and second audit entry exists"
+        ],
+        "expected": [
+          "After first toggle: flag state equals NOT(initial_state), HTTP 200",
+          "First audit entry records initial_state -> NOT(initial_state)",
+          "After second toggle: flag state equals initial_state, HTTP 200",
+          "Second audit entry records NOT(initial_state) -> initial_state",
+          "Total of exactly two new audit entries created during this test"
+        ],
+        "trace": [
+          "R-WEB-109: flag state changed (both transitions)",
+          "R-WEB-109: audit entry created for every toggle",
+          "STC: covers enabled->disabled->enabled state cycle"
+        ],
+        "executable": "import pytest\n\ndef test_admin_double_toggle_returns_to_original_state_with_two_audit_entries(\n    admin_api_client,       # <fixture>: authenticated HTTP client for admin\n    feature_flag_reset,    # <fixture>: restores flag to original state after test\n    list_recent_audit_entries,  # <helper_fn>(flag_name, env, since_id) -> list\n):\n    flag_name = \"FEATURE_Y\"\n    env = \"staging\"\n\n    init_resp = admin_api_client.get(\n        f\"/feature-flags/{flag_name}\", params={\"environment\": env}\n    )\n    assert init_resp.status_code == 200\n    initial_state = init_resp.json()[\"enabled\"]\n    baseline_audit_id = init_resp.json().get(\"last_audit_id\", 0)\n\n    r1 = admin_api_client.patch(\n        f\"/feature-flags/{flag_name}\",\n        json={\"environment\": env, \"enabled\": not initial_state},\n    )\n    assert r1.status_code == 200\n    assert r1.json()[\"enabled\"] == (not initial_state)\n\n    r2 = admin_api_client.patch(\n        f\"/feature-flags/{flag_name}\",\n        json={\"environment\": env, \"enabled\": initial_state},\n    )\n    assert r2.status_code == 200\n    assert r2.json()[\"enabled\"] == initial_state\n\n    new_entries = list_recent_audit_entries(flag_name, env, since_id=baseline_audit_id)\n    assert len(new_entries) == 2\n    assert new_entries[0][\"old_value\"] == initial_state\n    assert new_entries[0][\"new_value\"] == (not initial_state)\n    assert new_entries[1][\"old_value\"] == (not initial_state)\n    assert new_entries[1][\"new_value\"] == initial_state\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-109",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 970,
+    "output_tokens": 2421,
+    "latency_ms": 27440,
+    "wall_ms": 27440,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-109\",\n  \"reasoning\": \"R-WEB-109 mandates three distinct verification concerns: (1) an admin can successfully toggle a feature flag and an audit entry is created (positive/EP), (2) a non-admin user receives HTTP 403 and no state change occurs (negative/NEG), and (3) rapidly toggling the same flag back to its original state leaves the system in a consistent, audited state \u2014 exercising the enabled\u2192disabled\u2192enabled state cycle (boundary/STC). Each test is scoped to a single responsibility, uses fixtures/helpers as placeholders to stay under 40 lines, and resets state via teardown to guarantee idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_toggle_flag_creates_audit_entry\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:admin\",\n        \"Feature flag 'FEATURE_X' exists in the 'staging' environment with known initial state\",\n        \"Audit log is accessible via GET /audit-logs\"\n      ],\n      \"actions\": [\n        \"Record the current flag state for 'FEATURE_X' in 'staging'\",\n        \"Send PATCH /feature-flags/FEATURE_X with body {\\\"environment\\\":\\\"staging\\\",\\\"enabled\\\":<toggled_value>} using admin credentials\",\n        \"Assert HTTP 200 response\",\n        \"Fetch the latest audit log entry for 'FEATURE_X'\"\n      ],\n      \"expected\": [\n        \"Response status is 200\",\n        \"Response body contains updated flag state\",\n        \"Audit log contains an entry referencing 'FEATURE_X', the admin user id, old state, and new state\"\n      ],\n      \"trace\": [\n        \"R-WEB-109: flag state changed\",\n        \"R-WEB-109: audit entry created on toggle\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_admin_toggle_flag_creates_audit_entry(\\n    admin_api_client,       # <fixture>: authenticated HTTP client for admin\\n    feature_flag_reset,    # <fixture>: restores flag to original state after test\\n    get_audit_log_entry,   # <helper_fn>(flag_name, env) -> latest audit dict\\n):\\n    flag_name = \\\"FEATURE_X\\\"\\n    env = \\\"staging\\\"\\n\\n    current = admin_api_client.get(\\n        f\\\"/feature-flags/{flag_name}\\\",\\n        params={\\\"environment\\\": env},\\n    )\\n    assert current.status_code == 200\\n    original_state = current.json()[\\\"enabled\\\"]\\n    new_state = not original_state\\n\\n    response = admin_api_client.patch(\\n        f\\\"/feature-flags/{flag_name}\\\",\\n        json={\\\"environment\\\": env, \\\"enabled\\\": new_state},\\n    )\\n    assert response.status_code == 200\\n    assert response.json()[\\\"enabled\\\"] == new_state\\n\\n    audit = get_audit_log_entry(flag_name, env)\\n    assert audit[\\\"flag\\\"] == flag_name\\n    assert audit[\\\"new_value\\\"] == new_state\\n    assert audit[\\\"old_value\\\"] == original_state\\n    assert \\\"admin_user_id\\\" in audit\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_toggle_flag_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated session exists for a user with role:viewer (non-admin)\",\n        \"Feature flag 'FEATURE_X' exists in the 'staging' environment\"\n      ],\n      \"actions\": [\n        \"Record the current flag state for 'FEATURE_X' in 'staging' using an admin client\",\n        \"Send PATCH /feature-flags/FEATURE_X with body {\\\"environment\\\":\\\"staging\\\",\\\"enabled\\\":true} using non-admin credentials\",\n        \"Assert HTTP 403 response\",\n        \"Re-read the flag state using the admin client to confirm no change\"\n      ],\n      \"expected\": [\n        \"Response status is 403\",\n        \"Response body contains an error indicating insufficient permissions\",\n        \"Flag state remains unchanged after the rejected request\",\n        \"No new audit log entry is created for this attempt\"\n      ],\n      \"trace\": [\n        \"R-WEB-109: 403 when not admin\",\n        \"R-WEB-109: flag state must not change on unauthorized attempt\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_admin_toggle_flag_returns_403(\\n    viewer_api_cli"
+  }
+}

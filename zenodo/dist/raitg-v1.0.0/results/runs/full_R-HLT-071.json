@@ -1,0 +1,191 @@
+{
+  "req": {
+    "id": "R-HLT-071",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Break-glass access (negative)",
+    "statement": "A clinician shall invoke break-glass access for an emergent patient; break-glass use shall be audited and trigger a post-event review. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician asserts emergency"
+    ],
+    "expected_outcomes": [
+      "access granted",
+      "audit event emitted"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/BreakGlass"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-071",
+    "reasoning": "The break-glass endpoint has three critical dimensions: (1) a valid clinician asserting emergency on an existing patient (EP positive path), (2) negative paths covering missing mandatory fields, unauthorized roles, and conflicting state transitions (NEG/DT), and (3) boundary conditions around the reason string length and repeated invocations (BVA). The violation in test[4] was that a negative-kind test was assigned heuristic=STC; STC is reserved for state-transition coverage and is not appropriate for a simple negative/error-path test. That test has been corrected to heuristic=NEG to properly reflect its negative error-path nature. All other tests are preserved exactly as they passed verification.",
+    "tests": [
+      {
+        "name": "test_break_glass_valid_clinician_grants_access_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_token_fixture>",
+          "A patient record exists with ID from <unique_patient_id_fixture>",
+          "Audit log is queryable via <audit_query_helper>"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician Bearer token, patientId, and reason",
+          "Query audit log for the break-glass event",
+          "Assert HTTP 200 and accessGranted == true",
+          "Assert audit record exists with correct actor and patientId"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Response body contains accessGranted: true",
+          "Audit event with eventType=BREAK_GLASS emitted",
+          "Audit record actor matches clinician ID"
+        ],
+        "trace": [
+          "R-HLT-071: clinician invokes break-glass; access granted",
+          "R-HLT-071: break-glass use shall be audited"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_valid_clinician_grants_access_and_emits_audit(\n    clinician_token_fixture, unique_patient_id_fixture, audit_query_helper, base_url\n):\n    patient_id = unique_patient_id_fixture()\n    headers = {\"Authorization\": f\"Bearer {clinician_token_fixture}\"}\n    payload = {\n        \"patientId\": patient_id,\n        \"reason\": \"Cardiac arrest, immediate access required\"\n    }\n\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"accessGranted\") is True, \"accessGranted must be true\"\n    assert \"sessionToken\" in body, \"sessionToken missing from response\"\n\n    audit = audit_query_helper(patient_id=patient_id, event_type=\"BREAK_GLASS\")\n    assert audit is not None, \"Audit event not found\"\n    assert audit[\"actorId\"] == body.get(\"actorId\"), \"Audit actor mismatch\"\n    assert audit[\"patientId\"] == patient_id"
+      },
+      {
+        "name": "test_break_glass_missing_reason_returns_422_and_no_access",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_token_fixture>",
+          "A patient record exists with ID from <unique_patient_id_fixture>",
+          "reason field is omitted from the request body"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician token, patientId, but NO reason field",
+          "Assert HTTP 422 Unprocessable Entity",
+          "Assert response error references the missing reason field",
+          "Confirm no audit event is created for this request"
+        ],
+        "expected": [
+          "HTTP 422",
+          "Response body contains error referencing 'reason'",
+          "accessGranted absent or false",
+          "No BREAK_GLASS audit event emitted for this patient"
+        ],
+        "trace": [
+          "R-HLT-071: missing mandatory elements must be tested",
+          "R-HLT-071: negative paths must be covered"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_missing_reason_returns_422_and_no_access(\n    clinician_token_fixture, unique_patient_id_fixture, audit_query_helper, base_url\n):\n    patient_id = unique_patient_id_fixture()\n    headers = {\"Authorization\": f\"Bearer {clinician_token_fixture}\"}\n    payload = {\"patientId\": patient_id}  # reason intentionally omitted\n\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_detail = str(body).lower()\n    assert \"reason\" in error_detail, \"Error must reference missing 'reason' field\"\n    assert body.get(\"accessGranted\") is not True\n\n    audit = audit_query_helper(patient_id=patient_id, event_type=\"BREAK_GLASS\")\n    assert audit is None, \"No audit event should be emitted for rejected request\""
+      },
+      {
+        "name": "test_break_glass_non_clinician_role_returns_403",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "An authenticated token for a non-clinician role (e.g. billing) is available via <billing_token_fixture>",
+          "A patient record exists with ID from <unique_patient_id_fixture>"
+        ],
+        "actions": [
+          "POST /BreakGlass with billing role token and valid payload",
+          "Assert HTTP 403 Forbidden",
+          "Assert response error cites insufficient permissions",
+          "Confirm no audit event is created"
+        ],
+        "expected": [
+          "HTTP 403",
+          "Response body contains permission-denied error",
+          "accessGranted absent or false",
+          "No BREAK_GLASS audit event emitted"
+        ],
+        "trace": [
+          "R-HLT-071: permission denial must be tested",
+          "R-HLT-071: actor must hold role:clinician"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_non_clinician_role_returns_403(\n    billing_token_fixture, unique_patient_id_fixture, audit_query_helper, base_url\n):\n    patient_id = unique_patient_id_fixture()\n    headers = {\"Authorization\": f\"Bearer {billing_token_fixture}\"}\n    payload = {\n        \"patientId\": patient_id,\n        \"reason\": \"Testing unauthorized role\"\n    }\n\n    resp = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=headers)\n\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_detail = str(body).lower()\n    assert any(k in error_detail for k in [\"forbidden\", \"permission\", \"unauthorized\"]), \\\n        \"Error must cite permission denial\"\n    assert body.get(\"accessGranted\") is not True\n\n    audit = audit_query_helper(patient_id=patient_id, event_type=\"BREAK_GLASS\")\n    assert audit is None, \"Audit event must not be emitted for unauthorized request\""
+      },
+      {
+        "name": "test_break_glass_reason_at_max_length_boundary_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_token_fixture>",
+          "A patient record exists with ID from <unique_patient_id_fixture>",
+          "API enforces a maximum reason length (assumed 500 characters per spec)"
+        ],
+        "actions": [
+          "POST /BreakGlass with a reason string of exactly 500 characters",
+          "Assert HTTP 200 and accessGranted == true",
+          "POST /BreakGlass again with a reason string of 501 characters (one over boundary)",
+          "Assert HTTP 422 for the over-limit request"
+        ],
+        "expected": [
+          "500-char reason: HTTP 200, accessGranted true",
+          "501-char reason: HTTP 422 with reason-length error"
+        ],
+        "trace": [
+          "R-HLT-071: boundary conditions on mandatory elements",
+          "BVA applied to reason field max-length constraint"
+        ],
+        "executable": "import pytest\nimport requests\n\nMAX_REASON_LEN = 500\n\ndef test_break_glass_reason_at_max_length_boundary_succeeds(\n    clinician_token_fixture, unique_patient_id_fixture, audit_query_helper, base_url\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_token_fixture}\"}\n\n    # -- At boundary: exactly 500 chars --\n    patient_ok = unique_patient_id_fixture()\n    payload_ok = {\n        \"patientId\": patient_ok,\n        \"reason\": \"A\" * MAX_REASON_LEN\n    }\n    resp_ok = requests.post(f\"{base_url}/BreakGlass\", json=payload_ok, headers=headers)\n    assert resp_ok.status_code == 200, \\\n        f\"Expected 200 at max boundary, got {resp_ok.status_code}: {resp_ok.text}\"\n    assert resp_ok.json().get(\"accessGranted\") is True\n\n    # -- Over boundary: 501 chars --\n    patient_over = unique_patient_id_fixture()\n    payload_over = {\n        \"patientId\": patient_over,\n        \"reason\": \"A\" * (MAX_REASON_LEN + 1)\n    }\n    resp_over = requests.post(f\"{base_url}/BreakGlass\", json=payload_over, headers=headers)\n    assert resp_over.status_code == 422, \\\n        f\"Expected 422 over boundary, got {resp_over.status_code}: {resp_over.text}\"\n    error_detail = str(resp_over.json()).lower()\n    assert \"reason\" in error_detail, \"Error must reference reason field length violation\""
+      },
+      {
+        "name": "test_break_glass_duplicate_active_session_conflicting_state_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_token_fixture>",
+          "A patient record exists with ID from <unique_patient_id_fixture>",
+          "The system enforces that only one active break-glass session per patient per clinician is allowed at a time"
+        ],
+        "actions": [
+          "POST /BreakGlass with valid clinician token and patientId to establish first active session",
+          "Assert HTTP 200 and accessGranted == true for first request",
+          "POST /BreakGlass again with the same clinician token and same patientId while first session is still active",
+          "Assert HTTP 409 Conflict for the duplicate request",
+          "Assert response error cites conflicting state or existing active session"
+        ],
+        "expected": [
+          "First POST: HTTP 200, accessGranted true",
+          "Second POST: HTTP 409 Conflict",
+          "Response body for second POST references existing active session or conflicting state",
+          "No additional audit event emitted for the rejected duplicate request"
+        ],
+        "trace": [
+          "R-HLT-071: conflicting state transitions must be tested",
+          "R-HLT-071: negative paths must be covered"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_break_glass_duplicate_active_session_conflicting_state_returns_409(\n    clinician_token_fixture, unique_patient_id_fixture, audit_query_helper, base_url\n):\n    patient_id = unique_patient_id_fixture()\n    headers = {\"Authorization\": f\"Bearer {clinician_token_fixture}\"}\n    payload = {\n        \"patientId\": patient_id,\n        \"reason\": \"Emergency: establishing initial break-glass session\"\n    }\n\n    # First invocation - must succeed\n    resp_first = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=headers)\n    assert resp_first.status_code == 200, \\\n        f\"Expected 200 for first break-glass, got {resp_first.status_code}: {resp_first.text}\"\n    assert resp_first.json().get(\"accessGranted\") is True\n\n    # Second invocation with same patient while session is still active - must conflict\n    resp_second = requests.post(f\"{base_url}/BreakGlass\", json=payload, headers=headers)\n    assert resp_second.status_code == 409, \\\n        f\"Expected 409 Conflict for duplicate session, got {resp_second.status_code}: {resp_second.text}\"\n    body_second = resp_second.json()\n    error_detail = str(body_second).lower()\n    assert any(k in error_detail for k in [\"conflict\", \"active\", \"session\", \"already\"]), \\\n        \"Error must reference conflicting or already-active session state\"\n    assert body_second.get(\"accessGranted\") is not True\n\n    # Audit should reflect only the first successful event\n    audit = audit_query_helper(patient_id=patient_id, event_type=\"BREAK_GLASS\")\n    assert audit is not None, \"Audit event for first successful break-glass must exist\"\n    assert audit.get(\"count\", 1) == 1, \"Only one audit event should exist for this patient\""
+      }
+    ]
+  },
+  "req_id": "R-HLT-071",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 3570,
+    "latency_ms": 44769,
+    "wall_ms": 44769,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-071\",\n  \"reasoning\": \"The break-glass endpoint has three critical dimensions: (1) a valid clinician asserting emergency on an existing patient (EP positive path), (2) negative paths covering missing mandatory fields, unauthorized roles, and conflicting state transitions (NEG/DT), and (3) boundary conditions around the reason string length and repeated invocations (BVA/STC). Each test posts to /BreakGlass and independently verifies HTTP status, response body, and audit side-effects via a dedicated audit-query helper. Tests are idempotent because each creates its own patient fixture with a unique ID and cleans up via teardown or relies on the server's idempotency contract.\",\n  \"tests\": [\n    {\n      \"name\": \"test_break_glass_valid_clinician_grants_access_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token is available via <clinician_token_fixture>\",\n        \"A patient record exists with ID from <unique_patient_id_fixture>\",\n        \"Audit log is queryable via <audit_query_helper>\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with valid clinician Bearer token, patientId, and reason\",\n        \"Query audit log for the break-glass event\",\n        \"Assert HTTP 200 and accessGranted == true\",\n        \"Assert audit record exists with correct actor and patientId\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Response body contains accessGranted: true\",\n        \"Audit event with eventType=BREAK_GLASS emitted\",\n        \"Audit record actor matches clinician ID\"\n      ],\n      \"trace\": [\n        \"R-HLT-071: clinician invokes break-glass; access granted\",\n        \"R-HLT-071: break-glass use shall be audited\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_break_glass_valid_clinician_grants_access_and_emits_audit(\\n    clinician_token_fixture, unique_patient_id_fixture, audit_query_helper, base_url\\n):\\n    patient_id = unique_patient_id_fixture()\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {clinician_token_fixture}\\\"}\\n    payload = {\\n        \\\"patientId\\\": patient_id,\\n        \\\"reason\\\": \\\"Cardiac arrest, immediate access required\\\"\\n    }\\n\\n    resp = requests.post(f\\\"{base_url}/BreakGlass\\\", json=payload, headers=headers)\\n\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"accessGranted\\\") is True, \\\"accessGranted must be true\\\"\\n    assert \\\"sessionToken\\\" in body, \\\"sessionToken missing from response\\\"\\n\\n    audit = audit_query_helper(patient_id=patient_id, event_type=\\\"BREAK_GLASS\\\")\\n    assert audit is not None, \\\"Audit event not found\\\"\\n    assert audit[\\\"actorId\\\"] == body.get(\\\"actorId\\\"), \\\"Audit actor mismatch\\\"\\n    assert audit[\\\"patientId\\\"] == patient_id\"\n    },\n    {\n      \"name\": \"test_break_glass_missing_reason_returns_422_and_no_access\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token is available via <clinician_token_fixture>\",\n        \"A patient record exists with ID from <unique_patient_id_fixture>\",\n        \"reason field is omitted from the request body\"\n      ],\n      \"actions\": [\n        \"POST /BreakGlass with valid clinician token, patientId, but NO reason field\",\n        \"Assert HTTP 422 Unprocessable Entity\",\n        \"Assert response error references the missing reason field\",\n        \"Confirm no audit event is created for this request\"\n      ],\n      \"expected\": [\n        \"HTTP 422\",\n        \"Response body contains error referencing 'reason'\",\n        \"accessGranted absent or false\",\n        \"No BREAK_GLASS audit event emitted for this patient\"\n      ],\n      \"trace\": [\n        \"R-HLT-071: missing mandatory elements must be tested\",\n        \"R-HLT-071: negative paths must be covered\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_break_glass_missing_reason_returns_"
+  }
+}

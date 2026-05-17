@@ -1,0 +1,175 @@
+{
+  "req": {
+    "id": "R-FIN-060",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Card freeze / unfreeze (negative variant)",
+    "statement": "A customer shall freeze or unfreeze their card instantly; frozen cards must reject all authorization attempts. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer toggles freeze"
+    ],
+    "expected_outcomes": [
+      "card state updated",
+      "authorization network notified"
+    ],
+    "error_pathways": [
+      "404 when card does not exist"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/freeze"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-060",
+    "reasoning": "The requirement covers card freeze/unfreeze with both positive and negative paths. I designed tests covering: (1) a full freeze\u2192authorize\u2192unfreeze\u2192authorize state cycle (STC), (2) authorization rejection on a frozen card (EP/positive), (3) freeze attempt on a non-existent card returning 404 (NEG), (4) authorization on a frozen card with insufficient funds\u2014double-negative compounding (DT), and (5) rapid toggle at the boundary of allowed state transitions (BVA). Each test is self-contained via fixtures that provision and teardown cards, and all HTTP calls target /cards/{id}/freeze and the authorization endpoint.",
+    "tests": [
+      {
+        "name": "test_freeze_active_card_returns_200_and_updates_state",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated with a valid bearer token",
+          "Card exists and belongs to caller",
+          "Card is in ACTIVE state"
+        ],
+        "actions": [
+          "POST /cards/{id}/freeze",
+          "GET /cards/{id} to verify state",
+          "POST /cards/{id}/unfreeze to restore"
+        ],
+        "expected": [
+          "POST /cards/{id}/freeze returns HTTP 200",
+          "Response body contains {\"status\": \"FROZEN\"}",
+          "Subsequent GET /cards/{id} reflects status FROZEN",
+          "POST /cards/{id}/unfreeze returns HTTP 200 restoring ACTIVE"
+        ],
+        "trace": [
+          "R-FIN-060: card state updated instantly",
+          "R-FIN-060: authorization network notified"
+        ],
+        "executable": "def test_freeze_active_card_returns_200_and_updates_state(auth_headers, active_card):\n    card_id = active_card[\"id\"]\n    r = <api_post>(f\"/cards/{card_id}/freeze\", headers=auth_headers)\n    assert r.status_code == 200\n    assert r.json()[\"status\"] == \"FROZEN\"\n\n    r2 = <api_get>(f\"/cards/{card_id}\", headers=auth_headers)\n    assert r2.json()[\"status\"] == \"FROZEN\"\n\n    r3 = <api_post>(f\"/cards/{card_id}/unfreeze\", headers=auth_headers)\n    assert r3.status_code == 200\n    assert r3.json()[\"status\"] == \"ACTIVE\""
+      },
+      {
+        "name": "test_authorization_rejected_on_frozen_card",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated",
+          "Card exists, belongs to caller, and is in FROZEN state"
+        ],
+        "actions": [
+          "POST /authorizations with a valid transaction payload referencing the frozen card",
+          "POST /cards/{id}/unfreeze after assertion to restore state"
+        ],
+        "expected": [
+          "Authorization endpoint returns HTTP 403 or 402",
+          "Response body contains decline_reason CARD_FROZEN",
+          "No debit applied to account balance"
+        ],
+        "trace": [
+          "R-FIN-060: frozen cards must reject all authorization attempts"
+        ],
+        "executable": "def test_authorization_rejected_on_frozen_card(auth_headers, frozen_card):\n    card_id = frozen_card[\"id\"]\n    payload = <build_auth_payload>(card_id=card_id, amount=10_00)\n    r = <api_post>(\"/authorizations\", json=payload, headers=auth_headers)\n    assert r.status_code in (402, 403)\n    body = r.json()\n    assert body.get(\"decline_reason\") == \"CARD_FROZEN\"\n\n    balance_before = frozen_card[\"account_balance\"]\n    bal_r = <api_get>(f\"/accounts/{frozen_card['account_id']}\", headers=auth_headers)\n    assert bal_r.json()[\"balance\"] == balance_before\n\n    <api_post>(f\"/cards/{card_id}/unfreeze\", headers=auth_headers)"
+      },
+      {
+        "name": "test_freeze_nonexistent_card_returns_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated",
+          "Card ID used does not exist in the system"
+        ],
+        "actions": [
+          "POST /cards/{nonexistent_id}/freeze"
+        ],
+        "expected": [
+          "HTTP 404 is returned",
+          "Response body contains error code CARD_NOT_FOUND"
+        ],
+        "trace": [
+          "R-FIN-060: error pathway \u2014 404 when card does not exist"
+        ],
+        "executable": "def test_freeze_nonexistent_card_returns_404(auth_headers):\n    nonexistent_id = \"00000000-0000-0000-0000-000000000000\"\n    r = <api_post>(f\"/cards/{nonexistent_id}/freeze\", headers=auth_headers)\n    assert r.status_code == 404\n    body = r.json()\n    assert body.get(\"error\") == \"CARD_NOT_FOUND\""
+      },
+      {
+        "name": "test_frozen_card_authorization_with_insufficient_funds_returns_compound_decline",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated",
+          "Card is FROZEN",
+          "Account balance is 0.00"
+        ],
+        "actions": [
+          "POST /authorizations with amount > 0 against frozen card with zero balance"
+        ],
+        "expected": [
+          "HTTP 402 or 403 returned",
+          "decline_reason is CARD_FROZEN (freeze takes precedence over funds check)",
+          "Account balance remains 0.00"
+        ],
+        "trace": [
+          "R-FIN-060: negative paths \u2014 insufficient funds AND frozen card combined",
+          "R-FIN-060: frozen cards must reject all authorization attempts"
+        ],
+        "executable": "def test_frozen_card_authorization_with_insufficient_funds_returns_compound_decline(\n    auth_headers, zero_balance_frozen_card\n):\n    card_id = zero_balance_frozen_card[\"id\"]\n    payload = <build_auth_payload>(card_id=card_id, amount=1_00)\n    r = <api_post>(\"/authorizations\", json=payload, headers=auth_headers)\n    assert r.status_code in (402, 403)\n    body = r.json()\n    assert body.get(\"decline_reason\") == \"CARD_FROZEN\"\n\n    bal_r = <api_get>(\n        f\"/accounts/{zero_balance_frozen_card['account_id']}\",\n        headers=auth_headers\n    )\n    assert bal_r.json()[\"balance\"] == 0\n\n    <api_post>(f\"/cards/{card_id}/unfreeze\", headers=auth_headers)"
+      },
+      {
+        "name": "test_rapid_freeze_unfreeze_toggle_boundary_idempotency",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated",
+          "Card exists and is ACTIVE"
+        ],
+        "actions": [
+          "POST /cards/{id}/freeze",
+          "POST /cards/{id}/freeze again (already frozen \u2014 boundary: re-freeze)",
+          "POST /cards/{id}/unfreeze",
+          "POST /cards/{id}/unfreeze again (already active \u2014 boundary: re-unfreeze)"
+        ],
+        "expected": [
+          "First freeze returns HTTP 200 with status FROZEN",
+          "Second freeze returns HTTP 200 or 409 \u2014 must NOT corrupt state",
+          "First unfreeze returns HTTP 200 with status ACTIVE",
+          "Second unfreeze returns HTTP 200 or 409 \u2014 must NOT corrupt state",
+          "Final GET /cards/{id} shows status ACTIVE"
+        ],
+        "trace": [
+          "R-FIN-060: card state updated instantly",
+          "R-FIN-060: boundary \u2014 idempotent toggle at state edges"
+        ],
+        "executable": "def test_rapid_freeze_unfreeze_toggle_boundary_idempotency(auth_headers, active_card):\n    card_id = active_card[\"id\"]\n\n    r1 = <api_post>(f\"/cards/{card_id}/freeze\", headers=auth_headers)\n    assert r1.status_code == 200\n    assert r1.json()[\"status\"] == \"FROZEN\"\n\n    r2 = <api_post>(f\"/cards/{card_id}/freeze\", headers=auth_headers)\n    assert r2.status_code in (200, 409)\n    state_r = <api_get>(f\"/cards/{card_id}\", headers=auth_headers)\n    assert state_r.json()[\"status\"] == \"FROZEN\"\n\n    r3 = <api_post>(f\"/cards/{card_id}/unfreeze\", headers=auth_headers)\n    assert r3.status_code == 200\n    assert r3.json()[\"status\"] == \"ACTIVE\"\n\n    r4 = <api_post>(f\"/cards/{card_id}/unfreeze\", headers=auth_headers)\n    assert r4.status_code in (200, 409)\n    final_r = <api_get>(f\"/cards/{card_id}\", headers=auth_headers)\n    assert final_r.json()[\"status\"] == \"ACTIVE\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-060",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 2523,
+    "latency_ms": 31274,
+    "wall_ms": 31274,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-060\",\n  \"reasoning\": \"The requirement covers card freeze/unfreeze with both positive and negative paths. I designed tests covering: (1) a full freeze\u2192authorize\u2192unfreeze\u2192authorize state cycle (STC), (2) authorization rejection on a frozen card (EP/positive), (3) freeze attempt on a non-existent card returning 404 (NEG), (4) authorization on a frozen card with insufficient funds\u2014double-negative compounding (DT), and (5) rapid toggle at the boundary of allowed state transitions (BVA). Each test is self-contained via fixtures that provision and teardown cards, and all HTTP calls target /cards/{id}/freeze and the authorization endpoint.\",\n  \"tests\": [\n    {\n      \"name\": \"test_freeze_active_card_returns_200_and_updates_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Caller is authenticated with a valid bearer token\",\n        \"Card exists and belongs to caller\",\n        \"Card is in ACTIVE state\"\n      ],\n      \"actions\": [\n        \"POST /cards/{id}/freeze\",\n        \"GET /cards/{id} to verify state\",\n        \"POST /cards/{id}/unfreeze to restore\"\n      ],\n      \"expected\": [\n        \"POST /cards/{id}/freeze returns HTTP 200\",\n        \"Response body contains {\\\"status\\\": \\\"FROZEN\\\"}\",\n        \"Subsequent GET /cards/{id} reflects status FROZEN\",\n        \"POST /cards/{id}/unfreeze returns HTTP 200 restoring ACTIVE\"\n      ],\n      \"trace\": [\n        \"R-FIN-060: card state updated instantly\",\n        \"R-FIN-060: authorization network notified\"\n      ],\n      \"executable\": \"def test_freeze_active_card_returns_200_and_updates_state(auth_headers, active_card):\\n    card_id = active_card[\\\"id\\\"]\\n    r = <api_post>(f\\\"/cards/{card_id}/freeze\\\", headers=auth_headers)\\n    assert r.status_code == 200\\n    assert r.json()[\\\"status\\\"] == \\\"FROZEN\\\"\\n\\n    r2 = <api_get>(f\\\"/cards/{card_id}\\\", headers=auth_headers)\\n    assert r2.json()[\\\"status\\\"] == \\\"FROZEN\\\"\\n\\n    r3 = <api_post>(f\\\"/cards/{card_id}/unfreeze\\\", headers=auth_headers)\\n    assert r3.status_code == 200\\n    assert r3.json()[\\\"status\\\"] == \\\"ACTIVE\\\"\"\n    },\n    {\n      \"name\": \"test_authorization_rejected_on_frozen_card\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated\",\n        \"Card exists, belongs to caller, and is in FROZEN state\"\n      ],\n      \"actions\": [\n        \"POST /authorizations with a valid transaction payload referencing the frozen card\",\n        \"POST /cards/{id}/unfreeze after assertion to restore state\"\n      ],\n      \"expected\": [\n        \"Authorization endpoint returns HTTP 403 or 402\",\n        \"Response body contains decline_reason CARD_FROZEN\",\n        \"No debit applied to account balance\"\n      ],\n      \"trace\": [\n        \"R-FIN-060: frozen cards must reject all authorization attempts\"\n      ],\n      \"executable\": \"def test_authorization_rejected_on_frozen_card(auth_headers, frozen_card):\\n    card_id = frozen_card[\\\"id\\\"]\\n    payload = <build_auth_payload>(card_id=card_id, amount=10_00)\\n    r = <api_post>(\\\"/authorizations\\\", json=payload, headers=auth_headers)\\n    assert r.status_code in (402, 403)\\n    body = r.json()\\n    assert body.get(\\\"decline_reason\\\") == \\\"CARD_FROZEN\\\"\\n\\n    balance_before = frozen_card[\\\"account_balance\\\"]\\n    bal_r = <api_get>(f\\\"/accounts/{frozen_card['account_id']}\\\", headers=auth_headers)\\n    assert bal_r.json()[\\\"balance\\\"] == balance_before\\n\\n    <api_post>(f\\\"/cards/{card_id}/unfreeze\\\", headers=auth_headers)\"\n    },\n    {\n      \"name\": \"test_freeze_nonexistent_card_returns_404\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller is authenticated\",\n        \"Card ID used does not exist in the system\"\n      ],\n      \"actions\": [\n        \"POST /cards/{nonexistent_id}/freeze\"\n      ],\n      \"expected\": [\n        \"HTTP 404 is returned\",\n        \"Response body contains error code CARD_NOT_FOUND\"\n      ],\n      \"trace\": [\n        \"R-FIN-0"
+  }
+}

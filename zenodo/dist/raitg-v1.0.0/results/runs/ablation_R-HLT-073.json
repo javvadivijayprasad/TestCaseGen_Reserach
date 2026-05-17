@@ -1,0 +1,184 @@
+{
+  "req": {
+    "id": "R-HLT-073",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Patient portal login (negative)",
+    "statement": "A patient shall log in using SSO; failed attempts shall be rate-limited and notify the patient. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "valid SSO assertion"
+    ],
+    "triggers": [
+      "patient logs in"
+    ],
+    "expected_outcomes": [
+      "session established"
+    ],
+    "error_pathways": [
+      "429 when too many attempts"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/portal/login"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-073",
+    "reasoning": "The requirement covers SSO-based patient login with rate-limiting on failed attempts and notifications. Test design targets: (1) EP \u2013 valid SSO assertion produces a session (positive); (2) NEG \u2013 invalid/denied SSO assertion is rejected without a session; (3) BVA \u2013 the exact rate-limit threshold (N attempts) triggers HTTP 429 and patient notification; (4) STC \u2013 a mid-session logout followed by re-login exercises the idle\u2192active\u2192logged-out\u2192active state chain; (5) DT \u2013 missing mandatory SSO elements (no subject, no audience) are each independently rejected. This covers all three mandatory kinds (positive, negative, boundary) plus extended coverage of state transitions and decision-table paths.",
+    "tests": [
+      {
+        "name": "test_sso_login_valid_assertion_establishes_session",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite /portal/login endpoint is reachable",
+          "A well-formed, unexpired SSO assertion is available for a known patient",
+          "No prior failed attempts exist for this patient"
+        ],
+        "actions": [
+          "POST /portal/login with a valid SSO assertion payload",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 302 redirect to patient dashboard",
+          "Response contains a session token or Set-Cookie header",
+          "Response body or redirect target does not contain an error message"
+        ],
+        "trace": [
+          "R-HLT-073: 'A patient shall log in using SSO'",
+          "R-HLT-073: 'Expected outcomes: session established'"
+        ],
+        "executable": "import pytest\nfrom <fixture> import api_client, valid_sso_assertion, reset_rate_limit\n\ndef test_sso_login_valid_assertion_establishes_session(api_client, valid_sso_assertion, reset_rate_limit):\n    reset_rate_limit(api_client)\n    payload = {\"sso_assertion\": valid_sso_assertion}\n    response = api_client.post(\"/portal/login\", json=payload, allow_redirects=False)\n    assert response.status_code in (200, 302), (\n        f\"Expected 200 or 302, got {response.status_code}\"\n    )\n    has_session = (\n        \"session\" in response.cookies\n        or \"Set-Cookie\" in response.headers\n        or \"token\" in response.json().get(\"data\", {})\n    )\n    assert has_session, \"No session token or cookie found in successful login response\"\n"
+      },
+      {
+        "name": "test_sso_login_invalid_assertion_is_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite /portal/login endpoint is reachable",
+          "An expired or tampered SSO assertion is available",
+          "No prior failed attempts exist for this patient identity"
+        ],
+        "actions": [
+          "POST /portal/login with an invalid SSO assertion (expired signature)",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response body contains an error code indicating authentication failure",
+          "No session token or cookie is issued"
+        ],
+        "trace": [
+          "R-HLT-073: 'Negative paths including permission denial'",
+          "R-HLT-073: 'failed attempts shall be rate-limited and notify the patient'"
+        ],
+        "executable": "import pytest\nfrom <fixture> import api_client, invalid_sso_assertion, reset_rate_limit\n\ndef test_sso_login_invalid_assertion_is_rejected(api_client, invalid_sso_assertion, reset_rate_limit):\n    reset_rate_limit(api_client)\n    payload = {\"sso_assertion\": invalid_sso_assertion}\n    response = api_client.post(\"/portal/login\", json=payload)\n    assert response.status_code == 401, (\n        f\"Expected 401 for invalid assertion, got {response.status_code}\"\n    )\n    body = response.json()\n    assert \"error\" in body, \"Response body must contain an error field\"\n    assert \"session\" not in response.cookies, \"No session cookie must be set on auth failure\"\n    assert \"Set-Cookie\" not in response.headers or \"session\" not in response.headers.get(\"Set-Cookie\", \"\"), \\\n        \"Session must not be established on invalid SSO assertion\"\n"
+      },
+      {
+        "name": "test_rate_limit_triggers_on_threshold_attempt",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite /portal/login endpoint is reachable",
+          "Rate-limit threshold N is known (e.g. 5 attempts per window)",
+          "A deterministic invalid SSO assertion is available",
+          "Rate-limit counter for the test patient identity has been reset"
+        ],
+        "actions": [
+          "Reset the rate-limit counter for the target patient identity",
+          "POST /portal/login with an invalid assertion exactly N-1 times and assert each returns 401",
+          "POST /portal/login with an invalid assertion a Nth time",
+          "Capture status code and response body of the Nth attempt"
+        ],
+        "expected": [
+          "The first N-1 attempts each return HTTP 401",
+          "The Nth attempt returns HTTP 429 Too Many Requests",
+          "HTTP 429 response contains a Retry-After header",
+          "Patient notification event is emitted (verifiable via notification API or mock)"
+        ],
+        "trace": [
+          "R-HLT-073: 'failed attempts shall be rate-limited'",
+          "R-HLT-073: 'Error pathways: 429 when too many attempts'",
+          "R-HLT-073: 'notify the patient'"
+        ],
+        "executable": "import pytest\nfrom <fixture> import api_client, invalid_sso_assertion, reset_rate_limit, get_rate_limit_threshold, assert_notification_sent\n\ndef test_rate_limit_triggers_on_threshold_attempt(api_client, invalid_sso_assertion, reset_rate_limit, get_rate_limit_threshold, assert_notification_sent):\n    reset_rate_limit(api_client)\n    threshold = get_rate_limit_threshold()\n    payload = {\"sso_assertion\": invalid_sso_assertion}\n    for attempt in range(1, threshold):\n        r = api_client.post(\"/portal/login\", json=payload)\n        assert r.status_code == 401, f\"Attempt {attempt}: expected 401, got {r.status_code}\"\n    final = api_client.post(\"/portal/login\", json=payload)\n    assert final.status_code == 429, (\n        f\"Expected 429 on attempt {threshold}, got {final.status_code}\"\n    )\n    assert \"Retry-After\" in final.headers, \"429 response must include Retry-After header\"\n    assert_notification_sent(patient_id=<fixture>.PATIENT_ID)\n"
+      },
+      {
+        "name": "test_sso_login_missing_mandatory_subject_element_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite /portal/login endpoint is reachable",
+          "An SSO assertion with the mandatory subject element omitted is available",
+          "Rate-limit counter has been reset for this patient identity"
+        ],
+        "actions": [
+          "POST /portal/login with an SSO assertion missing the subject element",
+          "Capture the HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Response body references missing or invalid mandatory element",
+          "No session is established"
+        ],
+        "trace": [
+          "R-HLT-073: 'Negative paths including ... missing mandatory elements'",
+          "R-HLT-073: 'preconditions: valid SSO assertion'"
+        ],
+        "executable": "import pytest\nfrom <fixture> import api_client, sso_assertion_factory, reset_rate_limit\n\ndef test_sso_login_missing_mandatory_subject_element_rejected(api_client, sso_assertion_factory, reset_rate_limit):\n    reset_rate_limit(api_client)\n    assertion_no_subject = sso_assertion_factory(omit_fields=[\"subject\"])\n    payload = {\"sso_assertion\": assertion_no_subject}\n    response = api_client.post(\"/portal/login\", json=payload)\n    assert response.status_code == 400, (\n        f\"Expected 400 for missing subject, got {response.status_code}\"\n    )\n    body = response.json()\n    assert any(\n        kw in str(body).lower() for kw in (\"subject\", \"mandatory\", \"missing\", \"invalid\")\n    ), f\"Error body should reference missing element, got: {body}\"\n    assert \"session\" not in response.cookies, \"No session must be set for malformed assertion\"\n"
+      },
+      {
+        "name": "test_logout_then_relogin_restores_active_session",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "fhir-lite /portal/login and /portal/logout endpoints are reachable",
+          "A valid SSO assertion is available for a known patient",
+          "No prior failed attempts exist for this patient",
+          "Rate-limit counter has been reset"
+        ],
+        "actions": [
+          "POST /portal/login with a valid SSO assertion to reach active state",
+          "POST /portal/logout with the session token to transition to logged-out state",
+          "POST /portal/login again with a fresh valid SSO assertion"
+        ],
+        "expected": [
+          "First login returns HTTP 200 or 302 with a session token",
+          "Logout returns HTTP 200 and invalidates the session",
+          "Second login returns HTTP 200 or 302 with a new, distinct session token",
+          "Original session token is no longer valid after logout"
+        ],
+        "trace": [
+          "R-HLT-073: 'conflicting state transitions must be tested'",
+          "R-HLT-073: 'Expected outcomes: session established'"
+        ],
+        "executable": "import pytest\nfrom <fixture> import api_client, valid_sso_assertion, fresh_sso_assertion, reset_rate_limit\n\ndef test_logout_then_relogin_restores_active_session(api_client, valid_sso_assertion, fresh_sso_assertion, reset_rate_limit):\n    reset_rate_limit(api_client)\n    r1 = api_client.post(\"/portal/login\", json={\"sso_assertion\": valid_sso_assertion}, allow_redirects=False)\n    assert r1.status_code in (200, 302)\n    session_token_1 = <helper_fn>.extract_session_token(r1)\n    assert session_token_1, \"First login must return a session token\"\n    r_logout = api_client.post(\"/portal/logout\", headers={\"Authorization\": f\"Bearer {session_token_1}\"})\n    assert r_logout.status_code == 200, f\"Logout failed: {r_logout.status_code}\"\n    r2 = api_client.post(\"/portal/login\", json={\"sso_assertion\": fresh_sso_assertion}, allow_redirects=False)\n    assert r2.status_code in (200, 302)\n    session_token_2 = <helper_fn>.extract_session_token(r2)\n    assert session_token_2, \"Re-login must return a new session token\"\n    assert session_token_1 != session_token_2, \"Re-login must issue a distinct session token\"\n    r_verify_old = api_client.get(\"/portal/me\", headers={\"Authorization\": f\"Bearer {session_token_1}\"})\n    assert r_verify_old.status_code == 401, \"Invalidated session token must be rejected\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-073",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 994,
+    "output_tokens": 3164,
+    "latency_ms": 41372,
+    "wall_ms": 41372,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-073\",\n  \"reasoning\": \"The requirement covers SSO-based patient login with rate-limiting on failed attempts and notifications. Test design targets: (1) EP \u2013 valid SSO assertion produces a session (positive); (2) NEG \u2013 invalid/denied SSO assertion is rejected without a session; (3) BVA \u2013 the exact rate-limit threshold (N attempts) triggers HTTP 429 and patient notification; (4) STC \u2013 a mid-session logout followed by re-login exercises the idle\u2192active\u2192logged-out\u2192active state chain; (5) DT \u2013 missing mandatory SSO elements (no subject, no audience) are each independently rejected. This covers all three mandatory kinds (positive, negative, boundary) plus extended coverage of state transitions and decision-table paths.\",\n  \"tests\": [\n    {\n      \"name\": \"test_sso_login_valid_assertion_establishes_session\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite /portal/login endpoint is reachable\",\n        \"A well-formed, unexpired SSO assertion is available for a known patient\",\n        \"No prior failed attempts exist for this patient\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with a valid SSO assertion payload\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 302 redirect to patient dashboard\",\n        \"Response contains a session token or Set-Cookie header\",\n        \"Response body or redirect target does not contain an error message\"\n      ],\n      \"trace\": [\n        \"R-HLT-073: 'A patient shall log in using SSO'\",\n        \"R-HLT-073: 'Expected outcomes: session established'\"\n      ],\n      \"executable\": \"import pytest\\nfrom <fixture> import api_client, valid_sso_assertion, reset_rate_limit\\n\\ndef test_sso_login_valid_assertion_establishes_session(api_client, valid_sso_assertion, reset_rate_limit):\\n    reset_rate_limit(api_client)\\n    payload = {\\\"sso_assertion\\\": valid_sso_assertion}\\n    response = api_client.post(\\\"/portal/login\\\", json=payload, allow_redirects=False)\\n    assert response.status_code in (200, 302), (\\n        f\\\"Expected 200 or 302, got {response.status_code}\\\"\\n    )\\n    has_session = (\\n        \\\"session\\\" in response.cookies\\n        or \\\"Set-Cookie\\\" in response.headers\\n        or \\\"token\\\" in response.json().get(\\\"data\\\", {})\\n    )\\n    assert has_session, \\\"No session token or cookie found in successful login response\\\"\\n\"\n    },\n    {\n      \"name\": \"test_sso_login_invalid_assertion_is_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite /portal/login endpoint is reachable\",\n        \"An expired or tampered SSO assertion is available\",\n        \"No prior failed attempts exist for this patient identity\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with an invalid SSO assertion (expired signature)\",\n        \"Capture the HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized\",\n        \"Response body contains an error code indicating authentication failure\",\n        \"No session token or cookie is issued\"\n      ],\n      \"trace\": [\n        \"R-HLT-073: 'Negative paths including permission denial'\",\n        \"R-HLT-073: 'failed attempts shall be rate-limited and notify the patient'\"\n      ],\n      \"executable\": \"import pytest\\nfrom <fixture> import api_client, invalid_sso_assertion, reset_rate_limit\\n\\ndef test_sso_login_invalid_assertion_is_rejected(api_client, invalid_sso_assertion, reset_rate_limit):\\n    reset_rate_limit(api_client)\\n    payload = {\\\"sso_assertion\\\": invalid_sso_assertion}\\n    response = api_client.post(\\\"/portal/login\\\", json=payload)\\n    assert response.status_code == 401, (\\n        f\\\"Expected 401 for invalid assertion, got {response.status_code}\\\"\\n    )\\n    body = response.json()\\n    assert \\\"error\\\" in body, \\\"Response body must contain an error field\\\"\\n    assert \\\"session\\\" not in response.cookies, \\\"No session cookie must be set on aut"
+  }
+}

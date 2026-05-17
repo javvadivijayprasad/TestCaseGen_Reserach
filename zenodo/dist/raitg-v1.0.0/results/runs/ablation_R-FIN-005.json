@@ -1,0 +1,264 @@
+{
+  "req": {
+    "id": "R-FIN-005",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Recurring transfer",
+    "statement": "A premium-tier customer shall be able to schedule a recurring transfer up to $10,000 per occurrence; non-premium accounts capped at $2,500.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "tier in {standard,premium}"
+    ],
+    "triggers": [
+      "customer schedules transfer"
+    ],
+    "expected_outcomes": [
+      "schedule persisted",
+      "next run calculated"
+    ],
+    "error_pathways": [
+      "422 when per-occurrence limit exceeded",
+      "422 when frequency unsupported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/recurring"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-005",
+    "reasoning": "The requirement defines two equivalence partitions by tier (standard/premium), a hard per-occurrence cap per tier, an explicit error code (422) for limit and frequency violations, and an expected persistence + next-run calculation. Tests are designed using EP for valid-tier happy paths, BVA for the exact cap values, NEG for over-limit and unsupported-frequency rejection, DT for the cross-product of tier x amount, and STC for the schedule-creation state transition. Fixtures and helpers are referenced as placeholders to keep each test self-contained and under 40 lines.",
+    "tests": [
+      {
+        "name": "test_premium_recurring_transfer_within_limit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer account exists with tier=premium",
+          "Source account has sufficient balance",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Authenticate as a premium-tier customer and obtain bearer token",
+          "POST /transfers/recurring with amount=5000, frequency=monthly",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains schedule_id",
+          "Response body contains next_run date calculated from today + one month",
+          "Persisted record retrievable via GET /transfers/recurring/{schedule_id}"
+        ],
+        "trace": [
+          "R-FIN-005: premium tier may schedule up to $10,000 per occurrence",
+          "R-FIN-005: expected outcome - schedule persisted; next run calculated"
+        ],
+        "executable": "def test_premium_recurring_transfer_within_limit(premium_auth_token, api_client, assert_next_run):\n    payload = {\n        \"amount\": 5000,\n        \"currency\": \"USD\",\n        \"frequency\": \"monthly\",\n        \"source_account_id\": \"<fixture:premium_source_account>\",\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {premium_auth_token}\"}\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"schedule_id\" in body, \"Missing schedule_id in response\"\n    assert \"next_run\" in body, \"Missing next_run in response\"\n    assert_next_run(body[\"next_run\"], frequency=\"monthly\")\n    get_resp = api_client.get(\n        f\"/transfers/recurring/{body['schedule_id']}\",\n        headers={\"Authorization\": f\"Bearer {premium_auth_token}\"}\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"schedule_id\"] == body[\"schedule_id\"]\n"
+      },
+      {
+        "name": "test_standard_transfer_above_cap_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with tier=standard",
+          "Source account has sufficient balance",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Authenticate as a standard-tier customer and obtain bearer token",
+          "POST /transfers/recurring with amount=2501 (exceeds $2,500 cap), frequency=weekly",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains error code indicating per-occurrence limit exceeded",
+          "No schedule record is persisted"
+        ],
+        "trace": [
+          "R-FIN-005: non-premium accounts capped at $2,500 per occurrence",
+          "R-FIN-005: error pathway - 422 when per-occurrence limit exceeded"
+        ],
+        "executable": "def test_standard_transfer_above_cap_rejected(standard_auth_token, api_client, assert_no_schedule):\n    payload = {\n        \"amount\": 2501,\n        \"currency\": \"USD\",\n        \"frequency\": \"weekly\",\n        \"source_account_id\": \"<fixture:standard_source_account>\",\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {standard_auth_token}\"}\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body, \"No error detail in 422 response\"\n    error_text = str(body.get(\"error\") or body.get(\"detail\", \"\")).lower()\n    assert \"limit\" in error_text or \"exceed\" in error_text, f\"Unexpected error message: {error_text}\"\n    assert_no_schedule(standard_auth_token, amount=2501)\n"
+      },
+      {
+        "name": "test_standard_transfer_at_exact_cap_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with tier=standard",
+          "Source account has sufficient balance",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Authenticate as a standard-tier customer and obtain bearer token",
+          "POST /transfers/recurring with amount=2500 (exactly at cap), frequency=weekly",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains schedule_id",
+          "Response body contains next_run calculated from today + one week",
+          "Persisted record retrievable via GET /transfers/recurring/{schedule_id}"
+        ],
+        "trace": [
+          "R-FIN-005: non-premium accounts capped at $2,500 - boundary inclusive",
+          "R-FIN-005: expected outcome - schedule persisted; next run calculated"
+        ],
+        "executable": "def test_standard_transfer_at_exact_cap_accepted(standard_auth_token, api_client, assert_next_run):\n    payload = {\n        \"amount\": 2500,\n        \"currency\": \"USD\",\n        \"frequency\": \"weekly\",\n        \"source_account_id\": \"<fixture:standard_source_account>\",\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {standard_auth_token}\"}\n    )\n    assert resp.status_code == 201, f\"Expected 201 at boundary, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"schedule_id\" in body, \"Missing schedule_id in response\"\n    assert \"next_run\" in body, \"Missing next_run in response\"\n    assert_next_run(body[\"next_run\"], frequency=\"weekly\")\n    get_resp = api_client.get(\n        f\"/transfers/recurring/{body['schedule_id']}\",\n        headers={\"Authorization\": f\"Bearer {standard_auth_token}\"}\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"amount\"] == 2500\n"
+      },
+      {
+        "name": "test_premium_transfer_at_exact_cap_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with tier=premium",
+          "Source account has sufficient balance",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Authenticate as a premium-tier customer and obtain bearer token",
+          "POST /transfers/recurring with amount=10000 (exactly at premium cap), frequency=monthly",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains schedule_id and next_run",
+          "Amount stored equals 10000"
+        ],
+        "trace": [
+          "R-FIN-005: premium tier capped at $10,000 - upper boundary inclusive",
+          "R-FIN-005: expected outcome - schedule persisted; next run calculated"
+        ],
+        "executable": "def test_premium_transfer_at_exact_cap_accepted(premium_auth_token, api_client, assert_next_run):\n    payload = {\n        \"amount\": 10000,\n        \"currency\": \"USD\",\n        \"frequency\": \"monthly\",\n        \"source_account_id\": \"<fixture:premium_source_account>\",\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {premium_auth_token}\"}\n    )\n    assert resp.status_code == 201, f\"Expected 201 at boundary, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"schedule_id\" in body\n    assert \"next_run\" in body\n    assert_next_run(body[\"next_run\"], frequency=\"monthly\")\n    get_resp = api_client.get(\n        f\"/transfers/recurring/{body['schedule_id']}\",\n        headers={\"Authorization\": f\"Bearer {premium_auth_token}\"}\n    )\n    assert get_resp.json()[\"amount\"] == 10000\n"
+      },
+      {
+        "name": "test_premium_transfer_above_cap_rejected",
+        "kind": "negative",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer account exists with tier=premium",
+          "Source account has sufficient balance",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Authenticate as a premium-tier customer and obtain bearer token",
+          "POST /transfers/recurring with amount=10001 (one cent above premium cap), frequency=monthly",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response error indicates per-occurrence limit exceeded",
+          "No schedule record is persisted"
+        ],
+        "trace": [
+          "R-FIN-005: premium tier capped at $10,000 - amount 10001 is above limit",
+          "R-FIN-005: error pathway - 422 when per-occurrence limit exceeded"
+        ],
+        "executable": "def test_premium_transfer_above_cap_rejected(premium_auth_token, api_client, assert_no_schedule):\n    payload = {\n        \"amount\": 10001,\n        \"currency\": \"USD\",\n        \"frequency\": \"monthly\",\n        \"source_account_id\": \"<fixture:premium_source_account>\",\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {premium_auth_token}\"}\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_text = str(body.get(\"error\") or body.get(\"detail\", \"\")).lower()\n    assert \"limit\" in error_text or \"exceed\" in error_text\n    assert_no_schedule(premium_auth_token, amount=10001)\n"
+      },
+      {
+        "name": "test_unsupported_frequency_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer account exists with tier=premium",
+          "Source account has sufficient balance",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Authenticate as a premium-tier customer and obtain bearer token",
+          "POST /transfers/recurring with amount=1000 and frequency=hourly (unsupported value)",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response error references unsupported frequency",
+          "No schedule record is persisted"
+        ],
+        "trace": [
+          "R-FIN-005: error pathway - 422 when frequency unsupported"
+        ],
+        "executable": "def test_unsupported_frequency_rejected(premium_auth_token, api_client, assert_no_schedule):\n    payload = {\n        \"amount\": 1000,\n        \"currency\": \"USD\",\n        \"frequency\": \"hourly\",\n        \"source_account_id\": \"<fixture:premium_source_account>\",\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {premium_auth_token}\"}\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    error_text = str(body.get(\"error\") or body.get(\"detail\", \"\")).lower()\n    assert \"frequency\" in error_text or \"unsupported\" in error_text, f\"Unexpected: {error_text}\"\n    assert_no_schedule(premium_auth_token, amount=1000)\n"
+      },
+      {
+        "name": "test_tier_x_amount_decision_table",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Both standard and premium customer accounts exist",
+          "Source accounts have sufficient balance",
+          "API is reachable and auth tokens are valid"
+        ],
+        "actions": [
+          "For each (tier, amount, expected_status) row in decision table, POST /transfers/recurring",
+          "Capture status code per row and compare to expectation"
+        ],
+        "expected": [
+          "standard + 1000 -> 201",
+          "standard + 2500 -> 201",
+          "standard + 2501 -> 422",
+          "premium + 2501 -> 201",
+          "premium + 10000 -> 201",
+          "premium + 10001 -> 422"
+        ],
+        "trace": [
+          "R-FIN-005: decision table cross-product of tier and amount boundaries"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"token_fixture,amount,expected_status\", [\n    (\"standard_auth_token\", 1000,  201),\n    (\"standard_auth_token\", 2500,  201),\n    (\"standard_auth_token\", 2501,  422),\n    (\"premium_auth_token\",  2501,  201),\n    (\"premium_auth_token\",  10000, 201),\n    (\"premium_auth_token\",  10001, 422),\n])\ndef test_tier_x_amount_decision_table(token_fixture, amount, expected_status, request, api_client):\n    token = request.getfixturevalue(token_fixture)\n    src = \"<fixture:standard_source_account>\" if \"standard\" in token_fixture else \"<fixture:premium_source_account>\"\n    payload = {\n        \"amount\": amount,\n        \"currency\": \"USD\",\n        \"frequency\": \"monthly\",\n        \"source_account_id\": src,\n        \"destination_account_id\": \"<fixture:destination_account>\"\n    }\n    resp = api_client.post(\n        \"/transfers/recurring\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {token}\"}\n    )\n    assert resp.status_code == expected_status, (\n        f\"tier={token_fixture} amount={amount}: expected {expected_status}, got {resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_schedule_creation_state_transition",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer account exists with tier=standard",
+          "No pre-existing recurring schedule for this customer/account pair",
+          "API is reachable and auth token is valid"
+        ],
+        "actions": [
+          "Verify no schedule exists (GET returns 404 or empty list)",
+          "POST /transfers/recurring with amount=1000, frequency=weekly to create schedule",
+          "Verify schedule transitions to active state (GET returns status=active)",
+          "DELETE /transfers/recurring/{schedule_id} to cancel",
+          "Verify schedule transitions to cancelled state"
+        ],
+        "expected": [
+          "Pre-creation: no schedule present",
+          "Post-creation: schedule status=active, schedule_id returned",
+          "Post-cancellation: schedule status=cancelled"
+        ],
+        "trace": [
+          "R-FIN-005: state transition none -> active -> cancelled",
+          "R-FIN-005: schedule persisted with next run calculated"
+        ],
+        "executable": "def test_schedule_creation_state_transition(standard_auth_token, api_client, unique_account_pair):\n    src, dst = unique_account_pair\n    headers = {\"Authorization\": f\"Bearer {standard_auth_token}\"}\n    list_resp = api_client.get(\"/transfers/recurring\", headers=headers, params={\"source_account_id\": src})\n    assert list_resp.status_code == 200\n    assert all(s[\"source_account_id\"] != src for s in list_resp.json().get(\"schedules\", []))\n    payload = {\"amount\": 1000, \"currency\": \"USD\", \"frequency\": \"weekly\",\n               \"source_account_id\": src, \"destination_account_id\": dst}\n    create_resp = api_client.post(\"/transfers/recurring\", json=payload, headers=headers)\n    assert create_resp.status_code == 201\n    schedule_id = create_resp.json()[\"schedule_id\"]\n    get_resp = api_client.get(f\"/transfers/recurring/{schedule_id}\", headers=headers)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\"\n    assert \"next_run\" in get_resp.json()\n    del_resp = api_client.delete(f\"/transfers/recurring/{schedule_id}\", headers=headers)\n    assert del_resp.status_code in (200, 204)\n    final_resp = api_client.get(f\"/transfers/recurring/{schedule_id}\", headers=headers)\n    assert final_resp.json()[\"status\"] == \"cancelled\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-005",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=BVA"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1004,
+    "output_tokens": 5016,
+    "latency_ms": 55000,
+    "wall_ms": 55000,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-005\",\n  \"reasoning\": \"The requirement defines two equivalence partitions by tier (standard/premium), a hard per-occurrence cap per tier, an explicit error code (422) for limit and frequency violations, and an expected persistence + next-run calculation. Tests are designed using EP for valid-tier happy paths, BVA for the exact cap values, NEG for over-limit and unsupported-frequency rejection, DT for the cross-product of tier x amount, and STC for the schedule-creation state transition. Fixtures and helpers are referenced as placeholders to keep each test self-contained and under 40 lines.\",\n  \"tests\": [\n    {\n      \"name\": \"test_premium_recurring_transfer_within_limit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer account exists with tier=premium\",\n        \"Source account has sufficient balance\",\n        \"API is reachable and auth token is valid\"\n      ],\n      \"actions\": [\n        \"Authenticate as a premium-tier customer and obtain bearer token\",\n        \"POST /transfers/recurring with amount=5000, frequency=monthly\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains schedule_id\",\n        \"Response body contains next_run date calculated from today + one month\",\n        \"Persisted record retrievable via GET /transfers/recurring/{schedule_id}\"\n      ],\n      \"trace\": [\n        \"R-FIN-005: premium tier may schedule up to $10,000 per occurrence\",\n        \"R-FIN-005: expected outcome - schedule persisted; next run calculated\"\n      ],\n      \"executable\": \"def test_premium_recurring_transfer_within_limit(premium_auth_token, api_client, assert_next_run):\\n    payload = {\\n        \\\"amount\\\": 5000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"frequency\\\": \\\"monthly\\\",\\n        \\\"source_account_id\\\": \\\"<fixture:premium_source_account>\\\",\\n        \\\"destination_account_id\\\": \\\"<fixture:destination_account>\\\"\\n    }\\n    resp = api_client.post(\\n        \\\"/transfers/recurring\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {premium_auth_token}\\\"}\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"schedule_id\\\" in body, \\\"Missing schedule_id in response\\\"\\n    assert \\\"next_run\\\" in body, \\\"Missing next_run in response\\\"\\n    assert_next_run(body[\\\"next_run\\\"], frequency=\\\"monthly\\\")\\n    get_resp = api_client.get(\\n        f\\\"/transfers/recurring/{body['schedule_id']}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {premium_auth_token}\\\"}\\n    )\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"schedule_id\\\"] == body[\\\"schedule_id\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_standard_transfer_above_cap_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer account exists with tier=standard\",\n        \"Source account has sufficient balance\",\n        \"API is reachable and auth token is valid\"\n      ],\n      \"actions\": [\n        \"Authenticate as a standard-tier customer and obtain bearer token\",\n        \"POST /transfers/recurring with amount=2501 (exceeds $2,500 cap), frequency=weekly\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains error code indicating per-occurrence limit exceeded\",\n        \"No schedule record is persisted\"\n      ],\n      \"trace\": [\n        \"R-FIN-005: non-premium accounts capped at $2,500 per occurrence\",\n        \"R-FIN-005: error pathway - 422 when per-occurrence limit exceeded\"\n      ],\n      \"executable\": \"def test_standard_transfer_above_cap_rejected(standard_auth_token, api_client, assert_no_schedule):\\n    payload = {\\n        \\\"amount\\\": 2501,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"frequency\\\": \\\"weekly\\\",\\n        \\\"source_account_id\\\": \\\"<fixture:standard_source_a"
+  }
+}

@@ -1,0 +1,153 @@
+{
+  "req": {
+    "id": "R-FIN-088",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Fraud alert response (idempotency variant)",
+    "statement": "A customer shall confirm or deny a suspected-fraud alert within 24 hours; unacknowledged alerts shall auto-freeze the account. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "alert active"
+    ],
+    "triggers": [
+      "customer responds"
+    ],
+    "expected_outcomes": [
+      "alert closed",
+      "card reissued if fraud"
+    ],
+    "error_pathways": [
+      "410 when alert expired"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/alerts/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-088",
+    "reasoning": "R-FIN-088 has four distinct testable behaviours: (1) normal confirm/deny closes the alert and optionally reissues the card [positive, EP/STC], (2) duplicate submission with the same Idempotency-Key returns the original response without side-effects [positive, EP/DT], (3) responding to an already-expired (>24 h) alert returns 410 [negative, NEG], and (4) the system transitions to auto-freeze exactly at the 24-hour boundary when the alert is unacknowledged [boundary, BVA/STC]. These four cases together cover equivalence partitions (valid alert, duplicate key, expired alert), a state transition (active -> frozen), and the critical 24-hour boundary. Each test uses dedicated fixtures to remain self-contained and idempotent.",
+    "tests": [
+      {
+        "name": "test_confirm_fraud_alert_closes_alert_and_reissues_card",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A fraud alert with status=active exists for a known customer",
+          "The alert was created less than 24 hours ago",
+          "A unique Idempotency-Key is available"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} and header Idempotency-Key: <unique_key>",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 is returned",
+          "Response body contains {\"status\": \"closed\", \"outcome\": \"fraud_confirmed\"}",
+          "Response body contains card_reissue_requested=true",
+          "Alert status is closed when fetched via GET /alerts/{id}"
+        ],
+        "trace": [
+          "R-FIN-088: customer confirms fraud -> alert closed, card reissued"
+        ],
+        "executable": "def test_confirm_fraud_alert_closes_alert_and_reissues_card(api_client, active_fraud_alert, unique_idempotency_key):\n    alert_id = active_fraud_alert[\"id\"]\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    payload = {\"response\": \"confirm\"}\n\n    resp = api_client.patch(f\"/alerts/{alert_id}\", json=payload, headers=headers)\n\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"closed\"\n    assert body[\"outcome\"] == \"fraud_confirmed\"\n    assert body.get(\"card_reissue_requested\") is True\n\n    get_resp = api_client.get(f\"/alerts/{alert_id}\")\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"closed\""
+      },
+      {
+        "name": "test_idempotent_duplicate_submission_returns_original_result",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "A fraud alert with status=active exists for a known customer",
+          "The alert was created less than 24 hours ago",
+          "A fixed Idempotency-Key is available to be reused"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"deny\"} and header Idempotency-Key: <fixed_key> (first call)",
+          "Capture first response",
+          "PATCH /alerts/{id} with identical body and identical Idempotency-Key (second call)",
+          "Capture second response"
+        ],
+        "expected": [
+          "Both calls return HTTP 200",
+          "Second response body is identical to first response body",
+          "No duplicate card reissue or side-effect is triggered",
+          "Alert status remains closed after the second call"
+        ],
+        "trace": [
+          "R-FIN-088: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "def test_idempotent_duplicate_submission_returns_original_result(api_client, active_fraud_alert):\n    alert_id = active_fraud_alert[\"id\"]\n    fixed_key = \"idem-key-deny-001\"\n    headers = {\"Idempotency-Key\": fixed_key}\n    payload = {\"response\": \"deny\"}\n\n    resp1 = api_client.patch(f\"/alerts/{alert_id}\", json=payload, headers=headers)\n    assert resp1.status_code == 200\n    body1 = resp1.json()\n\n    resp2 = api_client.patch(f\"/alerts/{alert_id}\", json=payload, headers=headers)\n    assert resp2.status_code == 200\n    body2 = resp2.json()\n\n    assert body1 == body2\n\n    get_resp = api_client.get(f\"/alerts/{alert_id}\")\n    assert get_resp.json()[\"status\"] == \"closed\""
+      },
+      {
+        "name": "test_response_to_expired_alert_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A fraud alert exists that was created more than 24 hours ago and has not been acknowledged",
+          "The system has auto-frozen the account associated with that alert",
+          "A unique Idempotency-Key is available"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"} and header Idempotency-Key: <unique_key> targeting the expired alert"
+        ],
+        "expected": [
+          "HTTP 410 Gone is returned",
+          "Response body contains an error code indicating the alert has expired",
+          "Account remains in frozen state"
+        ],
+        "trace": [
+          "R-FIN-088: error pathway - 410 when alert expired"
+        ],
+        "executable": "def test_response_to_expired_alert_returns_410(api_client, expired_fraud_alert, unique_idempotency_key):\n    alert_id = expired_fraud_alert[\"id\"]\n    headers = {\"Idempotency-Key\": unique_idempotency_key}\n    payload = {\"response\": \"confirm\"}\n\n    resp = api_client.patch(f\"/alerts/{alert_id}\", json=payload, headers=headers)\n\n    assert resp.status_code == 410\n    body = resp.json()\n    assert \"error\" in body\n    assert body[\"error\"].get(\"code\") in (\"ALERT_EXPIRED\", \"GONE\", \"alert_expired\")\n\n    account_id = expired_fraud_alert[\"account_id\"]\n    account_resp = api_client.get(f\"/accounts/{account_id}\")\n    assert account_resp.json()[\"status\"] == \"frozen\""
+      },
+      {
+        "name": "test_unacknowledged_alert_auto_freezes_account_at_24h_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A fraud alert exists with created_at set to exactly 24 hours ago (boundary instant)",
+          "The alert has NOT been acknowledged by the customer",
+          "The system's scheduled freeze job has run at or after the 24-hour mark"
+        ],
+        "actions": [
+          "Wait for or simulate the system freeze job execution at T+24h",
+          "GET /alerts/{id} to check alert status",
+          "GET /accounts/{account_id} to check account status"
+        ],
+        "expected": [
+          "Alert status is auto_frozen or closed_unacknowledged",
+          "Account status is frozen",
+          "PATCH /alerts/{id} now returns 410 Gone"
+        ],
+        "trace": [
+          "R-FIN-088: unacknowledged alerts shall auto-freeze the account; 24-hour boundary"
+        ],
+        "executable": "def test_unacknowledged_alert_auto_freezes_account_at_24h_boundary(\n    api_client, alert_at_24h_boundary, unique_idempotency_key\n):\n    alert_id = alert_at_24h_boundary[\"id\"]\n    account_id = alert_at_24h_boundary[\"account_id\"]\n\n    <trigger_freeze_job>(api_client, alert_id)\n\n    alert_resp = api_client.get(f\"/alerts/{alert_id}\")\n    assert alert_resp.status_code == 200\n    assert alert_resp.json()[\"status\"] in (\"auto_frozen\", \"closed_unacknowledged\")\n\n    account_resp = api_client.get(f\"/accounts/{account_id}\")\n    assert account_resp.status_code == 200\n    assert account_resp.json()[\"status\"] == \"frozen\"\n\n    patch_resp = api_client.patch(\n        f\"/alerts/{alert_id}\",\n        json={\"response\": \"confirm\"},\n        headers={\"Idempotency-Key\": unique_idempotency_key},\n    )\n    assert patch_resp.status_code == 410"
+      }
+    ]
+  },
+  "req_id": "R-FIN-088",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1018,
+    "output_tokens": 2406,
+    "latency_ms": 31184,
+    "wall_ms": 31184,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-088\",\n  \"reasoning\": \"R-FIN-088 has four distinct testable behaviours: (1) normal confirm/deny closes the alert and optionally reissues the card [positive, EP/STC], (2) duplicate submission with the same Idempotency-Key returns the original response without side-effects [positive, EP/DT], (3) responding to an already-expired (>24 h) alert returns 410 [negative, NEG], and (4) the system transitions to auto-freeze exactly at the 24-hour boundary when the alert is unacknowledged [boundary, BVA/STC]. These four cases together cover equivalence partitions (valid alert, duplicate key, expired alert), a state transition (active -> frozen), and the critical 24-hour boundary. Each test uses dedicated fixtures to remain self-contained and idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_confirm_fraud_alert_closes_alert_and_reissues_card\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A fraud alert with status=active exists for a known customer\",\n        \"The alert was created less than 24 hours ago\",\n        \"A unique Idempotency-Key is available\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"confirm\\\"} and header Idempotency-Key: <unique_key>\",\n        \"Capture HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 is returned\",\n        \"Response body contains {\\\"status\\\": \\\"closed\\\", \\\"outcome\\\": \\\"fraud_confirmed\\\"}\",\n        \"Response body contains card_reissue_requested=true\",\n        \"Alert status is closed when fetched via GET /alerts/{id}\"\n      ],\n      \"trace\": [\n        \"R-FIN-088: customer confirms fraud -> alert closed, card reissued\"\n      ],\n      \"executable\": \"def test_confirm_fraud_alert_closes_alert_and_reissues_card(api_client, active_fraud_alert, unique_idempotency_key):\\n    alert_id = active_fraud_alert[\\\"id\\\"]\\n    headers = {\\\"Idempotency-Key\\\": unique_idempotency_key}\\n    payload = {\\\"response\\\": \\\"confirm\\\"}\\n\\n    resp = api_client.patch(f\\\"/alerts/{alert_id}\\\", json=payload, headers=headers)\\n\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"closed\\\"\\n    assert body[\\\"outcome\\\"] == \\\"fraud_confirmed\\\"\\n    assert body.get(\\\"card_reissue_requested\\\") is True\\n\\n    get_resp = api_client.get(f\\\"/alerts/{alert_id}\\\")\\n    assert get_resp.status_code == 200\\n    assert get_resp.json()[\\\"status\\\"] == \\\"closed\\\"\"\n    },\n    {\n      \"name\": \"test_idempotent_duplicate_submission_returns_original_result\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"A fraud alert with status=active exists for a known customer\",\n        \"The alert was created less than 24 hours ago\",\n        \"A fixed Idempotency-Key is available to be reused\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"deny\\\"} and header Idempotency-Key: <fixed_key> (first call)\",\n        \"Capture first response\",\n        \"PATCH /alerts/{id} with identical body and identical Idempotency-Key (second call)\",\n        \"Capture second response\"\n      ],\n      \"expected\": [\n        \"Both calls return HTTP 200\",\n        \"Second response body is identical to first response body\",\n        \"No duplicate card reissue or side-effect is triggered\",\n        \"Alert status remains closed after the second call\"\n      ],\n      \"trace\": [\n        \"R-FIN-088: duplicate submission with same Idempotency-Key must return original result\"\n      ],\n      \"executable\": \"def test_idempotent_duplicate_submission_returns_original_result(api_client, active_fraud_alert):\\n    alert_id = active_fraud_alert[\\\"id\\\"]\\n    fixed_key = \\\"idem-key-deny-001\\\"\\n    headers = {\\\"Idempotency-Key\\\": fixed_key}\\n    payload = {\\\"response\\\": \\\"deny\\\"}\\n\\n    resp1 = api_client.patch(f\\\"/alerts/{alert_id}\\\", json=payload, headers=headers)\\n    assert resp1.status_code == 200\\n    body1 = resp1.json()\\n\\n    resp2 = api_client.patch(f\\\"/alerts/{alert_id}\\\", json=payload"
+  }
+}

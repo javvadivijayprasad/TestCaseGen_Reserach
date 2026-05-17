@@ -1,0 +1,155 @@
+{
+  "req": {
+    "id": "R-FIN-084",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Transaction dispute (idempotency variant)",
+    "statement": "A customer shall dispute a transaction within 60 days of posting; disputes beyond 60 days shall be rejected. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "transaction.age < 60d"
+    ],
+    "triggers": [
+      "customer files dispute"
+    ],
+    "expected_outcomes": [
+      "dispute created",
+      "provisional credit applied"
+    ],
+    "error_pathways": [
+      "422 when transaction.age > 60d"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/disputes"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-084",
+    "reasoning": "The requirement has four testable behaviours: (1) valid dispute within 60 days succeeds with provisional credit (EP positive), (2) dispute beyond 60 days is rejected with 422 (NEG/EP negative), (3) dispute exactly on the 60-day boundary tests the limit (BVA boundary), and (4) duplicate submission with the same Idempotency-Key returns the original result without side-effects (STC idempotency). Together these cover all decision branches in R-FIN-084 and satisfy the minimum three-test requirement with an additional idempotency case.",
+    "tests": [
+      {
+        "name": "test_dispute_within_60_days_creates_dispute_and_applies_credit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_fixture>",
+          "A posted transaction aged 30 days exists, returned by <transaction_factory(age_days=30)>",
+          "The /disputes endpoint is reachable"
+        ],
+        "actions": [
+          "POST /disputes with transaction_id and a unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains dispute_id",
+          "Response body contains status='open'",
+          "Response body contains provisional_credit.applied=true"
+        ],
+        "trace": [
+          "R-FIN-084 \u2013 valid dispute within 60-day window",
+          "EP partition: transaction.age in [1, 59] days"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_dispute_within_60_days_creates_dispute_and_applies_credit(\n    api_client,          # <fixture> authenticated requests.Session\n    transaction_factory, # <fixture> creates & returns posted transaction dict\n):\n    txn = transaction_factory(age_days=30)\n    idempotency_key = str(uuid.uuid4())\n\n    resp = api_client.post(\n        \"/disputes\",\n        json={\"transaction_id\": txn[\"id\"]},\n        headers={\"Idempotency-Key\": idempotency_key},\n    )\n\n    assert resp.status_code == 201, resp.text\n    body = resp.json()\n    assert \"dispute_id\" in body\n    assert body[\"status\"] == \"open\"\n    assert body[\"provisional_credit\"][\"applied\"] is True\n"
+      },
+      {
+        "name": "test_dispute_beyond_60_days_rejected_with_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_fixture>",
+          "A posted transaction aged 61 days exists, returned by <transaction_factory(age_days=61)>",
+          "The /disputes endpoint is reachable"
+        ],
+        "actions": [
+          "POST /disputes with transaction_id for a transaction aged 61 days"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body error code indicates dispute_window_exceeded",
+          "No dispute record created",
+          "No provisional credit applied"
+        ],
+        "trace": [
+          "R-FIN-084 \u2013 error pathway: transaction.age > 60 days",
+          "NEG partition: transaction.age >= 61 days"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_dispute_beyond_60_days_rejected_with_422(\n    api_client,\n    transaction_factory,\n):\n    txn = transaction_factory(age_days=61)\n    idempotency_key = str(uuid.uuid4())\n\n    resp = api_client.post(\n        \"/disputes\",\n        json={\"transaction_id\": txn[\"id\"]},\n        headers={\"Idempotency-Key\": idempotency_key},\n    )\n\n    assert resp.status_code == 422, resp.text\n    body = resp.json()\n    assert body.get(\"error_code\") == \"dispute_window_exceeded\"\n"
+      },
+      {
+        "name": "test_dispute_exactly_at_60_day_boundary_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_fixture>",
+          "A posted transaction aged exactly 60 days exists, returned by <transaction_factory(age_days=60)>",
+          "The /disputes endpoint is reachable"
+        ],
+        "actions": [
+          "POST /disputes with transaction_id for a transaction aged exactly 60 days"
+        ],
+        "expected": [
+          "HTTP 201 Created (boundary is inclusive per R-FIN-084: 'within 60 days')",
+          "Response body contains dispute_id",
+          "Response body contains provisional_credit.applied=true"
+        ],
+        "trace": [
+          "R-FIN-084 \u2013 boundary: transaction.age == 60 days (last valid day)",
+          "BVA: on-point at upper limit of acceptance window"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_dispute_exactly_at_60_day_boundary_is_accepted(\n    api_client,\n    transaction_factory,\n):\n    txn = transaction_factory(age_days=60)\n    idempotency_key = str(uuid.uuid4())\n\n    resp = api_client.post(\n        \"/disputes\",\n        json={\"transaction_id\": txn[\"id\"]},\n        headers={\"Idempotency-Key\": idempotency_key},\n    )\n\n    assert resp.status_code == 201, (\n        f\"Expected 201 at 60-day boundary, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"dispute_id\" in body\n    assert body[\"provisional_credit\"][\"applied\"] is True\n"
+      },
+      {
+        "name": "test_duplicate_dispute_submission_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_fixture>",
+          "A posted transaction aged 10 days exists, returned by <transaction_factory(age_days=10)>",
+          "A fixed Idempotency-Key is chosen for both submissions",
+          "The /disputes endpoint is reachable"
+        ],
+        "actions": [
+          "POST /disputes with transaction_id and Idempotency-Key (first submission)",
+          "Record dispute_id from first response",
+          "POST /disputes with same transaction_id and same Idempotency-Key (second submission)"
+        ],
+        "expected": [
+          "First call returns HTTP 201 with dispute_id",
+          "Second call returns HTTP 200 (or 201) with identical dispute_id",
+          "Second call does not create a new dispute record",
+          "provisional_credit.applied is true in both responses and credit is not double-applied"
+        ],
+        "trace": [
+          "R-FIN-084 \u2013 idempotency variant: duplicate submission with same Idempotency-Key",
+          "STC: system transitions from 'no dispute' -> 'dispute open' on first call, stays 'dispute open' on repeat call"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_duplicate_dispute_submission_returns_original_result(\n    api_client,\n    transaction_factory,\n):\n    txn = transaction_factory(age_days=10)\n    idempotency_key = str(uuid.uuid4())\n    payload = {\"transaction_id\": txn[\"id\"]}\n    headers = {\"Idempotency-Key\": idempotency_key}\n\n    first = api_client.post(\"/disputes\", json=payload, headers=headers)\n    assert first.status_code == 201, first.text\n    first_body = first.json()\n    dispute_id = first_body[\"dispute_id\"]\n\n    second = api_client.post(\"/disputes\", json=payload, headers=headers)\n    assert second.status_code in (200, 201), second.text\n    second_body = second.json()\n\n    assert second_body[\"dispute_id\"] == dispute_id, (\n        \"Idempotent replay must return the original dispute_id\"\n    )\n    assert second_body[\"provisional_credit\"][\"applied\"] is True\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-084",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1015,
+    "output_tokens": 2258,
+    "latency_ms": 28466,
+    "wall_ms": 28466,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-084\",\n  \"reasoning\": \"The requirement has four testable behaviours: (1) valid dispute within 60 days succeeds with provisional credit (EP positive), (2) dispute beyond 60 days is rejected with 422 (NEG/EP negative), (3) dispute exactly on the 60-day boundary tests the limit (BVA boundary), and (4) duplicate submission with the same Idempotency-Key returns the original result without side-effects (STC idempotency). Together these cover all decision branches in R-FIN-084 and satisfy the minimum three-test requirement with an additional idempotency case.\",\n  \"tests\": [\n    {\n      \"name\": \"test_dispute_within_60_days_creates_dispute_and_applies_credit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer token is available via <auth_fixture>\",\n        \"A posted transaction aged 30 days exists, returned by <transaction_factory(age_days=30)>\",\n        \"The /disputes endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST /disputes with transaction_id and a unique Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains dispute_id\",\n        \"Response body contains status='open'\",\n        \"Response body contains provisional_credit.applied=true\"\n      ],\n      \"trace\": [\n        \"R-FIN-084 \u2013 valid dispute within 60-day window\",\n        \"EP partition: transaction.age in [1, 59] days\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_dispute_within_60_days_creates_dispute_and_applies_credit(\\n    api_client,          # <fixture> authenticated requests.Session\\n    transaction_factory, # <fixture> creates & returns posted transaction dict\\n):\\n    txn = transaction_factory(age_days=30)\\n    idempotency_key = str(uuid.uuid4())\\n\\n    resp = api_client.post(\\n        \\\"/disputes\\\",\\n        json={\\\"transaction_id\\\": txn[\\\"id\\\"]},\\n        headers={\\\"Idempotency-Key\\\": idempotency_key},\\n    )\\n\\n    assert resp.status_code == 201, resp.text\\n    body = resp.json()\\n    assert \\\"dispute_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"open\\\"\\n    assert body[\\\"provisional_credit\\\"][\\\"applied\\\"] is True\\n\"\n    },\n    {\n      \"name\": \"test_dispute_beyond_60_days_rejected_with_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated customer token is available via <auth_fixture>\",\n        \"A posted transaction aged 61 days exists, returned by <transaction_factory(age_days=61)>\",\n        \"The /disputes endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST /disputes with transaction_id for a transaction aged 61 days\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body error code indicates dispute_window_exceeded\",\n        \"No dispute record created\",\n        \"No provisional credit applied\"\n      ],\n      \"trace\": [\n        \"R-FIN-084 \u2013 error pathway: transaction.age > 60 days\",\n        \"NEG partition: transaction.age >= 61 days\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_dispute_beyond_60_days_rejected_with_422(\\n    api_client,\\n    transaction_factory,\\n):\\n    txn = transaction_factory(age_days=61)\\n    idempotency_key = str(uuid.uuid4())\\n\\n    resp = api_client.post(\\n        \\\"/disputes\\\",\\n        json={\\\"transaction_id\\\": txn[\\\"id\\\"]},\\n        headers={\\\"Idempotency-Key\\\": idempotency_key},\\n    )\\n\\n    assert resp.status_code == 422, resp.text\\n    body = resp.json()\\n    assert body.get(\\\"error_code\\\") == \\\"dispute_window_exceeded\\\"\\n\"\n    },\n    {\n      \"name\": \"test_dispute_exactly_at_60_day_boundary_is_accepted\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated customer token is available via <auth_fixture>\",\n        \"A posted transaction aged exactly 60 days exists, returned by <transaction_factory(age_days=60)>\",\n        \"The /disputes endpoint is reachable\"\n      ],\n      \"actions\": [\n   "
+  }
+}

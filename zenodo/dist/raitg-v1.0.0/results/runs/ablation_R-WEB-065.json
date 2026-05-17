@@ -1,0 +1,191 @@
+{
+  "req": {
+    "id": "R-WEB-065",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "transaction",
+    "title": "Approve leave request \u2014 variant 4",
+    "statement": "A manager shall approve or reject leave requests assigned to them within 5 business days; unactioned requests auto-escalate to hr-admin. Additionally, the operation must be rate-limited per user.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager",
+      "request assigned to manager"
+    ],
+    "triggers": [
+      "manager clicks approve"
+    ],
+    "expected_outcomes": [
+      "request state=approved",
+      "employee notified",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if manager not the assignee",
+      "409 if already actioned"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/leave-requests/{id}/approve"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-065",
+    "reasoning": "The requirement covers: (1) happy-path approval by the assigned manager \u2014 EP on valid actor/state; (2) rejection by a non-assignee manager \u2014 NEG/403 path; (3) double-action on an already-approved request \u2014 STC 'approved\u2192approved' transition producing 409; (4) rate-limit boundary \u2014 BVA at the exact threshold where the (N+1)th request within the window must be blocked; (5) decision-table coverage of the approve/reject \u00d7 assignee/non-assignee matrix. Together these provide EP, BVA, STC, DT, and NEG heuristic coverage as required by ISO/IEC/IEEE 29119-4.",
+    "tests": [
+      {
+        "name": "test_manager_approves_assigned_request_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated user has role=manager",
+          "Leave request exists with state=pending and is assigned to this manager",
+          "Employee account exists and can receive notifications"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with valid manager credentials",
+          "Capture HTTP response status and body",
+          "Query audit log for the request ID",
+          "Check employee notification store"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned",
+          "Leave request state transitions to approved",
+          "Employee notification record created",
+          "Audit entry exists with actor=manager, action=approve, request_id={id}"
+        ],
+        "trace": [
+          "R-WEB-065: manager clicks approve \u2192 request state=approved",
+          "R-WEB-065: employee notified",
+          "R-WEB-065: audit entry created"
+        ],
+        "executable": "import pytest\n\ndef test_manager_approves_assigned_request_succeeds(\n    api_client,          # <fixture> authenticated as manager\n    pending_leave_request,  # <fixture> returns {id, employee_id}\n    audit_log_query,     # <helper_fn>(request_id) -> list[dict]\n    notification_query,  # <helper_fn>(employee_id) -> list[dict]\n):\n    req_id = pending_leave_request[\"id\"]\n    emp_id = pending_leave_request[\"employee_id\"]\n\n    resp = api_client.post(f\"/leave-requests/{req_id}/approve\")\n    assert resp.status_code in (200, 204)\n\n    leave = api_client.get(f\"/leave-requests/{req_id}\").json()\n    assert leave[\"state\"] == \"approved\"\n\n    notes = notification_query(emp_id)\n    assert any(n[\"request_id\"] == req_id for n in notes)\n\n    entries = audit_log_query(req_id)\n    assert any(\n        e[\"action\"] == \"approve\" and e[\"actor_role\"] == \"manager\"\n        for e in entries\n    )\n"
+      },
+      {
+        "name": "test_non_assignee_manager_approve_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated user has role=manager but is NOT the assignee of the request",
+          "Leave request exists with state=pending assigned to a different manager"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve with credentials of a different manager",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden returned",
+          "Response body contains error code indicating not-assignee",
+          "Leave request state remains pending",
+          "No audit entry for approve action created"
+        ],
+        "trace": [
+          "R-WEB-065 error pathway: 403 if manager not the assignee"
+        ],
+        "executable": "import pytest\n\ndef test_non_assignee_manager_approve_returns_403(\n    api_client_factory,      # <helper_fn>(role, user_id) -> client\n    pending_leave_request,   # <fixture> assigned to manager_A\n    other_manager_credentials,  # <fixture> returns manager_B creds\n    audit_log_query,         # <helper_fn>(request_id) -> list[dict]\n):\n    req_id = pending_leave_request[\"id\"]\n    client_b = api_client_factory(\"manager\", other_manager_credentials[\"id\"])\n\n    resp = client_b.post(f\"/leave-requests/{req_id}/approve\")\n    assert resp.status_code == 403\n\n    error_body = resp.json()\n    assert \"not_assignee\" in error_body.get(\"error_code\", \"\").lower() \\\n        or \"forbidden\" in error_body.get(\"message\", \"\").lower()\n\n    leave = client_b.get(f\"/leave-requests/{req_id}\").json()\n    assert leave[\"state\"] == \"pending\"\n\n    entries = audit_log_query(req_id)\n    assert not any(e[\"action\"] == \"approve\" for e in entries)\n"
+      },
+      {
+        "name": "test_approve_already_approved_request_returns_409",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated user has role=manager and is the assignee",
+          "Leave request already has state=approved (previously actioned)"
+        ],
+        "actions": [
+          "POST /leave-requests/{id}/approve a second time with the same manager credentials",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict returned",
+          "Response body indicates request already actioned",
+          "Leave request state remains approved (no state regression)"
+        ],
+        "trace": [
+          "R-WEB-065 error pathway: 409 if already actioned",
+          "R-WEB-065 state transition: approved \u2192 approve-again is invalid"
+        ],
+        "executable": "import pytest\n\ndef test_approve_already_approved_request_returns_409(\n    api_client,               # <fixture> authenticated as assignee manager\n    approved_leave_request,   # <fixture> returns {id} with state=approved\n):\n    req_id = approved_leave_request[\"id\"]\n\n    resp = api_client.post(f\"/leave-requests/{req_id}/approve\")\n    assert resp.status_code == 409\n\n    error_body = resp.json()\n    assert \"already\" in error_body.get(\"message\", \"\").lower() \\\n        or \"conflict\" in error_body.get(\"error_code\", \"\").lower()\n\n    leave = api_client.get(f\"/leave-requests/{req_id}\").json()\n    assert leave[\"state\"] == \"approved\"\n"
+      },
+      {
+        "name": "test_rate_limit_exceeded_on_approve_endpoint",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated user has role=manager",
+          "Rate-limit policy for /leave-requests/*/approve is known (e.g. N requests per window)",
+          "N distinct pending leave requests assigned to this manager exist",
+          "Rate-limit counter for this manager is at zero (fresh window)"
+        ],
+        "actions": [
+          "Send exactly RATE_LIMIT_MAX approve requests (one per distinct request ID) \u2014 all should succeed",
+          "Send one additional (RATE_LIMIT_MAX + 1) approve request within the same window",
+          "Capture the status code of the final request"
+        ],
+        "expected": [
+          "First RATE_LIMIT_MAX requests each return 200 or 204",
+          "The (RATE_LIMIT_MAX + 1)th request returns 429 Too Many Requests",
+          "Response headers on 429 include Retry-After"
+        ],
+        "trace": [
+          "R-WEB-065: operation must be rate-limited per user",
+          "BVA: exactly at limit (N) passes; one beyond (N+1) is blocked"
+        ],
+        "executable": "import pytest\n\nRATE_LIMIT_MAX = 10  # <config_constant> read from env/config\n\ndef test_rate_limit_exceeded_on_approve_endpoint(\n    api_client,                     # <fixture> authenticated as manager\n    bulk_pending_requests_factory,  # <helper_fn>(n) -> list of request IDs\n    reset_rate_limit,               # <fixture> ensures clean window before test\n):\n    request_ids = bulk_pending_requests_factory(RATE_LIMIT_MAX + 1)\n\n    for req_id in request_ids[:RATE_LIMIT_MAX]:\n        r = api_client.post(f\"/leave-requests/{req_id}/approve\")\n        assert r.status_code in (200, 204), \\\n            f\"Expected success for request {req_id}, got {r.status_code}\"\n\n    overflow_id = request_ids[RATE_LIMIT_MAX]\n    resp = api_client.post(f\"/leave-requests/{overflow_id}/approve\")\n    assert resp.status_code == 429\n    assert \"retry-after\" in (k.lower() for k in resp.headers)\n"
+      },
+      {
+        "name": "test_approve_reject_decision_matrix_assignee_vs_non_assignee",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Two managers exist: manager_A (assignee) and manager_B (non-assignee)",
+          "Two pending leave requests exist, both assigned to manager_A",
+          "Decision conditions: actor \u2208 {assignee, non-assignee} \u00d7 action \u2208 {approve, reject}"
+        ],
+        "actions": [
+          "manager_A approves request_1 \u2014 expect 200/204",
+          "manager_A rejects request_2 \u2014 expect 200/204",
+          "manager_B attempts to approve request_1 (already approved) \u2014 expect 403 or 409",
+          "manager_B attempts to reject request_2 (already rejected) \u2014 expect 403 or 409"
+        ],
+        "expected": [
+          "manager_A approve \u2192 200/204, state=approved",
+          "manager_A reject  \u2192 200/204, state=rejected",
+          "manager_B approve on request not assigned to them \u2192 403",
+          "manager_B reject  on request not assigned to them \u2192 403"
+        ],
+        "trace": [
+          "R-WEB-065: approve/reject by assignee succeeds",
+          "R-WEB-065 error pathway: 403 if manager not the assignee",
+          "DT: 2 actors \u00d7 2 actions = 4 decision rules fully exercised"
+        ],
+        "executable": "import pytest\n\ndef test_approve_reject_decision_matrix_assignee_vs_non_assignee(\n    api_client_factory,         # <helper_fn>(role, user_id) -> client\n    manager_a_credentials,      # <fixture>\n    manager_b_credentials,      # <fixture>\n    two_pending_requests,       # <fixture> [{id, assignee_id}, ...] assigned to A\n):\n    client_a = api_client_factory(\"manager\", manager_a_credentials[\"id\"])\n    client_b = api_client_factory(\"manager\", manager_b_credentials[\"id\"])\n    r1, r2 = two_pending_requests[0][\"id\"], two_pending_requests[1][\"id\"]\n\n    resp_approve = client_a.post(f\"/leave-requests/{r1}/approve\")\n    assert resp_approve.status_code in (200, 204)\n    assert client_a.get(f\"/leave-requests/{r1}\").json()[\"state\"] == \"approved\"\n\n    resp_reject = client_a.post(f\"/leave-requests/{r2}/reject\")\n    assert resp_reject.status_code in (200, 204)\n    assert client_a.get(f\"/leave-requests/{r2}\").json()[\"state\"] == \"rejected\"\n\n    assert client_b.post(f\"/leave-requests/{r1}/approve\").status_code in (403, 409)\n    assert client_b.post(f\"/leave-requests/{r2}/reject\").status_code in (403, 409)\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-065",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[2] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1031,
+    "output_tokens": 3239,
+    "latency_ms": 40355,
+    "wall_ms": 40355,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-065\",\n  \"reasoning\": \"The requirement covers: (1) happy-path approval by the assigned manager \u2014 EP on valid actor/state; (2) rejection by a non-assignee manager \u2014 NEG/403 path; (3) double-action on an already-approved request \u2014 STC 'approved\u2192approved' transition producing 409; (4) rate-limit boundary \u2014 BVA at the exact threshold where the (N+1)th request within the window must be blocked; (5) decision-table coverage of the approve/reject \u00d7 assignee/non-assignee matrix. Together these provide EP, BVA, STC, DT, and NEG heuristic coverage as required by ISO/IEC/IEEE 29119-4.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_approves_assigned_request_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated user has role=manager\",\n        \"Leave request exists with state=pending and is assigned to this manager\",\n        \"Employee account exists and can receive notifications\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with valid manager credentials\",\n        \"Capture HTTP response status and body\",\n        \"Query audit log for the request ID\",\n        \"Check employee notification store\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 returned\",\n        \"Leave request state transitions to approved\",\n        \"Employee notification record created\",\n        \"Audit entry exists with actor=manager, action=approve, request_id={id}\"\n      ],\n      \"trace\": [\n        \"R-WEB-065: manager clicks approve \u2192 request state=approved\",\n        \"R-WEB-065: employee notified\",\n        \"R-WEB-065: audit entry created\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_manager_approves_assigned_request_succeeds(\\n    api_client,          # <fixture> authenticated as manager\\n    pending_leave_request,  # <fixture> returns {id, employee_id}\\n    audit_log_query,     # <helper_fn>(request_id) -> list[dict]\\n    notification_query,  # <helper_fn>(employee_id) -> list[dict]\\n):\\n    req_id = pending_leave_request[\\\"id\\\"]\\n    emp_id = pending_leave_request[\\\"employee_id\\\"]\\n\\n    resp = api_client.post(f\\\"/leave-requests/{req_id}/approve\\\")\\n    assert resp.status_code in (200, 204)\\n\\n    leave = api_client.get(f\\\"/leave-requests/{req_id}\\\").json()\\n    assert leave[\\\"state\\\"] == \\\"approved\\\"\\n\\n    notes = notification_query(emp_id)\\n    assert any(n[\\\"request_id\\\"] == req_id for n in notes)\\n\\n    entries = audit_log_query(req_id)\\n    assert any(\\n        e[\\\"action\\\"] == \\\"approve\\\" and e[\\\"actor_role\\\"] == \\\"manager\\\"\\n        for e in entries\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_non_assignee_manager_approve_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated user has role=manager but is NOT the assignee of the request\",\n        \"Leave request exists with state=pending assigned to a different manager\"\n      ],\n      \"actions\": [\n        \"POST /leave-requests/{id}/approve with credentials of a different manager\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden returned\",\n        \"Response body contains error code indicating not-assignee\",\n        \"Leave request state remains pending\",\n        \"No audit entry for approve action created\"\n      ],\n      \"trace\": [\n        \"R-WEB-065 error pathway: 403 if manager not the assignee\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_assignee_manager_approve_returns_403(\\n    api_client_factory,      # <helper_fn>(role, user_id) -> client\\n    pending_leave_request,   # <fixture> assigned to manager_A\\n    other_manager_credentials,  # <fixture> returns manager_B creds\\n    audit_log_query,         # <helper_fn>(request_id) -> list[dict]\\n):\\n    req_id = pending_leave_request[\\\"id\\\"]\\n    client_b = api_client_factory(\\\"manager\\\", other_manager_credentials[\\\"id\\\"])\\n\\n    resp = client_b.post(f\\\"/leave-requests/{req_id}/approve\\\")\\n    assert resp.sta"
+  }
+}

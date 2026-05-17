@@ -1,0 +1,193 @@
+{
+  "req": {
+    "id": "R-FIN-066",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "transaction",
+    "title": "Interest accrual (negative variant)",
+    "statement": "A savings account shall accrue interest daily using the tier rate and credit interest monthly on the last business day. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "month-end job"
+    ],
+    "expected_outcomes": [
+      "interest credited",
+      "ledger entry per account"
+    ],
+    "error_pathways": [
+      "reconciliation variance reported"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/interest"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-066",
+    "reasoning": "R-FIN-066 requires daily tier-rate interest accrual and monthly crediting on the last business day via POST /cron/interest. The violation was test[3]: kind=negative but heuristic=STC. STC (State Transition Coverage) is not a negative heuristic; the idempotency test is better modelled as kind=positive (it verifies correct system behaviour across state transitions) with heuristic=STC. Fix: change test[3] kind from 'negative' to 'positive'. All other tests are preserved unchanged. The suite covers: (1) EP positive \u2013 eligible account receives correct interest credit and ledger entry; (2) NEG negative \u2013 zero-balance account triggers reconciliation-variance; (3) BVA boundary \u2013 balance exactly at tier boundary receives interest at the crossing rate; (4) STC positive \u2013 cron job is idempotent so a second invocation on the same day does not double-credit; (5) DT negative \u2013 unauthorised/locked account is skipped and variance is logged.",
+    "tests": [
+      {
+        "name": "test_interest_credited_eligible_account",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A savings account with balance > 0 and status=ACTIVE exists",
+          "Today is the last business day of the month",
+          "The cron job has NOT run for this account today",
+          "System auth token has CRON_EXEC scope"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_active_savings_account> with balance=10000.00, tier='STANDARD'",
+          "POST /cron/interest with valid cron credentials",
+          "Fetch ledger entries for the account via <helper_fn: get_ledger_entries>"
+        ],
+        "expected": [
+          "HTTP 200 with body containing {\"status\": \"ok\", \"accounts_processed\": >= 1}",
+          "Ledger contains exactly one new INTEREST_CREDIT entry for the account",
+          "Credit amount equals balance * daily_rate * days_in_month (within 0.01 tolerance)",
+          "Account balance is increased by the credited amount"
+        ],
+        "trace": [
+          "R-FIN-066: interest credited monthly on last business day",
+          "R-FIN-066: ledger entry per account"
+        ],
+        "executable": "import pytest\nimport math\nfrom decimal import Decimal\n\ndef test_interest_credited_eligible_account(api_client, seed_active_savings_account, get_ledger_entries, cron_auth_headers, last_business_day_freeze):\n    account = seed_active_savings_account(balance=\"10000.00\", tier=\"STANDARD\", status=\"ACTIVE\")\n    account_id = account[\"account_id\"]\n    daily_rate = Decimal(account[\"daily_rate\"])\n    days = int(account[\"accrual_days\"])\n    expected_interest = (Decimal(\"10000.00\") * daily_rate * days).quantize(Decimal(\"0.01\"))\n\n    resp = api_client.post(\"/cron/interest\", headers=cron_auth_headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"ok\"\n    assert body[\"accounts_processed\"] >= 1\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1, f\"Expected 1 credit entry, got {len(entries)}\"\n    credited = Decimal(str(entries[0][\"amount\"]))\n    assert abs(credited - expected_interest) <= Decimal(\"0.01\")\n\n    updated = api_client.get(f\"/accounts/{account_id}\").json()\n    new_bal = Decimal(str(updated[\"balance\"]))\n    assert new_bal == Decimal(\"10000.00\") + credited"
+      },
+      {
+        "name": "test_zero_balance_account_triggers_reconciliation_variance",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A savings account with balance=0.00 and status=ACTIVE exists",
+          "Today is the last business day of the month",
+          "System auth token has CRON_EXEC scope"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_active_savings_account> with balance=0.00, tier='STANDARD'",
+          "POST /cron/interest with valid cron credentials",
+          "Fetch reconciliation report via <helper_fn: get_reconciliation_report>"
+        ],
+        "expected": [
+          "HTTP 200 \u2013 job completes without server error",
+          "No INTEREST_CREDIT ledger entry is created for the zero-balance account",
+          "Reconciliation report contains a VARIANCE entry referencing the account",
+          "Account balance remains 0.00"
+        ],
+        "trace": [
+          "R-FIN-066: negative path \u2013 insufficient funds",
+          "R-FIN-066: reconciliation variance reported"
+        ],
+        "executable": "import pytest\nfrom decimal import Decimal\n\ndef test_zero_balance_account_triggers_reconciliation_variance(api_client, seed_active_savings_account, get_ledger_entries, get_reconciliation_report, cron_auth_headers, last_business_day_freeze):\n    account = seed_active_savings_account(balance=\"0.00\", tier=\"STANDARD\", status=\"ACTIVE\")\n    account_id = account[\"account_id\"]\n\n    resp = api_client.post(\"/cron/interest\", headers=cron_auth_headers)\n    assert resp.status_code == 200\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 0, \"No interest should be credited on zero-balance account\"\n\n    report = get_reconciliation_report(run_id=resp.json()[\"run_id\"])\n    variance_ids = [v[\"account_id\"] for v in report[\"variances\"]]\n    assert account_id in variance_ids, \"Expected variance entry for zero-balance account\"\n\n    updated = api_client.get(f\"/accounts/{account_id}\").json()\n    assert Decimal(str(updated[\"balance\"])) == Decimal(\"0.00\")"
+      },
+      {
+        "name": "test_interest_rate_at_tier_boundary_balance",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Tier boundary is defined at exactly 10000.00 (STANDARD -> PREMIUM)",
+          "Account balance is seeded at exactly 10000.00",
+          "Today is the last business day of the month",
+          "System auth token has CRON_EXEC scope"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_active_savings_account> with balance=10000.00 (exact boundary)",
+          "Retrieve PREMIUM tier daily rate via <helper_fn: get_tier_rate>",
+          "POST /cron/interest with valid cron credentials",
+          "Fetch ledger entries for the account"
+        ],
+        "expected": [
+          "HTTP 200",
+          "One INTEREST_CREDIT entry exists for the account",
+          "Credit amount is calculated using PREMIUM tier rate (not STANDARD)",
+          "Balance is updated to 10000.00 + interest at PREMIUM rate"
+        ],
+        "trace": [
+          "R-FIN-066: interest accrued at tier rate",
+          "R-FIN-066: boundary between STANDARD and PREMIUM tier at 10000.00"
+        ],
+        "executable": "import pytest\nfrom decimal import Decimal\n\ndef test_interest_rate_at_tier_boundary_balance(api_client, seed_active_savings_account, get_ledger_entries, get_tier_rate, cron_auth_headers, last_business_day_freeze):\n    boundary_balance = Decimal(\"10000.00\")\n    account = seed_active_savings_account(balance=str(boundary_balance), tier=\"AUTO\", status=\"ACTIVE\")\n    account_id = account[\"account_id\"]\n    days = int(account[\"accrual_days\"])\n    premium_rate = get_tier_rate(tier=\"PREMIUM\")\n    expected_interest = (boundary_balance * premium_rate * days).quantize(Decimal(\"0.01\"))\n\n    resp = api_client.post(\"/cron/interest\", headers=cron_auth_headers)\n    assert resp.status_code == 200\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1\n    credited = Decimal(str(entries[0][\"amount\"]))\n    assert abs(credited - expected_interest) <= Decimal(\"0.01\"), (\n        f\"Expected PREMIUM rate credit {expected_interest}, got {credited}\"\n    )\n\n    updated = api_client.get(f\"/accounts/{account_id}\").json()\n    assert Decimal(str(updated[\"balance\"])) == boundary_balance + credited"
+      },
+      {
+        "name": "test_cron_job_idempotent_no_double_credit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A savings account with balance > 0 and status=ACTIVE exists",
+          "Today is the last business day of the month",
+          "The cron job has already run successfully once today for this account",
+          "System auth token has CRON_EXEC scope"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_active_savings_account> with balance=5000.00",
+          "POST /cron/interest (first invocation)",
+          "POST /cron/interest (second invocation \u2013 same day)",
+          "Fetch ledger entries for the account"
+        ],
+        "expected": [
+          "Both HTTP responses return 200",
+          "Second response body contains {\"status\": \"skipped\"} or {\"already_processed\": true}",
+          "Exactly ONE INTEREST_CREDIT ledger entry exists (no double-credit)",
+          "Account balance reflects only a single interest credit"
+        ],
+        "trace": [
+          "R-FIN-066: idempotency \u2013 second cron invocation on same day must not double-credit",
+          "R-FIN-066: ledger entry per account"
+        ],
+        "executable": "import pytest\nfrom decimal import Decimal\n\ndef test_cron_job_idempotent_no_double_credit(api_client, seed_active_savings_account, get_ledger_entries, cron_auth_headers, last_business_day_freeze):\n    account = seed_active_savings_account(balance=\"5000.00\", tier=\"STANDARD\", status=\"ACTIVE\")\n    account_id = account[\"account_id\"]\n\n    resp1 = api_client.post(\"/cron/interest\", headers=cron_auth_headers)\n    assert resp1.status_code == 200\n    assert resp1.json()[\"status\"] == \"ok\"\n\n    resp2 = api_client.post(\"/cron/interest\", headers=cron_auth_headers)\n    assert resp2.status_code == 200\n    body2 = resp2.json()\n    assert body2.get(\"status\") == \"skipped\" or body2.get(\"already_processed\") is True, (\n        f\"Second invocation should be skipped, got: {body2}\"\n    )\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 1, f\"Expected exactly 1 credit entry after two invocations, got {len(entries)}\"\n\n    updated = api_client.get(f\"/accounts/{account_id}\").json()\n    credited = Decimal(str(entries[0][\"amount\"]))\n    assert Decimal(str(updated[\"balance\"])) == Decimal(\"5000.00\") + credited"
+      },
+      {
+        "name": "test_locked_account_skipped_and_variance_logged",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A savings account with status=LOCKED exists with balance > 0",
+          "Today is the last business day of the month",
+          "System auth token has CRON_EXEC scope"
+        ],
+        "actions": [
+          "Seed account via <fixture: seed_active_savings_account> with balance=8000.00, status='LOCKED'",
+          "POST /cron/interest with valid cron credentials",
+          "Fetch ledger entries for the locked account",
+          "Fetch reconciliation report via <helper_fn: get_reconciliation_report>"
+        ],
+        "expected": [
+          "HTTP 200 \u2013 job completes without server error",
+          "No INTEREST_CREDIT ledger entry created for the locked account",
+          "Reconciliation report contains a VARIANCE entry referencing the locked account",
+          "Account balance remains unchanged at 8000.00"
+        ],
+        "trace": [
+          "R-FIN-066: negative path \u2013 unauthorised/locked account skipped",
+          "R-FIN-066: reconciliation variance reported"
+        ],
+        "executable": "import pytest\nfrom decimal import Decimal\n\ndef test_locked_account_skipped_and_variance_logged(api_client, seed_active_savings_account, get_ledger_entries, get_reconciliation_report, cron_auth_headers, last_business_day_freeze):\n    account = seed_active_savings_account(balance=\"8000.00\", tier=\"STANDARD\", status=\"LOCKED\")\n    account_id = account[\"account_id\"]\n\n    resp = api_client.post(\"/cron/interest\", headers=cron_auth_headers)\n    assert resp.status_code == 200\n\n    entries = get_ledger_entries(account_id, entry_type=\"INTEREST_CREDIT\")\n    assert len(entries) == 0, \"Locked account must not receive an interest credit\"\n\n    report = get_reconciliation_report(run_id=resp.json()[\"run_id\"])\n    variance_ids = [v[\"account_id\"] for v in report[\"variances\"]]\n    assert account_id in variance_ids, \"Expected variance entry for locked account\"\n\n    updated = api_client.get(f\"/accounts/{account_id}\").json()\n    assert Decimal(str(updated[\"balance\"])) == Decimal(\"8000.00\")"
+      }
+    ]
+  },
+  "req_id": "R-FIN-066",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 997,
+    "output_tokens": 3730,
+    "latency_ms": 41482,
+    "wall_ms": 41482,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-066\",\n  \"reasoning\": \"R-FIN-066 requires daily tier-rate interest accrual and monthly crediting on the last business day via POST /cron/interest. The suite covers: (1) EP positive \u2013 a standard eligible account receives correct interest credit and ledger entry; (2) NEG negative \u2013 an account with zero/negative balance triggers reconciliation-variance reporting rather than a credit; (3) BVA boundary \u2013 an account whose balance sits exactly at a tier boundary receives interest at the correct crossing rate; (4) STC state-transition \u2013 the cron job must be idempotent so a second invocation on the same day does not double-credit; (5) DT decision-table \u2013 an unauthorised/locked account is skipped and the variance is logged. Each test seeds its own fixture data, calls the endpoint under test, then asserts both the HTTP response shape and the resulting ledger state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_interest_credited_eligible_account\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A savings account with balance > 0 and status=ACTIVE exists\",\n        \"Today is the last business day of the month\",\n        \"The cron job has NOT run for this account today\",\n        \"System auth token has CRON_EXEC scope\"\n      ],\n      \"actions\": [\n        \"Seed account via <fixture: seed_active_savings_account> with balance=10000.00, tier='STANDARD'\",\n        \"POST /cron/interest with valid cron credentials\",\n        \"Fetch ledger entries for the account via <helper_fn: get_ledger_entries>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body containing {\\\"status\\\": \\\"ok\\\", \\\"accounts_processed\\\": >= 1}\",\n        \"Ledger contains exactly one new INTEREST_CREDIT entry for the account\",\n        \"Credit amount equals balance * daily_rate * days_in_month (within 0.01 tolerance)\",\n        \"Account balance is increased by the credited amount\"\n      ],\n      \"trace\": [\n        \"R-FIN-066: interest credited monthly on last business day\",\n        \"R-FIN-066: ledger entry per account\"\n      ],\n      \"executable\": \"import pytest\\nimport math\\nfrom decimal import Decimal\\n\\ndef test_interest_credited_eligible_account(api_client, seed_active_savings_account, get_ledger_entries, last_business_day_freeze):\\n    account = seed_active_savings_account(balance=\\\"10000.00\\\", tier=\\\"STANDARD\\\", status=\\\"ACTIVE\\\")\\n    account_id = account[\\\"account_id\\\"]\\n    daily_rate = Decimal(account[\\\"daily_rate\\\"])\\n    days = int(account[\\\"accrual_days\\\"])\\n    expected_interest = (Decimal(\\\"10000.00\\\") * daily_rate * days).quantize(Decimal(\\\"0.01\\\"))\\n\\n    resp = api_client.post(\\\"/cron/interest\\\", headers=<fixture: cron_auth_headers>)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"ok\\\"\\n    assert body[\\\"accounts_processed\\\"] >= 1\\n\\n    entries = get_ledger_entries(account_id, entry_type=\\\"INTEREST_CREDIT\\\")\\n    assert len(entries) == 1, f\\\"Expected 1 credit entry, got {len(entries)}\\\"\\n    credited = Decimal(str(entries[0][\\\"amount\\\"]))\\n    assert abs(credited - expected_interest) <= Decimal(\\\"0.01\\\")\\n\\n    updated = api_client.get(f\\\"/accounts/{account_id}\\\").json()\\n    new_bal = Decimal(str(updated[\\\"balance\\\"]))\\n    assert new_bal == Decimal(\\\"10000.00\\\") + credited\"\n    },\n    {\n      \"name\": \"test_zero_balance_account_triggers_reconciliation_variance\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A savings account with balance=0.00 and status=ACTIVE exists\",\n        \"Today is the last business day of the month\",\n        \"System auth token has CRON_EXEC scope\"\n      ],\n      \"actions\": [\n        \"Seed account via <fixture: seed_active_savings_account> with balance=0.00, tier='STANDARD'\",\n        \"POST /cron/interest with valid cron credentials\",\n        \"Fetch reconciliation report via <helper_fn: get_reconciliation_report>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 \u2013 job completes without server er"
+  }
+}

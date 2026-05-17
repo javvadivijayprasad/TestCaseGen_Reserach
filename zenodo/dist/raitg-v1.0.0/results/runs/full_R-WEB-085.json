@@ -1,0 +1,154 @@
+{
+  "req": {
+    "id": "R-WEB-085",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Export employee directory \u2014 variant 4",
+    "statement": "An hr-admin shall export the employee directory as CSV with PII redacted for employees who opted out of public directory. Additionally, the operation must be rate-limited per user.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin requests export"
+    ],
+    "expected_outcomes": [
+      "CSV streamed",
+      "PII redacted per opt-out",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if not hr-admin",
+      "429 if rate-limited"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/employees/export.csv"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-085",
+    "reasoning": "The requirement has four testable dimensions: (1) happy-path CSV export with PII redaction for opted-out employees (EP positive), (2) 403 rejection for non-hr-admin callers (NEG), (3) 429 rate-limit enforcement at the exact request boundary (BVA), and (4) decision-table coverage of the opt-out flag combinations driving PII visibility (DT). Together these cover the stated error pathways, the redaction invariant, and the rate-limit constraint while remaining self-contained and idempotent through fixture-based state setup and teardown.",
+    "tests": [
+      {
+        "name": "test_hr_admin_export_redacts_opted_out_employee_pii",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated as role:hr-admin",
+          "At least one employee has opted_out=true",
+          "At least one employee has opted_out=false"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with hr-admin bearer token",
+          "Parse response as CSV",
+          "Identify rows for opted-out vs opted-in employees"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Content-Type contains text/csv",
+          "Opted-in employee rows contain full PII fields (email, phone)",
+          "Opted-out employee rows have PII fields replaced with REDACTED sentinel"
+        ],
+        "trace": [
+          "R-WEB-085: CSV streamed",
+          "R-WEB-085: PII redacted per opt-out"
+        ],
+        "executable": "import csv, io\nimport pytest\n\ndef test_hr_admin_export_redacts_opted_out_employee_pii(\n    <hr_admin_token_fixture>,\n    <seed_employees_fixture>,  # seeds opted_in_id, opted_out_id\n    <api_client_fixture>\n):\n    resp = <api_client_fixture>.get(\n        \"/api/employees/export.csv\",\n        headers={\"Authorization\": f\"Bearer {<hr_admin_token_fixture>}\"}\n    )\n    assert resp.status_code == 200\n    assert \"text/csv\" in resp.headers.get(\"Content-Type\", \"\")\n\n    reader = csv.DictReader(io.StringIO(resp.text))\n    rows = {r[\"id\"]: r for r in reader}\n\n    opted_in_id = str(<seed_employees_fixture>[\"opted_in_id\"])\n    opted_out_id = str(<seed_employees_fixture>[\"opted_out_id\"])\n\n    assert rows[opted_in_id][\"email\"] != \"REDACTED\"\n    assert rows[opted_in_id][\"phone\"] != \"REDACTED\"\n    assert rows[opted_out_id][\"email\"] == \"REDACTED\"\n    assert rows[opted_out_id][\"phone\"] == \"REDACTED\""
+      },
+      {
+        "name": "test_non_hr_admin_export_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated as role:employee (not hr-admin)"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with employee bearer token"
+        ],
+        "expected": [
+          "HTTP 403",
+          "Response body contains error indicating forbidden/insufficient role"
+        ],
+        "trace": [
+          "R-WEB-085: 403 if not hr-admin"
+        ],
+        "executable": "import pytest\n\ndef test_non_hr_admin_export_returns_403(\n    <employee_token_fixture>,\n    <api_client_fixture>\n):\n    resp = <api_client_fixture>.get(\n        \"/api/employees/export.csv\",\n        headers={\"Authorization\": f\"Bearer {<employee_token_fixture>}\"}\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n\ndef test_unauthenticated_export_returns_401_or_403(\n    <api_client_fixture>\n):\n    resp = <api_client_fixture>.get(\"/api/employees/export.csv\")\n    assert resp.status_code in (401, 403)"
+      },
+      {
+        "name": "test_rate_limit_triggers_on_exact_boundary_request",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated as role:hr-admin",
+          "Rate-limit counter for this user reset to zero (fresh window)",
+          "Rate limit is known constant RATE_LIMIT_MAX (e.g. 5 per window)"
+        ],
+        "actions": [
+          "Send RATE_LIMIT_MAX requests sequentially; expect 200 each",
+          "Send one additional (RATE_LIMIT_MAX + 1) request in the same window",
+          "Expect 429 on the boundary-crossing request"
+        ],
+        "expected": [
+          "First RATE_LIMIT_MAX requests each return HTTP 200",
+          "Request number RATE_LIMIT_MAX + 1 returns HTTP 429",
+          "429 response includes Retry-After header"
+        ],
+        "trace": [
+          "R-WEB-085: rate-limited per user",
+          "R-WEB-085: 429 if rate-limited"
+        ],
+        "executable": "import pytest\n\nRATE_LIMIT_MAX = <rate_limit_constant>  # e.g. 5\n\ndef test_rate_limit_triggers_on_exact_boundary_request(\n    <hr_admin_token_fixture>,\n    <api_client_fixture>,\n    <reset_rate_limit_fixture>  # resets counter for this user before test\n):\n    headers = {\"Authorization\": f\"Bearer {<hr_admin_token_fixture>}\"}\n\n    for i in range(1, RATE_LIMIT_MAX + 1):\n        r = <api_client_fixture>.get(\"/api/employees/export.csv\", headers=headers)\n        assert r.status_code == 200, f\"Request {i} expected 200, got {r.status_code}\"\n\n    over_limit = <api_client_fixture>.get(\"/api/employees/export.csv\", headers=headers)\n    assert over_limit.status_code == 429\n    assert \"Retry-After\" in over_limit.headers"
+      },
+      {
+        "name": "test_opt_out_flag_combinations_drive_correct_pii_visibility",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated as role:hr-admin",
+          "Four employees seeded: opted_out=false active, opted_out=true active, opted_out=false inactive, opted_out=true inactive"
+        ],
+        "actions": [
+          "GET /api/employees/export.csv with hr-admin bearer token",
+          "Parse CSV rows for all four employee variants",
+          "Assert PII visibility per decision-table rule"
+        ],
+        "expected": [
+          "opted_out=false, active => email/phone visible",
+          "opted_out=true, active => email/phone REDACTED",
+          "opted_out=false, inactive => email/phone visible (status does not affect redaction)",
+          "opted_out=true, inactive => email/phone REDACTED"
+        ],
+        "trace": [
+          "R-WEB-085: PII redacted per opt-out",
+          "R-WEB-085: additional variant semantics honoured"
+        ],
+        "executable": "import csv, io\nimport pytest\n\n@pytest.mark.parametrize(\"opted_out,active,expect_redacted\", [\n    (False, True,  False),\n    (True,  True,  True),\n    (False, False, False),\n    (True,  False, True),\n])\ndef test_opt_out_flag_combinations_drive_correct_pii_visibility(\n    opted_out, active, expect_redacted,\n    <hr_admin_token_fixture>,\n    <api_client_fixture>,\n    <seed_single_employee_fixture>  # returns employee id for given params\n):\n    emp_id = str(<seed_single_employee_fixture>(opted_out=opted_out, active=active))\n    headers = {\"Authorization\": f\"Bearer {<hr_admin_token_fixture>}\"}\n    resp = <api_client_fixture>.get(\"/api/employees/export.csv\", headers=headers)\n    assert resp.status_code == 200\n    reader = csv.DictReader(io.StringIO(resp.text))\n    rows = {r[\"id\"]: r for r in reader}\n    assert emp_id in rows, f\"Employee {emp_id} missing from export\"\n    row = rows[emp_id]\n    if expect_redacted:\n        assert row[\"email\"] == \"REDACTED\"\n        assert row[\"phone\"] == \"REDACTED\"\n    else:\n        assert row[\"email\"] != \"REDACTED\"\n        assert row[\"phone\"] != \"REDACTED\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-085",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1023,
+    "output_tokens": 2413,
+    "latency_ms": 26380,
+    "wall_ms": 26380,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-085\",\n  \"reasoning\": \"The requirement has four testable dimensions: (1) happy-path CSV export with PII redaction for opted-out employees (EP positive), (2) 403 rejection for non-hr-admin callers (NEG), (3) 429 rate-limit enforcement at the exact request boundary (BVA), and (4) decision-table coverage of the opt-out flag combinations driving PII visibility (DT). Together these cover the stated error pathways, the redaction invariant, and the rate-limit constraint while remaining self-contained and idempotent through fixture-based state setup and teardown.\",\n  \"tests\": [\n    {\n      \"name\": \"test_hr_admin_export_redacts_opted_out_employee_pii\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated as role:hr-admin\",\n        \"At least one employee has opted_out=true\",\n        \"At least one employee has opted_out=false\"\n      ],\n      \"actions\": [\n        \"GET /api/employees/export.csv with hr-admin bearer token\",\n        \"Parse response as CSV\",\n        \"Identify rows for opted-out vs opted-in employees\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Content-Type contains text/csv\",\n        \"Opted-in employee rows contain full PII fields (email, phone)\",\n        \"Opted-out employee rows have PII fields replaced with REDACTED sentinel\"\n      ],\n      \"trace\": [\n        \"R-WEB-085: CSV streamed\",\n        \"R-WEB-085: PII redacted per opt-out\"\n      ],\n      \"executable\": \"import csv, io\\nimport pytest\\n\\ndef test_hr_admin_export_redacts_opted_out_employee_pii(\\n    <hr_admin_token_fixture>,\\n    <seed_employees_fixture>,  # seeds opted_in_id, opted_out_id\\n    <api_client_fixture>\\n):\\n    resp = <api_client_fixture>.get(\\n        \\\"/api/employees/export.csv\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {<hr_admin_token_fixture>}\\\"}\\n    )\\n    assert resp.status_code == 200\\n    assert \\\"text/csv\\\" in resp.headers.get(\\\"Content-Type\\\", \\\"\\\")\\n\\n    reader = csv.DictReader(io.StringIO(resp.text))\\n    rows = {r[\\\"id\\\"]: r for r in reader}\\n\\n    opted_in_id = str(<seed_employees_fixture>[\\\"opted_in_id\\\"])\\n    opted_out_id = str(<seed_employees_fixture>[\\\"opted_out_id\\\"])\\n\\n    assert rows[opted_in_id][\\\"email\\\"] != \\\"REDACTED\\\"\\n    assert rows[opted_in_id][\\\"phone\\\"] != \\\"REDACTED\\\"\\n    assert rows[opted_out_id][\\\"email\\\"] == \\\"REDACTED\\\"\\n    assert rows[opted_out_id][\\\"phone\\\"] == \\\"REDACTED\\\"\"\n    },\n    {\n      \"name\": \"test_non_hr_admin_export_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated as role:employee (not hr-admin)\"\n      ],\n      \"actions\": [\n        \"GET /api/employees/export.csv with employee bearer token\"\n      ],\n      \"expected\": [\n        \"HTTP 403\",\n        \"Response body contains error indicating forbidden/insufficient role\"\n      ],\n      \"trace\": [\n        \"R-WEB-085: 403 if not hr-admin\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_hr_admin_export_returns_403(\\n    <employee_token_fixture>,\\n    <api_client_fixture>\\n):\\n    resp = <api_client_fixture>.get(\\n        \\\"/api/employees/export.csv\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {<employee_token_fixture>}\\\"}\\n    )\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"detail\\\" in body\\n\\ndef test_unauthenticated_export_returns_401_or_403(\\n    <api_client_fixture>\\n):\\n    resp = <api_client_fixture>.get(\\\"/api/employees/export.csv\\\")\\n    assert resp.status_code in (401, 403)\"\n    },\n    {\n      \"name\": \"test_rate_limit_triggers_on_exact_boundary_request\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Authenticated as role:hr-admin\",\n        \"Rate-limit counter for this user reset to zero (fresh window)\",\n        \"Rate limit is known constant RATE_LIMIT_MAX (e.g. 5 per window)\"\n      ],\n      \"actions\": [\n        \"Send RATE_LIMIT_MAX requests sequentially; expect 200 each\",\n        \"Sen"
+  }
+}

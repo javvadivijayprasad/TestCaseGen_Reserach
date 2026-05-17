@@ -1,0 +1,138 @@
+{
+  "req": {
+    "id": "R-HLT-004",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Delete patient (soft)",
+    "statement": "A system-admin shall soft-delete a patient resource; deletion shall not remove history.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin deletes patient"
+    ],
+    "expected_outcomes": [
+      "resource marked deleted",
+      "retrievable via _history"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-004",
+    "reasoning": "The requirement mandates a soft-delete operation on a FHIR Patient resource by a system-admin. Three orthogonal test scenarios are needed: (1) EP positive \u2013 admin successfully soft-deletes an active patient, verifying the 200/204 response and that the resource is marked deleted while history is preserved; (2) NEG negative \u2013 a non-admin caller receives HTTP 403 and no deletion occurs; (3) STC boundary \u2013 deleting an already-deleted patient (re-delete idempotency / state transition from 'deleted' to 'deleted') verifying the server handles the repeated delete gracefully and history still accumulates without data loss. These cover EP (valid admin partition), NEG (invalid role partition), and STC (state: active\u2192deleted\u2192deleted transition).",
+    "tests": [
+      {
+        "name": "test_admin_soft_delete_active_patient_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Admin credentials are available via <admin_token fixture>",
+          "A patient resource exists and is active (created via <create_patient helper>)"
+        ],
+        "actions": [
+          "Obtain admin bearer token",
+          "Create a transient Patient resource to obtain a valid {id}",
+          "Send DELETE /Patient/{id} with Authorization: Bearer <admin_token>",
+          "Send GET /Patient/{id} to verify soft-delete marker",
+          "Send GET /Patient/{id}/_history to verify history is preserved"
+        ],
+        "expected": [
+          "DELETE returns HTTP 200 or 204",
+          "GET /Patient/{id} returns HTTP 410 Gone with 'inactive' or deleted marker in body",
+          "GET /Patient/{id}/_history returns HTTP 200 with at least one history entry"
+        ],
+        "trace": [
+          "R-HLT-004: soft-delete marks resource deleted",
+          "R-HLT-004: deletion shall not remove history"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_admin_soft_delete_active_patient_success(admin_token, base_url, create_patient):\n    patient_id = create_patient(admin_token, base_url)\n    headers = {\"Authorization\": f\"Bearer {admin_token}\", \"Content-Type\": \"application/fhir+json\"}\n\n    del_resp = requests.delete(f\"{base_url}/Patient/{patient_id}\", headers=headers)\n    assert del_resp.status_code in (200, 204), f\"Expected 200/204, got {del_resp.status_code}\"\n\n    get_resp = requests.get(f\"{base_url}/Patient/{patient_id}\", headers=headers)\n    assert get_resp.status_code == 410, f\"Expected 410 Gone, got {get_resp.status_code}\"\n\n    hist_resp = requests.get(f\"{base_url}/Patient/{patient_id}/_history\", headers=headers)\n    assert hist_resp.status_code == 200, f\"Expected 200 for history, got {hist_resp.status_code}\"\n    bundle = hist_resp.json()\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) >= 1, \"History must contain at least one entry after soft-delete\"\n"
+      },
+      {
+        "name": "test_non_admin_delete_patient_forbidden",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "A non-admin (role: practitioner) token is available via <practitioner_token fixture>",
+          "Admin token is available via <admin_token fixture>",
+          "A patient resource exists (created via <create_patient helper>)"
+        ],
+        "actions": [
+          "Obtain practitioner bearer token (non-admin role)",
+          "Create a transient Patient resource as admin to obtain a valid {id}",
+          "Send DELETE /Patient/{id} with Authorization: Bearer <practitioner_token>",
+          "Confirm the patient still exists by fetching it with admin token"
+        ],
+        "expected": [
+          "DELETE returns HTTP 403 Forbidden",
+          "Response body contains OperationOutcome with issue.code indicating forbidden",
+          "Subsequent GET /Patient/{id} by admin returns 200 (resource not deleted)"
+        ],
+        "trace": [
+          "R-HLT-004: 403 when not admin (error pathway)",
+          "R-HLT-004: only system-admin actor is authorized"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_non_admin_delete_patient_forbidden(admin_token, practitioner_token, base_url, create_patient):\n    patient_id = create_patient(admin_token, base_url)\n    non_admin_headers = {\"Authorization\": f\"Bearer {practitioner_token}\"}\n    admin_headers = {\"Authorization\": f\"Bearer {admin_token}\"}\n\n    del_resp = requests.delete(f\"{base_url}/Patient/{patient_id}\", headers=non_admin_headers)\n    assert del_resp.status_code == 403, f\"Expected 403 Forbidden, got {del_resp.status_code}\"\n\n    body = del_resp.json()\n    resource_type = body.get(\"resourceType\", \"\")\n    assert resource_type == \"OperationOutcome\", \"Body must be an OperationOutcome on 403\"\n\n    get_resp = requests.get(f\"{base_url}/Patient/{patient_id}\", headers=admin_headers)\n    assert get_resp.status_code == 200, \"Patient must still exist after forbidden delete attempt\"\n"
+      },
+      {
+        "name": "test_admin_soft_delete_already_deleted_patient_idempotent",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "FHIR-lite service is running",
+          "Admin credentials available via <admin_token fixture>",
+          "A patient resource exists and has already been soft-deleted once (state: deleted)"
+        ],
+        "actions": [
+          "Obtain admin bearer token",
+          "Create a transient Patient resource",
+          "Issue first DELETE /Patient/{id} to transition state from active to deleted",
+          "Issue second DELETE /Patient/{id} to attempt delete from already-deleted state",
+          "Fetch /Patient/{id}/_history to verify history integrity"
+        ],
+        "expected": [
+          "First DELETE returns 200 or 204",
+          "Second DELETE returns 200, 204, or 404 (server-defined idempotency; must NOT return 500)",
+          "GET /Patient/{id}/_history returns 200 with history entries >= 1 and no data loss"
+        ],
+        "trace": [
+          "R-HLT-004: deletion shall not remove history (re-delete boundary)",
+          "R-HLT-004: state transition active->deleted->deleted must not corrupt data"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_admin_soft_delete_already_deleted_patient_idempotent(admin_token, base_url, create_patient):\n    patient_id = create_patient(admin_token, base_url)\n    headers = {\"Authorization\": f\"Bearer {admin_token}\"}\n\n    first_del = requests.delete(f\"{base_url}/Patient/{patient_id}\", headers=headers)\n    assert first_del.status_code in (200, 204), f\"First delete failed: {first_del.status_code}\"\n\n    second_del = requests.delete(f\"{base_url}/Patient/{patient_id}\", headers=headers)\n    assert second_del.status_code in (200, 204, 404), (\n        f\"Second delete must not be a server error, got {second_del.status_code}\"\n    )\n    assert second_del.status_code != 500, \"Server error on re-delete is unacceptable\"\n\n    hist_resp = requests.get(f\"{base_url}/Patient/{patient_id}/_history\", headers=headers)\n    assert hist_resp.status_code == 200, f\"History endpoint failed: {hist_resp.status_code}\"\n    entries = hist_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"History must be preserved after repeated soft-delete\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-004",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 977,
+    "output_tokens": 2170,
+    "latency_ms": 29661,
+    "wall_ms": 29661,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-004\",\n  \"reasoning\": \"The requirement mandates a soft-delete operation on a FHIR Patient resource by a system-admin. Three orthogonal test scenarios are needed: (1) EP positive \u2013 admin successfully soft-deletes an active patient, verifying the 200/204 response and that the resource is marked deleted while history is preserved; (2) NEG negative \u2013 a non-admin caller receives HTTP 403 and no deletion occurs; (3) STC boundary \u2013 deleting an already-deleted patient (re-delete idempotency / state transition from 'deleted' to 'deleted') verifying the server handles the repeated delete gracefully and history still accumulates without data loss. These cover EP (valid admin partition), NEG (invalid role partition), and STC (state: active\u2192deleted\u2192deleted transition).\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_soft_delete_active_patient_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"FHIR-lite service is running\",\n        \"Admin credentials are available via <admin_token fixture>\",\n        \"A patient resource exists and is active (created via <create_patient helper>)\"\n      ],\n      \"actions\": [\n        \"Obtain admin bearer token\",\n        \"Create a transient Patient resource to obtain a valid {id}\",\n        \"Send DELETE /Patient/{id} with Authorization: Bearer <admin_token>\",\n        \"Send GET /Patient/{id} to verify soft-delete marker\",\n        \"Send GET /Patient/{id}/_history to verify history is preserved\"\n      ],\n      \"expected\": [\n        \"DELETE returns HTTP 200 or 204\",\n        \"GET /Patient/{id} returns HTTP 410 Gone with 'inactive' or deleted marker in body\",\n        \"GET /Patient/{id}/_history returns HTTP 200 with at least one history entry\"\n      ],\n      \"trace\": [\n        \"R-HLT-004: soft-delete marks resource deleted\",\n        \"R-HLT-004: deletion shall not remove history\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_admin_soft_delete_active_patient_success(admin_token, base_url, create_patient):\\n    patient_id = create_patient(admin_token, base_url)\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {admin_token}\\\", \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n\\n    del_resp = requests.delete(f\\\"{base_url}/Patient/{patient_id}\\\", headers=headers)\\n    assert del_resp.status_code in (200, 204), f\\\"Expected 200/204, got {del_resp.status_code}\\\"\\n\\n    get_resp = requests.get(f\\\"{base_url}/Patient/{patient_id}\\\", headers=headers)\\n    assert get_resp.status_code == 410, f\\\"Expected 410 Gone, got {get_resp.status_code}\\\"\\n\\n    hist_resp = requests.get(f\\\"{base_url}/Patient/{patient_id}/_history\\\", headers=headers)\\n    assert hist_resp.status_code == 200, f\\\"Expected 200 for history, got {hist_resp.status_code}\\\"\\n    bundle = hist_resp.json()\\n    entries = bundle.get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"History must contain at least one entry after soft-delete\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_delete_patient_forbidden\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"FHIR-lite service is running\",\n        \"A non-admin (role: practitioner) token is available via <practitioner_token fixture>\",\n        \"Admin token is available via <admin_token fixture>\",\n        \"A patient resource exists (created via <create_patient helper>)\"\n      ],\n      \"actions\": [\n        \"Obtain practitioner bearer token (non-admin role)\",\n        \"Create a transient Patient resource as admin to obtain a valid {id}\",\n        \"Send DELETE /Patient/{id} with Authorization: Bearer <practitioner_token>\",\n        \"Confirm the patient still exists by fetching it with admin token\"\n      ],\n      \"expected\": [\n        \"DELETE returns HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome with issue.code indicating forbidden\",\n        \"Subsequent GET /Patient/{id} by admin returns 200 (resource not deleted)\"\n      ],\n      \"trace\": [\n        \"R-HLT-004: 403 when not admin"
+  }
+}

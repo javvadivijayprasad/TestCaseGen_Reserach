@@ -1,0 +1,168 @@
+{
+  "req": {
+    "id": "R-WEB-072",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Run payroll",
+    "statement": "An hr-admin shall run a monthly payroll that computes gross pay, deductions, and net pay for each active employee; a failed run shall not partially commit.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin triggers payroll run"
+    ],
+    "expected_outcomes": [
+      "payroll-run state=completed",
+      "pay-stub records created",
+      "audit entry"
+    ],
+    "error_pathways": [
+      "409 if another run is in progress",
+      "500 rolled back atomically on failure"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/payroll-runs"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-072",
+    "reasoning": "The requirement mandates: (1) a successful payroll run produces completed state, pay-stubs, and an audit entry (positive/EP); (2) a concurrent run attempt is rejected with 409 (negative/STC); (3) a run with exactly one active employee represents the minimum valid partition boundary (boundary/BVA); (4) a simulated internal failure must not partially commit data (negative/DT). These four cases together cover the happy path, the concurrency guard, the atomicity rollback guarantee, and the single-employee edge case, providing full traceability to all stated expected outcomes and error pathways.",
+    "tests": [
+      {
+        "name": "test_payroll_run_completes_with_stubs_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "At least two active employees exist with salary data",
+          "No payroll run is currently in progress"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with valid month/year payload",
+          "Poll or await run completion",
+          "GET /api/payroll-runs/{run_id} to inspect state",
+          "GET /api/pay-stubs?run_id={run_id} to verify stub creation",
+          "GET /api/audit-log?run_id={run_id} to verify audit entry"
+        ],
+        "expected": [
+          "HTTP 201 on creation",
+          "Run state equals 'completed'",
+          "Pay-stub count equals active employee count",
+          "Each stub has gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions",
+          "Audit log contains exactly one entry for this run"
+        ],
+        "trace": [
+          "R-WEB-072: payroll-run state=completed",
+          "R-WEB-072: pay-stub records created",
+          "R-WEB-072: audit entry"
+        ],
+        "executable": "import pytest\n\ndef test_payroll_run_completes_with_stubs_and_audit(\n    hr_admin_client,\n    active_employees_fixture,\n    payroll_month_payload,\n    poll_until_completed\n):\n    employees = active_employees_fixture(count=2)\n    resp = hr_admin_client.post(\"/api/payroll-runs\", json=payroll_month_payload)\n    assert resp.status_code == 201\n    run_id = resp.json()[\"id\"]\n\n    run = poll_until_completed(hr_admin_client, run_id)\n    assert run[\"state\"] == \"completed\"\n\n    stubs_resp = hr_admin_client.get(f\"/api/pay-stubs?run_id={run_id}\")\n    assert stubs_resp.status_code == 200\n    stubs = stubs_resp.json()[\"items\"]\n    assert len(stubs) == len(employees)\n    for stub in stubs:\n        assert stub[\"gross_pay\"] > 0\n        assert stub[\"deductions\"] >= 0\n        assert stub[\"net_pay\"] == pytest.approx(\n            stub[\"gross_pay\"] - stub[\"deductions\"]\n        )\n\n    audit_resp = hr_admin_client.get(f\"/api/audit-log?run_id={run_id}\")\n    assert audit_resp.status_code == 200\n    assert len(audit_resp.json()[\"items\"]) >= 1\n"
+      },
+      {
+        "name": "test_concurrent_payroll_run_returns_409",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "A payroll run for the target month is already in progress (state=running)"
+        ],
+        "actions": [
+          "Seed a payroll run record in state 'running' via test fixture",
+          "POST /api/payroll-runs with the same month/year payload",
+          "Inspect response status and error body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response body contains error code indicating run already in progress"
+        ],
+        "trace": [
+          "R-WEB-072: 409 if another run is in progress"
+        ],
+        "executable": "def test_concurrent_payroll_run_returns_409(\n    hr_admin_client,\n    in_progress_payroll_run_fixture,\n    payroll_month_payload\n):\n    existing_run = in_progress_payroll_run_fixture(payroll_month_payload)\n    assert existing_run[\"state\"] == \"running\"\n\n    resp = hr_admin_client.post(\"/api/payroll-runs\", json=payroll_month_payload)\n\n    assert resp.status_code == 409\n    body = resp.json()\n    assert \"error\" in body or \"code\" in body\n"
+      },
+      {
+        "name": "test_payroll_run_with_single_active_employee",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "Exactly one active employee exists with salary data",
+          "No payroll run is currently in progress"
+        ],
+        "actions": [
+          "Ensure only one active employee via fixture",
+          "POST /api/payroll-runs with valid month/year payload",
+          "Poll or await run completion",
+          "GET /api/pay-stubs?run_id={run_id}"
+        ],
+        "expected": [
+          "HTTP 201 on creation",
+          "Run state equals 'completed'",
+          "Exactly one pay-stub is created",
+          "Stub arithmetic is correct: net_pay == gross_pay - deductions"
+        ],
+        "trace": [
+          "R-WEB-072: pay-stub records created (minimum boundary of 1 active employee)",
+          "R-WEB-072: payroll-run state=completed"
+        ],
+        "executable": "def test_payroll_run_with_single_active_employee(\n    hr_admin_client,\n    active_employees_fixture,\n    payroll_month_payload,\n    poll_until_completed\n):\n    employees = active_employees_fixture(count=1)\n    assert len(employees) == 1\n\n    resp = hr_admin_client.post(\"/api/payroll-runs\", json=payroll_month_payload)\n    assert resp.status_code == 201\n    run_id = resp.json()[\"id\"]\n\n    run = poll_until_completed(hr_admin_client, run_id)\n    assert run[\"state\"] == \"completed\"\n\n    stubs_resp = hr_admin_client.get(f\"/api/pay-stubs?run_id={run_id}\")\n    assert stubs_resp.status_code == 200\n    stubs = stubs_resp.json()[\"items\"]\n    assert len(stubs) == 1\n    stub = stubs[0]\n    assert stub[\"net_pay\"] == pytest.approx(stub[\"gross_pay\"] - stub[\"deductions\"])\n"
+      },
+      {
+        "name": "test_failed_payroll_run_rolls_back_atomically",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "Active employees exist",
+          "Server-side fault injection is enabled to trigger a processing failure mid-run"
+        ],
+        "actions": [
+          "Enable fault-injection header or config to cause mid-run failure",
+          "POST /api/payroll-runs with valid payload",
+          "Poll run state until terminal",
+          "GET /api/pay-stubs?run_id={run_id} to verify no stubs were persisted",
+          "GET /api/audit-log?run_id={run_id} to verify failure is recorded but no committed stubs"
+        ],
+        "expected": [
+          "Run state equals 'failed' (not 'completed')",
+          "HTTP 500 or run object indicates failure",
+          "Zero pay-stub records exist for this run (rollback confirmed)",
+          "No partial data persisted for any employee"
+        ],
+        "trace": [
+          "R-WEB-072: 500 rolled back atomically on failure",
+          "R-WEB-072: failed run shall not partially commit"
+        ],
+        "executable": "def test_failed_payroll_run_rolls_back_atomically(\n    hr_admin_client,\n    active_employees_fixture,\n    payroll_month_payload,\n    fault_injection_headers,\n    poll_until_terminal\n):\n    active_employees_fixture(count=3)\n\n    resp = hr_admin_client.post(\n        \"/api/payroll-runs\",\n        json=payroll_month_payload,\n        headers=fault_injection_headers(\"mid_run_failure\")\n    )\n    assert resp.status_code in (201, 500)\n\n    if resp.status_code == 201:\n        run_id = resp.json()[\"id\"]\n        run = poll_until_terminal(hr_admin_client, run_id)\n        assert run[\"state\"] == \"failed\"\n    else:\n        run_id = resp.json().get(\"run_id\")\n\n    if run_id:\n        stubs_resp = hr_admin_client.get(f\"/api/pay-stubs?run_id={run_id}\")\n        assert stubs_resp.status_code == 200\n        assert stubs_resp.json()[\"items\"] == []\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-072",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[1] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1018,
+    "output_tokens": 2522,
+    "latency_ms": 30880,
+    "wall_ms": 30880,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-072\",\n  \"reasoning\": \"The requirement mandates: (1) a successful payroll run produces completed state, pay-stubs, and an audit entry (positive/EP); (2) a concurrent run attempt is rejected with 409 (negative/STC); (3) a run with exactly one active employee represents the minimum valid partition boundary (boundary/BVA); (4) a simulated internal failure must not partially commit data (negative/DT). These four cases together cover the happy path, the concurrency guard, the atomicity rollback guarantee, and the single-employee edge case, providing full traceability to all stated expected outcomes and error pathways.\",\n  \"tests\": [\n    {\n      \"name\": \"test_payroll_run_completes_with_stubs_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as hr-admin\",\n        \"At least two active employees exist with salary data\",\n        \"No payroll run is currently in progress\"\n      ],\n      \"actions\": [\n        \"POST /api/payroll-runs with valid month/year payload\",\n        \"Poll or await run completion\",\n        \"GET /api/payroll-runs/{run_id} to inspect state\",\n        \"GET /api/pay-stubs?run_id={run_id} to verify stub creation\",\n        \"GET /api/audit-log?run_id={run_id} to verify audit entry\"\n      ],\n      \"expected\": [\n        \"HTTP 201 on creation\",\n        \"Run state equals 'completed'\",\n        \"Pay-stub count equals active employee count\",\n        \"Each stub has gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions\",\n        \"Audit log contains exactly one entry for this run\"\n      ],\n      \"trace\": [\n        \"R-WEB-072: payroll-run state=completed\",\n        \"R-WEB-072: pay-stub records created\",\n        \"R-WEB-072: audit entry\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_payroll_run_completes_with_stubs_and_audit(\\n    hr_admin_client,\\n    active_employees_fixture,\\n    payroll_month_payload,\\n    poll_until_completed\\n):\\n    employees = active_employees_fixture(count=2)\\n    resp = hr_admin_client.post(\\\"/api/payroll-runs\\\", json=payroll_month_payload)\\n    assert resp.status_code == 201\\n    run_id = resp.json()[\\\"id\\\"]\\n\\n    run = poll_until_completed(hr_admin_client, run_id)\\n    assert run[\\\"state\\\"] == \\\"completed\\\"\\n\\n    stubs_resp = hr_admin_client.get(f\\\"/api/pay-stubs?run_id={run_id}\\\")\\n    assert stubs_resp.status_code == 200\\n    stubs = stubs_resp.json()[\\\"items\\\"]\\n    assert len(stubs) == len(employees)\\n    for stub in stubs:\\n        assert stub[\\\"gross_pay\\\"] > 0\\n        assert stub[\\\"deductions\\\"] >= 0\\n        assert stub[\\\"net_pay\\\"] == pytest.approx(\\n            stub[\\\"gross_pay\\\"] - stub[\\\"deductions\\\"]\\n        )\\n\\n    audit_resp = hr_admin_client.get(f\\\"/api/audit-log?run_id={run_id}\\\")\\n    assert audit_resp.status_code == 200\\n    assert len(audit_resp.json()[\\\"items\\\"]) >= 1\\n\"\n    },\n    {\n      \"name\": \"test_concurrent_payroll_run_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Caller is authenticated as hr-admin\",\n        \"A payroll run for the target month is already in progress (state=running)\"\n      ],\n      \"actions\": [\n        \"Seed a payroll run record in state 'running' via test fixture\",\n        \"POST /api/payroll-runs with the same month/year payload\",\n        \"Inspect response status and error body\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response body contains error code indicating run already in progress\"\n      ],\n      \"trace\": [\n        \"R-WEB-072: 409 if another run is in progress\"\n      ],\n      \"executable\": \"def test_concurrent_payroll_run_returns_409(\\n    hr_admin_client,\\n    in_progress_payroll_run_fixture,\\n    payroll_month_payload\\n):\\n    existing_run = in_progress_payroll_run_fixture(payroll_month_payload)\\n    assert existing_run[\\\"state\\\"] == \\\"running\\\"\\n\\n    resp = hr_admin_client.post(\\\"/api/payroll-runs\\\", json=payroll_month_payload)\\n\\n    assert resp."
+  }
+}

@@ -1,0 +1,157 @@
+{
+  "req": {
+    "id": "R-FIN-049",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "integration",
+    "title": "Rate limiting (boundary variant)",
+    "statement": "The API shall enforce 60 requests per minute per user; overages shall return 429 with retry-after. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "any endpoint"
+    ],
+    "triggers": [
+      "burst requests"
+    ],
+    "expected_outcomes": [
+      "429 with retry-after"
+    ],
+    "error_pathways": [
+      "request tail rejected"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/*"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-049",
+    "reasoning": "R-FIN-049 mandates a hard cap of 60 requests/minute/user with 429+Retry-After on overage. Four tests are designed: (1) EP-positive: 30 requests (well within quota) all return non-429; (2) NEG-negative: 61 requests fired rapidly, verifying the 61st returns 429 with Retry-After header; (3) BVA-boundary-lower: exactly 60 requests return success (at-limit, not over); (4) BVA-boundary-upper: request 61 immediately after 60 returns 429 and Retry-After is a positive integer. Each test uses a fresh authenticated user token via <auth_fixture> and calls a lightweight read endpoint to minimise side-effects. Window reset is enforced by <reset_rate_limit> helper before each test to ensure idempotency.",
+    "tests": [
+      {
+        "name": "test_requests_well_within_limit_all_succeed",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Valid user auth token available",
+          "Rate-limit window is fresh (no prior requests in current minute)",
+          "Target endpoint /api/v1/accounts is reachable"
+        ],
+        "actions": [
+          "Reset rate-limit window for the test user via <reset_rate_limit>",
+          "Send 30 GET requests to /api/v1/accounts with valid Authorization header",
+          "Collect all HTTP response status codes"
+        ],
+        "expected": [
+          "All 30 responses have status code != 429",
+          "No Retry-After header present on any response"
+        ],
+        "trace": [
+          "R-FIN-049: requests below threshold must not be rate-limited",
+          "EP: mid-partition value (30) is representative of the allowed range [1,60]"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/api/v1/accounts\"\n\n\ndef test_requests_well_within_limit_all_succeed(auth_fixture, reset_rate_limit):\n    token = auth_fixture\n    reset_rate_limit(token)\n    statuses = []\n    for _ in range(30):\n        r = requests.get(\n            BASE_URL + ENDPOINT,\n            headers={\"Authorization\": f\"Bearer {token}\"},\n            timeout=5,\n        )\n        statuses.append(r.status_code)\n    assert all(s != 429 for s in statuses), (\n        f\"Unexpected 429 within quota. Statuses: {statuses}\"\n    )\n    assert len(statuses) == 30\n"
+      },
+      {
+        "name": "test_sixty_first_request_returns_429_with_retry_after",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Valid user auth token available",
+          "Rate-limit window is fresh",
+          "Target endpoint /api/v1/accounts is reachable"
+        ],
+        "actions": [
+          "Reset rate-limit window for the test user via <reset_rate_limit>",
+          "Send 60 GET requests to consume the full quota",
+          "Send one additional (61st) GET request",
+          "Inspect status code and Retry-After header of the 61st response"
+        ],
+        "expected": [
+          "61st response status code is 429",
+          "Retry-After header is present on the 61st response",
+          "Retry-After value is a positive integer (<= 60)"
+        ],
+        "trace": [
+          "R-FIN-049: overages shall return 429 with retry-after",
+          "NEG: deliberately exceed the allowed quota to trigger the error pathway"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/api/v1/accounts\"\n\n\ndef test_sixty_first_request_returns_429_with_retry_after(auth_fixture, reset_rate_limit):\n    token = auth_fixture\n    reset_rate_limit(token)\n    hdrs = {\"Authorization\": f\"Bearer {token}\"}\n    for _ in range(60):\n        requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\n    r = requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\n    assert r.status_code == 429, f\"Expected 429, got {r.status_code}\"\n    assert \"Retry-After\" in r.headers, \"Retry-After header missing on 429 response\"\n    retry_after = int(r.headers[\"Retry-After\"])\n    assert 1 <= retry_after <= 60, f\"Retry-After out of expected range: {retry_after}\"\n"
+      },
+      {
+        "name": "test_exactly_sixty_requests_at_boundary_all_succeed",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Valid user auth token available",
+          "Rate-limit window is fresh",
+          "Target endpoint /api/v1/accounts is reachable"
+        ],
+        "actions": [
+          "Reset rate-limit window for the test user via <reset_rate_limit>",
+          "Send exactly 60 GET requests to /api/v1/accounts",
+          "Record status of every response, especially the 60th"
+        ],
+        "expected": [
+          "All 60 responses have status code != 429",
+          "60th response is specifically not 429 (at-limit boundary is inclusive)"
+        ],
+        "trace": [
+          "R-FIN-049: boundary behaviour at exact max threshold must be tested",
+          "BVA: tests the upper inclusive boundary value of the allowed partition (N=60)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/api/v1/accounts\"\n\n\ndef test_exactly_sixty_requests_at_boundary_all_succeed(auth_fixture, reset_rate_limit):\n    token = auth_fixture\n    reset_rate_limit(token)\n    hdrs = {\"Authorization\": f\"Bearer {token}\"}\n    statuses = []\n    for _ in range(60):\n        r = requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\n        statuses.append(r.status_code)\n    assert len(statuses) == 60\n    assert statuses[-1] != 429, (\n        f\"60th request (boundary) must not be rate-limited, got {statuses[-1]}\"\n    )\n    assert all(s != 429 for s in statuses), (\n        f\"Unexpected 429 within quota. Statuses: {statuses}\"\n    )\n"
+      },
+      {
+        "name": "test_rate_limit_window_resets_after_one_minute",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Valid user auth token available",
+          "Rate-limit window is fresh",
+          "Target endpoint /api/v1/accounts is reachable",
+          "Test environment permits a ~65-second wall-clock wait"
+        ],
+        "actions": [
+          "Reset rate-limit window via <reset_rate_limit>",
+          "Send 61 requests to trigger 429 on the last",
+          "Wait 65 seconds for the rate-limit window to expire",
+          "Send one additional request after window reset"
+        ],
+        "expected": [
+          "61st request returns 429",
+          "Request sent after window expiry returns status != 429",
+          "System has transitioned from rate-limited state back to allowed state"
+        ],
+        "trace": [
+          "R-FIN-049: per-minute window implies state transition from limited back to normal",
+          "STC: covers the state transition: [within_limit] -> [rate_limited] -> [within_limit]"
+        ],
+        "executable": "import time\nimport pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/api/v1/accounts\"\nWINDOW_WAIT = 65\n\n\n@pytest.mark.slow\ndef test_rate_limit_window_resets_after_one_minute(auth_fixture, reset_rate_limit):\n    token = auth_fixture\n    reset_rate_limit(token)\n    hdrs = {\"Authorization\": f\"Bearer {token}\"}\n    for _ in range(60):\n        requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\n    over = requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\n    assert over.status_code == 429, f\"Expected 429 on request 61, got {over.status_code}\"\n    time.sleep(WINDOW_WAIT)\n    after_reset = requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\n    assert after_reset.status_code != 429, (\n        f\"Expected non-429 after window reset, got {after_reset.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-049",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 987,
+    "output_tokens": 2420,
+    "latency_ms": 33135,
+    "wall_ms": 33135,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-049\",\n  \"reasoning\": \"R-FIN-049 mandates a hard cap of 60 requests/minute/user with 429+Retry-After on overage. Four tests are designed: (1) EP-positive: 30 requests (well within quota) all return non-429; (2) NEG-negative: 61 requests fired rapidly, verifying the 61st returns 429 with Retry-After header; (3) BVA-boundary-lower: exactly 60 requests return success (at-limit, not over); (4) BVA-boundary-upper: request 61 immediately after 60 returns 429 and Retry-After is a positive integer. Each test uses a fresh authenticated user token via <auth_fixture> and calls a lightweight read endpoint to minimise side-effects. Window reset is enforced by <reset_rate_limit> helper before each test to ensure idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_requests_well_within_limit_all_succeed\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Valid user auth token available\",\n        \"Rate-limit window is fresh (no prior requests in current minute)\",\n        \"Target endpoint /api/v1/accounts is reachable\"\n      ],\n      \"actions\": [\n        \"Reset rate-limit window for the test user via <reset_rate_limit>\",\n        \"Send 30 GET requests to /api/v1/accounts with valid Authorization header\",\n        \"Collect all HTTP response status codes\"\n      ],\n      \"expected\": [\n        \"All 30 responses have status code != 429\",\n        \"No Retry-After header present on any response\"\n      ],\n      \"trace\": [\n        \"R-FIN-049: requests below threshold must not be rate-limited\",\n        \"EP: mid-partition value (30) is representative of the allowed range [1,60]\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\nENDPOINT = \\\"/api/v1/accounts\\\"\\n\\n\\ndef test_requests_well_within_limit_all_succeed(auth_fixture, reset_rate_limit):\\n    token = auth_fixture\\n    reset_rate_limit(token)\\n    statuses = []\\n    for _ in range(30):\\n        r = requests.get(\\n            BASE_URL + ENDPOINT,\\n            headers={\\\"Authorization\\\": f\\\"Bearer {token}\\\"},\\n            timeout=5,\\n        )\\n        statuses.append(r.status_code)\\n    assert all(s != 429 for s in statuses), (\\n        f\\\"Unexpected 429 within quota. Statuses: {statuses}\\\"\\n    )\\n    assert len(statuses) == 30\\n\"\n    },\n    {\n      \"name\": \"test_sixty_first_request_returns_429_with_retry_after\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Valid user auth token available\",\n        \"Rate-limit window is fresh\",\n        \"Target endpoint /api/v1/accounts is reachable\"\n      ],\n      \"actions\": [\n        \"Reset rate-limit window for the test user via <reset_rate_limit>\",\n        \"Send 60 GET requests to consume the full quota\",\n        \"Send one additional (61st) GET request\",\n        \"Inspect status code and Retry-After header of the 61st response\"\n      ],\n      \"expected\": [\n        \"61st response status code is 429\",\n        \"Retry-After header is present on the 61st response\",\n        \"Retry-After value is a positive integer (<= 60)\"\n      ],\n      \"trace\": [\n        \"R-FIN-049: overages shall return 429 with retry-after\",\n        \"NEG: deliberately exceed the allowed quota to trigger the error pathway\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\nENDPOINT = \\\"/api/v1/accounts\\\"\\n\\n\\ndef test_sixty_first_request_returns_429_with_retry_after(auth_fixture, reset_rate_limit):\\n    token = auth_fixture\\n    reset_rate_limit(token)\\n    hdrs = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    for _ in range(60):\\n        requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\\n    r = requests.get(BASE_URL + ENDPOINT, headers=hdrs, timeout=5)\\n    assert r.status_code == 429, f\\\"Expected 429, got {r.status_code}\\\"\\n    assert \\\"Retry-After\\\" in r.headers, \\\"Retry-After header missing on 429 response\\\"\\n    retry_after = int(r.headers[\\\"Retry-After\\\"])\\n    assert 1 <= retry_aft"
+  }
+}

@@ -1,0 +1,186 @@
+{
+  "req": {
+    "id": "R-HLT-081",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create encounter (audit)",
+    "statement": "A clinician shall create an Encounter for a patient with start and end timestamps; end before start shall be rejected. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician opens encounter"
+    ],
+    "expected_outcomes": [
+      "encounter stored"
+    ],
+    "error_pathways": [
+      "422 when end < start"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-081",
+    "reasoning": "The requirement mandates: (1) a clinician can create an Encounter with valid start/end timestamps, (2) end-before-start must be rejected with HTTP 422, (3) an AuditEvent must be emitted for every operation. I apply EP for the happy-path valid encounter, NEG for the invalid temporal ordering, BVA for the equal start==end boundary, STC to verify the state transition from no-encounter to stored-encounter, and DT to cover the audit-event emission rule across both success and failure paths. Each test is self-contained via fixtures that provision and teardown state.",
+    "tests": [
+      {
+        "name": "test_create_encounter_valid_timestamps",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller has role:clinician and a valid bearer token",
+          "Patient resource with id <patient_id> exists",
+          "System is able to emit AuditEvents"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T09:00:00Z'",
+          "Capture the returned encounter id",
+          "Poll AuditEvent endpoint filtering by encounter id"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType='Encounter'",
+          "Stored encounter start and end match submitted values",
+          "At least one AuditEvent references the created encounter"
+        ],
+        "trace": [
+          "R-HLT-081: encounter stored",
+          "R-HLT-081: AuditEvent emitted for every operation"
+        ],
+        "executable": "def test_create_encounter_valid_timestamps(clinician_token, existing_patient_id, fhir_client, audit_poller):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-06-01T08:00:00Z\",\n            \"end\": \"2024-06-01T09:00:00Z\"\n        }\n    }\n    resp = fhir_client.post(\"/Encounter\", json=payload, token=clinician_token)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Encounter\"\n    enc_id = body[\"id\"]\n    assert body[\"period\"][\"start\"] == \"2024-06-01T08:00:00Z\"\n    assert body[\"period\"][\"end\"] == \"2024-06-01T09:00:00Z\"\n    audit = audit_poller.find_for_entity(f\"Encounter/{enc_id}\")\n    assert audit is not None, \"AuditEvent must be emitted for create operation\"\n    assert audit[\"action\"] in (\"C\", \"create\")\n    fhir_client.delete(f\"/Encounter/{enc_id}\", token=clinician_token)"
+      },
+      {
+        "name": "test_create_encounter_end_before_start_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller has role:clinician and a valid bearer token",
+          "Patient resource with id <patient_id> exists"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T10:00:00Z' and end='2024-06-01T09:00:00Z' (end < start)",
+          "Capture HTTP status and error body",
+          "Poll AuditEvent endpoint for the rejected attempt"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an OperationOutcome or equivalent error descriptor",
+          "No Encounter resource is persisted in the store",
+          "An AuditEvent with outcome=failure is emitted for the rejected operation"
+        ],
+        "trace": [
+          "R-HLT-081: 422 when end < start",
+          "R-HLT-081: AuditEvent emitted for every operation"
+        ],
+        "executable": "def test_create_encounter_end_before_start_rejected(clinician_token, existing_patient_id, fhir_client, audit_poller):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-06-01T10:00:00Z\",\n            \"end\": \"2024-06-01T09:00:00Z\"\n        }\n    }\n    resp = fhir_client.post(\"/Encounter\", json=payload, token=clinician_token)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"resourceType\" in body and body[\"resourceType\"] in (\"OperationOutcome\", \"error\")\n    search = fhir_client.get(\n        \"/Encounter\",\n        params={\"subject\": existing_patient_id, \"date\": \"2024-06-01\"},\n        token=clinician_token\n    )\n    entries = search.json().get(\"entry\", [])\n    assert not any(\n        e[\"resource\"][\"period\"][\"start\"] == \"2024-06-01T10:00:00Z\" for e in entries\n    ), \"No encounter must be stored on invalid input\"\n    audit = audit_poller.find_failed_for_subject(existing_patient_id, action=\"create\")\n    assert audit is not None, \"AuditEvent with failure outcome must be emitted\""
+      },
+      {
+        "name": "test_create_encounter_equal_start_end_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller has role:clinician and a valid bearer token",
+          "Patient resource with id <patient_id> exists"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T08:00:00Z' (start == end, zero-duration boundary)",
+          "Capture HTTP status and body",
+          "Poll AuditEvent endpoint for the resulting operation"
+        ],
+        "expected": [
+          "HTTP 201 Created (equal timestamps represent a zero-duration encounter which is valid)",
+          "Response body contains resourceType='Encounter' with matching period",
+          "An AuditEvent is emitted referencing the created encounter"
+        ],
+        "trace": [
+          "R-HLT-081: boundary between valid and invalid temporal ordering (start == end)",
+          "R-HLT-081: AuditEvent emitted for every operation"
+        ],
+        "executable": "def test_create_encounter_equal_start_end_boundary(clinician_token, existing_patient_id, fhir_client, audit_poller):\n    ts = \"2024-06-01T08:00:00Z\"\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": ts, \"end\": ts}\n    }\n    resp = fhir_client.post(\"/Encounter\", json=payload, token=clinician_token)\n    assert resp.status_code == 201, (\n        f\"Zero-duration encounter should be accepted; got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Encounter\"\n    enc_id = body[\"id\"]\n    assert body[\"period\"][\"start\"] == ts\n    assert body[\"period\"][\"end\"] == ts\n    audit = audit_poller.find_for_entity(f\"Encounter/{enc_id}\")\n    assert audit is not None, \"AuditEvent must be emitted for boundary create operation\"\n    fhir_client.delete(f\"/Encounter/{enc_id}\", token=clinician_token)"
+      },
+      {
+        "name": "test_encounter_state_transition_created_to_stored",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller has role:clinician and a valid bearer token",
+          "Patient resource with id <patient_id> exists",
+          "No prior Encounter exists for this patient in the test window"
+        ],
+        "actions": [
+          "Verify no Encounter exists for the patient (initial state: absent)",
+          "POST /Encounter with valid start and end timestamps",
+          "GET /Encounter/<id> to confirm persisted state",
+          "Verify AuditEvent chain covers both creation and read"
+        ],
+        "expected": [
+          "Before POST: GET returns empty bundle or 404",
+          "After POST: HTTP 201 and encounter retrievable via GET with HTTP 200",
+          "Encounter status field reflects stored state",
+          "AuditEvents present for both the create and the subsequent read"
+        ],
+        "trace": [
+          "R-HLT-081: encounter stored",
+          "R-HLT-081: AuditEvent emitted for every operation",
+          "State transition: absent -> created -> stored/retrievable"
+        ],
+        "executable": "def test_encounter_state_transition_created_to_stored(clinician_token, existing_patient_id, fhir_client, audit_poller):\n    pre = fhir_client.get(\n        \"/Encounter\",\n        params={\"subject\": existing_patient_id, \"date\": \"2024-07-15\"},\n        token=clinician_token\n    )\n    assert pre.json().get(\"total\", 0) == 0, \"Precondition: no prior encounter\"\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-07-15T09:00:00Z\",\n            \"end\": \"2024-07-15T10:00:00Z\"\n        }\n    }\n    create_resp = fhir_client.post(\"/Encounter\", json=payload, token=clinician_token)\n    assert create_resp.status_code == 201\n    enc_id = create_resp.json()[\"id\"]\n    get_resp = fhir_client.get(f\"/Encounter/{enc_id}\", token=clinician_token)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"finished\"\n    audit_create = audit_poller.find_for_entity(f\"Encounter/{enc_id}\", action=\"create\")\n    audit_read = audit_poller.find_for_entity(f\"Encounter/{enc_id}\", action=\"read\")\n    assert audit_create is not None\n    assert audit_read is not None\n    fhir_client.delete(f\"/Encounter/{enc_id}\", token=clinician_token)"
+      },
+      {
+        "name": "test_encounter_decision_table_audit_on_success_and_failure",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller has role:clinician and a valid bearer token",
+          "Patient resource with id <patient_id> exists"
+        ],
+        "actions": [
+          "POST /Encounter with valid timestamps (rule: valid period -> 201 + success audit)",
+          "POST /Encounter with end before start (rule: invalid period -> 422 + failure audit)",
+          "Assert each outcome independently"
+        ],
+        "expected": [
+          "Valid request: HTTP 201 and AuditEvent outcome=0 (success)",
+          "Invalid request: HTTP 422 and AuditEvent outcome=8 (serious failure) or equivalent failure code",
+          "No cross-contamination between audit records"
+        ],
+        "trace": [
+          "R-HLT-081: 422 when end < start",
+          "R-HLT-081: AuditEvent emitted for every operation",
+          "Decision table row 1: valid period -> stored + audit success",
+          "Decision table row 2: invalid period -> rejected + audit failure"
+        ],
+        "executable": "def test_encounter_decision_table_audit_on_success_and_failure(clinician_token, existing_patient_id, fhir_client, audit_poller):\n    valid_payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-08-01T07:00:00Z\", \"end\": \"2024-08-01T08:00:00Z\"}\n    }\n    r1 = fhir_client.post(\"/Encounter\", json=valid_payload, token=clinician_token)\n    assert r1.status_code == 201\n    enc_id = r1.json()[\"id\"]\n    audit_ok = audit_poller.find_for_entity(f\"Encounter/{enc_id}\", action=\"create\")\n    assert audit_ok is not None\n    assert str(audit_ok.get(\"outcome\", \"0\")) == \"0\", \"Success AuditEvent outcome must be 0\"\n    invalid_payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-08-01T09:00:00Z\", \"end\": \"2024-08-01T08:00:00Z\"}\n    }\n    r2 = fhir_client.post(\"/Encounter\", json=invalid_payload, token=clinician_token)\n    assert r2.status_code == 422\n    audit_fail = audit_poller.find_failed_for_subject(existing_patient_id, action=\"create\")\n    assert audit_fail is not None\n    assert str(audit_fail.get(\"outcome\", \"\")) != \"0\", \"Failure AuditEvent outcome must not be 0\"\n    fhir_client.delete(f\"/Encounter/{enc_id}\", token=clinician_token)"
+      }
+    ]
+  },
+  "req_id": "R-HLT-081",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 3841,
+    "latency_ms": 37771,
+    "wall_ms": 37771,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-081\",\n  \"reasoning\": \"The requirement mandates: (1) a clinician can create an Encounter with valid start/end timestamps, (2) end-before-start must be rejected with HTTP 422, (3) an AuditEvent must be emitted for every operation. I apply EP for the happy-path valid encounter, NEG for the invalid temporal ordering, BVA for the equal start==end boundary, STC to verify the state transition from no-encounter to stored-encounter, and DT to cover the audit-event emission rule across both success and failure paths. Each test is self-contained via fixtures that provision and teardown state.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_encounter_valid_timestamps\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller has role:clinician and a valid bearer token\",\n        \"Patient resource with id <patient_id> exists\",\n        \"System is able to emit AuditEvents\"\n      ],\n      \"actions\": [\n        \"POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T09:00:00Z'\",\n        \"Capture the returned encounter id\",\n        \"Poll AuditEvent endpoint filtering by encounter id\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType='Encounter'\",\n        \"Stored encounter start and end match submitted values\",\n        \"At least one AuditEvent references the created encounter\"\n      ],\n      \"trace\": [\n        \"R-HLT-081: encounter stored\",\n        \"R-HLT-081: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"def test_create_encounter_valid_timestamps(clinician_token, existing_patient_id, fhir_client, audit_poller):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Encounter\\\",\\n        \\\"status\\\": \\\"finished\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{existing_patient_id}\\\"},\\n        \\\"period\\\": {\\n            \\\"start\\\": \\\"2024-06-01T08:00:00Z\\\",\\n            \\\"end\\\": \\\"2024-06-01T09:00:00Z\\\"\\n        }\\n    }\\n    resp = fhir_client.post(\\\"/Encounter\\\", json=payload, token=clinician_token)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Encounter\\\"\\n    enc_id = body[\\\"id\\\"]\\n    assert body[\\\"period\\\"][\\\"start\\\"] == \\\"2024-06-01T08:00:00Z\\\"\\n    assert body[\\\"period\\\"][\\\"end\\\"] == \\\"2024-06-01T09:00:00Z\\\"\\n    audit = audit_poller.find_for_entity(f\\\"Encounter/{enc_id}\\\")\\n    assert audit is not None, \\\"AuditEvent must be emitted for create operation\\\"\\n    assert audit[\\\"action\\\"] in (\\\"C\\\", \\\"create\\\")\\n    fhir_client.delete(f\\\"/Encounter/{enc_id}\\\", token=clinician_token)\"\n    },\n    {\n      \"name\": \"test_create_encounter_end_before_start_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller has role:clinician and a valid bearer token\",\n        \"Patient resource with id <patient_id> exists\"\n      ],\n      \"actions\": [\n        \"POST /Encounter with start='2024-06-01T10:00:00Z' and end='2024-06-01T09:00:00Z' (end < start)\",\n        \"Capture HTTP status and error body\",\n        \"Poll AuditEvent endpoint for the rejected attempt\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an OperationOutcome or equivalent error descriptor\",\n        \"No Encounter resource is persisted in the store\",\n        \"An AuditEvent with outcome=failure is emitted for the rejected operation\"\n      ],\n      \"trace\": [\n        \"R-HLT-081: 422 when end < start\",\n        \"R-HLT-081: AuditEvent emitted for every operation\"\n      ],\n      \"executable\": \"def test_create_encounter_end_before_start_rejected(clinician_token, existing_patient_id, fhir_client, audit_poller):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Encounter\\\",\\n        \\\"status\\\": \\\"finished\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{existing_patient_id}\\\"},\\n        \\\"period\\\": {\\n            \\\"start\\\": \\\"2024-06-01T10:00:00Z\\\",\\n            \\\"end\\\": \\\"2024-06-01T09:00:00Z\\\"\\n     "
+  }
+}

@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-HLT-059",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "integration",
+    "title": "Allergy intolerance (negative)",
+    "statement": "A clinician shall record an AllergyIntolerance linked to the patient; subsequent MedicationRequests shall warn on conflict. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records allergy"
+    ],
+    "expected_outcomes": [
+      "allergy stored",
+      "alerts regenerated"
+    ],
+    "error_pathways": [
+      "409 when exact duplicate"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AllergyIntolerance"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-059",
+    "reasoning": "The requirement covers AllergyIntolerance creation with conflict detection on MedicationRequest. I selected: (1) a positive EP test that creates a valid allergy and verifies alert regeneration on a conflicting MedicationRequest; (2) a NEG test for duplicate-allergy submission expecting HTTP 409; (3) a NEG test for missing mandatory 'code' element expecting HTTP 422; (4) a STC test covering the active\u2192resolved state transition and verifying that a resolved allergy no longer triggers an alert; (5) a BVA test posting a code string at exactly 1 character (minimal boundary) to probe field-length validation. Decision Table coverage is embedded in the STC and NEG cases by enumerating condition combinations (role, state, payload completeness).",
+    "tests": [
+      {
+        "name": "test_create_allergy_and_medication_conflict_alert",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician auth token available via <clinician_auth_token> fixture",
+          "Patient resource exists, ID available via <patient_id> fixture",
+          "Medication resource for penicillin exists, ID available via <penicillin_med_id> fixture"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with valid penicillin allergy linked to patient",
+          "Capture allergy ID from 201 response",
+          "POST /MedicationRequest prescribing penicillin for the same patient",
+          "Inspect response or GET /DetectedIssue for conflict alert"
+        ],
+        "expected": [
+          "AllergyIntolerance POST returns HTTP 201",
+          "Response body contains resourceType AllergyIntolerance",
+          "MedicationRequest POST returns HTTP 201 with a warning extension OR DetectedIssue exists referencing the allergy"
+        ],
+        "trace": [
+          "R-HLT-059: allergy stored",
+          "R-HLT-059: alerts regenerated on conflicting MedicationRequest"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_create_allergy_and_medication_conflict_alert(\n    clinician_auth_token, patient_id, penicillin_med_id, fhir_base_url\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n\n    allergy_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls\",\n                              \"code\": \"7980\", \"display\": \"Penicillin\"}]}\n    }\n    r1 = requests.post(f\"{fhir_base_url}/AllergyIntolerance\",\n                       json=allergy_payload, headers=headers)\n    assert r1.status_code == 201\n    assert r1.json()[\"resourceType\"] == \"AllergyIntolerance\"\n    allergy_id = r1.json()[\"id\"]\n\n    med_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"medicationReference\": {\"reference\": f\"Medication/{penicillin_med_id}\"}\n    }\n    r2 = requests.post(f\"{fhir_base_url}/MedicationRequest\",\n                       json=med_payload, headers=headers)\n    assert r2.status_code == 201\n\n    r3 = requests.get(\n        f\"{fhir_base_url}/DetectedIssue\",\n        params={\"patient\": patient_id, \"implicated\": f\"AllergyIntolerance/{allergy_id}\"},\n        headers=headers\n    )\n    assert r3.status_code == 200\n    entries = r3.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"Expected at least one conflict DetectedIssue\"\n"
+      },
+      {
+        "name": "test_duplicate_allergy_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician auth token available via <clinician_auth_token> fixture",
+          "Patient resource exists, ID available via <patient_id> fixture",
+          "An identical AllergyIntolerance for penicillin already exists for the patient (created in fixture or setup call)"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with the exact same payload as the pre-existing allergy",
+          "Observe HTTP status code"
+        ],
+        "expected": [
+          "HTTP 409 Conflict returned",
+          "OperationOutcome body contains issue with code 'duplicate'"
+        ],
+        "trace": [
+          "R-HLT-059: Error pathway \u2014 409 when exact duplicate"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_duplicate_allergy_returns_409(\n    clinician_auth_token, patient_id, fhir_base_url, existing_penicillin_allergy\n):\n    # existing_penicillin_allergy fixture pre-creates the allergy and returns its code\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n\n    duplicate_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://www.nlm.nih.gov/research/umls\",\n                              \"code\": \"7980\", \"display\": \"Penicillin\"}]}\n    }\n    r = requests.post(f\"{fhir_base_url}/AllergyIntolerance\",\n                      json=duplicate_payload, headers=headers)\n    assert r.status_code == 409\n    outcome = r.json()\n    assert outcome[\"resourceType\"] == \"OperationOutcome\"\n    codes = [i.get(\"code\") for i in outcome.get(\"issue\", [])]\n    assert \"duplicate\" in codes\n"
+      },
+      {
+        "name": "test_missing_mandatory_code_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician auth token available via <clinician_auth_token> fixture",
+          "Patient resource exists, ID available via <patient_id> fixture"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance payload omitting the mandatory 'code' element",
+          "Observe HTTP status code and OperationOutcome"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity returned",
+          "OperationOutcome issue severity is 'error' and references missing 'code' field"
+        ],
+        "trace": [
+          "R-HLT-059: Negative path \u2014 missing mandatory elements"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_missing_mandatory_code_returns_422(\n    clinician_auth_token, patient_id, fhir_base_url\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n\n    payload_no_code = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"}\n        # 'code' intentionally omitted\n    }\n    r = requests.post(f\"{fhir_base_url}/AllergyIntolerance\",\n                      json=payload_no_code, headers=headers)\n    assert r.status_code == 422\n    outcome = r.json()\n    assert outcome[\"resourceType\"] == \"OperationOutcome\"\n    issues = outcome.get(\"issue\", [])\n    assert any(i.get(\"severity\") == \"error\" for i in issues)\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues)\n    assert \"code\" in diagnostics.lower()\n"
+      },
+      {
+        "name": "test_allergy_active_to_resolved_suppresses_alert",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician auth token available via <clinician_auth_token> fixture",
+          "Patient resource exists, ID available via <patient_id> fixture",
+          "Penicillin MedicationRequest already exists for the patient",
+          "Active penicillin AllergyIntolerance exists (created via fixture)"
+        ],
+        "actions": [
+          "GET /AllergyIntolerance/<id> to confirm state is 'active'",
+          "PUT /AllergyIntolerance/<id> updating clinicalStatus to 'resolved'",
+          "GET /DetectedIssue for patient to confirm alert is cleared or marked resolved"
+        ],
+        "expected": [
+          "PUT returns HTTP 200 with updated clinicalStatus 'resolved'",
+          "DetectedIssue bundle contains no active conflict issues for the allergy"
+        ],
+        "trace": [
+          "R-HLT-059: alerts regenerated \u2014 resolved allergy must not trigger active alert",
+          "R-HLT-059: conflicting state transitions"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_allergy_active_to_resolved_suppresses_alert(\n    clinician_auth_token, patient_id, fhir_base_url, active_penicillin_allergy_id\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n    base = fhir_base_url\n\n    r_get = requests.get(f\"{base}/AllergyIntolerance/{active_penicillin_allergy_id}\",\n                         headers=headers)\n    assert r_get.status_code == 200\n    resource = r_get.json()\n    assert resource[\"clinicalStatus\"][\"coding\"][0][\"code\"] == \"active\"\n\n    resource[\"clinicalStatus\"][\"coding\"][0][\"code\"] = \"resolved\"\n    r_put = requests.put(\n        f\"{base}/AllergyIntolerance/{active_penicillin_allergy_id}\",\n        json=resource, headers=headers\n    )\n    assert r_put.status_code == 200\n    updated = r_put.json()\n    assert updated[\"clinicalStatus\"][\"coding\"][0][\"code\"] == \"resolved\"\n\n    r_issues = requests.get(f\"{base}/DetectedIssue\",\n        params={\"patient\": patient_id,\n                \"implicated\": f\"AllergyIntolerance/{active_penicillin_allergy_id}\"},\n        headers=headers)\n    assert r_issues.status_code == 200\n    active_conflicts = [\n        e for e in r_issues.json().get(\"entry\", [])\n        if e.get(\"resource\", {}).get(\"status\") == \"final\"\n    ]\n    assert len(active_conflicts) == 0, \"Resolved allergy should not have active conflict issues\"\n"
+      },
+      {
+        "name": "test_allergy_code_single_character_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician auth token available via <clinician_auth_token> fixture",
+          "Patient resource exists, ID available via <patient_id> fixture"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with a 'code' coding.code value of exactly 1 character ('X')",
+          "Observe HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 201 Created if single-character codes are valid per server profile, OR HTTP 422 if minimum length is > 1",
+          "Response does not return HTTP 500 (server must handle boundary gracefully)"
+        ],
+        "trace": [
+          "R-HLT-059: boundary \u2014 minimum field length for mandatory 'code' element"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_allergy_code_single_character_boundary(\n    clinician_auth_token, patient_id, fhir_base_url\n):\n    headers = {\"Authorization\": f\"Bearer {clinician_auth_token}\",\n               \"Content-Type\": \"application/fhir+json\"}\n\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{patient_id}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://example.org/test-system\",\n                              \"code\": \"X\"}]}\n    }\n    r = requests.post(f\"{fhir_base_url}/AllergyIntolerance\",\n                      json=payload, headers=headers)\n\n    # Server must not crash; only 201 or 422 are acceptable\n    assert r.status_code in (201, 422), (\n        f\"Unexpected status {r.status_code} for single-char code boundary test\"\n    )\n    assert r.status_code != 500\n    if r.status_code == 422:\n        outcome = r.json()\n        assert outcome[\"resourceType\"] == \"OperationOutcome\"\n    if r.status_code == 201:\n        assert r.json()[\"resourceType\"] == \"AllergyIntolerance\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-059",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 3800,
+    "latency_ms": 46728,
+    "wall_ms": 46728,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-059\",\n  \"reasoning\": \"The requirement covers AllergyIntolerance creation with conflict detection on MedicationRequest. I selected: (1) a positive EP test that creates a valid allergy and verifies alert regeneration on a conflicting MedicationRequest; (2) a NEG test for duplicate-allergy submission expecting HTTP 409; (3) a NEG test for missing mandatory 'code' element expecting HTTP 422; (4) a STC test covering the active\u2192resolved state transition and verifying that a resolved allergy no longer triggers an alert; (5) a BVA test posting a code string at exactly 1 character (minimal boundary) to probe field-length validation. Decision Table coverage is embedded in the STC and NEG cases by enumerating condition combinations (role, state, payload completeness).\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_allergy_and_medication_conflict_alert\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician auth token available via <clinician_auth_token> fixture\",\n        \"Patient resource exists, ID available via <patient_id> fixture\",\n        \"Medication resource for penicillin exists, ID available via <penicillin_med_id> fixture\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with valid penicillin allergy linked to patient\",\n        \"Capture allergy ID from 201 response\",\n        \"POST /MedicationRequest prescribing penicillin for the same patient\",\n        \"Inspect response or GET /DetectedIssue for conflict alert\"\n      ],\n      \"expected\": [\n        \"AllergyIntolerance POST returns HTTP 201\",\n        \"Response body contains resourceType AllergyIntolerance\",\n        \"MedicationRequest POST returns HTTP 201 with a warning extension OR DetectedIssue exists referencing the allergy\"\n      ],\n      \"trace\": [\n        \"R-HLT-059: allergy stored\",\n        \"R-HLT-059: alerts regenerated on conflicting MedicationRequest\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_create_allergy_and_medication_conflict_alert(\\n    clinician_auth_token, patient_id, penicillin_med_id, fhir_base_url\\n):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {clinician_auth_token}\\\",\\n               \\\"Content-Type\\\": \\\"application/fhir+json\\\"}\\n\\n    allergy_payload = {\\n        \\\"resourceType\\\": \\\"AllergyIntolerance\\\",\\n        \\\"clinicalStatus\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"active\\\"}]},\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://www.nlm.nih.gov/research/umls\\\",\\n                              \\\"code\\\": \\\"7980\\\", \\\"display\\\": \\\"Penicillin\\\"}]}\\n    }\\n    r1 = requests.post(f\\\"{fhir_base_url}/AllergyIntolerance\\\",\\n                       json=allergy_payload, headers=headers)\\n    assert r1.status_code == 201\\n    assert r1.json()[\\\"resourceType\\\"] == \\\"AllergyIntolerance\\\"\\n    allergy_id = r1.json()[\\\"id\\\"]\\n\\n    med_payload = {\\n        \\\"resourceType\\\": \\\"MedicationRequest\\\",\\n        \\\"status\\\": \\\"active\\\",\\n        \\\"intent\\\": \\\"order\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{patient_id}\\\"},\\n        \\\"medicationReference\\\": {\\\"reference\\\": f\\\"Medication/{penicillin_med_id}\\\"}\\n    }\\n    r2 = requests.post(f\\\"{fhir_base_url}/MedicationRequest\\\",\\n                       json=med_payload, headers=headers)\\n    assert r2.status_code == 201\\n\\n    r3 = requests.get(\\n        f\\\"{fhir_base_url}/DetectedIssue\\\",\\n        params={\\\"patient\\\": patient_id, \\\"implicated\\\": f\\\"AllergyIntolerance/{allergy_id}\\\"},\\n        headers=headers\\n    )\\n    assert r3.status_code == 200\\n    entries = r3.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"Expected at least one conflict DetectedIssue\\\"\\n\"\n    },\n    {\n      \"name\": \"test_duplicate_allergy_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician auth token available via <clinician_auth_token> fixture\",\n        \"Patient resource exists, ID available via <p"
+  }
+}

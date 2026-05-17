@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-HLT-067",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "integration",
+    "title": "Inter-facility referral (negative)",
+    "statement": "A clinician shall send a referral to another facility; the referral shall trigger a secure message and consent check. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician sends referral"
+    ],
+    "expected_outcomes": [
+      "referral stored",
+      "secure message dispatched"
+    ],
+    "error_pathways": [
+      "403 when consent absent"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/ReferralRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-067",
+    "reasoning": "The requirement covers inter-facility referral with secure messaging and consent checks. I designed: (1) a positive EP test confirming a fully-valid referral returns 201, stores the resource, and triggers a secure message; (2) a NEG test verifying that absent patient consent yields HTTP 403; (3) a BVA test exercising the exact character limit of the mandatory 'reason' field (1 char at minimum boundary); (4) a STC test attempting a referral from an already-cancelled state to cover illegal state transitions; (5) a DT test covering the combination of missing mandatory elements (patient, requester) to ensure 422 validation rejection.",
+    "tests": [
+      {
+        "name": "test_valid_referral_returns_201_and_dispatches_message",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient consent record exists and is active",
+          "Target facility is registered in the system",
+          "All mandatory referral fields are present"
+        ],
+        "actions": [
+          "POST /ReferralRequest with a fully-populated valid payload",
+          "Capture the response status and Location header",
+          "Poll or assert the secure message queue for a dispatched message"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains 'id' field",
+          "Location header points to the new ReferralRequest resource",
+          "Secure message dispatched to target facility"
+        ],
+        "trace": [
+          "R-HLT-067: referral stored",
+          "R-HLT-067: secure message dispatched"
+        ],
+        "executable": "import pytest\n\ndef test_valid_referral_returns_201_and_dispatches_message(\n    clinician_auth_headers, valid_referral_payload, api_client, assert_message_dispatched\n):\n    resp = api_client.post(\n        \"/ReferralRequest\",\n        json=valid_referral_payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"id\" in body, \"Response must contain resource id\"\n    assert resp.headers.get(\"Location\"), \"Location header must be present\"\n    assert_message_dispatched(body[\"id\"])\n"
+      },
+      {
+        "name": "test_referral_without_consent_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient consent record is absent or revoked",
+          "All other mandatory referral fields are present"
+        ],
+        "actions": [
+          "POST /ReferralRequest with a valid payload but no active patient consent"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body includes error code indicating consent absent"
+        ],
+        "trace": [
+          "R-HLT-067: 403 when consent absent"
+        ],
+        "executable": "import pytest\n\ndef test_referral_without_consent_returns_403(\n    clinician_auth_headers, valid_referral_payload, api_client, revoke_patient_consent\n):\n    patient_id = valid_referral_payload[\"subject\"][\"reference\"].split(\"/\")[-1]\n    revoke_patient_consent(patient_id)\n    resp = api_client.post(\n        \"/ReferralRequest\",\n        json=valid_referral_payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"consent\" in body.get(\"error\", \"\").lower() or \\\n           \"consent\" in body.get(\"detail\", \"\").lower(), \\\n           \"Error body must reference consent denial\"\n"
+      },
+      {
+        "name": "test_referral_reason_at_minimum_boundary_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient consent is active",
+          "Referral payload is fully populated except 'reason' which is exactly 1 character"
+        ],
+        "actions": [
+          "POST /ReferralRequest with reason field set to exactly 1 character (minimum valid length)",
+          "POST /ReferralRequest with reason field set to empty string (below minimum)"
+        ],
+        "expected": [
+          "1-character reason: HTTP 201 Created",
+          "Empty reason: HTTP 422 Unprocessable Entity"
+        ],
+        "trace": [
+          "R-HLT-067: mandatory elements validation",
+          "R-HLT-067: boundary of reason field"
+        ],
+        "executable": "import pytest\nimport copy\n\ndef test_referral_reason_at_minimum_boundary_length(\n    clinician_auth_headers, valid_referral_payload, api_client\n):\n    payload_min = copy.deepcopy(valid_referral_payload)\n    payload_min[\"reasonCode\"][0][\"text\"] = \"X\"\n    resp_min = api_client.post(\n        \"/ReferralRequest\", json=payload_min, headers=clinician_auth_headers\n    )\n    assert resp_min.status_code == 201, \\\n        f\"1-char reason should be accepted, got {resp_min.status_code}\"\n\n    payload_empty = copy.deepcopy(valid_referral_payload)\n    payload_empty[\"reasonCode\"][0][\"text\"] = \"\"\n    resp_empty = api_client.post(\n        \"/ReferralRequest\", json=payload_empty, headers=clinician_auth_headers\n    )\n    assert resp_empty.status_code == 422, \\\n        f\"Empty reason should be rejected, got {resp_empty.status_code}\"\n"
+      },
+      {
+        "name": "test_referral_from_cancelled_state_is_rejected",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "A ReferralRequest exists in 'cancelled' status",
+          "Patient consent is active"
+        ],
+        "actions": [
+          "Attempt to PUT /ReferralRequest/{id} to transition status from 'cancelled' to 'active'"
+        ],
+        "expected": [
+          "HTTP 409 Conflict or 422 Unprocessable Entity",
+          "Response body indicates illegal state transition"
+        ],
+        "trace": [
+          "R-HLT-067: conflicting state transitions must be tested"
+        ],
+        "executable": "import pytest\n\ndef test_referral_from_cancelled_state_is_rejected(\n    clinician_auth_headers, api_client, create_referral_in_state\n):\n    referral_id = create_referral_in_state(\"cancelled\")\n    update_payload = {\n        \"resourceType\": \"ReferralRequest\",\n        \"id\": referral_id,\n        \"status\": \"active\",\n    }\n    resp = api_client.put(\n        f\"/ReferralRequest/{referral_id}\",\n        json=update_payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code in (409, 422), \\\n        f\"Illegal transition from cancelled->active must be rejected, got {resp.status_code}\"\n    body = resp.json()\n    error_text = (body.get(\"error\", \"\") + body.get(\"detail\", \"\")).lower()\n    assert \"state\" in error_text or \"transition\" in error_text or \"status\" in error_text, \\\n        \"Error must reference invalid state transition\"\n"
+      },
+      {
+        "name": "test_referral_missing_patient_and_requester_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Patient consent is active",
+          "Payload omits both 'subject' (patient) and 'requester' mandatory elements"
+        ],
+        "actions": [
+          "POST /ReferralRequest with payload missing subject and requester fields"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body lists validation errors for both missing fields"
+        ],
+        "trace": [
+          "R-HLT-067: missing mandatory elements must be tested"
+        ],
+        "executable": "import pytest\nimport copy\n\ndef test_referral_missing_patient_and_requester_returns_422(\n    clinician_auth_headers, valid_referral_payload, api_client\n):\n    payload = copy.deepcopy(valid_referral_payload)\n    payload.pop(\"subject\", None)\n    payload.pop(\"requester\", None)\n    resp = api_client.post(\n        \"/ReferralRequest\",\n        json=payload,\n        headers=clinician_auth_headers,\n    )\n    assert resp.status_code == 422, \\\n        f\"Missing mandatory fields must yield 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    issues = str(body).lower()\n    assert \"subject\" in issues or \"patient\" in issues, \\\n        \"Validation error must reference missing subject/patient\"\n    assert \"requester\" in issues, \\\n        \"Validation error must reference missing requester\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-067",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1009,
+    "output_tokens": 2564,
+    "latency_ms": 32590,
+    "wall_ms": 32590,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-067\",\n  \"reasoning\": \"The requirement covers inter-facility referral with secure messaging and consent checks. I designed: (1) a positive EP test confirming a fully-valid referral returns 201, stores the resource, and triggers a secure message; (2) a NEG test verifying that absent patient consent yields HTTP 403; (3) a BVA test exercising the exact character limit of the mandatory 'reason' field (1 char at minimum boundary); (4) a STC test attempting a referral from an already-cancelled state to cover illegal state transitions; (5) a DT test covering the combination of missing mandatory elements (patient, requester) to ensure 422 validation rejection.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_referral_returns_201_and_dispatches_message\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient consent record exists and is active\",\n        \"Target facility is registered in the system\",\n        \"All mandatory referral fields are present\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with a fully-populated valid payload\",\n        \"Capture the response status and Location header\",\n        \"Poll or assert the secure message queue for a dispatched message\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains 'id' field\",\n        \"Location header points to the new ReferralRequest resource\",\n        \"Secure message dispatched to target facility\"\n      ],\n      \"trace\": [\n        \"R-HLT-067: referral stored\",\n        \"R-HLT-067: secure message dispatched\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_valid_referral_returns_201_and_dispatches_message(\\n    clinician_auth_headers, valid_referral_payload, api_client, assert_message_dispatched\\n):\\n    resp = api_client.post(\\n        \\\"/ReferralRequest\\\",\\n        json=valid_referral_payload,\\n        headers=clinician_auth_headers,\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"id\\\" in body, \\\"Response must contain resource id\\\"\\n    assert resp.headers.get(\\\"Location\\\"), \\\"Location header must be present\\\"\\n    assert_message_dispatched(body[\\\"id\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_referral_without_consent_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient consent record is absent or revoked\",\n        \"All other mandatory referral fields are present\"\n      ],\n      \"actions\": [\n        \"POST /ReferralRequest with a valid payload but no active patient consent\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body includes error code indicating consent absent\"\n      ],\n      \"trace\": [\n        \"R-HLT-067: 403 when consent absent\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_referral_without_consent_returns_403(\\n    clinician_auth_headers, valid_referral_payload, api_client, revoke_patient_consent\\n):\\n    patient_id = valid_referral_payload[\\\"subject\\\"][\\\"reference\\\"].split(\\\"/\\\")[-1]\\n    revoke_patient_consent(patient_id)\\n    resp = api_client.post(\\n        \\\"/ReferralRequest\\\",\\n        json=valid_referral_payload,\\n        headers=clinician_auth_headers,\\n    )\\n    assert resp.status_code == 403, f\\\"Expected 403, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"consent\\\" in body.get(\\\"error\\\", \\\"\\\").lower() or \\\\\\n           \\\"consent\\\" in body.get(\\\"detail\\\", \\\"\\\").lower(), \\\\\\n           \\\"Error body must reference consent denial\\\"\\n\"\n    },\n    {\n      \"name\": \"test_referral_reason_at_minimum_boundary_length\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"Patient consent is active\",\n        \"Referral payload is fully pop"
+  }
+}

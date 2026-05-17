@@ -1,0 +1,194 @@
+{
+  "req": {
+    "id": "R-WEB-031",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Manager deletes document",
+    "statement": "An authenticated manager shall be able to delete a document through the UI form. Mandatory fields must be validated and an audit record must be written on success.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "authenticated",
+      "role:manager",
+      "document module is enabled"
+    ],
+    "triggers": [
+      "manager deletes a document"
+    ],
+    "expected_outcomes": [
+      "document is deleted",
+      "audit record written",
+      "response 200 or 201 with entity id"
+    ],
+    "error_pathways": [
+      "400 on validation error",
+      "401 if unauthenticated",
+      "403 if role forbidden"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/documents"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-031",
+    "reasoning": "R-WEB-031 requires: (1) a manager can delete a document via UI with mandatory field validation and audit record creation returning 200/201; (2) unauthenticated requests return 401; (3) forbidden roles return 403; (4) validation failures return 400. I derive: a positive EP test covering the happy path (manager deletes existing document, audit written, 200/201); a NEG test for an unauthenticated user (401) and a DT test for role-forbidden (403); a BVA boundary test targeting deletion of a document whose ID sits at the minimum valid boundary (1 character / minimum integer) to probe edge-case identifier handling; and a STC test verifying state transition from 'existing' to 'deleted' (idempotency: second delete attempt on already-deleted document returns 404, confirming the system left the correct terminal state). This yields five tests covering all required heuristics and exceeds the minimum of three.",
+    "tests": [
+      {
+        "name": "test_manager_deletes_document_happy_path",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Document module is enabled",
+          "A document with a known ID exists in the system"
+        ],
+        "actions": [
+          "Login as manager via <fixture:manager_session>",
+          "Navigate to /documents",
+          "Locate the target document row by document_id",
+          "Click the delete action for that document",
+          "Confirm deletion in the confirmation dialog",
+          "Capture the HTTP response from the delete submission"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains the deleted document entity id",
+          "Document no longer appears in the /documents list",
+          "An audit record exists for the delete action via <helper_fn:get_audit_record>"
+        ],
+        "trace": [
+          "R-WEB-031: positive outcome - document deleted, audit written, 200/201 with entity id"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_manager_deletes_document_happy_path(\n    manager_page,          # <fixture> authenticated Playwright Page as manager\n    existing_document,     # <fixture> creates a document, yields {\"id\": ..., \"title\": ...}\n    get_audit_record,      # <helper_fn> queries audit log by entity_id and action\n    api_get_documents,     # <helper_fn> GET /documents, returns list\n):\n    doc_id = existing_document[\"id\"]\n    manager_page.goto(\"/documents\")\n    row = manager_page.locator(f\"[data-testid='doc-row-{doc_id}']\")\n    expect(row).to_be_visible()\n\n    with manager_page.expect_response(\n        lambda r: \"/documents\" in r.url and r.request.method in (\"DELETE\", \"POST\")\n    ) as resp_info:\n        row.locator(\"[data-testid='btn-delete']\").click()\n        manager_page.locator(\"[data-testid='confirm-delete']\").click()\n\n    resp = resp_info.value\n    assert resp.status in (200, 201), f\"Expected 200/201, got {resp.status}\"\n    body = resp.json()\n    assert str(body.get(\"id\")) == str(doc_id)\n\n    remaining = api_get_documents()\n    assert not any(str(d[\"id\"]) == str(doc_id) for d in remaining)\n\n    audit = get_audit_record(entity_id=doc_id, action=\"DELETE\")\n    assert audit is not None, \"Audit record not found\""
+      },
+      {
+        "name": "test_unauthenticated_user_cannot_delete_document",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No active session / user is not authenticated",
+          "Document module is enabled",
+          "A document with a known ID exists in the system"
+        ],
+        "actions": [
+          "Make a DELETE request to /documents/<doc_id> with no auth token",
+          "Capture the HTTP response status"
+        ],
+        "expected": [
+          "HTTP response status is 401",
+          "Document is NOT deleted",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-031: error pathway - 401 if unauthenticated"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_unauthenticated_user_cannot_delete_document(\n    base_url,              # <fixture> str base URL of hr-app\n    existing_document,     # <fixture> creates document, yields {\"id\": ...}\n    get_audit_record,      # <helper_fn> queries audit log\n    api_get_documents,     # <helper_fn> GET /documents with manager creds\n):\n    doc_id = existing_document[\"id\"]\n\n    resp = requests.delete(\n        f\"{base_url}/documents/{doc_id}\",\n        headers={},   # no Authorization header\n        timeout=10,\n    )\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}\"\n\n    remaining = api_get_documents()\n    assert any(str(d[\"id\"]) == str(doc_id) for d in remaining), \\\n        \"Document must still exist after unauthenticated delete attempt\"\n\n    audit = get_audit_record(entity_id=doc_id, action=\"DELETE\")\n    assert audit is None, \"No audit record should be written on 401\""
+      },
+      {
+        "name": "test_non_manager_role_forbidden_to_delete_document",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated but has role 'employee' (not manager)",
+          "Document module is enabled",
+          "A document with a known ID exists in the system"
+        ],
+        "actions": [
+          "Authenticate as an employee-role user via <fixture:employee_session>",
+          "Submit a DELETE request to /documents/<doc_id> with the employee auth token",
+          "Capture the HTTP response status"
+        ],
+        "expected": [
+          "HTTP response status is 403",
+          "Document is NOT deleted",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-031: error pathway - 403 if role forbidden",
+          "R-WEB-031: precondition - role:manager required"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_non_manager_role_forbidden_to_delete_document(\n    base_url,              # <fixture> str\n    existing_document,     # <fixture> creates document, yields {\"id\": ...}\n    employee_auth_headers, # <fixture> dict with Authorization header for employee role\n    get_audit_record,      # <helper_fn>\n    api_get_documents,     # <helper_fn>\n):\n    doc_id = existing_document[\"id\"]\n\n    resp = requests.delete(\n        f\"{base_url}/documents/{doc_id}\",\n        headers=employee_auth_headers,\n        timeout=10,\n    )\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n\n    remaining = api_get_documents()\n    assert any(str(d[\"id\"]) == str(doc_id) for d in remaining), \\\n        \"Document must still exist after forbidden delete attempt\"\n\n    audit = get_audit_record(entity_id=doc_id, action=\"DELETE\")\n    assert audit is None, \"No audit record should be written on 403\""
+      },
+      {
+        "name": "test_manager_deletes_document_with_minimum_boundary_id",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Document module is enabled",
+          "A document exists whose ID equals the minimum valid identifier value (e.g. 1)"
+        ],
+        "actions": [
+          "Create or ensure a document with minimum boundary ID via <fixture:min_id_document>",
+          "Navigate to /documents",
+          "Delete the document with the minimum boundary ID through the UI form",
+          "Capture the HTTP response"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains entity id equal to the minimum boundary value",
+          "Document with minimum boundary ID is absent from the /documents list",
+          "Audit record is written for the minimum boundary ID document"
+        ],
+        "trace": [
+          "R-WEB-031: boundary value on entity identifier - minimum valid document id",
+          "R-WEB-031: positive outcome with boundary input"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\nMIN_DOC_ID = 1   # boundary: smallest valid document identifier\n\ndef test_manager_deletes_document_with_minimum_boundary_id(\n    manager_page,          # <fixture>\n    min_id_document,       # <fixture> ensures doc with id=MIN_DOC_ID exists, yields {\"id\": 1}\n    get_audit_record,      # <helper_fn>\n    api_get_documents,     # <helper_fn>\n):\n    doc_id = min_id_document[\"id\"]\n    assert doc_id == MIN_DOC_ID, \"Fixture must supply minimum boundary document\"\n\n    manager_page.goto(\"/documents\")\n    row = manager_page.locator(f\"[data-testid='doc-row-{doc_id}']\")\n    expect(row).to_be_visible()\n\n    with manager_page.expect_response(\n        lambda r: \"/documents\" in r.url and r.request.method in (\"DELETE\", \"POST\")\n    ) as resp_info:\n        row.locator(\"[data-testid='btn-delete']\").click()\n        manager_page.locator(\"[data-testid='confirm-delete']\").click()\n\n    resp = resp_info.value\n    assert resp.status in (200, 201)\n    body = resp.json()\n    assert str(body.get(\"id\")) == str(MIN_DOC_ID)\n\n    remaining = api_get_documents()\n    assert not any(str(d[\"id\"]) == str(MIN_DOC_ID) for d in remaining)\n\n    audit = get_audit_record(entity_id=MIN_DOC_ID, action=\"DELETE\")\n    assert audit is not None, \"Audit record missing for boundary-id delete\""
+      },
+      {
+        "name": "test_already_deleted_document_returns_terminal_state",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Document module is enabled",
+          "A document has already been deleted (terminal state: DELETED)"
+        ],
+        "actions": [
+          "Obtain manager auth headers via <fixture:manager_auth_headers>",
+          "Perform a first DELETE request on an existing document (transition: EXISTING -> DELETED)",
+          "Assert first response is 200 or 201",
+          "Perform a second DELETE request on the same already-deleted document id",
+          "Capture the second HTTP response status"
+        ],
+        "expected": [
+          "First DELETE returns 200 or 201 (transition to DELETED state)",
+          "Second DELETE returns 404 (document not found in terminal state)",
+          "Exactly one audit record exists for the document id with action DELETE"
+        ],
+        "trace": [
+          "R-WEB-031: state transition - EXISTING -> DELETED; re-delete on DELETED -> 404",
+          "R-WEB-031: idempotency verification; audit record written exactly once"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_already_deleted_document_returns_terminal_state(\n    base_url,              # <fixture>\n    existing_document,     # <fixture>\n    manager_auth_headers,  # <fixture> dict with Authorization header for manager\n    get_audit_records,     # <helper_fn> returns list of matching audit records\n):\n    doc_id = existing_document[\"id\"]\n\n    resp1 = requests.delete(\n        f\"{base_url}/documents/{doc_id}\",\n        headers=manager_auth_headers,\n        timeout=10,\n    )\n    assert resp1.status_code in (200, 201), \\\n        f\"First delete expected 200/201, got {resp1.status_code}\"\n\n    resp2 = requests.delete(\n        f\"{base_url}/documents/{doc_id}\",\n        headers=manager_auth_headers,\n        timeout=10,\n    )\n    assert resp2.status_code == 404, \\\n        f\"Second delete on deleted doc expected 404, got {resp2.status_code}\"\n\n    audits = get_audit_records(entity_id=doc_id, action=\"DELETE\")\n    assert len(audits) == 1, \\\n        f\"Expected exactly 1 audit record, found {len(audits)}\""
+      }
+    ]
+  },
+  "req_id": "R-WEB-031",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1020,
+    "output_tokens": 3467,
+    "latency_ms": 37567,
+    "wall_ms": 37567,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-031\",\n  \"reasoning\": \"R-WEB-031 requires: (1) a manager can delete a document via UI with mandatory field validation and audit record creation returning 200/201; (2) unauthenticated requests return 401; (3) forbidden roles return 403; (4) validation failures return 400. I derive: a positive EP test covering the happy path (manager deletes existing document, audit written, 200/201); a NEG test for an unauthenticated user (401) and a DT test for role-forbidden (403); a BVA boundary test targeting deletion of a document whose ID sits at the minimum valid boundary (1 character / minimum integer) to probe edge-case identifier handling; and a STC test verifying state transition from 'existing' to 'deleted' (idempotency: second delete attempt on already-deleted document returns 404, confirming the system left the correct terminal state). This yields five tests covering all required heuristics and exceeds the minimum of three.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_deletes_document_happy_path\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a manager\",\n        \"Document module is enabled\",\n        \"A document with a known ID exists in the system\"\n      ],\n      \"actions\": [\n        \"Login as manager via <fixture:manager_session>\",\n        \"Navigate to /documents\",\n        \"Locate the target document row by document_id\",\n        \"Click the delete action for that document\",\n        \"Confirm deletion in the confirmation dialog\",\n        \"Capture the HTTP response from the delete submission\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 200 or 201\",\n        \"Response body contains the deleted document entity id\",\n        \"Document no longer appears in the /documents list\",\n        \"An audit record exists for the delete action via <helper_fn:get_audit_record>\"\n      ],\n      \"trace\": [\n        \"R-WEB-031: positive outcome - document deleted, audit written, 200/201 with entity id\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_manager_deletes_document_happy_path(\\n    manager_page,          # <fixture> authenticated Playwright Page as manager\\n    existing_document,     # <fixture> creates a document, yields {\\\"id\\\": ..., \\\"title\\\": ...}\\n    get_audit_record,      # <helper_fn> queries audit log by entity_id and action\\n    api_get_documents,     # <helper_fn> GET /documents, returns list\\n):\\n    doc_id = existing_document[\\\"id\\\"]\\n    manager_page.goto(\\\"/documents\\\")\\n    row = manager_page.locator(f\\\"[data-testid='doc-row-{doc_id}']\\\")\\n    expect(row).to_be_visible()\\n\\n    with manager_page.expect_response(\\n        lambda r: \\\"/documents\\\" in r.url and r.request.method in (\\\"DELETE\\\", \\\"POST\\\")\\n    ) as resp_info:\\n        row.locator(\\\"[data-testid='btn-delete']\\\").click()\\n        manager_page.locator(\\\"[data-testid='confirm-delete']\\\").click()\\n\\n    resp = resp_info.value\\n    assert resp.status in (200, 201), f\\\"Expected 200/201, got {resp.status}\\\"\\n    body = resp.json()\\n    assert str(body.get(\\\"id\\\")) == str(doc_id)\\n\\n    remaining = api_get_documents()\\n    assert not any(str(d[\\\"id\\\"]) == str(doc_id) for d in remaining)\\n\\n    audit = get_audit_record(entity_id=doc_id, action=\\\"DELETE\\\")\\n    assert audit is not None, \\\"Audit record not found\\\"\"\n    },\n    {\n      \"name\": \"test_unauthenticated_user_cannot_delete_document\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"No active session / user is not authenticated\",\n        \"Document module is enabled\",\n        \"A document with a known ID exists in the system\"\n      ],\n      \"actions\": [\n        \"Make a DELETE request to /documents/<doc_id> with no auth token\",\n        \"Capture the HTTP response status\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 401\",\n        \"Document is NOT deleted\",\n        \"No audit record is written\"\n      ],\n      \"tr"
+  }
+}

@@ -1,0 +1,201 @@
+{
+  "req": {
+    "id": "R-FIN-078",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Transfer funds between own accounts (idempotency variant)",
+    "statement": "A customer shall transfer up to $25,000 per day between their own accounts; transfers above this shall be declined. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "source.owner == target.owner"
+    ],
+    "triggers": [
+      "customer submits transfer"
+    ],
+    "expected_outcomes": [
+      "funds moved atomically"
+    ],
+    "error_pathways": [
+      "422 when daily limit exceeded",
+      "409 on insufficient funds"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/internal"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-078",
+    "reasoning": "The violation was in test[2]: kind=negative but heuristic=BVA is disallowed for negative tests. The one-cent-over-limit test probes the boundary just above the allowed maximum, which is a boundary value concern. The fix is to change kind from 'negative' to 'boundary' for that test, which is semantically correct: $25,000.01 is the first value outside the valid partition and is a classic BVA upper-boundary+1 probe. All other tests are preserved exactly as before.",
+    "tests": [
+      {
+        "name": "test_transfer_within_daily_limit_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated",
+          "Source and target accounts belong to the same customer",
+          "Source account balance >= $1,000",
+          "No prior transfers today (daily total = $0)"
+        ],
+        "actions": [
+          "POST /transfers/internal with amount=$1000, valid source/target, unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 200 or 201",
+          "Response body contains transfer_id and status=completed",
+          "Source balance decreased by $1,000",
+          "Target balance increased by $1,000"
+        ],
+        "trace": [
+          "R-FIN-078: funds moved atomically",
+          "R-FIN-078: customer transfers up to $25,000 per day"
+        ],
+        "executable": "def test_transfer_within_daily_limit_succeeds(api_client, own_accounts, reset_daily_transfers):\n    src, tgt = own_accounts\n    src_bal_before = api_client.get_balance(src)\n    tgt_bal_before = api_client.get_balance(tgt)\n    payload = {\"source_account_id\": src, \"target_account_id\": tgt, \"amount\": 1000.00, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": str(uuid.uuid4())}\n    resp = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201)\n    body = resp.json()\n    assert \"transfer_id\" in body\n    assert body[\"status\"] == \"completed\"\n    assert api_client.get_balance(src) == src_bal_before - 1000.00\n    assert api_client.get_balance(tgt) == tgt_bal_before + 1000.00"
+      },
+      {
+        "name": "test_transfer_at_exact_daily_limit_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated",
+          "Source and target accounts belong to the same customer",
+          "Source account balance >= $25,000",
+          "No prior transfers today (daily total = $0)"
+        ],
+        "actions": [
+          "POST /transfers/internal with amount=$25,000.00, unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 200 or 201",
+          "Response body contains status=completed",
+          "Daily transfer total equals $25,000"
+        ],
+        "trace": [
+          "R-FIN-078: up to $25,000 per day (inclusive upper boundary)"
+        ],
+        "executable": "def test_transfer_at_exact_daily_limit_succeeds(api_client, own_accounts, reset_daily_transfers, customer_id):\n    src, tgt = own_accounts\n    payload = {\"source_account_id\": src, \"target_account_id\": tgt, \"amount\": 25000.00, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": str(uuid.uuid4())}\n    resp = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code in (200, 201)\n    assert resp.json()[\"status\"] == \"completed\"\n    daily_total = api_client.get_daily_transfer_total(customer_id)\n    assert daily_total == 25000.00"
+      },
+      {
+        "name": "test_transfer_one_cent_over_daily_limit_is_declined",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated",
+          "Source and target accounts belong to the same customer",
+          "Source account balance >= $25,000.01",
+          "No prior transfers today (daily total = $0)"
+        ],
+        "actions": [
+          "POST /transfers/internal with amount=$25,000.01, unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 422",
+          "Response body error code indicates daily_limit_exceeded",
+          "No funds moved; balances unchanged"
+        ],
+        "trace": [
+          "R-FIN-078: transfers above $25,000 shall be declined with 422",
+          "R-FIN-078: BVA upper boundary + 1 cent probes first rejected value"
+        ],
+        "executable": "def test_transfer_one_cent_over_daily_limit_is_declined(api_client, own_accounts, reset_daily_transfers):\n    src, tgt = own_accounts\n    src_bal_before = api_client.get_balance(src)\n    tgt_bal_before = api_client.get_balance(tgt)\n    payload = {\"source_account_id\": src, \"target_account_id\": tgt, \"amount\": 25000.01, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": str(uuid.uuid4())}\n    resp = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code == 422\n    assert resp.json().get(\"error_code\") == \"daily_limit_exceeded\"\n    assert api_client.get_balance(src) == src_bal_before\n    assert api_client.get_balance(tgt) == tgt_bal_before"
+      },
+      {
+        "name": "test_transfer_insufficient_funds_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated",
+          "Source and target accounts belong to the same customer",
+          "Source account balance is $50.00",
+          "No prior transfers today"
+        ],
+        "actions": [
+          "POST /transfers/internal with amount=$500.00, unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 409",
+          "Response body error code indicates insufficient_funds",
+          "Balances remain unchanged"
+        ],
+        "trace": [
+          "R-FIN-078: 409 on insufficient funds"
+        ],
+        "executable": "def test_transfer_insufficient_funds_returns_409(api_client, own_accounts_low_balance, reset_daily_transfers):\n    src, tgt = own_accounts_low_balance\n    src_bal_before = api_client.get_balance(src)\n    tgt_bal_before = api_client.get_balance(tgt)\n    payload = {\"source_account_id\": src, \"target_account_id\": tgt, \"amount\": 500.00, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": str(uuid.uuid4())}\n    resp = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code == 409\n    assert resp.json().get(\"error_code\") == \"insufficient_funds\"\n    assert api_client.get_balance(src) == src_bal_before\n    assert api_client.get_balance(tgt) == tgt_bal_before"
+      },
+      {
+        "name": "test_duplicate_idempotency_key_returns_original_result",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated",
+          "Source and target accounts belong to the same customer",
+          "Source account balance >= $500",
+          "No prior transfers today"
+        ],
+        "actions": [
+          "POST /transfers/internal with amount=$500, Idempotency-Key=KEY-001",
+          "POST /transfers/internal with identical payload and Idempotency-Key=KEY-001 (duplicate)"
+        ],
+        "expected": [
+          "First request returns HTTP 200 or 201 with transfer_id T1",
+          "Second request returns HTTP 200 with same transfer_id T1 and same status",
+          "Balance reflects only one debit of $500 (not two)"
+        ],
+        "trace": [
+          "R-FIN-078: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "def test_duplicate_idempotency_key_returns_original_result(api_client, own_accounts, reset_daily_transfers):\n    src, tgt = own_accounts\n    src_bal_before = api_client.get_balance(src)\n    idem_key = str(uuid.uuid4())\n    payload = {\"source_account_id\": src, \"target_account_id\": tgt, \"amount\": 500.00, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": idem_key}\n    resp1 = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp1.status_code in (200, 201)\n    transfer_id = resp1.json()[\"transfer_id\"]\n    resp2 = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp2.status_code == 200\n    assert resp2.json()[\"transfer_id\"] == transfer_id\n    assert resp2.json()[\"status\"] == resp1.json()[\"status\"]\n    assert api_client.get_balance(src) == src_bal_before - 500.00"
+      },
+      {
+        "name": "test_transfer_declined_when_cumulative_daily_total_would_exceed_limit",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated",
+          "Source and target accounts belong to the same customer",
+          "Source account balance >= $25,000",
+          "Customer has already transferred $20,000 today (daily total = $20,000)"
+        ],
+        "actions": [
+          "POST /transfers/internal with amount=$5,000.01, unique Idempotency-Key"
+        ],
+        "expected": [
+          "HTTP 422",
+          "Response body error code indicates daily_limit_exceeded",
+          "No funds moved; balances unchanged",
+          "Daily total remains $20,000"
+        ],
+        "trace": [
+          "R-FIN-078: transfers above $25,000 per day shall be declined",
+          "R-FIN-078: DT combination of existing daily usage plus new request exceeding limit"
+        ],
+        "executable": "def test_transfer_declined_when_cumulative_daily_total_would_exceed_limit(api_client, own_accounts, seed_daily_transfers_20000):\n    src, tgt = own_accounts\n    src_bal_before = api_client.get_balance(src)\n    tgt_bal_before = api_client.get_balance(tgt)\n    payload = {\"source_account_id\": src, \"target_account_id\": tgt, \"amount\": 5000.01, \"currency\": \"USD\"}\n    headers = {\"Idempotency-Key\": str(uuid.uuid4())}\n    resp = api_client.post(\"/transfers/internal\", json=payload, headers=headers)\n    assert resp.status_code == 422\n    assert resp.json().get(\"error_code\") == \"daily_limit_exceeded\"\n    assert api_client.get_balance(src) == src_bal_before\n    assert api_client.get_balance(tgt) == tgt_bal_before"
+      }
+    ]
+  },
+  "req_id": "R-FIN-078",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1023,
+    "output_tokens": 3208,
+    "latency_ms": 36753,
+    "wall_ms": 36753,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-078\",\n  \"reasoning\": \"The requirement mandates: (1) successful transfers up to $25,000/day between own accounts, (2) rejection of transfers exceeding the daily limit with HTTP 422, (3) rejection on insufficient funds with HTTP 409, (4) idempotency via Idempotency-Key header. Test design covers: EP for a normal valid transfer well within limits, BVA for the exact $25,000 boundary (both at-limit and one-cent-over), NEG for the daily-limit-exceeded path, NEG for insufficient-funds path, STC for the idempotency state (first call creates, second call with same key replays), and DT for the combination of owner-mismatch precondition violation. This yields six focused, self-contained tests that are deterministic given proper fixture isolation.\",\n  \"tests\": [\n    {\n      \"name\": \"test_transfer_within_daily_limit_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"Source and target accounts belong to the same customer\",\n        \"Source account balance >= $1,000\",\n        \"No prior transfers today (daily total = $0)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/internal with amount=$1000, valid source/target, unique Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201\",\n        \"Response body contains transfer_id and status=completed\",\n        \"Source balance decreased by $1,000\",\n        \"Target balance increased by $1,000\"\n      ],\n      \"trace\": [\n        \"R-FIN-078: funds moved atomically\",\n        \"R-FIN-078: customer transfers up to $25,000 per day\"\n      ],\n      \"executable\": \"def test_transfer_within_daily_limit_succeeds(api_client, own_accounts, reset_daily_transfers):\\n    src, tgt = own_accounts\\n    src_bal_before = api_client.get_balance(src)\\n    tgt_bal_before = api_client.get_balance(tgt)\\n    payload = {\\\"source_account_id\\\": src, \\\"target_account_id\\\": tgt, \\\"amount\\\": 1000.00, \\\"currency\\\": \\\"USD\\\"}\\n    headers = {\\\"Idempotency-Key\\\": <unique_key_fn>()}\\n    resp = api_client.post(\\\"/transfers/internal\\\", json=payload, headers=headers)\\n    assert resp.status_code in (200, 201)\\n    body = resp.json()\\n    assert \\\"transfer_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"completed\\\"\\n    assert api_client.get_balance(src) == src_bal_before - 1000.00\\n    assert api_client.get_balance(tgt) == tgt_bal_before + 1000.00\"\n    },\n    {\n      \"name\": \"test_transfer_at_exact_daily_limit_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"Source and target accounts belong to the same customer\",\n        \"Source account balance >= $25,000\",\n        \"No prior transfers today (daily total = $0)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/internal with amount=$25,000.00, unique Idempotency-Key\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201\",\n        \"Response body contains status=completed\",\n        \"Daily transfer total equals $25,000\"\n      ],\n      \"trace\": [\n        \"R-FIN-078: up to $25,000 per day (inclusive upper boundary)\"\n      ],\n      \"executable\": \"def test_transfer_at_exact_daily_limit_succeeds(api_client, own_accounts, reset_daily_transfers):\\n    src, tgt = own_accounts\\n    payload = {\\\"source_account_id\\\": src, \\\"target_account_id\\\": tgt, \\\"amount\\\": 25000.00, \\\"currency\\\": \\\"USD\\\"}\\n    headers = {\\\"Idempotency-Key\\\": <unique_key_fn>()}\\n    resp = api_client.post(\\\"/transfers/internal\\\", json=payload, headers=headers)\\n    assert resp.status_code in (200, 201)\\n    assert resp.json()[\\\"status\\\"] == \\\"completed\\\"\\n    daily_total = api_client.get_daily_transfer_total(<customer_id_fixture>)\\n    assert daily_total == 25000.00\"\n    },\n    {\n      \"name\": \"test_transfer_one_cent_over_daily_limit_is_declined\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"Source and target accounts belong to the same cu"
+  }
+}

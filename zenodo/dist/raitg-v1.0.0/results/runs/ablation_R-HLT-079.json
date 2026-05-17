@@ -1,0 +1,158 @@
+{
+  "req": {
+    "id": "R-HLT-079",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Delete patient (soft) (audit)",
+    "statement": "A system-admin shall soft-delete a patient resource; deletion shall not remove history. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin deletes patient"
+    ],
+    "expected_outcomes": [
+      "resource marked deleted",
+      "retrievable via _history"
+    ],
+    "error_pathways": [
+      "403 when not admin"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-079",
+    "reasoning": "R-HLT-079 mandates three verification axes: (1) happy-path soft-delete by an admin preserves history and emits an AuditEvent, (2) rejection with 403 when a non-admin caller attempts deletion, and (3) boundary behaviour when the patient resource is accessed via _history immediately after deletion to confirm exactly one new history version is appended. STC covers the active\u2192deleted state transition. EP covers the valid-admin partition. NEG covers the unauthorized-caller partition. BVA covers the version-count boundary (versionId increments by exactly 1). An additional DT test covers the compound decision: admin role \u00d7 delete operation \u00d7 AuditEvent emission all true simultaneously.",
+    "tests": [
+      {
+        "name": "test_admin_soft_delete_marks_resource_deleted_and_emits_audit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds role:admin JWT",
+          "A Patient resource exists with a known id",
+          "AuditEvent store is reachable"
+        ],
+        "actions": [
+          "DELETE /Patient/{id} with admin Authorization header",
+          "GET /Patient/{id} to confirm 410 Gone",
+          "GET /Patient/{id}/_history to confirm resource is still retrievable",
+          "GET /AuditEvent?entity={id}&action=D to confirm audit record exists"
+        ],
+        "expected": [
+          "DELETE returns HTTP 200 or 204",
+          "GET /Patient/{id} returns HTTP 410 Gone",
+          "GET /Patient/{id}/_history returns bundle with at least one entry",
+          "AuditEvent bundle contains at least one entry with action=D for this patient"
+        ],
+        "trace": [
+          "R-HLT-079: soft-delete",
+          "R-HLT-079: deletion shall not remove history",
+          "R-HLT-079: AuditEvent must be emitted"
+        ],
+        "executable": "import pytest\n\ndef test_admin_soft_delete_marks_resource_deleted_and_emits_audit(\n    admin_client,\n    create_patient,\n):\n    patient_id = create_patient(admin_client)\n\n    delete_resp = admin_client.delete(f\"/Patient/{patient_id}\")\n    assert delete_resp.status_code in (200, 204)\n\n    get_resp = admin_client.get(f\"/Patient/{patient_id}\")\n    assert get_resp.status_code == 410\n\n    history_resp = admin_client.get(f\"/Patient/{patient_id}/_history\")\n    assert history_resp.status_code == 200\n    bundle = history_resp.json()\n    assert bundle.get(\"total\", 0) >= 1 or len(bundle.get(\"entry\", [])) >= 1\n\n    audit_resp = admin_client.get(\n        \"/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\", \"action\": \"D\"},\n    )\n    assert audit_resp.status_code == 200\n    audit_bundle = audit_resp.json()\n    entries = audit_bundle.get(\"entry\", [])\n    assert len(entries) >= 1, \"Expected at least one AuditEvent for delete action\"\n"
+      },
+      {
+        "name": "test_non_admin_delete_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role:practitioner JWT (not admin)",
+          "A Patient resource exists with a known id"
+        ],
+        "actions": [
+          "DELETE /Patient/{id} with non-admin Authorization header"
+        ],
+        "expected": [
+          "Response status is 403 Forbidden",
+          "Patient resource is NOT marked deleted (still returns 200 on GET)",
+          "No AuditEvent with action=D is created for this attempt (or an access-denied event is recorded)"
+        ],
+        "trace": [
+          "R-HLT-079: error pathway 403 when not admin"
+        ],
+        "executable": "import pytest\n\ndef test_non_admin_delete_returns_403(\n    admin_client,\n    practitioner_client,\n    create_patient,\n):\n    patient_id = create_patient(admin_client)\n\n    delete_resp = practitioner_client.delete(f\"/Patient/{patient_id}\")\n    assert delete_resp.status_code == 403\n\n    get_resp = admin_client.get(f\"/Patient/{patient_id}\")\n    assert get_resp.status_code == 200, \"Patient must still exist after unauthorized delete\"\n\n    audit_resp = admin_client.get(\n        \"/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\", \"action\": \"D\"},\n    )\n    if audit_resp.status_code == 200:\n        entries = audit_resp.json().get(\"entry\", [])\n        successful_deletes = [\n            e for e in entries\n            if e.get(\"resource\", {}).get(\"outcome\") == \"0\"\n        ]\n        assert len(successful_deletes) == 0, \"No successful delete AuditEvent expected\"\n"
+      },
+      {
+        "name": "test_history_version_increments_by_exactly_one_after_soft_delete",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role:admin JWT",
+          "A Patient resource exists with a known id and a recorded current versionId"
+        ],
+        "actions": [
+          "Capture current versionId from GET /Patient/{id}",
+          "DELETE /Patient/{id} with admin Authorization header",
+          "GET /Patient/{id}/_history and collect all versionIds"
+        ],
+        "expected": [
+          "The maximum versionId in _history equals pre-delete versionId + 1 (boundary: exactly one increment)",
+          "The latest history entry has meta.tag or status indicating deleted",
+          "Total history entry count equals pre-delete count + 1"
+        ],
+        "trace": [
+          "R-HLT-079: deletion shall not remove history",
+          "R-HLT-079: resource marked deleted"
+        ],
+        "executable": "import pytest\n\ndef test_history_version_increments_by_exactly_one_after_soft_delete(\n    admin_client,\n    create_patient,\n):\n    patient_id = create_patient(admin_client)\n\n    get_resp = admin_client.get(f\"/Patient/{patient_id}\")\n    assert get_resp.status_code == 200\n    pre_version = int(get_resp.json()[\"meta\"][\"versionId\"])\n\n    history_before = admin_client.get(f\"/Patient/{patient_id}/_history\").json()\n    count_before = len(history_before.get(\"entry\", []))\n\n    delete_resp = admin_client.delete(f\"/Patient/{patient_id}\")\n    assert delete_resp.status_code in (200, 204)\n\n    history_after = admin_client.get(f\"/Patient/{patient_id}/_history\").json()\n    entries_after = history_after.get(\"entry\", [])\n    assert len(entries_after) == count_before + 1, \"History must grow by exactly 1\"\n\n    versions = [int(e[\"resource\"][\"meta\"][\"versionId\"]) for e in entries_after]\n    assert max(versions) == pre_version + 1, \"versionId must increment by exactly 1\"\n"
+      },
+      {
+        "name": "test_admin_delete_decision_table_all_conditions_true",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role:admin JWT",
+          "Patient resource exists and is in active state",
+          "AuditEvent endpoint is reachable"
+        ],
+        "actions": [
+          "DELETE /Patient/{id} with admin token",
+          "Assert HTTP 200/204",
+          "Assert GET /Patient/{id} returns 410",
+          "Assert GET /Patient/{id}/_history returns bundle with deleted entry",
+          "Assert AuditEvent exists with action=D and outcome=success"
+        ],
+        "expected": [
+          "All three conditions simultaneously satisfied: role=admin AND resource deleted AND AuditEvent emitted",
+          "AuditEvent outcome code is '0' (success)",
+          "AuditEvent agent references the admin actor"
+        ],
+        "trace": [
+          "R-HLT-079: admin role condition",
+          "R-HLT-079: resource marked deleted condition",
+          "R-HLT-079: AuditEvent emitted condition"
+        ],
+        "executable": "import pytest\n\ndef test_admin_delete_decision_table_all_conditions_true(\n    admin_client,\n    create_patient,\n    admin_user_id,\n):\n    patient_id = create_patient(admin_client)\n\n    del_resp = admin_client.delete(f\"/Patient/{patient_id}\")\n    assert del_resp.status_code in (200, 204), \"Condition: delete accepted\"\n\n    gone_resp = admin_client.get(f\"/Patient/{patient_id}\")\n    assert gone_resp.status_code == 410, \"Condition: resource marked deleted\"\n\n    hist_resp = admin_client.get(f\"/Patient/{patient_id}/_history\")\n    assert hist_resp.status_code == 200\n    assert len(hist_resp.json().get(\"entry\", [])) >= 1, \"Condition: history preserved\"\n\n    audit_resp = admin_client.get(\n        \"/AuditEvent\",\n        params={\"entity\": f\"Patient/{patient_id}\", \"action\": \"D\"},\n    )\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1, \"Condition: AuditEvent emitted\"\n    latest = entries[-1][\"resource\"]\n    assert latest.get(\"outcome\") == \"0\", \"Condition: AuditEvent outcome = success\"\n    agents = latest.get(\"agent\", [])\n    agent_refs = [a.get(\"who\", {}).get(\"reference\", \"\") for a in agents]\n    assert any(admin_user_id in ref for ref in agent_refs), \"Condition: admin actor recorded\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-079",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 2770,
+    "latency_ms": 30389,
+    "wall_ms": 30389,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-079\",\n  \"reasoning\": \"R-HLT-079 mandates three verification axes: (1) happy-path soft-delete by an admin preserves history and emits an AuditEvent, (2) rejection with 403 when a non-admin caller attempts deletion, and (3) boundary behaviour when the patient resource is accessed via _history immediately after deletion to confirm exactly one new history version is appended. STC covers the active\u2192deleted state transition. EP covers the valid-admin partition. NEG covers the unauthorized-caller partition. BVA covers the version-count boundary (versionId increments by exactly 1). An additional DT test covers the compound decision: admin role \u00d7 delete operation \u00d7 AuditEvent emission all true simultaneously.\",\n  \"tests\": [\n    {\n      \"name\": \"test_admin_soft_delete_marks_resource_deleted_and_emits_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Caller holds role:admin JWT\",\n        \"A Patient resource exists with a known id\",\n        \"AuditEvent store is reachable\"\n      ],\n      \"actions\": [\n        \"DELETE /Patient/{id} with admin Authorization header\",\n        \"GET /Patient/{id} to confirm 410 Gone\",\n        \"GET /Patient/{id}/_history to confirm resource is still retrievable\",\n        \"GET /AuditEvent?entity={id}&action=D to confirm audit record exists\"\n      ],\n      \"expected\": [\n        \"DELETE returns HTTP 200 or 204\",\n        \"GET /Patient/{id} returns HTTP 410 Gone\",\n        \"GET /Patient/{id}/_history returns bundle with at least one entry\",\n        \"AuditEvent bundle contains at least one entry with action=D for this patient\"\n      ],\n      \"trace\": [\n        \"R-HLT-079: soft-delete\",\n        \"R-HLT-079: deletion shall not remove history\",\n        \"R-HLT-079: AuditEvent must be emitted\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_admin_soft_delete_marks_resource_deleted_and_emits_audit(\\n    admin_client,\\n    create_patient,\\n):\\n    patient_id = create_patient(admin_client)\\n\\n    delete_resp = admin_client.delete(f\\\"/Patient/{patient_id}\\\")\\n    assert delete_resp.status_code in (200, 204)\\n\\n    get_resp = admin_client.get(f\\\"/Patient/{patient_id}\\\")\\n    assert get_resp.status_code == 410\\n\\n    history_resp = admin_client.get(f\\\"/Patient/{patient_id}/_history\\\")\\n    assert history_resp.status_code == 200\\n    bundle = history_resp.json()\\n    assert bundle.get(\\\"total\\\", 0) >= 1 or len(bundle.get(\\\"entry\\\", [])) >= 1\\n\\n    audit_resp = admin_client.get(\\n        \\\"/AuditEvent\\\",\\n        params={\\\"entity\\\": f\\\"Patient/{patient_id}\\\", \\\"action\\\": \\\"D\\\"},\\n    )\\n    assert audit_resp.status_code == 200\\n    audit_bundle = audit_resp.json()\\n    entries = audit_bundle.get(\\\"entry\\\", [])\\n    assert len(entries) >= 1, \\\"Expected at least one AuditEvent for delete action\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_delete_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role:practitioner JWT (not admin)\",\n        \"A Patient resource exists with a known id\"\n      ],\n      \"actions\": [\n        \"DELETE /Patient/{id} with non-admin Authorization header\"\n      ],\n      \"expected\": [\n        \"Response status is 403 Forbidden\",\n        \"Patient resource is NOT marked deleted (still returns 200 on GET)\",\n        \"No AuditEvent with action=D is created for this attempt (or an access-denied event is recorded)\"\n      ],\n      \"trace\": [\n        \"R-HLT-079: error pathway 403 when not admin\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_non_admin_delete_returns_403(\\n    admin_client,\\n    practitioner_client,\\n    create_patient,\\n):\\n    patient_id = create_patient(admin_client)\\n\\n    delete_resp = practitioner_client.delete(f\\\"/Patient/{patient_id}\\\")\\n    assert delete_resp.status_code == 403\\n\\n    get_resp = admin_client.get(f\\\"/Patient/{patient_id}\\\")\\n    assert get_resp.status_code == 200, \\\"Patient must still exist after unauthorized delete\\\"\\n\\n    a"
+  }
+}

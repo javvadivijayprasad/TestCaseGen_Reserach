@@ -1,0 +1,173 @@
+{
+  "req": {
+    "id": "R-HLT-085",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Immunization record (audit)",
+    "statement": "A clinician shall record an Immunization with administered date not in the future. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records immunization"
+    ],
+    "expected_outcomes": [
+      "immunization stored"
+    ],
+    "error_pathways": [
+      "422 when date > today"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Immunization"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-085",
+    "reasoning": "R-HLT-085 mandates three distinct test axes: (1) valid immunization creation by a clinician with a past/present date, (2) rejection of future dates with HTTP 422, and (3) boundary behavior at exactly today's date. An AuditEvent must be emitted and verifiable after every operation, making end-to-end audit coverage mandatory in all cases. Equivalence Partitioning separates the valid-date partition from the invalid-date partition. Boundary Value Analysis targets the today/today+1 edge. A Negative Path test covers the future-date error pathway. A State Transition Coverage test ensures the system transitions from 'no record' to 'record stored + audit emitted' atomically. Decision Table reasoning drives the audit-emission assertion across all paths.",
+    "tests": [
+      {
+        "name": "test_immunization_past_date_creates_record_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_auth_token fixture>",
+          "A valid patient reference exists via <patient_ref fixture>",
+          "The /Immunization endpoint is reachable",
+          "The /AuditEvent endpoint is queryable"
+        ],
+        "actions": [
+          "Build an Immunization payload with occurrenceDateTime set to 30 days in the past",
+          "POST payload to /Immunization with Authorization header",
+          "Capture the Location header and response body",
+          "Query /AuditEvent filtering on the returned Immunization id"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType=Immunization",
+          "Response body occurrenceDateTime matches submitted past date",
+          "At least one AuditEvent exists referencing the new Immunization id",
+          "AuditEvent.action is 'C' (create)"
+        ],
+        "trace": [
+          "R-HLT-085: clinician records immunization",
+          "R-HLT-085: immunization stored",
+          "R-HLT-085: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom datetime import date, timedelta\nimport <helper_fn: post_resource>\nimport <helper_fn: get_audit_events>\n\ndef test_immunization_past_date_creates_record_and_audit(<clinician_auth_token>, <patient_ref>):\n    occurrence = (date.today() - timedelta(days=30)).isoformat()\n    payload = {\n        \"resourceType\": \"Immunization\",\n        \"status\": \"completed\",\n        \"vaccineCode\": {\"text\": \"COVID-19\"},\n        \"patient\": {\"reference\": f\"Patient/{<patient_ref>}\"},\n        \"occurrenceDateTime\": occurrence\n    }\n    resp = post_resource(\"/Immunization\", payload, token=<clinician_auth_token>)\n    assert resp.status_code == 201\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Immunization\"\n    assert body[\"occurrenceDateTime\"] == occurrence\n    imm_id = body[\"id\"]\n    audits = get_audit_events(entity_id=imm_id, token=<clinician_auth_token>)\n    assert len(audits) >= 1\n    assert any(a.get(\"action\") == \"C\" for a in audits)\n"
+      },
+      {
+        "name": "test_immunization_future_date_returns_422_and_audit",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_auth_token fixture>",
+          "A valid patient reference exists via <patient_ref fixture>",
+          "The /Immunization endpoint is reachable",
+          "The /AuditEvent endpoint is queryable"
+        ],
+        "actions": [
+          "Build an Immunization payload with occurrenceDateTime set to tomorrow (today + 1 day)",
+          "POST payload to /Immunization with Authorization header",
+          "Capture the response status and body",
+          "Query /AuditEvent for rejected operation trace"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an OperationOutcome or error message referencing invalid date",
+          "No Immunization resource is persisted (GET /Immunization search returns no new id)",
+          "An AuditEvent is emitted recording the failed attempt with outcome != success"
+        ],
+        "trace": [
+          "R-HLT-085: 422 when date > today",
+          "R-HLT-085: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom datetime import date, timedelta\nimport <helper_fn: post_resource>\nimport <helper_fn: search_resource>\nimport <helper_fn: get_audit_events_by_outcome>\n\ndef test_immunization_future_date_returns_422_and_audit(<clinician_auth_token>, <patient_ref>):\n    future = (date.today() + timedelta(days=1)).isoformat()\n    payload = {\n        \"resourceType\": \"Immunization\",\n        \"status\": \"completed\",\n        \"vaccineCode\": {\"text\": \"Influenza\"},\n        \"patient\": {\"reference\": f\"Patient/{<patient_ref>}\"},\n        \"occurrenceDateTime\": future\n    }\n    resp = post_resource(\"/Immunization\", payload, token=<clinician_auth_token>)\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"resourceType\" in body and body[\"resourceType\"] == \"OperationOutcome\"\n    search = search_resource(\"/Immunization\", params={\"date\": future}, token=<clinician_auth_token>)\n    assert search.json().get(\"total\", 0) == 0\n    failed_audits = get_audit_events_by_outcome(outcome=\"8\", token=<clinician_auth_token>)\n    assert len(failed_audits) >= 1\n"
+      },
+      {
+        "name": "test_immunization_today_boundary_accepted_and_audit",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_auth_token fixture>",
+          "A valid patient reference exists via <patient_ref fixture>",
+          "The /Immunization endpoint is reachable",
+          "The /AuditEvent endpoint is queryable",
+          "System clock is synchronized (deterministic 'today' reference)"
+        ],
+        "actions": [
+          "Compute today's date using date.today().isoformat()",
+          "Build an Immunization payload with occurrenceDateTime exactly equal to today",
+          "POST payload to /Immunization with Authorization header",
+          "Capture the Location header, response body, and resource id",
+          "Query /AuditEvent filtering on the returned Immunization id"
+        ],
+        "expected": [
+          "HTTP 201 Created (today is the inclusive upper boundary of valid dates)",
+          "Response body occurrenceDateTime equals today's date string",
+          "At least one AuditEvent references the new Immunization id",
+          "AuditEvent.action is 'C' and outcome indicates success"
+        ],
+        "trace": [
+          "R-HLT-085: administered date not in the future (boundary: today is valid)",
+          "R-HLT-085: immunization stored",
+          "R-HLT-085: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom datetime import date\nimport <helper_fn: post_resource>\nimport <helper_fn: get_audit_events>\n\ndef test_immunization_today_boundary_accepted_and_audit(<clinician_auth_token>, <patient_ref>):\n    today = date.today().isoformat()\n    payload = {\n        \"resourceType\": \"Immunization\",\n        \"status\": \"completed\",\n        \"vaccineCode\": {\"text\": \"Hepatitis B\"},\n        \"patient\": {\"reference\": f\"Patient/{<patient_ref>}\"},\n        \"occurrenceDateTime\": today\n    }\n    resp = post_resource(\"/Immunization\", payload, token=<clinician_auth_token>)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"occurrenceDateTime\"] == today\n    imm_id = body[\"id\"]\n    audits = get_audit_events(entity_id=imm_id, token=<clinician_auth_token>)\n    assert len(audits) >= 1\n    audit = audits[0]\n    assert audit.get(\"action\") == \"C\"\n    assert audit.get(\"outcome\") in (\"0\", 0)\n"
+      },
+      {
+        "name": "test_immunization_state_transition_none_to_stored_with_audit",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated clinician token is available via <clinician_auth_token fixture>",
+          "A valid patient reference exists via <patient_ref fixture>",
+          "No pre-existing Immunization record exists for the patient on the target date",
+          "The /Immunization and /AuditEvent endpoints are reachable"
+        ],
+        "actions": [
+          "Confirm no Immunization exists for patient on target date (GET /Immunization?patient=<id>&date=<past>)",
+          "POST a new Immunization with a past date (14 days ago)",
+          "Verify system transitioned to 'record stored' state via GET on returned id",
+          "Verify system emitted AuditEvent (state: 'audit present')"
+        ],
+        "expected": [
+          "Pre-state: 0 Immunization records for that patient+date combination",
+          "POST returns HTTP 201",
+          "GET on new id returns HTTP 200 with matching resource",
+          "Post-state: exactly 1 AuditEvent with action='C' referencing the new resource id"
+        ],
+        "trace": [
+          "R-HLT-085: state transition from no record to immunization stored",
+          "R-HLT-085: AuditEvent must be emitted for every operation (end-to-end)"
+        ],
+        "executable": "import pytest\nfrom datetime import date, timedelta\nimport <helper_fn: post_resource>\nimport <helper_fn: get_resource>\nimport <helper_fn: search_resource>\nimport <helper_fn: get_audit_events>\n\ndef test_immunization_state_transition_none_to_stored_with_audit(<clinician_auth_token>, <patient_ref>):\n    target_date = (date.today() - timedelta(days=14)).isoformat()\n    pre = search_resource(\"/Immunization\",\n        params={\"patient\": <patient_ref>, \"date\": target_date},\n        token=<clinician_auth_token>)\n    assert pre.json().get(\"total\", 0) == 0, \"Pre-condition: record must not exist\"\n    payload = {\n        \"resourceType\": \"Immunization\",\n        \"status\": \"completed\",\n        \"vaccineCode\": {\"text\": \"MMR\"},\n        \"patient\": {\"reference\": f\"Patient/{<patient_ref>}\"},\n        \"occurrenceDateTime\": target_date\n    }\n    resp = post_resource(\"/Immunization\", payload, token=<clinician_auth_token>)\n    assert resp.status_code == 201\n    imm_id = resp.json()[\"id\"]\n    get_resp = get_resource(f\"/Immunization/{imm_id}\", token=<clinician_auth_token>)\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"id\"] == imm_id\n    audits = get_audit_events(entity_id=imm_id, token=<clinician_auth_token>)\n    assert len(audits) == 1\n    assert audits[0][\"action\"] == \"C\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-085",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 995,
+    "output_tokens": 3235,
+    "latency_ms": 41200,
+    "wall_ms": 41200,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-085\",\n  \"reasoning\": \"R-HLT-085 mandates three distinct test axes: (1) valid immunization creation by a clinician with a past/present date, (2) rejection of future dates with HTTP 422, and (3) boundary behavior at exactly today's date. An AuditEvent must be emitted and verifiable after every operation, making end-to-end audit coverage mandatory in all cases. Equivalence Partitioning separates the valid-date partition from the invalid-date partition. Boundary Value Analysis targets the today/today+1 edge. A Negative Path test covers the future-date error pathway. A State Transition Coverage test ensures the system transitions from 'no record' to 'record stored + audit emitted' atomically. Decision Table reasoning drives the audit-emission assertion across all paths.\",\n  \"tests\": [\n    {\n      \"name\": \"test_immunization_past_date_creates_record_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token is available via <clinician_auth_token fixture>\",\n        \"A valid patient reference exists via <patient_ref fixture>\",\n        \"The /Immunization endpoint is reachable\",\n        \"The /AuditEvent endpoint is queryable\"\n      ],\n      \"actions\": [\n        \"Build an Immunization payload with occurrenceDateTime set to 30 days in the past\",\n        \"POST payload to /Immunization with Authorization header\",\n        \"Capture the Location header and response body\",\n        \"Query /AuditEvent filtering on the returned Immunization id\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType=Immunization\",\n        \"Response body occurrenceDateTime matches submitted past date\",\n        \"At least one AuditEvent exists referencing the new Immunization id\",\n        \"AuditEvent.action is 'C' (create)\"\n      ],\n      \"trace\": [\n        \"R-HLT-085: clinician records immunization\",\n        \"R-HLT-085: immunization stored\",\n        \"R-HLT-085: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import date, timedelta\\nimport <helper_fn: post_resource>\\nimport <helper_fn: get_audit_events>\\n\\ndef test_immunization_past_date_creates_record_and_audit(<clinician_auth_token>, <patient_ref>):\\n    occurrence = (date.today() - timedelta(days=30)).isoformat()\\n    payload = {\\n        \\\"resourceType\\\": \\\"Immunization\\\",\\n        \\\"status\\\": \\\"completed\\\",\\n        \\\"vaccineCode\\\": {\\\"text\\\": \\\"COVID-19\\\"},\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{<patient_ref>}\\\"},\\n        \\\"occurrenceDateTime\\\": occurrence\\n    }\\n    resp = post_resource(\\\"/Immunization\\\", payload, token=<clinician_auth_token>)\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Immunization\\\"\\n    assert body[\\\"occurrenceDateTime\\\"] == occurrence\\n    imm_id = body[\\\"id\\\"]\\n    audits = get_audit_events(entity_id=imm_id, token=<clinician_auth_token>)\\n    assert len(audits) >= 1\\n    assert any(a.get(\\\"action\\\") == \\\"C\\\" for a in audits)\\n\"\n    },\n    {\n      \"name\": \"test_immunization_future_date_returns_422_and_audit\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token is available via <clinician_auth_token fixture>\",\n        \"A valid patient reference exists via <patient_ref fixture>\",\n        \"The /Immunization endpoint is reachable\",\n        \"The /AuditEvent endpoint is queryable\"\n      ],\n      \"actions\": [\n        \"Build an Immunization payload with occurrenceDateTime set to tomorrow (today + 1 day)\",\n        \"POST payload to /Immunization with Authorization header\",\n        \"Capture the response status and body\",\n        \"Query /AuditEvent for rejected operation trace\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an OperationOutcome or error message referencing invalid date\",\n        \"No Immunization "
+  }
+}

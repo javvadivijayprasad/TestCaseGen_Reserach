@@ -1,0 +1,171 @@
+{
+  "req": {
+    "id": "R-FIN-035",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Card freeze / unfreeze (boundary variant)",
+    "statement": "A customer shall freeze or unfreeze their card instantly; frozen cards must reject all authorization attempts. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "card belongs to caller"
+    ],
+    "triggers": [
+      "customer toggles freeze"
+    ],
+    "expected_outcomes": [
+      "card state updated",
+      "authorization network notified"
+    ],
+    "error_pathways": [
+      "404 when card does not exist"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cards/{id}/freeze"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-035",
+    "reasoning": "R-FIN-035 mandates instant card freeze/unfreeze with authorization rejection on frozen cards, boundary behaviour at min/max thresholds, 404 on missing card, and authorization network notification. I derived five tests: (1) EP-positive: freeze an active card and confirm state + network notification; (2) STC-positive: full freeze\u2192unfreeze round-trip confirming state machine; (3) NEG-negative: 404 on non-existent card ID; (4) DT-negative: frozen card rejects an authorization attempt; (5) BVA-boundary: freeze/unfreeze at the exact maximum card-ID boundary value. Each test resets state via the unfreeze endpoint or uses a dedicated fixture to remain idempotent.",
+    "tests": [
+      {
+        "name": "test_freeze_active_card_returns_200_and_notifies_network",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_token_fixture>",
+          "Card <ACTIVE_CARD_ID> exists, belongs to caller, and is currently unfrozen"
+        ],
+        "actions": [
+          "POST /cards/{ACTIVE_CARD_ID}/freeze with body {\"action\": \"freeze\"}",
+          "Capture HTTP response status and body",
+          "Query authorization network stub for notification event"
+        ],
+        "expected": [
+          "HTTP 200 with body containing {\"status\": \"frozen\"}",
+          "Authorization network stub received exactly one FREEZE event for the card"
+        ],
+        "trace": [
+          "R-FIN-035: card state updated",
+          "R-FIN-035: authorization network notified"
+        ],
+        "executable": "import pytest\n\ndef test_freeze_active_card_returns_200_and_notifies_network(\n    api_client,          # <fixture>\n    active_card_id,      # <fixture> yields unfrozen card ID, teardown unfreezes\n    auth_network_stub,   # <fixture> captures outbound network calls\n):\n    resp = api_client.post(\n        f\"/cards/{active_card_id}/freeze\",\n        json={\"action\": \"freeze\"},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"status\"] == \"frozen\"\n\n    events = auth_network_stub.get_events(card_id=active_card_id, event_type=\"FREEZE\")\n    assert len(events) == 1"
+      },
+      {
+        "name": "test_freeze_then_unfreeze_card_state_transition",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_token_fixture>",
+          "Card <ACTIVE_CARD_ID> exists, belongs to caller, and is currently unfrozen"
+        ],
+        "actions": [
+          "POST /cards/{ACTIVE_CARD_ID}/freeze with {\"action\": \"freeze\"}",
+          "Assert card is frozen",
+          "POST /cards/{ACTIVE_CARD_ID}/freeze with {\"action\": \"unfreeze\"}",
+          "Assert card is active again"
+        ],
+        "expected": [
+          "First call returns 200 with status=frozen",
+          "Second call returns 200 with status=active",
+          "State machine transitions: active \u2192 frozen \u2192 active"
+        ],
+        "trace": [
+          "R-FIN-035: customer toggles freeze",
+          "R-FIN-035: card state updated (both directions)"
+        ],
+        "executable": "def test_freeze_then_unfreeze_card_state_transition(\n    api_client,\n    active_card_id,   # <fixture>\n):\n    freeze_resp = api_client.post(\n        f\"/cards/{active_card_id}/freeze\",\n        json={\"action\": \"freeze\"},\n    )\n    assert freeze_resp.status_code == 200\n    assert freeze_resp.json()[\"status\"] == \"frozen\"\n\n    unfreeze_resp = api_client.post(\n        f\"/cards/{active_card_id}/freeze\",\n        json={\"action\": \"unfreeze\"},\n    )\n    assert unfreeze_resp.status_code == 200\n    assert unfreeze_resp.json()[\"status\"] == \"active\""
+      },
+      {
+        "name": "test_freeze_nonexistent_card_returns_404",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_token_fixture>",
+          "Card ID <NONEXISTENT_CARD_ID> does not exist in the system"
+        ],
+        "actions": [
+          "POST /cards/{NONEXISTENT_CARD_ID}/freeze with body {\"action\": \"freeze\"}"
+        ],
+        "expected": [
+          "HTTP 404 response",
+          "Response body contains error code or message indicating card not found"
+        ],
+        "trace": [
+          "R-FIN-035: error pathway \u2014 404 when card does not exist"
+        ],
+        "executable": "NONEXISTENT_CARD_ID = \"00000000-0000-0000-0000-000000000000\"\n\ndef test_freeze_nonexistent_card_returns_404(api_client):\n    resp = api_client.post(\n        f\"/cards/{NONEXISTENT_CARD_ID}/freeze\",\n        json={\"action\": \"freeze\"},\n    )\n    assert resp.status_code == 404\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body"
+      },
+      {
+        "name": "test_frozen_card_rejects_authorization_attempt",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_token_fixture>",
+          "Card <ACTIVE_CARD_ID> exists and is currently frozen via setup step"
+        ],
+        "actions": [
+          "POST /cards/{ACTIVE_CARD_ID}/freeze to ensure card is frozen",
+          "POST /authorizations with payload referencing the frozen card",
+          "Capture authorization response"
+        ],
+        "expected": [
+          "Authorization endpoint returns HTTP 402 or 403 indicating card is frozen",
+          "Response body contains decline reason referencing frozen status"
+        ],
+        "trace": [
+          "R-FIN-035: frozen cards must reject all authorization attempts"
+        ],
+        "executable": "def test_frozen_card_rejects_authorization_attempt(\n    api_client,\n    active_card_id,   # <fixture> teardown unfreezes card\n):\n    freeze_resp = api_client.post(\n        f\"/cards/{active_card_id}/freeze\",\n        json={\"action\": \"freeze\"},\n    )\n    assert freeze_resp.status_code == 200\n\n    auth_resp = api_client.post(\n        \"/authorizations\",\n        json={\"card_id\": active_card_id, \"amount\": 100, \"currency\": \"USD\"},\n    )\n    assert auth_resp.status_code in (402, 403)\n    body = auth_resp.json()\n    decline_reason = body.get(\"decline_reason\", \"\").lower()\n    assert \"frozen\" in decline_reason or \"card_frozen\" in body.get(\"code\", \"\")"
+      },
+      {
+        "name": "test_freeze_at_max_card_id_boundary_value",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated customer token is available via <auth_token_fixture>",
+          "A card provisioned with the maximum allowed numeric card ID exists and is unfrozen",
+          "MAX_CARD_ID is defined as the largest valid identifier accepted by the system schema"
+        ],
+        "actions": [
+          "POST /cards/{MAX_CARD_ID}/freeze with body {\"action\": \"freeze\"}",
+          "Assert response",
+          "POST /cards/{MAX_CARD_ID}/freeze with body {\"action\": \"unfreeze\"} to restore state"
+        ],
+        "expected": [
+          "HTTP 200 with status=frozen for the max boundary card ID",
+          "Subsequent unfreeze returns HTTP 200 with status=active",
+          "No overflow or unexpected error at the boundary value"
+        ],
+        "trace": [
+          "R-FIN-035: boundary behaviour at exact max threshold must be tested"
+        ],
+        "executable": "MAX_CARD_ID = <MAX_CARD_ID_CONSTANT>  # <helper_fn> returns system max card ID\n\ndef test_freeze_at_max_card_id_boundary_value(\n    api_client,\n    max_boundary_card,   # <fixture> provisions card at MAX_CARD_ID, teardown unfreezes\n):\n    freeze_resp = api_client.post(\n        f\"/cards/{MAX_CARD_ID}/freeze\",\n        json={\"action\": \"freeze\"},\n    )\n    assert freeze_resp.status_code == 200\n    assert freeze_resp.json()[\"status\"] == \"frozen\"\n\n    unfreeze_resp = api_client.post(\n        f\"/cards/{MAX_CARD_ID}/freeze\",\n        json={\"action\": \"unfreeze\"},\n    )\n    assert unfreeze_resp.status_code == 200\n    assert unfreeze_resp.json()[\"status\"] == \"active\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-035",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1001,
+    "output_tokens": 2512,
+    "latency_ms": 31350,
+    "wall_ms": 31351,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-035\",\n  \"reasoning\": \"R-FIN-035 mandates instant card freeze/unfreeze with authorization rejection on frozen cards, boundary behaviour at min/max thresholds, 404 on missing card, and authorization network notification. I derived five tests: (1) EP-positive: freeze an active card and confirm state + network notification; (2) STC-positive: full freeze\u2192unfreeze round-trip confirming state machine; (3) NEG-negative: 404 on non-existent card ID; (4) DT-negative: frozen card rejects an authorization attempt; (5) BVA-boundary: freeze/unfreeze at the exact maximum card-ID boundary value. Each test resets state via the unfreeze endpoint or uses a dedicated fixture to remain idempotent.\",\n  \"tests\": [\n    {\n      \"name\": \"test_freeze_active_card_returns_200_and_notifies_network\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated customer token is available via <auth_token_fixture>\",\n        \"Card <ACTIVE_CARD_ID> exists, belongs to caller, and is currently unfrozen\"\n      ],\n      \"actions\": [\n        \"POST /cards/{ACTIVE_CARD_ID}/freeze with body {\\\"action\\\": \\\"freeze\\\"}\",\n        \"Capture HTTP response status and body\",\n        \"Query authorization network stub for notification event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with body containing {\\\"status\\\": \\\"frozen\\\"}\",\n        \"Authorization network stub received exactly one FREEZE event for the card\"\n      ],\n      \"trace\": [\n        \"R-FIN-035: card state updated\",\n        \"R-FIN-035: authorization network notified\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_freeze_active_card_returns_200_and_notifies_network(\\n    api_client,          # <fixture>\\n    active_card_id,      # <fixture> yields unfrozen card ID, teardown unfreezes\\n    auth_network_stub,   # <fixture> captures outbound network calls\\n):\\n    resp = api_client.post(\\n        f\\\"/cards/{active_card_id}/freeze\\\",\\n        json={\\\"action\\\": \\\"freeze\\\"},\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"frozen\\\"\\n\\n    events = auth_network_stub.get_events(card_id=active_card_id, event_type=\\\"FREEZE\\\")\\n    assert len(events) == 1\"\n    },\n    {\n      \"name\": \"test_freeze_then_unfreeze_card_state_transition\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Authenticated customer token is available via <auth_token_fixture>\",\n        \"Card <ACTIVE_CARD_ID> exists, belongs to caller, and is currently unfrozen\"\n      ],\n      \"actions\": [\n        \"POST /cards/{ACTIVE_CARD_ID}/freeze with {\\\"action\\\": \\\"freeze\\\"}\",\n        \"Assert card is frozen\",\n        \"POST /cards/{ACTIVE_CARD_ID}/freeze with {\\\"action\\\": \\\"unfreeze\\\"}\",\n        \"Assert card is active again\"\n      ],\n      \"expected\": [\n        \"First call returns 200 with status=frozen\",\n        \"Second call returns 200 with status=active\",\n        \"State machine transitions: active \u2192 frozen \u2192 active\"\n      ],\n      \"trace\": [\n        \"R-FIN-035: customer toggles freeze\",\n        \"R-FIN-035: card state updated (both directions)\"\n      ],\n      \"executable\": \"def test_freeze_then_unfreeze_card_state_transition(\\n    api_client,\\n    active_card_id,   # <fixture>\\n):\\n    freeze_resp = api_client.post(\\n        f\\\"/cards/{active_card_id}/freeze\\\",\\n        json={\\\"action\\\": \\\"freeze\\\"},\\n    )\\n    assert freeze_resp.status_code == 200\\n    assert freeze_resp.json()[\\\"status\\\"] == \\\"frozen\\\"\\n\\n    unfreeze_resp = api_client.post(\\n        f\\\"/cards/{active_card_id}/freeze\\\",\\n        json={\\\"action\\\": \\\"unfreeze\\\"},\\n    )\\n    assert unfreeze_resp.status_code == 200\\n    assert unfreeze_resp.json()[\\\"status\\\"] == \\\"active\\\"\"\n    },\n    {\n      \"name\": \"test_freeze_nonexistent_card_returns_404\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated customer token is available via <auth_token_fixture>\",\n        \"Card ID <NONEXISTENT_CARD_"
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "req": {
+    "id": "R-WEB-069",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Submit timesheet \u2014 variant 3",
+    "statement": "An employee shall submit a weekly timesheet where each day has hours between 0 and 24 and total week hours are between 0 and 80. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "authenticated"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "employee submits weekly timesheet"
+    ],
+    "expected_outcomes": [
+      "timesheet state=submitted",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "422 when per-day hours outside 0-24",
+      "422 when weekly total outside 0-80"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/timesheets/submit"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-069",
+    "reasoning": "The requirement defines a weekly timesheet submission with per-day hours in [0,24] and weekly total in [0,80], plus a mandatory webhook emission. I identified four partitions: (1) valid mid-range hours, (2) per-day hours outside [0,24], (3) weekly total outside [0,80], and (4) exact boundary values (0, 24, 80). State transition: draft -> submitted. DT covers the combined per-day AND weekly-total guard. I also verify the webhook event fires on success. Tests are self-contained via fixtures and helpers declared as placeholders.",
+    "tests": [
+      {
+        "name": "test_submit_timesheet_valid_midrange_emits_webhook",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Employee is authenticated",
+          "A draft timesheet exists for the current week",
+          "Webhook listener is configured and reachable"
+        ],
+        "actions": [
+          "Build payload with 7 days each having 8 hours (total=56)",
+          "POST to /timesheets/submit with valid auth token",
+          "Capture HTTP response",
+          "Poll webhook listener for emitted event"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains state=submitted",
+          "Webhook listener receives exactly one event with type=timesheet.submitted"
+        ],
+        "trace": [
+          "R-WEB-069: valid per-day hours 0-24 partition",
+          "R-WEB-069: valid weekly total 0-80 partition",
+          "R-WEB-069: webhook event emission on successful submit"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_valid_midrange_emits_webhook(\n    auth_token, api_client, webhook_listener, draft_timesheet\n):\n    payload = {\n        \"timesheet_id\": draft_timesheet[\"id\"],\n        \"days\": [\n            {\"day\": d, \"hours\": 8}\n            for d in [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\n        ],\n    }\n    resp = api_client.post(\n        \"/timesheets/submit\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert resp.status_code in (200, 201), resp.text\n    body = resp.json()\n    assert body[\"state\"] == \"submitted\"\n    event = webhook_listener.wait_for_event(\n        event_type=\"timesheet.submitted\", timeout=5\n    )\n    assert event is not None\n    assert event[\"timesheet_id\"] == draft_timesheet[\"id\"]\n"
+      },
+      {
+        "name": "test_submit_timesheet_per_day_hours_exceeds_24_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Employee is authenticated",
+          "A draft timesheet exists for the current week"
+        ],
+        "actions": [
+          "Build payload where Monday has 25 hours (outside [0,24])",
+          "POST to /timesheets/submit with valid auth token",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity response",
+          "Response body references per-day hours validation error",
+          "Timesheet state remains draft (not submitted)"
+        ],
+        "trace": [
+          "R-WEB-069: error pathway \u2014 per-day hours outside 0-24 yields 422",
+          "R-WEB-069: negative partition for day hours > 24"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_per_day_hours_exceeds_24_returns_422(\n    auth_token, api_client, draft_timesheet\n):\n    days = [{\"day\": d, \"hours\": 8} for d in [\"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]]\n    days.insert(0, {\"day\": \"mon\", \"hours\": 25})\n    payload = {\"timesheet_id\": draft_timesheet[\"id\"], \"days\": days}\n    resp = api_client.post(\n        \"/timesheets/submit\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert resp.status_code == 422, resp.text\n    error_body = resp.json()\n    assert \"hours\" in str(error_body).lower() or \"day\" in str(error_body).lower()\n    state_resp = api_client.get(\n        f\"/timesheets/{draft_timesheet['id']}\",\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert state_resp.json()[\"state\"] == \"draft\"\n"
+      },
+      {
+        "name": "test_submit_timesheet_weekly_total_exceeds_80_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Employee is authenticated",
+          "A draft timesheet exists for the current week"
+        ],
+        "actions": [
+          "Build payload where each day has valid hours but total=84 (>80)",
+          "POST to /timesheets/submit with valid auth token",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity response",
+          "Response body references weekly total validation error",
+          "Timesheet state remains draft"
+        ],
+        "trace": [
+          "R-WEB-069: error pathway \u2014 weekly total outside 0-80 yields 422",
+          "R-WEB-069: DT row: per-day valid AND weekly total invalid => 422"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_weekly_total_exceeds_80_returns_422(\n    auth_token, api_client, draft_timesheet\n):\n    # 7 days * 12 = 84 hours; each day <= 24 so per-day rule passes\n    payload = {\n        \"timesheet_id\": draft_timesheet[\"id\"],\n        \"days\": [\n            {\"day\": d, \"hours\": 12}\n            for d in [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\n        ],\n    }\n    resp = api_client.post(\n        \"/timesheets/submit\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert resp.status_code == 422, resp.text\n    error_body = resp.json()\n    assert \"total\" in str(error_body).lower() or \"weekly\" in str(error_body).lower()\n    state_resp = api_client.get(\n        f\"/timesheets/{draft_timesheet['id']}\",\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert state_resp.json()[\"state\"] == \"draft\"\n"
+      },
+      {
+        "name": "test_submit_timesheet_boundary_max_day_and_max_week",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Employee is authenticated",
+          "A draft timesheet exists for the current week"
+        ],
+        "actions": [
+          "Build payload: Mon-Thu = 20 hours each (total=80), all remaining days = 0",
+          "POST to /timesheets/submit with valid auth token",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains state=submitted",
+          "No validation error for boundary-exact values"
+        ],
+        "trace": [
+          "R-WEB-069: BVA upper boundary \u2014 weekly total exactly 80",
+          "R-WEB-069: BVA valid per-day boundary \u2014 day hours exactly 20 (within [0,24])"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_boundary_max_day_and_max_week(\n    auth_token, api_client, draft_timesheet\n):\n    # Mon-Thu: 20h each = 80h total; Fri-Sun: 0h; all per-day <= 24\n    hours_map = {\"mon\": 20, \"tue\": 20, \"wed\": 20, \"thu\": 20, \"fri\": 0, \"sat\": 0, \"sun\": 0}\n    payload = {\n        \"timesheet_id\": draft_timesheet[\"id\"],\n        \"days\": [{\"day\": d, \"hours\": h} for d, h in hours_map.items()],\n    }\n    resp = api_client.post(\n        \"/timesheets/submit\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert resp.status_code in (200, 201), resp.text\n    assert resp.json()[\"state\"] == \"submitted\"\n"
+      },
+      {
+        "name": "test_submit_timesheet_boundary_zero_hours_all_days",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Employee is authenticated",
+          "A draft timesheet exists for the current week"
+        ],
+        "actions": [
+          "Build payload where all 7 days have 0 hours (lower boundary, total=0)",
+          "POST to /timesheets/submit with valid auth token",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 or 201 response",
+          "Response body contains state=submitted",
+          "Zero-hour timesheet is accepted at lower boundary"
+        ],
+        "trace": [
+          "R-WEB-069: BVA lower boundary \u2014 per-day hours exactly 0",
+          "R-WEB-069: BVA lower boundary \u2014 weekly total exactly 0"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_boundary_zero_hours_all_days(\n    auth_token, api_client, draft_timesheet\n):\n    payload = {\n        \"timesheet_id\": draft_timesheet[\"id\"],\n        \"days\": [\n            {\"day\": d, \"hours\": 0}\n            for d in [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\n        ],\n    }\n    resp = api_client.post(\n        \"/timesheets/submit\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert resp.status_code in (200, 201), resp.text\n    assert resp.json()[\"state\"] == \"submitted\"\n"
+      },
+      {
+        "name": "test_submit_timesheet_state_transition_draft_to_submitted",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Employee is authenticated",
+          "A timesheet exists in state=draft for the current week"
+        ],
+        "actions": [
+          "Verify timesheet is in draft state via GET /timesheets/{id}",
+          "POST valid payload to /timesheets/submit",
+          "Re-fetch timesheet state via GET /timesheets/{id}"
+        ],
+        "expected": [
+          "Initial state is draft",
+          "Submit returns HTTP 200 or 201",
+          "Final state is submitted (draft -> submitted transition)"
+        ],
+        "trace": [
+          "R-WEB-069: STC \u2014 timesheet transitions from draft to submitted on valid submit",
+          "R-WEB-069: expected outcome \u2014 timesheet state=submitted"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_state_transition_draft_to_submitted(\n    auth_token, api_client, draft_timesheet\n):\n    headers = {\"Authorization\": f\"Bearer {auth_token}\"}\n    pre = api_client.get(f\"/timesheets/{draft_timesheet['id']}\", headers=headers)\n    assert pre.json()[\"state\"] == \"draft\"\n    payload = {\n        \"timesheet_id\": draft_timesheet[\"id\"],\n        \"days\": [\n            {\"day\": d, \"hours\": 7}\n            for d in [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\", \"sat\", \"sun\"]\n        ],\n    }\n    submit = api_client.post(\"/timesheets/submit\", json=payload, headers=headers)\n    assert submit.status_code in (200, 201), submit.text\n    post = api_client.get(f\"/timesheets/{draft_timesheet['id']}\", headers=headers)\n    assert post.json()[\"state\"] == \"submitted\"\n"
+      },
+      {
+        "name": "test_submit_timesheet_negative_hours_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Employee is authenticated",
+          "A draft timesheet exists for the current week"
+        ],
+        "actions": [
+          "Build payload where Wednesday has -1 hours (below lower boundary 0)",
+          "POST to /timesheets/submit with valid auth token",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity response",
+          "Response body references per-day hours validation error",
+          "Timesheet state remains draft"
+        ],
+        "trace": [
+          "R-WEB-069: error pathway \u2014 per-day hours outside 0-24 (below 0) yields 422",
+          "R-WEB-069: NEG partition for day hours < 0"
+        ],
+        "executable": "import pytest\n\ndef test_submit_timesheet_negative_hours_returns_422(\n    auth_token, api_client, draft_timesheet\n):\n    days = [{\"day\": d, \"hours\": 8} for d in [\"mon\", \"tue\", \"thu\", \"fri\", \"sat\", \"sun\"]]\n    days.insert(2, {\"day\": \"wed\", \"hours\": -1})\n    payload = {\"timesheet_id\": draft_timesheet[\"id\"], \"days\": days}\n    resp = api_client.post(\n        \"/timesheets/submit\",\n        json=payload,\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert resp.status_code == 422, resp.text\n    error_body = resp.json()\n    assert \"hours\" in str(error_body).lower() or \"day\" in str(error_body).lower()\n    state_resp = api_client.get(\n        f\"/timesheets/{draft_timesheet['id']}\",\n        headers={\"Authorization\": f\"Bearer {auth_token}\"},\n    )\n    assert state_resp.json()[\"state\"] == \"draft\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-069",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1030,
+    "output_tokens": 4016,
+    "latency_ms": 37514,
+    "wall_ms": 37514,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-069\",\n  \"reasoning\": \"The requirement defines a weekly timesheet submission with per-day hours in [0,24] and weekly total in [0,80], plus a mandatory webhook emission. I identified four partitions: (1) valid mid-range hours, (2) per-day hours outside [0,24], (3) weekly total outside [0,80], and (4) exact boundary values (0, 24, 80). State transition: draft -> submitted. DT covers the combined per-day AND weekly-total guard. I also verify the webhook event fires on success. Tests are self-contained via fixtures and helpers declared as placeholders.\",\n  \"tests\": [\n    {\n      \"name\": \"test_submit_timesheet_valid_midrange_emits_webhook\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Employee is authenticated\",\n        \"A draft timesheet exists for the current week\",\n        \"Webhook listener is configured and reachable\"\n      ],\n      \"actions\": [\n        \"Build payload with 7 days each having 8 hours (total=56)\",\n        \"POST to /timesheets/submit with valid auth token\",\n        \"Capture HTTP response\",\n        \"Poll webhook listener for emitted event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 response\",\n        \"Response body contains state=submitted\",\n        \"Webhook listener receives exactly one event with type=timesheet.submitted\"\n      ],\n      \"trace\": [\n        \"R-WEB-069: valid per-day hours 0-24 partition\",\n        \"R-WEB-069: valid weekly total 0-80 partition\",\n        \"R-WEB-069: webhook event emission on successful submit\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_submit_timesheet_valid_midrange_emits_webhook(\\n    auth_token, api_client, webhook_listener, draft_timesheet\\n):\\n    payload = {\\n        \\\"timesheet_id\\\": draft_timesheet[\\\"id\\\"],\\n        \\\"days\\\": [\\n            {\\\"day\\\": d, \\\"hours\\\": 8}\\n            for d in [\\\"mon\\\", \\\"tue\\\", \\\"wed\\\", \\\"thu\\\", \\\"fri\\\", \\\"sat\\\", \\\"sun\\\"]\\n        ],\\n    }\\n    resp = api_client.post(\\n        \\\"/timesheets/submit\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"},\\n    )\\n    assert resp.status_code in (200, 201), resp.text\\n    body = resp.json()\\n    assert body[\\\"state\\\"] == \\\"submitted\\\"\\n    event = webhook_listener.wait_for_event(\\n        event_type=\\\"timesheet.submitted\\\", timeout=5\\n    )\\n    assert event is not None\\n    assert event[\\\"timesheet_id\\\"] == draft_timesheet[\\\"id\\\"]\\n\"\n    },\n    {\n      \"name\": \"test_submit_timesheet_per_day_hours_exceeds_24_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Employee is authenticated\",\n        \"A draft timesheet exists for the current week\"\n      ],\n      \"actions\": [\n        \"Build payload where Monday has 25 hours (outside [0,24])\",\n        \"POST to /timesheets/submit with valid auth token\",\n        \"Capture HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity response\",\n        \"Response body references per-day hours validation error\",\n        \"Timesheet state remains draft (not submitted)\"\n      ],\n      \"trace\": [\n        \"R-WEB-069: error pathway \u2014 per-day hours outside 0-24 yields 422\",\n        \"R-WEB-069: negative partition for day hours > 24\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_submit_timesheet_per_day_hours_exceeds_24_returns_422(\\n    auth_token, api_client, draft_timesheet\\n):\\n    days = [{\\\"day\\\": d, \\\"hours\\\": 8} for d in [\\\"tue\\\", \\\"wed\\\", \\\"thu\\\", \\\"fri\\\", \\\"sat\\\", \\\"sun\\\"]]\\n    days.insert(0, {\\\"day\\\": \\\"mon\\\", \\\"hours\\\": 25})\\n    payload = {\\\"timesheet_id\\\": draft_timesheet[\\\"id\\\"], \\\"days\\\": days}\\n    resp = api_client.post(\\n        \\\"/timesheets/submit\\\",\\n        json=payload,\\n        headers={\\\"Authorization\\\": f\\\"Bearer {auth_token}\\\"},\\n    )\\n    assert resp.status_code == 422, resp.text\\n    error_body = resp.json()\\n    assert \\\"hours\\\" in str(error_body).lower() or \\\"day\\\" in str(error_body).lower()\\n    state_resp = api_client.get(\\n     "
+  }
+}

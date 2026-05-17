@@ -1,0 +1,189 @@
+{
+  "req": {
+    "id": "R-FIN-023",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-023",
+    "reasoning": "R-FIN-023 mandates a 24-hour hold before biller activation and defers withdrawals to new billers. The test suite validates: (1) successful biller registration enters HOLD state via positive path, (2) duplicate biller registration returns 409 via negative path, (3) biller registration at exactly 24-hour boundary transitions to ACTIVE via boundary analysis, and (4) state transitions from HOLD\u2192ACTIVE via STC. Tests are deterministic by mocking time, idempotent via unique biller identifiers, and traceable to the requirement statement.",
+    "tests": [
+      {
+        "name": "test_biller_registration_success_enters_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated with valid JWT token",
+          "User account exists and is active",
+          "Biller does not already exist in system"
+        ],
+        "actions": [
+          "POST /billers with valid biller details (name, routing_number, account_number)",
+          "Verify response status code"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response contains biller_id",
+          "Response biller_status field equals 'HOLD'",
+          "Response hold_until field is 24 hours from current timestamp",
+          "Biller record persists in database with status HOLD"
+        ],
+        "trace": [
+          "R-FIN-023: biller shall be registered",
+          "R-FIN-023: biller enters hold state"
+        ],
+        "executable": "def test_biller_registration_success_enters_hold_state():\n    headers = {\"Authorization\": f\"Bearer {<valid_jwt_token>}\"}\n    payload = {\n        \"biller_name\": \"Test Utility Co\",\n        \"routing_number\": \"021000021\",\n        \"account_number\": \"123456789\"\n    }\n    resp = <requests_post>(\"http://localhost/billers\", json=payload, headers=headers)\n    assert resp.status_code == 201\n    data = resp.json()\n    assert \"biller_id\" in data\n    assert data[\"biller_status\"] == \"HOLD\"\n    assert \"hold_until\" in data\n    assert <extract_hours_from_timestamp>(data[\"hold_until\"]) == 24"
+      },
+      {
+        "name": "test_duplicate_biller_registration_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated with valid JWT token",
+          "User account exists and is active",
+          "Biller with identical routing_number and account_number already registered"
+        ],
+        "actions": [
+          "POST /billers with biller details matching existing biller",
+          "Verify response status and error details"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response contains error_code field",
+          "error_code equals 'BILLER_DUPLICATE'",
+          "Response contains error_message field with human-readable message",
+          "No new biller record created"
+        ],
+        "trace": [
+          "R-FIN-023: error pathway - 409 if duplicate biller",
+          "R-FIN-023: duplicate prevention enforced"
+        ],
+        "executable": "def test_duplicate_biller_registration_returns_409():\n    headers = {\"Authorization\": f\"Bearer {<valid_jwt_token>}\"}\n    payload = {\n        \"biller_name\": \"Existing Utility\",\n        \"routing_number\": \"021000021\",\n        \"account_number\": \"111111111\"\n    }\n    <requests_post>(\"http://localhost/billers\", json=payload, headers=headers)\n    resp = <requests_post>(\"http://localhost/billers\", json=payload, headers=headers)\n    assert resp.status_code == 409\n    data = resp.json()\n    assert data[\"error_code\"] == \"BILLER_DUPLICATE\"\n    assert \"error_message\" in data"
+      },
+      {
+        "name": "test_biller_hold_period_boundary_24_hours",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated with valid JWT token",
+          "User account exists and is active",
+          "System clock is mocked to controllable state",
+          "Biller registered 24 hours ago enters HOLD state"
+        ],
+        "actions": [
+          "Register biller at time T0, confirm status HOLD",
+          "Advance mock time by exactly 24 hours to T0+24h",
+          "Verify biller eligibility for withdrawal transitions to ACTIVE"
+        ],
+        "expected": [
+          "At T0: biller_status equals 'HOLD'",
+          "At T0+24h: biller_status transitions to 'ACTIVE'",
+          "At T0+24h-1s: biller_status remains 'HOLD'",
+          "Withdrawals to biller are allowed at T0+24h and onward"
+        ],
+        "trace": [
+          "R-FIN-023: 24-hour hold period boundary condition",
+          "R-FIN-023: state transition HOLD\u2192ACTIVE after hold expires",
+          "R-FIN-023: withdrawals deferred until hold expires"
+        ],
+        "executable": "def test_biller_hold_period_boundary_24_hours():\n    headers = {\"Authorization\": f\"Bearer {<valid_jwt_token>}\"}\n    with <freeze_time>(\"2024-01-01 12:00:00\"):\n        payload = {\n            \"biller_name\": \"Time Test Biller\",\n            \"routing_number\": \"021000021\",\n            \"account_number\": \"999999999\"\n        }\n        resp = <requests_post>(\"http://localhost/billers\", json=payload, headers=headers)\n        biller_id = resp.json()[\"biller_id\"]\n        assert resp.json()[\"biller_status\"] == \"HOLD\"\n    with <freeze_time>(\"2024-01-02 12:00:00\"):\n        resp = <requests_get>(f\"http://localhost/billers/{biller_id}\", headers=headers)\n        assert resp.json()[\"biller_status\"] == \"ACTIVE\""
+      },
+      {
+        "name": "test_withdrawal_to_hold_biller_deferred",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with valid JWT token",
+          "Biller registered and in HOLD state",
+          "User account has sufficient funds",
+          "Current time is within 24-hour hold period"
+        ],
+        "actions": [
+          "POST /withdrawals with target_biller pointing to HOLD biller",
+          "Verify response indicates deferral"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response error_code equals 'BILLER_ON_HOLD'",
+          "Response includes hold_until timestamp",
+          "Withdrawal is not created or queued for immediate processing",
+          "Withdrawal request is rejected (not deferred silently)"
+        ],
+        "trace": [
+          "R-FIN-023: withdrawals to new billers shall be deferred",
+          "R-FIN-023: hold state prevents withdrawal processing"
+        ],
+        "executable": "def test_withdrawal_to_hold_biller_deferred():\n    headers = {\"Authorization\": f\"Bearer {<valid_jwt_token>}\"}\n    biller_resp = <requests_post>(\"http://localhost/billers\",\n        json={\"biller_name\": \"Hold Test\", \"routing_number\": \"021000021\",\n        \"account_number\": \"555555555\"}, headers=headers)\n    biller_id = biller_resp.json()[\"biller_id\"]\n    withdraw_resp = <requests_post>(\"http://localhost/withdrawals\",\n        json={\"amount\": 100.00, \"biller_id\": biller_id}, headers=headers)\n    assert withdraw_resp.status_code == 422\n    assert withdraw_resp.json()[\"error_code\"] == \"BILLER_ON_HOLD\""
+      },
+      {
+        "name": "test_biller_state_transition_hold_to_active",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated with valid JWT token",
+          "Biller registered in HOLD state",
+          "Mock time can be advanced"
+        ],
+        "actions": [
+          "Verify initial state is HOLD with hold_until set",
+          "Advance time past hold_until timestamp",
+          "Query biller status"
+        ],
+        "expected": [
+          "Initial state: biller_status == 'HOLD'",
+          "After 24h expiry: biller_status == 'ACTIVE'",
+          "State transition is irreversible (no revert to HOLD)",
+          "hold_until field becomes null or deprecated in ACTIVE state"
+        ],
+        "trace": [
+          "R-FIN-023: state transition coverage HOLD\u2192ACTIVE",
+          "R-FIN-023: biller becomes eligible for withdrawals post-transition"
+        ],
+        "executable": "def test_biller_state_transition_hold_to_active():\n    headers = {\"Authorization\": f\"Bearer {<valid_jwt_token>}\"}\n    with <freeze_time>(\"2024-01-01 10:00:00\"):\n        resp = <requests_post>(\"http://localhost/billers\",\n            json={\"biller_name\": \"STC Test\", \"routing_number\": \"021000021\",\n            \"account_number\": \"777777777\"}, headers=headers)\n        biller_id = resp.json()[\"biller_id\"]\n        assert resp.json()[\"biller_status\"] == \"HOLD\"\n    with <freeze_time>(\"2024-01-02 10:00:01\"):\n        resp = <requests_get>(f\"http://localhost/billers/{biller_id}\", headers=headers)\n        assert resp.json()[\"biller_status\"] == \"ACTIVE\"\n        assert resp.json().get(\"hold_until\") is None"
+      }
+    ]
+  },
+  "req_id": "R-FIN-023",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1020,
+    "output_tokens": 2700,
+    "latency_ms": 16214,
+    "wall_ms": 16214,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-023\",\n  \"reasoning\": \"R-FIN-023 mandates a 24-hour hold before biller activation and defers withdrawals to new billers. The test suite validates: (1) successful biller registration enters HOLD state via positive path, (2) duplicate biller registration returns 409 via negative path, (3) biller registration at exactly 24-hour boundary transitions to ACTIVE via boundary analysis, and (4) state transitions from HOLD\u2192ACTIVE via STC. Tests are deterministic by mocking time, idempotent via unique biller identifiers, and traceable to the requirement statement.\",\n  \"tests\": [\n    {\n      \"name\": \"test_biller_registration_success_enters_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated with valid JWT token\",\n        \"User account exists and is active\",\n        \"Biller does not already exist in system\"\n      ],\n      \"actions\": [\n        \"POST /billers with valid biller details (name, routing_number, account_number)\",\n        \"Verify response status code\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response contains biller_id\",\n        \"Response biller_status field equals 'HOLD'\",\n        \"Response hold_until field is 24 hours from current timestamp\",\n        \"Biller record persists in database with status HOLD\"\n      ],\n      \"trace\": [\n        \"R-FIN-023: biller shall be registered\",\n        \"R-FIN-023: biller enters hold state\"\n      ],\n      \"executable\": \"def test_biller_registration_success_enters_hold_state():\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {<valid_jwt_token>}\\\"}\\n    payload = {\\n        \\\"biller_name\\\": \\\"Test Utility Co\\\",\\n        \\\"routing_number\\\": \\\"021000021\\\",\\n        \\\"account_number\\\": \\\"123456789\\\"\\n    }\\n    resp = <requests_post>(\\\"http://localhost/billers\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201\\n    data = resp.json()\\n    assert \\\"biller_id\\\" in data\\n    assert data[\\\"biller_status\\\"] == \\\"HOLD\\\"\\n    assert \\\"hold_until\\\" in data\\n    assert <extract_hours_from_timestamp>(data[\\\"hold_until\\\"]) == 24\"\n    },\n    {\n      \"name\": \"test_duplicate_biller_registration_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated with valid JWT token\",\n        \"User account exists and is active\",\n        \"Biller with identical routing_number and account_number already registered\"\n      ],\n      \"actions\": [\n        \"POST /billers with biller details matching existing biller\",\n        \"Verify response status and error details\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response contains error_code field\",\n        \"error_code equals 'BILLER_DUPLICATE'\",\n        \"Response contains error_message field with human-readable message\",\n        \"No new biller record created\"\n      ],\n      \"trace\": [\n        \"R-FIN-023: error pathway - 409 if duplicate biller\",\n        \"R-FIN-023: duplicate prevention enforced\"\n      ],\n      \"executable\": \"def test_duplicate_biller_registration_returns_409():\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {<valid_jwt_token>}\\\"}\\n    payload = {\\n        \\\"biller_name\\\": \\\"Existing Utility\\\",\\n        \\\"routing_number\\\": \\\"021000021\\\",\\n        \\\"account_number\\\": \\\"111111111\\\"\\n    }\\n    <requests_post>(\\\"http://localhost/billers\\\", json=payload, headers=headers)\\n    resp = <requests_post>(\\\"http://localhost/billers\\\", json=payload, headers=headers)\\n    assert resp.status_code == 409\\n    data = resp.json()\\n    assert data[\\\"error_code\\\"] == \\\"BILLER_DUPLICATE\\\"\\n    assert \\\"error_message\\\" in data\"\n    },\n    {\n      \"name\": \"test_biller_hold_period_boundary_24_hours\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated with valid JWT token\",\n        \"User account exists and is active\",\n        \"System clock is mocked to controllable state\",\n        \"Biller registered 24 hours ago e"
+  }
+}

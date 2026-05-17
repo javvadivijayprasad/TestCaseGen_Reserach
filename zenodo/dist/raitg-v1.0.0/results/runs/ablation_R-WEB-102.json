@@ -1,0 +1,182 @@
+{
+  "req": {
+    "id": "R-WEB-102",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Reset employee password",
+    "statement": "An employee shall reset their password via an email link that expires after 30 minutes; expired links must be rejected.",
+    "actors": [
+      "valid reset token"
+    ],
+    "preconditions": [
+      "valid reset token"
+    ],
+    "triggers": [
+      "employee submits new password"
+    ],
+    "expected_outcomes": [
+      "password updated",
+      "all sessions invalidated"
+    ],
+    "error_pathways": [
+      "410 when token expired",
+      "422 when password fails policy"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/password/reset"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-102",
+    "reasoning": "The requirement covers four distinct testable behaviours: (1) successful reset with a valid, unexpired token (EP positive path); (2) rejection of an expired token that is clearly past the 30-minute window (NEG/DT); (3) the exact 30-minute expiry boundary \u2013 a token used at t=30 min must be rejected while one used just before must succeed (BVA); (4) state transition confirming all existing sessions are invalidated after a successful reset (STC); and (5) password-policy violation returning 422 (DT negative). These five cases satisfy the minimum three-case requirement while providing full decision-table and state coverage of the requirement's error pathways and expected outcomes. Each test is self-contained via fixtures that create and clean up their own tokens/sessions.",
+    "tests": [
+      {
+        "name": "test_reset_password_with_valid_token_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A valid, unexpired reset token exists for an active employee account",
+          "The new password satisfies the system password policy",
+          "The /password/reset endpoint is reachable"
+        ],
+        "actions": [
+          "POST /password/reset with the valid token and a policy-compliant new password",
+          "Attempt login with the new password",
+          "Assert HTTP 200 on reset and successful login"
+        ],
+        "expected": [
+          "HTTP 200 returned from /password/reset",
+          "Employee can authenticate with the new password",
+          "Old password is no longer accepted"
+        ],
+        "trace": [
+          "R-WEB-102: password updated",
+          "R-WEB-102: actors \u2013 valid reset token",
+          "R-WEB-102: trigger \u2013 employee submits new password"
+        ],
+        "executable": "import pytest\n\ndef test_reset_password_with_valid_token_succeeds(\n    api_client,           # <fixture> base-URL-aware requests.Session\n    valid_reset_token,    # <fixture> yields (token, employee_creds) for a fresh account\n    policy_password,      # <fixture> returns a password that satisfies policy\n):\n    token, creds = valid_reset_token\n    resp = api_client.post(\n        \"/password/reset\",\n        json={\"token\": token, \"new_password\": policy_password},\n    )\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n\n    login_resp = api_client.post(\n        \"/auth/login\",\n        json={\"username\": creds[\"username\"], \"password\": policy_password},\n    )\n    assert login_resp.status_code == 200, \"Login with new password should succeed\"\n\n    old_login = api_client.post(\n        \"/auth/login\",\n        json={\"username\": creds[\"username\"], \"password\": creds[\"old_password\"]},\n    )\n    assert old_login.status_code in (401, 403), \"Old password must be rejected\"\n"
+      },
+      {
+        "name": "test_reset_password_with_expired_token_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A reset token that was issued more than 30 minutes ago exists",
+          "The token has not been used previously",
+          "The /password/reset endpoint is reachable"
+        ],
+        "actions": [
+          "POST /password/reset with the expired token and a policy-compliant new password",
+          "Assert HTTP 410 is returned",
+          "Assert employee password has NOT changed"
+        ],
+        "expected": [
+          "HTTP 410 Gone returned",
+          "Response body contains an error indicating token expiry",
+          "Employee password remains unchanged"
+        ],
+        "trace": [
+          "R-WEB-102: error pathway \u2013 410 when token expired",
+          "R-WEB-102: email link expires after 30 minutes"
+        ],
+        "executable": "import pytest\n\ndef test_reset_password_with_expired_token_returns_410(\n    api_client,              # <fixture>\n    expired_reset_token,     # <fixture> yields (token, employee_creds) aged > 30 min\n    policy_password,         # <fixture>\n):\n    token, creds = expired_reset_token\n    resp = api_client.post(\n        \"/password/reset\",\n        json={\"token\": token, \"new_password\": policy_password},\n    )\n    assert resp.status_code == 410, f\"Expected 410, got {resp.status_code}: {resp.text}\"\n\n    body = resp.json()\n    assert \"expired\" in body.get(\"error\", \"\").lower() or \\\n           \"expired\" in body.get(\"message\", \"\").lower(), \\\n           \"Response must indicate token expiry\"\n\n    login_resp = api_client.post(\n        \"/auth/login\",\n        json={\"username\": creds[\"username\"], \"password\": creds[\"old_password\"]},\n    )\n    assert login_resp.status_code == 200, \"Password must remain unchanged after expired-token attempt\"\n"
+      },
+      {
+        "name": "test_reset_token_expires_exactly_at_30_minutes",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Two reset tokens exist: one aged 29 min 59 sec (within window) and one aged 30 min 00 sec (at boundary)",
+          "The /password/reset endpoint is reachable"
+        ],
+        "actions": [
+          "POST /password/reset with the token aged 29 min 59 sec \u2013 assert 200",
+          "POST /password/reset with the token aged exactly 30 min 00 sec \u2013 assert 410"
+        ],
+        "expected": [
+          "Token at 29 min 59 sec: HTTP 200 \u2013 password updated",
+          "Token at 30 min 00 sec: HTTP 410 \u2013 token rejected as expired"
+        ],
+        "trace": [
+          "R-WEB-102: email link expires after 30 minutes",
+          "R-WEB-102: boundary \u2013 last valid second vs first invalid second"
+        ],
+        "executable": "import pytest\n\ndef test_reset_token_expires_exactly_at_30_minutes(\n    api_client,                  # <fixture>\n    near_expiry_reset_token,     # <fixture> yields token issued 29 min 59 sec ago\n    at_expiry_reset_token,       # <fixture> yields token issued exactly 30 min ago\n    policy_password,             # <fixture>\n    alt_policy_password,         # <fixture> second distinct compliant password\n):\n    # --- within window (29:59) must succeed ---\n    resp_valid = api_client.post(\n        \"/password/reset\",\n        json={\"token\": near_expiry_reset_token, \"new_password\": policy_password},\n    )\n    assert resp_valid.status_code == 200, (\n        f\"Token at 29:59 should be accepted; got {resp_valid.status_code}\"\n    )\n\n    # --- at boundary (30:00) must be rejected ---\n    resp_expired = api_client.post(\n        \"/password/reset\",\n        json={\"token\": at_expiry_reset_token, \"new_password\": alt_policy_password},\n    )\n    assert resp_expired.status_code == 410, (\n        f\"Token at 30:00 should be rejected; got {resp_expired.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_successful_reset_invalidates_all_existing_sessions",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "An active employee account has at least two live sessions (session cookies / JWT tokens)",
+          "A valid, unexpired reset token exists for that account",
+          "The /password/reset endpoint is reachable"
+        ],
+        "actions": [
+          "Capture two active session tokens for the employee",
+          "POST /password/reset with a valid token and policy-compliant new password",
+          "Attempt an authenticated request using each of the two old session tokens",
+          "Assert all old sessions are rejected with 401"
+        ],
+        "expected": [
+          "HTTP 200 from /password/reset",
+          "All pre-existing session tokens return HTTP 401 on subsequent authenticated requests"
+        ],
+        "trace": [
+          "R-WEB-102: expected outcome \u2013 all sessions invalidated",
+          "R-WEB-102: state transition from authenticated \u2192 unauthenticated for pre-reset sessions"
+        ],
+        "executable": "import pytest\n\ndef test_successful_reset_invalidates_all_existing_sessions(\n    api_client,                  # <fixture>\n    employee_with_two_sessions,  # <fixture> yields (token, session_a, session_b, creds)\n    policy_password,             # <fixture>\n):\n    reset_token, session_a, session_b, _creds = employee_with_two_sessions\n\n    reset_resp = api_client.post(\n        \"/password/reset\",\n        json={\"token\": reset_token, \"new_password\": policy_password},\n    )\n    assert reset_resp.status_code == 200, f\"Reset failed: {reset_resp.text}\"\n\n    for session_token in (session_a, session_b):\n        probe = api_client.get(\n            \"/employee/profile\",\n            headers={\"Authorization\": f\"Bearer {session_token}\"},\n        )\n        assert probe.status_code == 401, (\n            f\"Session {session_token[:8]}... should be invalidated; got {probe.status_code}\"\n        )\n"
+      },
+      {
+        "name": "test_reset_password_violating_policy_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A valid, unexpired reset token exists for an active employee account",
+          "A password string that violates the system password policy is prepared",
+          "The /password/reset endpoint is reachable"
+        ],
+        "actions": [
+          "POST /password/reset with the valid token and a policy-violating password",
+          "Assert HTTP 422 is returned",
+          "Assert the response body lists a policy violation reason",
+          "Assert the employee password has NOT changed"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity returned",
+          "Response body contains field-level validation error referencing password policy",
+          "Employee can still log in with the original password"
+        ],
+        "trace": [
+          "R-WEB-102: error pathway \u2013 422 when password fails policy",
+          "R-WEB-102: trigger \u2013 employee submits new password (non-compliant)"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"bad_password\", [\n    \"short\",           # too short\n    \"alllowercase1!\",  # missing uppercase (example policy rule)\n    \"ALLUPPERCASE1!\",  # missing lowercase\n    \"NoSpecialChar1\",  # missing special character\n])\ndef test_reset_password_violating_policy_returns_422(\n    api_client,          # <fixture>\n    valid_reset_token,   # <fixture> yields (token, employee_creds)\n    bad_password,\n):\n    token, creds = valid_reset_token\n    resp = api_client.post(\n        \"/password/reset\",\n        json={\"token\": token, \"new_password\": bad_password},\n    )\n    assert resp.status_code == 422, (\n        f\"Expected 422 for password '{bad_password}', got {resp.status_code}: {resp.text}\"\n    )\n\n    body = resp.json()\n    errors = body.get(\"errors\") or body.get(\"detail\") or []\n    assert errors, \"422 response must contain validation error details\"\n\n    login_resp = api_client.post(\n        \"/auth/login\",\n        json={\"username\": creds[\"username\"], \"password\": creds[\"old_password\"]},\n    )\n    assert login_resp.status_code == 200, \"Password must remain unchanged after policy violation\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-102",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 988,
+    "output_tokens": 3259,
+    "latency_ms": 43277,
+    "wall_ms": 43277,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-102\",\n  \"reasoning\": \"The requirement covers four distinct testable behaviours: (1) successful reset with a valid, unexpired token (EP positive path); (2) rejection of an expired token that is clearly past the 30-minute window (NEG/DT); (3) the exact 30-minute expiry boundary \u2013 a token used at t=30 min must be rejected while one used just before must succeed (BVA); (4) state transition confirming all existing sessions are invalidated after a successful reset (STC); and (5) password-policy violation returning 422 (DT negative). These five cases satisfy the minimum three-case requirement while providing full decision-table and state coverage of the requirement's error pathways and expected outcomes. Each test is self-contained via fixtures that create and clean up their own tokens/sessions.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reset_password_with_valid_token_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A valid, unexpired reset token exists for an active employee account\",\n        \"The new password satisfies the system password policy\",\n        \"The /password/reset endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with the valid token and a policy-compliant new password\",\n        \"Attempt login with the new password\",\n        \"Assert HTTP 200 on reset and successful login\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned from /password/reset\",\n        \"Employee can authenticate with the new password\",\n        \"Old password is no longer accepted\"\n      ],\n      \"trace\": [\n        \"R-WEB-102: password updated\",\n        \"R-WEB-102: actors \u2013 valid reset token\",\n        \"R-WEB-102: trigger \u2013 employee submits new password\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_reset_password_with_valid_token_succeeds(\\n    api_client,           # <fixture> base-URL-aware requests.Session\\n    valid_reset_token,    # <fixture> yields (token, employee_creds) for a fresh account\\n    policy_password,      # <fixture> returns a password that satisfies policy\\n):\\n    token, creds = valid_reset_token\\n    resp = api_client.post(\\n        \\\"/password/reset\\\",\\n        json={\\\"token\\\": token, \\\"new_password\\\": policy_password},\\n    )\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}: {resp.text}\\\"\\n\\n    login_resp = api_client.post(\\n        \\\"/auth/login\\\",\\n        json={\\\"username\\\": creds[\\\"username\\\"], \\\"password\\\": policy_password},\\n    )\\n    assert login_resp.status_code == 200, \\\"Login with new password should succeed\\\"\\n\\n    old_login = api_client.post(\\n        \\\"/auth/login\\\",\\n        json={\\\"username\\\": creds[\\\"username\\\"], \\\"password\\\": creds[\\\"old_password\\\"]},\\n    )\\n    assert old_login.status_code in (401, 403), \\\"Old password must be rejected\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reset_password_with_expired_token_returns_410\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A reset token that was issued more than 30 minutes ago exists\",\n        \"The token has not been used previously\",\n        \"The /password/reset endpoint is reachable\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with the expired token and a policy-compliant new password\",\n        \"Assert HTTP 410 is returned\",\n        \"Assert employee password has NOT changed\"\n      ],\n      \"expected\": [\n        \"HTTP 410 Gone returned\",\n        \"Response body contains an error indicating token expiry\",\n        \"Employee password remains unchanged\"\n      ],\n      \"trace\": [\n        \"R-WEB-102: error pathway \u2013 410 when token expired\",\n        \"R-WEB-102: email link expires after 30 minutes\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_reset_password_with_expired_token_returns_410(\\n    api_client,              # <fixture>\\n    expired_reset_token,     # <fixture> yields (token, employee_creds) aged > 30 min\\n    policy_password,         # <fixture>\\n"
+  }
+}

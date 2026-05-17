@@ -1,0 +1,169 @@
+{
+  "req": {
+    "id": "R-HLT-006",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Create encounter",
+    "statement": "A clinician shall create an Encounter for a patient with start and end timestamps; end before start shall be rejected.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician",
+      "patient exists"
+    ],
+    "triggers": [
+      "clinician opens encounter"
+    ],
+    "expected_outcomes": [
+      "encounter stored"
+    ],
+    "error_pathways": [
+      "422 when end < start"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Encounter"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-006",
+    "reasoning": "The requirement has two clear decision branches: (1) valid start < end produces a stored encounter, (2) end < start produces HTTP 422. BVA drives a boundary case where end equals start (same instant), which sits on the partition boundary and tests whether the system treats equal timestamps as valid or invalid. EP covers the happy path with a clearly valid interval. NEG covers the inverted interval. DT would capture combined field combinations; STC is less applicable here since the requirement is stateless from the test perspective. Each test uses a fixture for auth headers and a helper to create a transient patient, ensuring idempotency via unique resource identifiers per run.",
+    "tests": [
+      {
+        "name": "test_create_encounter_valid_interval_returns_201",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as a clinician (role:clinician)",
+          "A patient resource exists in the system"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T09:00:00Z' for the existing patient"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains an Encounter resource with a server-assigned id",
+          "Stored start and end timestamps match the submitted values"
+        ],
+        "trace": [
+          "R-HLT-006: clinician creates encounter",
+          "R-HLT-006: encounter stored",
+          "R-HLT-006: start < end is the valid equivalence class"
+        ],
+        "executable": "import pytest\nimport requests\nfrom uuid import uuid4\n\ndef test_create_encounter_valid_interval_returns_201(clinician_headers, existing_patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-06-01T08:00:00Z\",\n            \"end\": \"2024-06-01T09:00:00Z\"\n        },\n        \"identifier\": [{\"value\": str(uuid4())}]\n    }\n    resp = requests.post(\n        f\"{base_url}/Encounter\",\n        json=payload,\n        headers=clinician_headers\n    )\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Encounter\"\n    assert \"id\" in body\n    assert body[\"period\"][\"start\"] == \"2024-06-01T08:00:00Z\"\n    assert body[\"period\"][\"end\"] == \"2024-06-01T09:00:00Z\"\n"
+      },
+      {
+        "name": "test_create_encounter_end_before_start_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as a clinician (role:clinician)",
+          "A patient resource exists in the system"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T09:00:00Z' and end='2024-06-01T08:00:00Z' (end strictly before start)"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an error indicating invalid period (end before start)"
+        ],
+        "trace": [
+          "R-HLT-006: error pathway \u2014 422 when end < start",
+          "R-HLT-006: encounter must NOT be stored"
+        ],
+        "executable": "import pytest\nimport requests\nfrom uuid import uuid4\n\ndef test_create_encounter_end_before_start_returns_422(clinician_headers, existing_patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\n            \"start\": \"2024-06-01T09:00:00Z\",\n            \"end\": \"2024-06-01T08:00:00Z\"\n        },\n        \"identifier\": [{\"value\": str(uuid4())}]\n    }\n    resp = requests.post(\n        f\"{base_url}/Encounter\",\n        json=payload,\n        headers=clinician_headers\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body is not None, \"Expected non-empty error body\"\n"
+      },
+      {
+        "name": "test_create_encounter_end_equals_start_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as a clinician (role:clinician)",
+          "A patient resource exists in the system"
+        ],
+        "actions": [
+          "POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T08:00:00Z' (end exactly equals start \u2014 zero-duration encounter)"
+        ],
+        "expected": [
+          "HTTP status is either 201 (if zero-duration is accepted) or 422 (if zero-duration is rejected)",
+          "Response is deterministic and consistent with the server's boundary policy",
+          "If 201: resource is stored with matching timestamps",
+          "If 422: error body indicates invalid period"
+        ],
+        "trace": [
+          "R-HLT-006: BVA on the start==end boundary of the end>=start / end<start partition",
+          "R-HLT-006: clarifies whether the boundary is inclusive or exclusive"
+        ],
+        "executable": "import pytest\nimport requests\nfrom uuid import uuid4\n\nACCEPTED_STATUSES = {201, 422}\n\ndef test_create_encounter_end_equals_start_boundary(clinician_headers, existing_patient_id, base_url):\n    ts = \"2024-06-01T08:00:00Z\"\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": ts, \"end\": ts},\n        \"identifier\": [{\"value\": str(uuid4())}]\n    }\n    resp = requests.post(\n        f\"{base_url}/Encounter\",\n        json=payload,\n        headers=clinician_headers\n    )\n    assert resp.status_code in ACCEPTED_STATUSES, (\n        f\"Expected 201 or 422 at boundary, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    if resp.status_code == 201:\n        assert body.get(\"period\", {}).get(\"start\") == ts\n        assert body.get(\"period\", {}).get(\"end\") == ts\n    else:\n        assert body is not None, \"Expected non-empty error body on 422\"\n"
+      },
+      {
+        "name": "test_create_encounter_transitions_patient_to_active_encounter_state",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller is authenticated as a clinician (role:clinician)",
+          "A patient exists with no current in-progress encounter"
+        ],
+        "actions": [
+          "POST /Encounter with status='in-progress', start='2024-06-01T10:00:00Z', no end timestamp",
+          "GET /Encounter?patient=<patient_id>&status=in-progress to confirm state transition"
+        ],
+        "expected": [
+          "POST returns HTTP 201",
+          "GET returns the newly created in-progress encounter for the patient",
+          "Patient is now in the 'encounter active' state"
+        ],
+        "trace": [
+          "R-HLT-006: clinician opens encounter (trigger)",
+          "R-HLT-006: encounter stored (expected outcome)",
+          "STC: patient state transitions from no-encounter to encounter-active"
+        ],
+        "executable": "import pytest\nimport requests\nfrom uuid import uuid4\n\ndef test_create_encounter_transitions_patient_to_active_encounter_state(clinician_headers, existing_patient_id, base_url):\n    uid = str(uuid4())\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"in-progress\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"start\": \"2024-06-01T10:00:00Z\"},\n        \"identifier\": [{\"value\": uid}]\n    }\n    post_resp = requests.post(\n        f\"{base_url}/Encounter\",\n        json=payload,\n        headers=clinician_headers\n    )\n    assert post_resp.status_code == 201, f\"Expected 201, got {post_resp.status_code}: {post_resp.text}\"\n    encounter_id = post_resp.json()[\"id\"]\n    get_resp = requests.get(\n        f\"{base_url}/Encounter\",\n        params={\"patient\": existing_patient_id, \"status\": \"in-progress\"},\n        headers=clinician_headers\n    )\n    assert get_resp.status_code == 200\n    ids = [e[\"id\"] for e in get_resp.json().get(\"entry\", [])]\n    assert encounter_id in ids, f\"Encounter {encounter_id} not found in active encounters\"\n"
+      },
+      {
+        "name": "test_create_encounter_decision_table_missing_start_returns_error",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as a clinician (role:clinician)",
+          "A patient resource exists in the system"
+        ],
+        "actions": [
+          "POST /Encounter with end timestamp provided but start timestamp omitted (invalid combination per decision table)"
+        ],
+        "expected": [
+          "HTTP 400 or 422 \u2014 start is a required field; request is rejected",
+          "Response body contains a field-level validation error referencing period.start"
+        ],
+        "trace": [
+          "R-HLT-006: start timestamp is required for encounter creation",
+          "DT: decision table row \u2014 start=absent, end=present \u2192 invalid input \u2192 error response"
+        ],
+        "executable": "import pytest\nimport requests\nfrom uuid import uuid4\n\nREJECT_STATUSES = {400, 422}\n\ndef test_create_encounter_decision_table_missing_start_returns_error(clinician_headers, existing_patient_id, base_url):\n    payload = {\n        \"resourceType\": \"Encounter\",\n        \"status\": \"finished\",\n        \"subject\": {\"reference\": f\"Patient/{existing_patient_id}\"},\n        \"period\": {\"end\": \"2024-06-01T09:00:00Z\"},\n        \"identifier\": [{\"value\": str(uuid4())}]\n    }\n    resp = requests.post(\n        f\"{base_url}/Encounter\",\n        json=payload,\n        headers=clinician_headers\n    )\n    assert resp.status_code in REJECT_STATUSES, (\n        f\"Expected 400 or 422 for missing start, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body is not None, \"Expected non-empty error body\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-006",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 977,
+    "output_tokens": 3164,
+    "latency_ms": 32574,
+    "wall_ms": 32574,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-006\",\n  \"reasoning\": \"The requirement has two clear decision branches: (1) valid start < end produces a stored encounter, (2) end < start produces HTTP 422. BVA drives a boundary case where end equals start (same instant), which sits on the partition boundary and tests whether the system treats equal timestamps as valid or invalid. EP covers the happy path with a clearly valid interval. NEG covers the inverted interval. DT would capture combined field combinations; STC is less applicable here since the requirement is stateless from the test perspective. Each test uses a fixture for auth headers and a helper to create a transient patient, ensuring idempotency via unique resource identifiers per run.\",\n  \"tests\": [\n    {\n      \"name\": \"test_create_encounter_valid_interval_returns_201\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as a clinician (role:clinician)\",\n        \"A patient resource exists in the system\"\n      ],\n      \"actions\": [\n        \"POST /Encounter with start='2024-06-01T08:00:00Z' and end='2024-06-01T09:00:00Z' for the existing patient\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains an Encounter resource with a server-assigned id\",\n        \"Stored start and end timestamps match the submitted values\"\n      ],\n      \"trace\": [\n        \"R-HLT-006: clinician creates encounter\",\n        \"R-HLT-006: encounter stored\",\n        \"R-HLT-006: start < end is the valid equivalence class\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom uuid import uuid4\\n\\ndef test_create_encounter_valid_interval_returns_201(clinician_headers, existing_patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Encounter\\\",\\n        \\\"status\\\": \\\"finished\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{existing_patient_id}\\\"},\\n        \\\"period\\\": {\\n            \\\"start\\\": \\\"2024-06-01T08:00:00Z\\\",\\n            \\\"end\\\": \\\"2024-06-01T09:00:00Z\\\"\\n        },\\n        \\\"identifier\\\": [{\\\"value\\\": str(uuid4())}]\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Encounter\\\",\\n        json=payload,\\n        headers=clinician_headers\\n    )\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Encounter\\\"\\n    assert \\\"id\\\" in body\\n    assert body[\\\"period\\\"][\\\"start\\\"] == \\\"2024-06-01T08:00:00Z\\\"\\n    assert body[\\\"period\\\"][\\\"end\\\"] == \\\"2024-06-01T09:00:00Z\\\"\\n\"\n    },\n    {\n      \"name\": \"test_create_encounter_end_before_start_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller is authenticated as a clinician (role:clinician)\",\n        \"A patient resource exists in the system\"\n      ],\n      \"actions\": [\n        \"POST /Encounter with start='2024-06-01T09:00:00Z' and end='2024-06-01T08:00:00Z' (end strictly before start)\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an error indicating invalid period (end before start)\"\n      ],\n      \"trace\": [\n        \"R-HLT-006: error pathway \u2014 422 when end < start\",\n        \"R-HLT-006: encounter must NOT be stored\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\nfrom uuid import uuid4\\n\\ndef test_create_encounter_end_before_start_returns_422(clinician_headers, existing_patient_id, base_url):\\n    payload = {\\n        \\\"resourceType\\\": \\\"Encounter\\\",\\n        \\\"status\\\": \\\"finished\\\",\\n        \\\"subject\\\": {\\\"reference\\\": f\\\"Patient/{existing_patient_id}\\\"},\\n        \\\"period\\\": {\\n            \\\"start\\\": \\\"2024-06-01T09:00:00Z\\\",\\n            \\\"end\\\": \\\"2024-06-01T08:00:00Z\\\"\\n        },\\n        \\\"identifier\\\": [{\\\"value\\\": str(uuid4())}]\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/Encounter\\\",\\n        json=payload,\\n        headers=clinician_headers\\n    )\\n    assert resp.status_code ="
+  }
+}

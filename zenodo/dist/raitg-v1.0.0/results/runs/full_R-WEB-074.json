@@ -1,0 +1,200 @@
+{
+  "req": {
+    "id": "R-WEB-074",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Run payroll \u2014 variant 3",
+    "statement": "An hr-admin shall run a monthly payroll that computes gross pay, deductions, and net pay for each active employee; a failed run shall not partially commit. Additionally, the action must emit a webhook event for external consumers.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin triggers payroll run"
+    ],
+    "expected_outcomes": [
+      "payroll-run state=completed",
+      "pay-stub records created",
+      "audit entry",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "409 if another run is in progress",
+      "500 rolled back atomically on failure"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/payroll-runs"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-074",
+    "reasoning": "The requirement covers: (1) happy-path payroll completion with gross/deduction/net computation, pay-stub creation, audit entry, and webhook emission; (2) conflict guard when a run is already in progress (409); (3) atomic rollback on engine failure (500, no partial commit); (4) boundary of exactly one active employee (minimum non-empty cohort). State transitions idle\u2192running\u2192completed and idle\u2192running\u2192failed are also exercised. Tests are scoped to the /api/payroll-runs REST endpoint with an hr-admin bearer token supplied via fixture.",
+    "tests": [
+      {
+        "name": "test_payroll_run_completes_for_active_employees",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller holds role hr-admin (bearer token from <hr_admin_token> fixture)",
+          "At least two active employees exist with salary data",
+          "No payroll run is currently in progress",
+          "Webhook receiver endpoint is reachable (<webhook_sink> fixture)"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\": \"2024-05\", \"type\": \"monthly\"}",
+          "Poll GET /api/payroll-runs/{id} until state=completed or timeout 30 s",
+          "GET /api/payroll-runs/{id}/pay-stubs",
+          "GET /api/audit-log?ref={id}",
+          "GET recorded events from <webhook_sink>"
+        ],
+        "expected": [
+          "POST returns 201 with body containing id and state=queued|running",
+          "Polled state reaches completed",
+          "pay-stubs collection contains one record per active employee",
+          "Each pay-stub has gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions",
+          "Audit log contains exactly one entry referencing the run id",
+          "Webhook sink received exactly one event with type=payroll.completed and run_id matching"
+        ],
+        "trace": [
+          "R-WEB-074: monthly payroll computes gross/deductions/net",
+          "R-WEB-074: pay-stub records created",
+          "R-WEB-074: audit entry emitted",
+          "R-WEB-074: webhook event emitted for external consumers"
+        ],
+        "executable": "import pytest\nimport time\n\ndef test_payroll_run_completes_for_active_employees(\n    hr_admin_client,   # <fixture>: requests.Session with hr-admin bearer token\n    seed_two_employees,  # <fixture>: ensures 2 active employees exist, yields employee ids\n    webhook_sink,      # <fixture>: captures POST events, exposes .events list\n    api_base,          # <fixture>: base URL string\n):\n    resp = hr_admin_client.post(\n        f\"{api_base}/api/payroll-runs\",\n        json={\"period\": \"2024-05\", \"type\": \"monthly\"},\n    )\n    assert resp.status_code == 201\n    run_id = resp.json()[\"id\"]\n\n    state = <poll_until_terminal>(hr_admin_client, api_base, run_id, timeout=30)\n    assert state == \"completed\"\n\n    stubs = hr_admin_client.get(f\"{api_base}/api/payroll-runs/{run_id}/pay-stubs\").json()\n    assert len(stubs) == len(seed_two_employees)\n    for stub in stubs:\n        assert stub[\"gross_pay\"] > 0\n        assert stub[\"deductions\"] >= 0\n        assert stub[\"net_pay\"] == pytest.approx(stub[\"gross_pay\"] - stub[\"deductions\"])\n\n    audit = hr_admin_client.get(f\"{api_base}/api/audit-log?ref={run_id}\").json()\n    assert len(audit[\"entries\"]) >= 1\n\n    matched = [e for e in webhook_sink.events if e.get(\"run_id\") == run_id]\n    assert len(matched) == 1\n    assert matched[0][\"type\"] == \"payroll.completed\"\n"
+      },
+      {
+        "name": "test_payroll_run_returns_409_when_run_already_in_progress",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller holds role hr-admin",
+          "A payroll run for period 2024-05 is currently in state=running (seeded via <fixture>)",
+          "No completed run for the same period exists"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\": \"2024-05\", \"type\": \"monthly\"} while a run is already in progress"
+        ],
+        "expected": [
+          "Response status is 409 Conflict",
+          "Response body contains error code PAYROLL_RUN_IN_PROGRESS",
+          "No new payroll run record is created",
+          "No webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-074: 409 if another run is in progress"
+        ],
+        "executable": "def test_payroll_run_returns_409_when_run_already_in_progress(\n    hr_admin_client,\n    running_payroll_run,  # <fixture>: seeds a payroll run in state=running for 2024-05, yields run_id\n    webhook_sink,\n    api_base,\n):\n    resp = hr_admin_client.post(\n        f\"{api_base}/api/payroll-runs\",\n        json={\"period\": \"2024-05\", \"type\": \"monthly\"},\n    )\n    assert resp.status_code == 409\n    body = resp.json()\n    assert body.get(\"error\") == \"PAYROLL_RUN_IN_PROGRESS\"\n\n    runs = hr_admin_client.get(\n        f\"{api_base}/api/payroll-runs?period=2024-05\"\n    ).json()[\"items\"]\n    run_ids = [r[\"id\"] for r in runs]\n    assert run_ids == [running_payroll_run], \"duplicate run must not be created\"\n\n    duplicate_events = [\n        e for e in webhook_sink.events\n        if e.get(\"run_id\") != running_payroll_run\n    ]\n    assert duplicate_events == []\n"
+      },
+      {
+        "name": "test_payroll_run_atomic_rollback_on_engine_failure",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Caller holds role hr-admin",
+          "Payroll engine fault-injection is enabled via <fault_injection_header> or feature flag",
+          "Active employees exist",
+          "No run is currently in progress"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with fault-injection header to force engine failure mid-run",
+          "Poll GET /api/payroll-runs/{id} until state=failed or timeout 30 s",
+          "GET /api/payroll-runs/{id}/pay-stubs",
+          "GET /api/audit-log?ref={id}"
+        ],
+        "expected": [
+          "POST returns 202 or 201 (run accepted before failure occurs)",
+          "Polled state eventually equals failed",
+          "pay-stubs collection is empty (no partial commit)",
+          "Audit log records the failure with state=failed",
+          "No payroll.completed webhook event emitted; optionally a payroll.failed event may exist"
+        ],
+        "trace": [
+          "R-WEB-074: 500 rolled back atomically on failure",
+          "R-WEB-074: failed run shall not partially commit"
+        ],
+        "executable": "def test_payroll_run_atomic_rollback_on_engine_failure(\n    hr_admin_client,\n    seed_two_employees,\n    webhook_sink,\n    api_base,\n    fault_injection_headers,  # <fixture>: dict with header that forces engine fault\n):\n    resp = hr_admin_client.post(\n        f\"{api_base}/api/payroll-runs\",\n        json={\"period\": \"2024-06\", \"type\": \"monthly\"},\n        headers=fault_injection_headers,\n    )\n    assert resp.status_code in (201, 202)\n    run_id = resp.json()[\"id\"]\n\n    state = <poll_until_terminal>(hr_admin_client, api_base, run_id, timeout=30)\n    assert state == \"failed\"\n\n    stubs = hr_admin_client.get(\n        f\"{api_base}/api/payroll-runs/{run_id}/pay-stubs\"\n    ).json()\n    assert stubs[\"items\"] == [], \"partial pay-stubs must be rolled back\"\n\n    audit = hr_admin_client.get(f\"{api_base}/api/audit-log?ref={run_id}\").json()\n    failed_entries = [e for e in audit[\"entries\"] if e.get(\"state\") == \"failed\"]\n    assert len(failed_entries) >= 1\n\n    completed_events = [\n        e for e in webhook_sink.events\n        if e.get(\"type\") == \"payroll.completed\" and e.get(\"run_id\") == run_id\n    ]\n    assert completed_events == []\n"
+      },
+      {
+        "name": "test_payroll_run_with_exactly_one_active_employee",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller holds role hr-admin",
+          "Exactly one active employee exists with valid salary record",
+          "All other employees are inactive or absent",
+          "No payroll run is in progress"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\": \"2024-07\", \"type\": \"monthly\"}",
+          "Poll GET /api/payroll-runs/{id} until terminal state",
+          "GET /api/payroll-runs/{id}/pay-stubs"
+        ],
+        "expected": [
+          "POST returns 201",
+          "State reaches completed",
+          "Exactly one pay-stub record exists",
+          "Pay-stub net_pay equals gross_pay minus deductions and is greater than zero",
+          "Webhook emits exactly one payroll.completed event"
+        ],
+        "trace": [
+          "R-WEB-074: boundary \u2014 minimum valid employee cohort (N=1)",
+          "R-WEB-074: pay-stub records created",
+          "R-WEB-074: webhook event emitted"
+        ],
+        "executable": "def test_payroll_run_with_exactly_one_active_employee(\n    hr_admin_client,\n    seed_one_employee,   # <fixture>: ensures exactly 1 active employee, deactivates others, yields emp_id\n    webhook_sink,\n    api_base,\n):\n    resp = hr_admin_client.post(\n        f\"{api_base}/api/payroll-runs\",\n        json={\"period\": \"2024-07\", \"type\": \"monthly\"},\n    )\n    assert resp.status_code == 201\n    run_id = resp.json()[\"id\"]\n\n    state = <poll_until_terminal>(hr_admin_client, api_base, run_id, timeout=30)\n    assert state == \"completed\"\n\n    stubs = hr_admin_client.get(\n        f\"{api_base}/api/payroll-runs/{run_id}/pay-stubs\"\n    ).json()[\"items\"]\n    assert len(stubs) == 1, \"exactly one stub for one active employee\"\n\n    stub = stubs[0]\n    assert stub[\"gross_pay\"] > 0\n    assert stub[\"net_pay\"] == pytest.approx(stub[\"gross_pay\"] - stub[\"deductions\"])\n    assert stub[\"employee_id\"] == seed_one_employee\n\n    events = [e for e in webhook_sink.events if e.get(\"run_id\") == run_id]\n    assert len(events) == 1\n    assert events[0][\"type\"] == \"payroll.completed\"\n"
+      },
+      {
+        "name": "test_payroll_run_unauthorized_role_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller holds role employee (not hr-admin)",
+          "Active employees exist",
+          "No payroll run is in progress"
+        ],
+        "actions": [
+          "POST /api/payroll-runs with body {\"period\": \"2024-05\", \"type\": \"monthly\"} using employee-role token"
+        ],
+        "expected": [
+          "Response status is 403 Forbidden",
+          "Response body contains error indicating insufficient permissions",
+          "No payroll run record is created",
+          "No webhook event is emitted"
+        ],
+        "trace": [
+          "R-WEB-074: precondition role:hr-admin \u2014 non-admin must be denied",
+          "R-WEB-074: decision table row: actor=employee \u2192 reject"
+        ],
+        "executable": "def test_payroll_run_unauthorized_role_rejected(\n    employee_client,   # <fixture>: requests.Session with employee (non-admin) bearer token\n    webhook_sink,\n    api_base,\n):\n    initial_runs = employee_client.get(\n        f\"{api_base}/api/payroll-runs?period=2024-05\"\n    )\n    # 403 may also be returned for list; track count if accessible\n    before_count = (\n        len(initial_runs.json().get(\"items\", []))\n        if initial_runs.status_code == 200 else None\n    )\n\n    resp = employee_client.post(\n        f\"{api_base}/api/payroll-runs\",\n        json={\"period\": \"2024-05\", \"type\": \"monthly\"},\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body\n\n    if before_count is not None:\n        after = employee_client.get(\n            f\"{api_base}/api/payroll-runs?period=2024-05\"\n        ).json().get(\"items\", [])\n        assert len(after) == before_count, \"no new run must be created\"\n\n    rogue_events = [\n        e for e in webhook_sink.events\n        if e.get(\"type\") == \"payroll.completed\"\n    ]\n    assert rogue_events == []\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-074",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[2] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1042,
+    "output_tokens": 3876,
+    "latency_ms": 49350,
+    "wall_ms": 49350,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-074\",\n  \"reasoning\": \"The requirement covers: (1) happy-path payroll completion with gross/deduction/net computation, pay-stub creation, audit entry, and webhook emission; (2) conflict guard when a run is already in progress (409); (3) atomic rollback on engine failure (500, no partial commit); (4) boundary of exactly one active employee (minimum non-empty cohort). State transitions idle\u2192running\u2192completed and idle\u2192running\u2192failed are also exercised. Tests are scoped to the /api/payroll-runs REST endpoint with an hr-admin bearer token supplied via fixture.\",\n  \"tests\": [\n    {\n      \"name\": \"test_payroll_run_completes_for_active_employees\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller holds role hr-admin (bearer token from <hr_admin_token> fixture)\",\n        \"At least two active employees exist with salary data\",\n        \"No payroll run is currently in progress\",\n        \"Webhook receiver endpoint is reachable (<webhook_sink> fixture)\"\n      ],\n      \"actions\": [\n        \"POST /api/payroll-runs with body {\\\"period\\\": \\\"2024-05\\\", \\\"type\\\": \\\"monthly\\\"}\",\n        \"Poll GET /api/payroll-runs/{id} until state=completed or timeout 30 s\",\n        \"GET /api/payroll-runs/{id}/pay-stubs\",\n        \"GET /api/audit-log?ref={id}\",\n        \"GET recorded events from <webhook_sink>\"\n      ],\n      \"expected\": [\n        \"POST returns 201 with body containing id and state=queued|running\",\n        \"Polled state reaches completed\",\n        \"pay-stubs collection contains one record per active employee\",\n        \"Each pay-stub has gross_pay > 0, deductions >= 0, net_pay == gross_pay - deductions\",\n        \"Audit log contains exactly one entry referencing the run id\",\n        \"Webhook sink received exactly one event with type=payroll.completed and run_id matching\"\n      ],\n      \"trace\": [\n        \"R-WEB-074: monthly payroll computes gross/deductions/net\",\n        \"R-WEB-074: pay-stub records created\",\n        \"R-WEB-074: audit entry emitted\",\n        \"R-WEB-074: webhook event emitted for external consumers\"\n      ],\n      \"executable\": \"import pytest\\nimport time\\n\\ndef test_payroll_run_completes_for_active_employees(\\n    hr_admin_client,   # <fixture>: requests.Session with hr-admin bearer token\\n    seed_two_employees,  # <fixture>: ensures 2 active employees exist, yields employee ids\\n    webhook_sink,      # <fixture>: captures POST events, exposes .events list\\n    api_base,          # <fixture>: base URL string\\n):\\n    resp = hr_admin_client.post(\\n        f\\\"{api_base}/api/payroll-runs\\\",\\n        json={\\\"period\\\": \\\"2024-05\\\", \\\"type\\\": \\\"monthly\\\"},\\n    )\\n    assert resp.status_code == 201\\n    run_id = resp.json()[\\\"id\\\"]\\n\\n    state = <poll_until_terminal>(hr_admin_client, api_base, run_id, timeout=30)\\n    assert state == \\\"completed\\\"\\n\\n    stubs = hr_admin_client.get(f\\\"{api_base}/api/payroll-runs/{run_id}/pay-stubs\\\").json()\\n    assert len(stubs) == len(seed_two_employees)\\n    for stub in stubs:\\n        assert stub[\\\"gross_pay\\\"] > 0\\n        assert stub[\\\"deductions\\\"] >= 0\\n        assert stub[\\\"net_pay\\\"] == pytest.approx(stub[\\\"gross_pay\\\"] - stub[\\\"deductions\\\"])\\n\\n    audit = hr_admin_client.get(f\\\"{api_base}/api/audit-log?ref={run_id}\\\").json()\\n    assert len(audit[\\\"entries\\\"]) >= 1\\n\\n    matched = [e for e in webhook_sink.events if e.get(\\\"run_id\\\") == run_id]\\n    assert len(matched) == 1\\n    assert matched[0][\\\"type\\\"] == \\\"payroll.completed\\\"\\n\"\n    },\n    {\n      \"name\": \"test_payroll_run_returns_409_when_run_already_in_progress\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller holds role hr-admin\",\n        \"A payroll run for period 2024-05 is currently in state=running (seeded via <fixture>)\",\n        \"No completed run for the same period exists\"\n      ],\n      \"actions\": [\n        \"POST /api/payroll-runs with body {\\\"period\\\": \\\"2024-05\\\", \\\"type\\\": \\\"monthly\\\"} while a run is al"
+  }
+}

@@ -1,0 +1,133 @@
+{
+  "req": {
+    "id": "R-HLT-084",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "integration",
+    "title": "Allergy intolerance (audit)",
+    "statement": "A clinician shall record an AllergyIntolerance linked to the patient; subsequent MedicationRequests shall warn on conflict. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records allergy"
+    ],
+    "expected_outcomes": [
+      "allergy stored",
+      "alerts regenerated"
+    ],
+    "error_pathways": [
+      "409 when exact duplicate"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/AllergyIntolerance"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-084",
+    "reasoning": "R-HLT-084 mandates three verifiable behaviours: (1) a clinician can POST a valid AllergyIntolerance and receive 201 + an AuditEvent (positive/EP); (2) posting the exact same allergy a second time returns 409 (negative/NEG); (3) the system handles the state boundary where an allergy is created then a conflicting MedicationRequest is submitted, triggering a warning alert (boundary/STC). Each test is self-contained via pytest fixtures that create a fresh patient, authenticate as clinician, and clean up via teardown. Determinism is enforced by using unique patient identifiers per test run (uuid4).",
+    "tests": [
+      {
+        "name": "test_post_allergy_intolerance_creates_resource_and_audit_event",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "A patient resource exists with known patient_id",
+          "No prior AllergyIntolerance for this patient+substance combination"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with a valid FHIR R4 payload referencing the patient and substance 'peanut'",
+          "Assert HTTP 201 and capture resource id from Location header",
+          "GET /AuditEvent?entity=AllergyIntolerance/<resource_id> to check audit trail"
+        ],
+        "expected": [
+          "POST returns HTTP 201",
+          "Response body contains resourceType AllergyIntolerance",
+          "AuditEvent query returns at least one event with action='C' and outcome='0'"
+        ],
+        "trace": [
+          "R-HLT-084: allergy stored",
+          "R-HLT-084: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nimport uuid\nfrom <helper_fn> import fhir_client, clinician_token, create_patient, delete_resource\n\n@pytest.fixture()\ndef ctx():\n    token = clinician_token()\n    patient_id = create_patient(token)\n    yield {\"token\": token, \"patient_id\": patient_id}\n    delete_resource(token, f\"Patient/{patient_id}\")\n\ndef test_post_allergy_intolerance_creates_resource_and_audit_event(ctx):\n    client = fhir_client(ctx[\"token\"])\n    substance_code = \"762952008\"\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{ctx['patient_id']}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": substance_code}]}\n    }\n    post_resp = client.post(\"/AllergyIntolerance\", json=payload)\n    assert post_resp.status_code == 201, post_resp.text\n    resource_id = post_resp.json()[\"id\"]\n    assert post_resp.json()[\"resourceType\"] == \"AllergyIntolerance\"\n    audit_resp = client.get(f\"/AuditEvent?entity=AllergyIntolerance/{resource_id}\")\n    assert audit_resp.status_code == 200\n    entries = audit_resp.json().get(\"entry\", [])\n    assert len(entries) >= 1\n    event = entries[0][\"resource\"]\n    assert event[\"action\"] == \"C\"\n    assert event[\"outcome\"] == \"0\"\n    delete_resource(ctx[\"token\"], f\"AllergyIntolerance/{resource_id}\")"
+      },
+      {
+        "name": "test_post_duplicate_allergy_intolerance_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "A patient resource exists with known patient_id",
+          "An AllergyIntolerance for the same patient+substance already exists"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance with a valid payload (first insert \u2014 expect 201)",
+          "POST /AllergyIntolerance with the identical payload a second time",
+          "Assert HTTP 409 on the second POST"
+        ],
+        "expected": [
+          "First POST returns HTTP 201",
+          "Second POST returns HTTP 409",
+          "Response body contains an OperationOutcome with issue.code='duplicate'"
+        ],
+        "trace": [
+          "R-HLT-084: error pathway \u2014 409 when exact duplicate"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import fhir_client, clinician_token, create_patient, delete_resource\n\n@pytest.fixture()\ndef ctx():\n    token = clinician_token()\n    patient_id = create_patient(token)\n    yield {\"token\": token, \"patient_id\": patient_id}\n    delete_resource(token, f\"Patient/{patient_id}\")\n\ndef test_post_duplicate_allergy_intolerance_returns_409(ctx):\n    client = fhir_client(ctx[\"token\"])\n    payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{ctx['patient_id']}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\"}]}\n    }\n    first = client.post(\"/AllergyIntolerance\", json=payload)\n    assert first.status_code == 201, first.text\n    resource_id = first.json()[\"id\"]\n    second = client.post(\"/AllergyIntolerance\", json=payload)\n    assert second.status_code == 409, second.text\n    body = second.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    codes = [i.get(\"code\") for i in body.get(\"issue\", [])]\n    assert \"duplicate\" in codes\n    delete_resource(ctx[\"token\"], f\"AllergyIntolerance/{resource_id}\")"
+      },
+      {
+        "name": "test_medication_request_warns_on_allergy_conflict_after_allergy_recorded",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Authenticated as role:clinician",
+          "A patient resource exists with known patient_id",
+          "No prior AllergyIntolerance or MedicationRequest for this patient"
+        ],
+        "actions": [
+          "POST /AllergyIntolerance for substance 'penicillin' \u2014 expect 201 (state: allergy stored)",
+          "POST /MedicationRequest prescribing a medication containing penicillin for the same patient",
+          "Assert response contains a conflict warning",
+          "Verify AuditEvent emitted for both operations"
+        ],
+        "expected": [
+          "AllergyIntolerance POST returns HTTP 201",
+          "MedicationRequest POST returns HTTP 201 or 422 with a detectedIssue of type 'drug-allergy-alert'",
+          "AuditEvent records exist for both the AllergyIntolerance and the MedicationRequest"
+        ],
+        "trace": [
+          "R-HLT-084: subsequent MedicationRequests shall warn on conflict",
+          "R-HLT-084: alerts regenerated",
+          "R-HLT-084: AuditEvent must be emitted for every operation"
+        ],
+        "executable": "import pytest\nfrom <helper_fn> import fhir_client, clinician_token, create_patient, delete_resource\n\n@pytest.fixture()\ndef ctx():\n    token = clinician_token()\n    patient_id = create_patient(token)\n    yield {\"token\": token, \"patient_id\": patient_id}\n    delete_resource(token, f\"Patient/{patient_id}\")\n\ndef test_medication_request_warns_on_allergy_conflict_after_allergy_recorded(ctx):\n    client = fhir_client(ctx[\"token\"])\n    allergy_payload = {\n        \"resourceType\": \"AllergyIntolerance\",\n        \"clinicalStatus\": {\"coding\": [{\"code\": \"active\"}]},\n        \"patient\": {\"reference\": f\"Patient/{ctx['patient_id']}\"},\n        \"code\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\", \"display\": \"Penicillin\"}]}\n    }\n    ai_resp = client.post(\"/AllergyIntolerance\", json=allergy_payload)\n    assert ai_resp.status_code == 201, ai_resp.text\n    ai_id = ai_resp.json()[\"id\"]\n    med_payload = {\n        \"resourceType\": \"MedicationRequest\",\n        \"status\": \"active\",\n        \"intent\": \"order\",\n        \"subject\": {\"reference\": f\"Patient/{ctx['patient_id']}\"},\n        \"medicationCodeableConcept\": {\"coding\": [{\"system\": \"http://snomed.info/sct\", \"code\": \"372687004\"}]}\n    }\n    med_resp = client.post(\"/MedicationRequest\", json=med_payload)\n    assert med_resp.status_code in (201, 422), med_resp.text\n    body = med_resp.json()\n    if med_resp.status_code == 422:\n        issues = body.get(\"issue\", [])\n        codes = [i.get(\"code\", \"\") for i in issues]\n        assert any(\"drug-allergy\" in c for c in codes)\n    else:\n        warning = body.get(\"extension\", [])\n        assert any(\"drug-allergy\" in str(w) for w in warning)\n    for ref in [f\"AllergyIntolerance/{ai_id}\", f\"Patient/{ctx['patient_id']}\"]:\n        audit = client.get(f\"/AuditEvent?entity={ref}\")\n        assert audit.status_code == 200\n        assert len(audit.json().get(\"entry\", [])) >= 1\n    if med_resp.status_code == 201:\n        delete_resource(ctx[\"token\"], f\"MedicationRequest/{body['id']}\")\n    delete_resource(ctx[\"token\"], f\"AllergyIntolerance/{ai_id}\")"
+      }
+    ]
+  },
+  "req_id": "R-HLT-084",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1014,
+    "output_tokens": 2833,
+    "latency_ms": 35265,
+    "wall_ms": 35265,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-084\",\n  \"reasoning\": \"R-HLT-084 mandates three verifiable behaviours: (1) a clinician can POST a valid AllergyIntolerance and receive 201 + an AuditEvent (positive/EP); (2) posting the exact same allergy a second time returns 409 (negative/NEG); (3) the system handles the state boundary where an allergy is created then a conflicting MedicationRequest is submitted, triggering a warning alert (boundary/STC). Each test is self-contained via pytest fixtures that create a fresh patient, authenticate as clinician, and clean up via teardown. Determinism is enforced by using unique patient identifiers per test run (uuid4).\",\n  \"tests\": [\n    {\n      \"name\": \"test_post_allergy_intolerance_creates_resource_and_audit_event\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated as role:clinician\",\n        \"A patient resource exists with known patient_id\",\n        \"No prior AllergyIntolerance for this patient+substance combination\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with a valid FHIR R4 payload referencing the patient and substance 'peanut'\",\n        \"Assert HTTP 201 and capture resource id from Location header\",\n        \"GET /AuditEvent?entity=AllergyIntolerance/<resource_id> to check audit trail\"\n      ],\n      \"expected\": [\n        \"POST returns HTTP 201\",\n        \"Response body contains resourceType AllergyIntolerance\",\n        \"AuditEvent query returns at least one event with action='C' and outcome='0'\"\n      ],\n      \"trace\": [\n        \"R-HLT-084: allergy stored\",\n        \"R-HLT-084: AuditEvent must be emitted for every operation\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\nfrom <helper_fn> import fhir_client, clinician_token, create_patient, delete_resource\\n\\n@pytest.fixture()\\ndef ctx():\\n    token = clinician_token()\\n    patient_id = create_patient(token)\\n    yield {\\\"token\\\": token, \\\"patient_id\\\": patient_id}\\n    delete_resource(token, f\\\"Patient/{patient_id}\\\")\\n\\ndef test_post_allergy_intolerance_creates_resource_and_audit_event(ctx):\\n    client = fhir_client(ctx[\\\"token\\\"])\\n    substance_code = \\\"762952008\\\"\\n    payload = {\\n        \\\"resourceType\\\": \\\"AllergyIntolerance\\\",\\n        \\\"clinicalStatus\\\": {\\\"coding\\\": [{\\\"code\\\": \\\"active\\\"}]},\\n        \\\"patient\\\": {\\\"reference\\\": f\\\"Patient/{ctx['patient_id']}\\\"},\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://snomed.info/sct\\\", \\\"code\\\": substance_code}]}\\n    }\\n    post_resp = client.post(\\\"/AllergyIntolerance\\\", json=payload)\\n    assert post_resp.status_code == 201, post_resp.text\\n    resource_id = post_resp.json()[\\\"id\\\"]\\n    assert post_resp.json()[\\\"resourceType\\\"] == \\\"AllergyIntolerance\\\"\\n    audit_resp = client.get(f\\\"/AuditEvent?entity=AllergyIntolerance/{resource_id}\\\")\\n    assert audit_resp.status_code == 200\\n    entries = audit_resp.json().get(\\\"entry\\\", [])\\n    assert len(entries) >= 1\\n    event = entries[0][\\\"resource\\\"]\\n    assert event[\\\"action\\\"] == \\\"C\\\"\\n    assert event[\\\"outcome\\\"] == \\\"0\\\"\\n    delete_resource(ctx[\\\"token\\\"], f\\\"AllergyIntolerance/{resource_id}\\\")\"\n    },\n    {\n      \"name\": \"test_post_duplicate_allergy_intolerance_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated as role:clinician\",\n        \"A patient resource exists with known patient_id\",\n        \"An AllergyIntolerance for the same patient+substance already exists\"\n      ],\n      \"actions\": [\n        \"POST /AllergyIntolerance with a valid payload (first insert \u2014 expect 201)\",\n        \"POST /AllergyIntolerance with the identical payload a second time\",\n        \"Assert HTTP 409 on the second POST\"\n      ],\n      \"expected\": [\n        \"First POST returns HTTP 201\",\n        \"Second POST returns HTTP 409\",\n        \"Response body contains an OperationOutcome with issue.code='duplicate'\"\n      ],\n      \"trace\": [\n        \"R-HLT-084: error pathway \u2014 409 when exact duplicate\"\n      ],"
+  }
+}

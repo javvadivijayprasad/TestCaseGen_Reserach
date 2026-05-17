@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-FIN-073",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Biller registration (negative variant)",
+    "statement": "A customer shall register a biller only after a 24-hour hold; withdrawals to new billers shall be deferred. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer adds biller"
+    ],
+    "expected_outcomes": [
+      "biller in hold state"
+    ],
+    "error_pathways": [
+      "409 if duplicate biller"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/billers"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-073",
+    "reasoning": "R-FIN-073 mandates a 24-hour hold on newly registered billers and deferred withdrawals. The test suite covers: (1) a positive EP case confirming a valid biller lands in 'hold' state with HTTP 201; (2) a negative DT case confirming a duplicate biller returns HTTP 409; (3) a boundary BVA case confirming registration with the maximum-length biller name is accepted; (4) a negative NEG case confirming an unauthenticated request is rejected with HTTP 401; (5) a state-transition STC case \u2014 corrected from 'negative' to 'positive' kind because STC heuristic models valid state transitions (the system correctly deferring a withdrawal is the expected, specified behaviour, not an error path) \u2014 confirming that a withdrawal attempted within 24 hours of registration is deferred. The violation in test[4] (negative kind paired with STC heuristic) is fixed by changing kind to 'positive': the deferred-withdrawal behaviour is the required outcome specified in R-FIN-073, making it a positive state-transition scenario.",
+    "tests": [
+      {
+        "name": "test_register_biller_valid_lands_in_hold_state",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid JWT available via <auth_fixture>)",
+          "Biller name does not already exist for this customer",
+          "Customer account is in good standing"
+        ],
+        "actions": [
+          "POST /billers with valid biller payload",
+          "Assert HTTP 201 returned",
+          "Assert response body contains status == 'hold'",
+          "Assert hold_until is approximately NOW + 24 hours"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response JSON field 'status' equals 'hold'",
+          "Response JSON field 'hold_until' is within [23h55m, 24h05m] from request time"
+        ],
+        "trace": [
+          "R-FIN-073: biller registration places biller in hold state",
+          "R-FIN-073: 24-hour hold enforced on new billers"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_register_biller_valid_lands_in_hold_state(auth_headers, api_client, unique_biller_payload):\n    before = datetime.now(timezone.utc)\n    resp = api_client.post(\"/billers\", json=unique_biller_payload, headers=auth_headers)\n    after = datetime.now(timezone.utc)\n\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n\n    assert body[\"status\"] == \"hold\", f\"Expected 'hold', got {body.get('status')}\"\n\n    hold_until = datetime.fromisoformat(body[\"hold_until\"])\n    lower = before + timedelta(hours=23, minutes=55)\n    upper = after + timedelta(hours=24, minutes=5)\n    assert lower <= hold_until <= upper, (\n        f\"hold_until {hold_until} not within expected 24-hour window [{lower}, {upper}]\"\n    )\n"
+      },
+      {
+        "name": "test_register_duplicate_biller_returns_409",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated (valid JWT available via <auth_fixture>)",
+          "Biller with the same account number already registered for this customer (pre-seeded via <seed_biller_fixture>)"
+        ],
+        "actions": [
+          "POST /billers with payload whose account number matches existing biller",
+          "Assert HTTP 409 returned",
+          "Assert error code in response body indicates duplicate biller"
+        ],
+        "expected": [
+          "HTTP 409 Conflict",
+          "Response JSON field 'error_code' equals 'DUPLICATE_BILLER'",
+          "No second biller record created"
+        ],
+        "trace": [
+          "R-FIN-073 error pathway: 409 if duplicate biller"
+        ],
+        "executable": "import pytest\n\ndef test_register_duplicate_biller_returns_409(auth_headers, api_client, seeded_biller_payload):\n    # seeded_biller_payload fixture pre-registers the biller and returns same payload\n    resp = api_client.post(\"/billers\", json=seeded_biller_payload, headers=auth_headers)\n\n    assert resp.status_code == 409, f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"error_code\") == \"DUPLICATE_BILLER\", (\n        f\"Unexpected error_code: {body.get('error_code')}\"\n    )\n\n    # Confirm only one biller record exists\n    list_resp = api_client.get(\"/billers\", headers=auth_headers)\n    assert list_resp.status_code == 200\n    billers = [b for b in list_resp.json()[\"billers\"]\n               if b[\"account_number\"] == seeded_biller_payload[\"account_number\"]]\n    assert len(billers) == 1, f\"Expected 1 record, found {len(billers)}\"\n"
+      },
+      {
+        "name": "test_register_biller_max_length_name_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated (valid JWT available via <auth_fixture>)",
+          "API schema defines maximum biller name length of 100 characters",
+          "No existing biller with the same account number"
+        ],
+        "actions": [
+          "Build payload with biller_name of exactly 100 characters",
+          "POST /billers with that payload",
+          "Assert HTTP 201 returned",
+          "Assert response status == 'hold'"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Biller record created with full 100-character name preserved",
+          "Response JSON field 'status' equals 'hold'"
+        ],
+        "trace": [
+          "R-FIN-073: valid biller registration accepted at upper boundary of name length",
+          "BVA on biller_name field maximum boundary (100 chars)"
+        ],
+        "executable": "import pytest\n\nMAX_NAME_LEN = 100\n\ndef test_register_biller_max_length_name_accepted(auth_headers, api_client, unique_account_number):\n    max_name = \"B\" * MAX_NAME_LEN\n    payload = {\n        \"biller_name\": max_name,\n        \"account_number\": unique_account_number,\n        \"biller_code\": \"TST001\"\n    }\n\n    resp = api_client.post(\"/billers\", json=payload, headers=auth_headers)\n\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"hold\"\n    assert body[\"biller_name\"] == max_name, \"Biller name not preserved at max length\"\n"
+      },
+      {
+        "name": "test_register_biller_unauthenticated_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No authentication token is provided in the request",
+          "Biller payload is otherwise valid"
+        ],
+        "actions": [
+          "POST /billers with valid payload but no Authorization header",
+          "Assert HTTP 401 returned",
+          "Assert no biller record is created"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response JSON field 'error_code' equals 'UNAUTHORIZED'",
+          "No biller record persisted"
+        ],
+        "trace": [
+          "R-FIN-073 precondition: customer must be authenticated",
+          "R-FIN-073 error pathway: unauthorised access rejected"
+        ],
+        "executable": "import pytest\n\ndef test_register_biller_unauthenticated_returns_401(api_client, unique_biller_payload):\n    resp = api_client.post(\"/billers\", json=unique_biller_payload)  # no auth headers\n\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body.get(\"error_code\") == \"UNAUTHORIZED\", (\n        f\"Unexpected error_code: {body.get('error_code')}\"\n    )\n"
+      },
+      {
+        "name": "test_withdrawal_to_new_biller_within_hold_period_is_deferred",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated (valid JWT available via <auth_fixture>)",
+          "Biller was just registered and is in 'hold' state (pre-seeded via <new_biller_in_hold_fixture>)",
+          "Customer account has sufficient funds"
+        ],
+        "actions": [
+          "POST /billers/{biller_id}/withdrawals with a valid amount",
+          "Assert HTTP 202 with deferred status OR HTTP 403 indicating withdrawal blocked during hold",
+          "Assert withdrawal is not immediately executed",
+          "Assert withdrawal record reflects deferred or pending state"
+        ],
+        "expected": [
+          "HTTP 202 Accepted with response body status 'deferred' or 'pending', OR HTTP 403 with error_code 'BILLER_IN_HOLD'",
+          "No funds debited from account immediately",
+          "Withdrawal record reflects deferred/pending state confirming the system correctly enforces the 24-hour hold transition"
+        ],
+        "trace": [
+          "R-FIN-073: withdrawals to new billers shall be deferred during 24-hour hold",
+          "STC: state transition from 'registered' to 'hold' correctly gates withdrawal execution \u2014 deferred outcome is the specified positive behaviour"
+        ],
+        "executable": "import pytest\n\nDEFERRED_STATUSES = {\"deferred\", \"pending\"}\nBLOCKED_HTTP_CODES = {202, 403}\n\ndef test_withdrawal_to_new_biller_within_hold_period_is_deferred(\n    auth_headers, api_client, new_biller_in_hold\n):\n    biller_id = new_biller_in_hold[\"id\"]\n    withdrawal_payload = {\"amount\": \"50.00\", \"currency\": \"AUD\"}\n\n    resp = api_client.post(\n        f\"/billers/{biller_id}/withdrawals\",\n        json=withdrawal_payload,\n        headers=auth_headers\n    )\n\n    assert resp.status_code in BLOCKED_HTTP_CODES, (\n        f\"Expected one of {BLOCKED_HTTP_CODES}, got {resp.status_code}: {resp.text}\"\n    )\n\n    body = resp.json()\n    if resp.status_code == 202:\n        assert body.get(\"status\") in DEFERRED_STATUSES, (\n            f\"Expected deferred/pending status, got {body.get('status')}\"\n        )\n    else:\n        assert body.get(\"error_code\") == \"BILLER_IN_HOLD\", (\n            f\"Expected BILLER_IN_HOLD error_code, got {body.get('error_code')}\"\n        )\n\n    # Verify no immediate debit occurred\n    account_resp = api_client.get(\"/accounts/balance\", headers=auth_headers)\n    assert account_resp.status_code == 200\n    balance_after = float(account_resp.json()[\"available_balance\"])\n    balance_before = float(new_biller_in_hold[\"account_balance_before\"])\n    assert balance_after == balance_before, (\n        f\"Balance changed unexpectedly: before={balance_before}, after={balance_after}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-073",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 998,
+    "output_tokens": 2926,
+    "latency_ms": 37545,
+    "wall_ms": 37545,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-073\",\n  \"reasoning\": \"R-FIN-073 mandates a 24-hour hold on newly registered billers and deferred withdrawals. The test suite covers: (1) a positive EP case confirming a valid biller lands in 'hold' state with HTTP 201; (2) a negative DT case confirming a duplicate biller returns HTTP 409; (3) a boundary BVA case confirming registration with the maximum-length biller name is accepted; (4) a negative NEG case confirming an unauthenticated request is rejected with HTTP 401; (5) a state-transition STC case confirming that a withdrawal attempted within 24 hours of registration is deferred. Together these span all error pathways called out in the requirement and satisfy the minimum positive/negative/boundary coverage mandate.\",\n  \"tests\": [\n    {\n      \"name\": \"test_register_biller_valid_lands_in_hold_state\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT available via <auth_fixture>)\",\n        \"Biller name does not already exist for this customer\",\n        \"Customer account is in good standing\"\n      ],\n      \"actions\": [\n        \"POST /billers with valid biller payload\",\n        \"Assert HTTP 201 returned\",\n        \"Assert response body contains status == 'hold'\",\n        \"Assert hold_until is approximately NOW + 24 hours\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response JSON field 'status' equals 'hold'\",\n        \"Response JSON field 'hold_until' is within [23h55m, 24h05m] from request time\"\n      ],\n      \"trace\": [\n        \"R-FIN-073: biller registration places biller in hold state\",\n        \"R-FIN-073: 24-hour hold enforced on new billers\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_register_biller_valid_lands_in_hold_state(auth_headers, api_client, unique_biller_payload):\\n    before = datetime.now(timezone.utc)\\n    resp = api_client.post(\\\"/billers\\\", json=unique_biller_payload, headers=auth_headers)\\n    after = datetime.now(timezone.utc)\\n\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n\\n    assert body[\\\"status\\\"] == \\\"hold\\\", f\\\"Expected 'hold', got {body.get('status')}\\\"\\n\\n    hold_until = datetime.fromisoformat(body[\\\"hold_until\\\"])\\n    lower = before + timedelta(hours=23, minutes=55)\\n    upper = after + timedelta(hours=24, minutes=5)\\n    assert lower <= hold_until <= upper, (\\n        f\\\"hold_until {hold_until} not within expected 24-hour window [{lower}, {upper}]\\\"\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_register_duplicate_biller_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT available via <auth_fixture>)\",\n        \"Biller with the same account number already registered for this customer (pre-seeded via <seed_biller_fixture>)\"\n      ],\n      \"actions\": [\n        \"POST /billers with payload whose account number matches existing biller\",\n        \"Assert HTTP 409 returned\",\n        \"Assert error code in response body indicates duplicate biller\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict\",\n        \"Response JSON field 'error_code' equals 'DUPLICATE_BILLER'\",\n        \"No second biller record created\"\n      ],\n      \"trace\": [\n        \"R-FIN-073 error pathway: 409 if duplicate biller\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_register_duplicate_biller_returns_409(auth_headers, api_client, seeded_biller_payload):\\n    # seeded_biller_payload fixture pre-registers the biller and returns same payload\\n    resp = api_client.post(\\\"/billers\\\", json=seeded_biller_payload, headers=auth_headers)\\n\\n    assert resp.status_code == 409, f\\\"Expected 409, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"error_code\\\") == \\\"DUPLICATE_BILLER\\\", (\\n        f\\\"Unexpected error_code: {body.get('error_code')}\\\"\\n    )\\n"
+  }
+}

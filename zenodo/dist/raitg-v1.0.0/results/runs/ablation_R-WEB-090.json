@@ -1,0 +1,153 @@
+{
+  "req": {
+    "id": "R-WEB-090",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Announcement rollout \u2014 variant 4",
+    "statement": "A system-admin shall publish an org-wide announcement to employees in chosen departments; publishing without any department selection shall be rejected. Additionally, the operation must be rate-limited per user.",
+    "actors": [
+      "admin"
+    ],
+    "preconditions": [
+      "role:admin"
+    ],
+    "triggers": [
+      "admin publishes announcement"
+    ],
+    "expected_outcomes": [
+      "announcement created",
+      "target employees notified",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "422 when no departments selected"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/org-announcements/new"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-090",
+    "reasoning": "The requirement covers four testable concerns: (1) successful announcement publication to selected departments (positive / EP), (2) rejection when no departments are selected (negative / NEG), (3) boundary on department selection \u2014 exactly one department selected (boundary / BVA), and (4) rate-limit enforcement after repeated rapid submissions (negative / STC). Tests are designed to be self-contained via admin_session and announcement_payload fixtures, use deterministic UUIDs for idempotency, and target /org-announcements/new.",
+    "tests": [
+      {
+        "name": "test_publish_announcement_with_multiple_departments_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "At least two departments exist in the org",
+          "No duplicate announcement with same idempotency key exists"
+        ],
+        "actions": [
+          "POST /org-announcements/new with valid title, body, and two department IDs",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Response body contains announcement ID",
+          "Target employees in both departments receive notification"
+        ],
+        "trace": [
+          "R-WEB-090: announcement created",
+          "R-WEB-090: target employees notified"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_publish_announcement_with_multiple_departments_succeeds(admin_session, dept_ids):\n    idempotency_key = str(uuid.uuid4())\n    payload = {\n        \"title\": f\"Announcement {idempotency_key}\",\n        \"body\": \"All-hands meeting scheduled.\",\n        \"department_ids\": dept_ids[:2],\n        \"idempotency_key\": idempotency_key,\n    }\n    resp = admin_session.post(\"/org-announcements/new\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    data = resp.json()\n    assert \"id\" in data, \"Response missing announcement ID\"\n    assert data[\"department_ids\"] == dept_ids[:2]\n    notifications = <get_notifications_for_departments>(dept_ids[:2])\n    assert len(notifications) > 0, \"No notifications delivered to target employees\"\n"
+      },
+      {
+        "name": "test_publish_announcement_without_departments_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "No department IDs are selected"
+        ],
+        "actions": [
+          "POST /org-announcements/new with valid title and body but empty department_ids list",
+          "Capture HTTP response status and error body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity is returned",
+          "Response body contains field-level validation error referencing department_ids"
+        ],
+        "trace": [
+          "R-WEB-090: error pathway \u2014 422 when no departments selected"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_publish_announcement_without_departments_returns_422(admin_session):\n    payload = {\n        \"title\": f\"Announcement {uuid.uuid4()}\",\n        \"body\": \"This should be rejected.\",\n        \"department_ids\": [],\n    }\n    resp = admin_session.post(\"/org-announcements/new\", json=payload)\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    error_body = resp.json()\n    error_fields = <extract_error_fields>(error_body)\n    assert \"department_ids\" in error_fields, \"Error must reference department_ids field\"\n"
+      },
+      {
+        "name": "test_publish_announcement_with_exactly_one_department_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "At least one department exists in the org"
+        ],
+        "actions": [
+          "POST /org-announcements/new with valid title, body, and exactly one department ID",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 201 Created is returned",
+          "Announcement is persisted with exactly one department association",
+          "Employees in that single department receive notification"
+        ],
+        "trace": [
+          "R-WEB-090: boundary \u2014 minimum valid department count is 1",
+          "R-WEB-090: announcement created"
+        ],
+        "executable": "import uuid\nimport pytest\n\ndef test_publish_announcement_with_exactly_one_department_succeeds(admin_session, dept_ids):\n    idempotency_key = str(uuid.uuid4())\n    single_dept = [dept_ids[0]]\n    payload = {\n        \"title\": f\"Announcement {idempotency_key}\",\n        \"body\": \"Boundary: one department only.\",\n        \"department_ids\": single_dept,\n        \"idempotency_key\": idempotency_key,\n    }\n    resp = admin_session.post(\"/org-announcements/new\", json=payload)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    data = resp.json()\n    assert data[\"department_ids\"] == single_dept, \"Expected exactly one department association\"\n    notifications = <get_notifications_for_departments>(single_dept)\n    assert len(notifications) > 0, \"No notifications delivered for single-department announcement\"\n"
+      },
+      {
+        "name": "test_publish_announcement_rate_limit_enforced_per_user",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as system-admin",
+          "At least one department exists",
+          "Rate-limit threshold N is known (imported from config)",
+          "Admin has made fewer than N announcement requests in current window"
+        ],
+        "actions": [
+          "POST /org-announcements/new N+1 times in rapid succession with unique idempotency keys",
+          "Record status code of each response"
+        ],
+        "expected": [
+          "First N requests return HTTP 201",
+          "The (N+1)th request returns HTTP 429 Too Many Requests",
+          "429 response includes Retry-After header"
+        ],
+        "trace": [
+          "R-WEB-090: operation must be rate-limited per user",
+          "R-WEB-090: additional variant semantics honoured"
+        ],
+        "executable": "import uuid\nimport pytest\nfrom config import ANNOUNCEMENT_RATE_LIMIT_THRESHOLD\n\ndef test_publish_announcement_rate_limit_enforced_per_user(rate_limit_admin_session, dept_ids):\n    <reset_rate_limit_for_user>(rate_limit_admin_session)\n    responses = []\n    for _ in range(ANNOUNCEMENT_RATE_LIMIT_THRESHOLD + 1):\n        payload = {\n            \"title\": f\"RL-Test {uuid.uuid4()}\",\n            \"body\": \"Rate limit probe.\",\n            \"department_ids\": [dept_ids[0]],\n            \"idempotency_key\": str(uuid.uuid4()),\n        }\n        responses.append(rate_limit_admin_session.post(\"/org-announcements/new\", json=payload))\n    accepted = [r for r in responses if r.status_code == 201]\n    throttled = [r for r in responses if r.status_code == 429]\n    assert len(accepted) == ANNOUNCEMENT_RATE_LIMIT_THRESHOLD\n    assert len(throttled) >= 1, \"Expected at least one 429 after threshold exceeded\"\n    assert \"Retry-After\" in throttled[0].headers, \"429 must include Retry-After header\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-090",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1007,
+    "output_tokens": 2125,
+    "latency_ms": 22845,
+    "wall_ms": 22845,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-090\",\n  \"reasoning\": \"The requirement covers four testable concerns: (1) successful announcement publication to selected departments (positive / EP), (2) rejection when no departments are selected (negative / NEG), (3) boundary on department selection \u2014 exactly one department selected (boundary / BVA), and (4) rate-limit enforcement after repeated rapid submissions (negative / STC). Tests are designed to be self-contained via admin_session and announcement_payload fixtures, use deterministic UUIDs for idempotency, and target /org-announcements/new.\",\n  \"tests\": [\n    {\n      \"name\": \"test_publish_announcement_with_multiple_departments_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as system-admin\",\n        \"At least two departments exist in the org\",\n        \"No duplicate announcement with same idempotency key exists\"\n      ],\n      \"actions\": [\n        \"POST /org-announcements/new with valid title, body, and two department IDs\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created is returned\",\n        \"Response body contains announcement ID\",\n        \"Target employees in both departments receive notification\"\n      ],\n      \"trace\": [\n        \"R-WEB-090: announcement created\",\n        \"R-WEB-090: target employees notified\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_publish_announcement_with_multiple_departments_succeeds(admin_session, dept_ids):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = {\\n        \\\"title\\\": f\\\"Announcement {idempotency_key}\\\",\\n        \\\"body\\\": \\\"All-hands meeting scheduled.\\\",\\n        \\\"department_ids\\\": dept_ids[:2],\\n        \\\"idempotency_key\\\": idempotency_key,\\n    }\\n    resp = admin_session.post(\\\"/org-announcements/new\\\", json=payload)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    data = resp.json()\\n    assert \\\"id\\\" in data, \\\"Response missing announcement ID\\\"\\n    assert data[\\\"department_ids\\\"] == dept_ids[:2]\\n    notifications = <get_notifications_for_departments>(dept_ids[:2])\\n    assert len(notifications) > 0, \\\"No notifications delivered to target employees\\\"\\n\"\n    },\n    {\n      \"name\": \"test_publish_announcement_without_departments_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as system-admin\",\n        \"No department IDs are selected\"\n      ],\n      \"actions\": [\n        \"POST /org-announcements/new with valid title and body but empty department_ids list\",\n        \"Capture HTTP response status and error body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity is returned\",\n        \"Response body contains field-level validation error referencing department_ids\"\n      ],\n      \"trace\": [\n        \"R-WEB-090: error pathway \u2014 422 when no departments selected\"\n      ],\n      \"executable\": \"import uuid\\nimport pytest\\n\\ndef test_publish_announcement_without_departments_returns_422(admin_session):\\n    payload = {\\n        \\\"title\\\": f\\\"Announcement {uuid.uuid4()}\\\",\\n        \\\"body\\\": \\\"This should be rejected.\\\",\\n        \\\"department_ids\\\": [],\\n    }\\n    resp = admin_session.post(\\\"/org-announcements/new\\\", json=payload)\\n    assert resp.status_code == 422, f\\\"Expected 422, got {resp.status_code}: {resp.text}\\\"\\n    error_body = resp.json()\\n    error_fields = <extract_error_fields>(error_body)\\n    assert \\\"department_ids\\\" in error_fields, \\\"Error must reference department_ids field\\\"\\n\"\n    },\n    {\n      \"name\": \"test_publish_announcement_with_exactly_one_department_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"User is authenticated as system-admin\",\n        \"At least one department exists in the org\"\n      ],\n      \"actions\": [\n        \"POST /org-announcements/new with valid title, body, and exact"
+  }
+}

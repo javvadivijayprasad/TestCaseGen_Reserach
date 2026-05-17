@@ -1,0 +1,215 @@
+{
+  "req": {
+    "id": "R-WEB-096",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Schedule performance review \u2014 variant 5",
+    "statement": "A manager shall schedule a performance review with the reviewee at least 7 days in advance; past or sub-7-day dates shall be rejected. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "role:manager"
+    ],
+    "triggers": [
+      "manager schedules review"
+    ],
+    "expected_outcomes": [
+      "review scheduled",
+      "participants notified",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "422 when scheduled_at < now + 7d"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/performance-reviews/schedule"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-096",
+    "reasoning": "The requirement mandates: (1) scheduled_at >= now+7d (strict lower bound), (2) 2FA confirmation before scheduling succeeds, (3) 422 on sub-7-day or past dates. I derive: EP positive partition (date > now+7d, 2FA supplied), BVA lower boundary (exactly now+7d = valid; now+7d-1s = invalid), NEG for past date, DT for 2FA absent + valid date combo, STC for the state machine: unauthenticated -> 2FA-pending -> scheduled. Five tests cover all mandatory case types and all stated error pathways.",
+    "tests": [
+      {
+        "name": "test_schedule_review_valid_date_with_2fa_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User authenticated as manager",
+          "Reviewee employee exists",
+          "2FA device enrolled for manager",
+          "scheduled_at = now + 10 days (well inside valid partition)"
+        ],
+        "actions": [
+          "POST /auth/2fa/initiate to receive OTP challenge",
+          "Submit valid OTP to /auth/2fa/verify",
+          "POST /performance-reviews/schedule with scheduled_at=now+10d and reviewee_id"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains review_id",
+          "Response body status == 'scheduled'",
+          "Notification record created for both manager and reviewee"
+        ],
+        "trace": [
+          "R-WEB-096: valid date partition (>= now+7d)",
+          "R-WEB-096: 2FA confirmation required",
+          "R-WEB-096: review scheduled; participants notified"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_review_valid_date_with_2fa_succeeds(\n    manager_api_client,\n    reviewee_id,\n    complete_2fa,\n    assert_notification_sent,\n):\n    scheduled_at = (\n        datetime.now(timezone.utc) + timedelta(days=10)\n    ).isoformat()\n\n    complete_2fa(manager_api_client)\n\n    resp = manager_api_client.post(\n        \"/performance-reviews/schedule\",\n        json={\"reviewee_id\": reviewee_id, \"scheduled_at\": scheduled_at},\n    )\n\n    assert resp.status_code == 201\n    body = resp.json()\n    assert \"review_id\" in body\n    assert body[\"status\"] == \"scheduled\"\n    assert_notification_sent(body[\"review_id\"], roles=[\"manager\", \"reviewee\"])\n"
+      },
+      {
+        "name": "test_schedule_review_past_date_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User authenticated as manager",
+          "Reviewee employee exists",
+          "2FA completed",
+          "scheduled_at = now - 1 day (past date, clearly invalid partition)"
+        ],
+        "actions": [
+          "Complete 2FA flow",
+          "POST /performance-reviews/schedule with scheduled_at=now-1d"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response error code indicates date_too_early or equivalent",
+          "No review record created in database"
+        ],
+        "trace": [
+          "R-WEB-096: past dates shall be rejected",
+          "R-WEB-096: error pathway 422 when scheduled_at < now+7d"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_review_past_date_returns_422(\n    manager_api_client,\n    reviewee_id,\n    complete_2fa,\n    review_db_count,\n):\n    scheduled_at = (\n        datetime.now(timezone.utc) - timedelta(days=1)\n    ).isoformat()\n\n    complete_2fa(manager_api_client)\n    count_before = review_db_count()\n\n    resp = manager_api_client.post(\n        \"/performance-reviews/schedule\",\n        json={\"reviewee_id\": reviewee_id, \"scheduled_at\": scheduled_at},\n    )\n\n    assert resp.status_code == 422\n    body = resp.json()\n    assert \"scheduled_at\" in str(body.get(\"detail\", \"\")).lower() or \\\n           body.get(\"error_code\") in (\"date_too_early\", \"invalid_date\")\n    assert review_db_count() == count_before\n"
+      },
+      {
+        "name": "test_schedule_review_exactly_7_days_ahead_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User authenticated as manager",
+          "Reviewee employee exists",
+          "2FA completed",
+          "scheduled_at = now + exactly 7 days (lower boundary of valid range)"
+        ],
+        "actions": [
+          "Complete 2FA flow",
+          "POST /performance-reviews/schedule with scheduled_at=now+7d (to the second)"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body status == 'scheduled'",
+          "Boundary value accepted \u2014 confirms inclusive boundary"
+        ],
+        "trace": [
+          "R-WEB-096: at least 7 days in advance \u2014 boundary value now+7d must be valid",
+          "R-WEB-096: BVA lower bound ON point"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_review_exactly_7_days_ahead_is_accepted(\n    manager_api_client,\n    reviewee_id,\n    complete_2fa,\n    freeze_time,\n):\n    with freeze_time() as frozen_now:\n        scheduled_at = (\n            frozen_now + timedelta(days=7)\n        ).isoformat()\n\n        complete_2fa(manager_api_client)\n\n        resp = manager_api_client.post(\n            \"/performance-reviews/schedule\",\n            json={\"reviewee_id\": reviewee_id, \"scheduled_at\": scheduled_at},\n        )\n\n    assert resp.status_code == 201\n    assert resp.json()[\"status\"] == \"scheduled\"\n"
+      },
+      {
+        "name": "test_schedule_review_6_days_23_hours_ahead_returns_422",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User authenticated as manager",
+          "Reviewee employee exists",
+          "2FA completed",
+          "scheduled_at = now + 7 days - 1 second (one second below valid boundary)"
+        ],
+        "actions": [
+          "Complete 2FA flow",
+          "POST /performance-reviews/schedule with scheduled_at=now+7d-1s"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Sub-7-day boundary correctly rejected \u2014 confirms exclusive lower bound"
+        ],
+        "trace": [
+          "R-WEB-096: sub-7-day dates shall be rejected",
+          "R-WEB-096: BVA lower bound OFF-by-one point",
+          "R-WEB-096: error pathway 422 when scheduled_at < now+7d"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_review_6_days_23_hours_ahead_returns_422(\n    manager_api_client,\n    reviewee_id,\n    complete_2fa,\n    freeze_time,\n):\n    with freeze_time() as frozen_now:\n        scheduled_at = (\n            frozen_now + timedelta(days=7) - timedelta(seconds=1)\n        ).isoformat()\n\n        complete_2fa(manager_api_client)\n\n        resp = manager_api_client.post(\n            \"/performance-reviews/schedule\",\n            json={\"reviewee_id\": reviewee_id, \"scheduled_at\": scheduled_at},\n        )\n\n    assert resp.status_code == 422\n"
+      },
+      {
+        "name": "test_schedule_review_without_2fa_is_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User authenticated as manager (session token only, no 2FA token)",
+          "Reviewee employee exists",
+          "scheduled_at = now + 10 days (valid date partition)",
+          "2FA step intentionally skipped"
+        ],
+        "actions": [
+          "POST /performance-reviews/schedule directly, omitting 2FA header/token"
+        ],
+        "expected": [
+          "HTTP 401 or 403 (missing 2FA confirmation)",
+          "Response indicates 2FA required",
+          "No review record created"
+        ],
+        "trace": [
+          "R-WEB-096: action requires two-factor authentication confirmation",
+          "R-WEB-096: DT \u2014 valid date BUT missing 2FA => must fail",
+          "Decision table row: (date=valid, 2FA=absent) -> reject"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_review_without_2fa_is_rejected(\n    manager_api_client,\n    reviewee_id,\n    review_db_count,\n):\n    scheduled_at = (\n        datetime.now(timezone.utc) + timedelta(days=10)\n    ).isoformat()\n\n    count_before = review_db_count()\n\n    # Deliberately skip complete_2fa \u2014 raw manager session only\n    resp = manager_api_client.post(\n        \"/performance-reviews/schedule\",\n        json={\"reviewee_id\": reviewee_id, \"scheduled_at\": scheduled_at},\n    )\n\n    assert resp.status_code in (401, 403)\n    body = resp.json()\n    assert \"2fa\" in str(body).lower() or \"two_factor\" in str(body).lower() \\\n           or \"mfa\" in str(body).lower()\n    assert review_db_count() == count_before\n"
+      },
+      {
+        "name": "test_schedule_review_state_transition_unauthenticated_to_scheduled",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Fresh unauthenticated session",
+          "Valid manager credentials available",
+          "2FA device enrolled",
+          "scheduled_at = now + 14 days"
+        ],
+        "actions": [
+          "POST /auth/login with manager credentials (state: unauthenticated -> authenticated)",
+          "POST /auth/2fa/initiate (state: authenticated -> 2fa-pending)",
+          "POST /auth/2fa/verify with valid OTP (state: 2fa-pending -> 2fa-confirmed)",
+          "POST /performance-reviews/schedule (state: 2fa-confirmed -> review-scheduled)"
+        ],
+        "expected": [
+          "Each state transition returns expected HTTP 2xx",
+          "Final POST returns HTTP 201",
+          "Response status == 'scheduled'",
+          "Full state path exercised without shortcut"
+        ],
+        "trace": [
+          "R-WEB-096: 2FA confirmation \u2014 full state machine traversal",
+          "R-WEB-096: review scheduled outcome after complete auth lifecycle",
+          "STC: covers all transitions from entry to terminal scheduled state"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_review_state_transition_unauthenticated_to_scheduled(\n    unauthenticated_client,\n    manager_credentials,\n    reviewee_id,\n    otp_for_manager,\n):\n    scheduled_at = (\n        datetime.now(timezone.utc) + timedelta(days=14)\n    ).isoformat()\n\n    r1 = unauthenticated_client.post(\n        \"/auth/login\", json=manager_credentials\n    )\n    assert r1.status_code == 200\n    session_token = r1.json()[\"session_token\"]\n\n    unauthenticated_client.headers[\"Authorization\"] = f\"Bearer {session_token}\"\n\n    r2 = unauthenticated_client.post(\"/auth/2fa/initiate\")\n    assert r2.status_code == 200\n\n    r3 = unauthenticated_client.post(\n        \"/auth/2fa/verify\", json={\"otp\": otp_for_manager()}\n    )\n    assert r3.status_code == 200\n\n    r4 = unauthenticated_client.post(\n        \"/performance-reviews/schedule\",\n        json={\"reviewee_id\": reviewee_id, \"scheduled_at\": scheduled_at},\n    )\n    assert r4.status_code == 201\n    assert r4.json()[\"status\"] == \"scheduled\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-096",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1015,
+    "output_tokens": 3498,
+    "latency_ms": 43055,
+    "wall_ms": 43055,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-096\",\n  \"reasoning\": \"The requirement mandates: (1) scheduled_at >= now+7d (strict lower bound), (2) 2FA confirmation before scheduling succeeds, (3) 422 on sub-7-day or past dates. I derive: EP positive partition (date > now+7d, 2FA supplied), BVA lower boundary (exactly now+7d = valid; now+7d-1s = invalid), NEG for past date, DT for 2FA absent + valid date combo, STC for the state machine: unauthenticated -> 2FA-pending -> scheduled. Five tests cover all mandatory case types and all stated error pathways.\",\n  \"tests\": [\n    {\n      \"name\": \"test_schedule_review_valid_date_with_2fa_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User authenticated as manager\",\n        \"Reviewee employee exists\",\n        \"2FA device enrolled for manager\",\n        \"scheduled_at = now + 10 days (well inside valid partition)\"\n      ],\n      \"actions\": [\n        \"POST /auth/2fa/initiate to receive OTP challenge\",\n        \"Submit valid OTP to /auth/2fa/verify\",\n        \"POST /performance-reviews/schedule with scheduled_at=now+10d and reviewee_id\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains review_id\",\n        \"Response body status == 'scheduled'\",\n        \"Notification record created for both manager and reviewee\"\n      ],\n      \"trace\": [\n        \"R-WEB-096: valid date partition (>= now+7d)\",\n        \"R-WEB-096: 2FA confirmation required\",\n        \"R-WEB-096: review scheduled; participants notified\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_schedule_review_valid_date_with_2fa_succeeds(\\n    manager_api_client,\\n    reviewee_id,\\n    complete_2fa,\\n    assert_notification_sent,\\n):\\n    scheduled_at = (\\n        datetime.now(timezone.utc) + timedelta(days=10)\\n    ).isoformat()\\n\\n    complete_2fa(manager_api_client)\\n\\n    resp = manager_api_client.post(\\n        \\\"/performance-reviews/schedule\\\",\\n        json={\\\"reviewee_id\\\": reviewee_id, \\\"scheduled_at\\\": scheduled_at},\\n    )\\n\\n    assert resp.status_code == 201\\n    body = resp.json()\\n    assert \\\"review_id\\\" in body\\n    assert body[\\\"status\\\"] == \\\"scheduled\\\"\\n    assert_notification_sent(body[\\\"review_id\\\"], roles=[\\\"manager\\\", \\\"reviewee\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_schedule_review_past_date_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User authenticated as manager\",\n        \"Reviewee employee exists\",\n        \"2FA completed\",\n        \"scheduled_at = now - 1 day (past date, clearly invalid partition)\"\n      ],\n      \"actions\": [\n        \"Complete 2FA flow\",\n        \"POST /performance-reviews/schedule with scheduled_at=now-1d\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response error code indicates date_too_early or equivalent\",\n        \"No review record created in database\"\n      ],\n      \"trace\": [\n        \"R-WEB-096: past dates shall be rejected\",\n        \"R-WEB-096: error pathway 422 when scheduled_at < now+7d\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_schedule_review_past_date_returns_422(\\n    manager_api_client,\\n    reviewee_id,\\n    complete_2fa,\\n    review_db_count,\\n):\\n    scheduled_at = (\\n        datetime.now(timezone.utc) - timedelta(days=1)\\n    ).isoformat()\\n\\n    complete_2fa(manager_api_client)\\n    count_before = review_db_count()\\n\\n    resp = manager_api_client.post(\\n        \\\"/performance-reviews/schedule\\\",\\n        json={\\\"reviewee_id\\\": reviewee_id, \\\"scheduled_at\\\": scheduled_at},\\n    )\\n\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    assert \\\"scheduled_at\\\" in str(body.get(\\\"detail\\\", \\\"\\\")).lower() or \\\\\\n           body.get(\\\"error_code\\\") in (\\\"date_too_early\\\", \\\"invalid_date\\\")\\n    assert review_db_count() == count_before\\n\"\n    },\n    {\n      \"name\": \"test_schedule_review_"
+  }
+}

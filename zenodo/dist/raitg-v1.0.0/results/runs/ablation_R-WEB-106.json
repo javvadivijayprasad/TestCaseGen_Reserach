@@ -1,0 +1,211 @@
+{
+  "req": {
+    "id": "R-WEB-106",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Reset employee password \u2014 variant 5",
+    "statement": "An employee shall reset their password via an email link that expires after 30 minutes; expired links must be rejected. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "valid reset token"
+    ],
+    "preconditions": [
+      "valid reset token"
+    ],
+    "triggers": [
+      "employee submits new password"
+    ],
+    "expected_outcomes": [
+      "password updated",
+      "all sessions invalidated",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "410 when token expired",
+      "422 when password fails policy"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/password/reset"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-106",
+    "reasoning": "The requirement covers: (1) happy-path reset with valid token + 2FA, (2) rejection of an expired token (410), (3) password policy violation (422), (4) boundary at the 30-minute expiry edge, and (5) session invalidation post-reset. Tests are partitioned across EP (valid credentials partition), NEG (expired token, bad password), BVA (token age at 30-min boundary), STC (session state transition), and DT (2FA + policy decision table). Each test is self-contained via fixtures and helper placeholders.",
+    "tests": [
+      {
+        "name": "test_reset_password_valid_token_and_2fa_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Employee account exists",
+          "A fresh reset token (age < 30 min) is available",
+          "Employee has 2FA device registered",
+          "New password satisfies policy"
+        ],
+        "actions": [
+          "POST /password/reset with valid token, valid new password, and correct 2FA code",
+          "Assert HTTP 200 and success body",
+          "Assert old session cookies/tokens are invalidated"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body confirms password updated",
+          "All prior sessions for the employee are invalidated",
+          "Employee can log in with new password"
+        ],
+        "trace": [
+          "R-WEB-106: password updated on valid token",
+          "R-WEB-106: all sessions invalidated",
+          "R-WEB-106: 2FA confirmation required"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_valid_token_and_2fa_succeeds(\n    fresh_reset_token,   # <fixture> returns {'token': str, 'employee_id': str}\n    valid_2fa_code,      # <fixture> returns current TOTP code for employee\n    compliant_password,  # <fixture> returns policy-compliant password string\n    active_session_token # <fixture> returns a pre-existing session token\n):\n    payload = {\n        \"token\": fresh_reset_token[\"token\"],\n        \"new_password\": compliant_password,\n        \"totp_code\": valid_2fa_code\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    assert resp.status_code == 200\n    assert resp.json().get(\"status\") == \"password_updated\"\n\n    # Verify old session is invalidated\n    session_check = requests.get(\n        \"http://hr-app/api/me\",\n        headers={\"Authorization\": f\"Bearer {active_session_token}\"}\n    )\n    assert session_check.status_code == 401\n\n    # Verify new password works\n    login_resp = <helper_fn>.login(\n        fresh_reset_token[\"employee_id\"], compliant_password\n    )\n    assert login_resp.status_code == 200\n"
+      },
+      {
+        "name": "test_reset_password_expired_token_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A reset token older than 30 minutes exists for an employee",
+          "Employee provides a valid 2FA code",
+          "New password satisfies policy"
+        ],
+        "actions": [
+          "POST /password/reset with the expired token, valid 2FA code, and compliant password",
+          "Assert HTTP 410 is returned",
+          "Assert error body indicates token expiry"
+        ],
+        "expected": [
+          "HTTP 410 returned",
+          "Response body contains error code 'token_expired'",
+          "Password is NOT changed"
+        ],
+        "trace": [
+          "R-WEB-106: expired links must be rejected",
+          "R-WEB-106: 410 when token expired"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_expired_token_returns_410(\n    expired_reset_token, # <fixture> returns token created > 30 min ago\n    valid_2fa_code,\n    compliant_password\n):\n    payload = {\n        \"token\": expired_reset_token[\"token\"],\n        \"new_password\": compliant_password,\n        \"totp_code\": valid_2fa_code\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    assert resp.status_code == 410\n    body = resp.json()\n    assert body.get(\"error\") == \"token_expired\"\n\n    # Confirm password unchanged by attempting old-password login\n    login_resp = <helper_fn>.login(\n        expired_reset_token[\"employee_id\"],\n        expired_reset_token[\"original_password\"]\n    )\n    assert login_resp.status_code == 200, \"Password must not have changed\"\n"
+      },
+      {
+        "name": "test_reset_password_token_at_30_minute_boundary_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A reset token aged exactly 30 minutes (1800 seconds) exists",
+          "Employee has a registered 2FA device",
+          "New password satisfies policy"
+        ],
+        "actions": [
+          "POST /password/reset with a token whose age == 1800 seconds (boundary), valid 2FA, compliant password",
+          "Assert the response is 410 (expired at boundary, not before)"
+        ],
+        "expected": [
+          "HTTP 410 returned at t=1800s (token is not valid at exactly 30 minutes)",
+          "Error body contains 'token_expired'"
+        ],
+        "trace": [
+          "R-WEB-106: link expires after 30 minutes \u2014 boundary at exact 30-min mark"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_token_at_30_minute_boundary_rejected(\n    boundary_reset_token, # <fixture> returns token created exactly 1800s ago\n    valid_2fa_code,\n    compliant_password\n):\n    payload = {\n        \"token\": boundary_reset_token[\"token\"],\n        \"new_password\": compliant_password,\n        \"totp_code\": valid_2fa_code\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    # At exactly 30 min the token must be considered expired\n    assert resp.status_code == 410\n    assert resp.json().get(\"error\") == \"token_expired\"\n\n\ndef test_reset_password_token_just_before_30_minute_boundary_accepted(\n    near_boundary_reset_token, # <fixture> token created 1799s ago\n    valid_2fa_code,\n    compliant_password\n):\n    payload = {\n        \"token\": near_boundary_reset_token[\"token\"],\n        \"new_password\": compliant_password,\n        \"totp_code\": valid_2fa_code\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    assert resp.status_code == 200\n    assert resp.json().get(\"status\") == \"password_updated\"\n"
+      },
+      {
+        "name": "test_reset_password_policy_violation_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A fresh reset token exists",
+          "Employee has 2FA device registered",
+          "New password does NOT satisfy policy (e.g., too short, no special char)"
+        ],
+        "actions": [
+          "POST /password/reset with valid token, correct 2FA code, and a non-compliant password",
+          "Assert HTTP 422 is returned",
+          "Assert error body details the policy violation"
+        ],
+        "expected": [
+          "HTTP 422 returned",
+          "Response body contains 'password_policy_violation' error",
+          "Password is NOT changed",
+          "Token is NOT consumed (still usable)"
+        ],
+        "trace": [
+          "R-WEB-106: 422 when password fails policy",
+          "R-WEB-106: 2FA + policy decision table \u2014 valid 2FA but bad password"
+        ],
+        "executable": "import pytest\nimport requests\n\n@pytest.mark.parametrize(\"bad_password\", [\n    \"short\",          # too short\n    \"alllowercase1!\",  # missing uppercase (example policy rule)\n    \"NOLOWER1!\",       # missing lowercase\n    \"NoSpecialChar1\",  # missing special character\n])\ndef test_reset_password_policy_violation_returns_422(\n    fresh_reset_token,\n    valid_2fa_code,\n    bad_password\n):\n    payload = {\n        \"token\": fresh_reset_token[\"token\"],\n        \"new_password\": bad_password,\n        \"totp_code\": valid_2fa_code\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    assert resp.status_code == 422\n    body = resp.json()\n    assert body.get(\"error\") == \"password_policy_violation\"\n    assert \"violations\" in body\n"
+      },
+      {
+        "name": "test_reset_password_sessions_invalidated_after_successful_reset",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Employee has multiple active sessions (web, mobile)",
+          "A fresh reset token exists",
+          "Employee has 2FA device registered",
+          "New password satisfies policy"
+        ],
+        "actions": [
+          "Capture multiple active session tokens for the employee",
+          "POST /password/reset with valid token, 2FA, and compliant password",
+          "Assert HTTP 200",
+          "Assert all captured session tokens are invalidated (401 on subsequent requests)"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "All pre-existing sessions return 401 on use",
+          "System transitions from AUTHENTICATED state to SESSIONS_CLEARED state for all devices"
+        ],
+        "trace": [
+          "R-WEB-106: all sessions invalidated after password reset",
+          "R-WEB-106: state transition AUTHENTICATED -> SESSIONS_CLEARED"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_sessions_invalidated_after_successful_reset(\n    fresh_reset_token,\n    valid_2fa_code,\n    compliant_password,\n    multiple_active_sessions # <fixture> returns list of session token strings\n):\n    payload = {\n        \"token\": fresh_reset_token[\"token\"],\n        \"new_password\": compliant_password,\n        \"totp_code\": valid_2fa_code\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    assert resp.status_code == 200\n\n    for session_token in multiple_active_sessions:\n        check = requests.get(\n            \"http://hr-app/api/me\",\n            headers={\"Authorization\": f\"Bearer {session_token}\"}\n        )\n        assert check.status_code == 401, (\n            f\"Session {session_token[:8]}... must be invalidated\"\n        )\n"
+      },
+      {
+        "name": "test_reset_password_invalid_2fa_code_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A fresh reset token exists",
+          "Employee has 2FA device registered",
+          "New password satisfies policy",
+          "An incorrect 2FA code is used"
+        ],
+        "actions": [
+          "POST /password/reset with valid token, WRONG 2FA code, and compliant password",
+          "Assert non-200 response indicating 2FA failure"
+        ],
+        "expected": [
+          "HTTP 401 or 403 returned",
+          "Response body contains '2fa_invalid' or 'mfa_required' error",
+          "Password is NOT changed"
+        ],
+        "trace": [
+          "R-WEB-106: 2FA confirmation required \u2014 decision table row: valid token + invalid 2FA + valid password"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_reset_password_invalid_2fa_code_rejected(\n    fresh_reset_token,\n    compliant_password\n):\n    wrong_totp = \"000000\"  # statically wrong TOTP value\n    payload = {\n        \"token\": fresh_reset_token[\"token\"],\n        \"new_password\": compliant_password,\n        \"totp_code\": wrong_totp\n    }\n    resp = requests.post(\n        \"http://hr-app/password/reset\",\n        json=payload\n    )\n    assert resp.status_code in (401, 403)\n    body = resp.json()\n    assert body.get(\"error\") in (\"2fa_invalid\", \"mfa_required\")\n\n    # Confirm password unchanged\n    login_resp = <helper_fn>.login(\n        fresh_reset_token[\"employee_id\"],\n        fresh_reset_token[\"original_password\"]\n    )\n    assert login_resp.status_code == 200, \"Password must be unchanged after 2FA failure\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-106",
+  "domain": "commercial_web",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1010,
+    "output_tokens": 3627,
+    "latency_ms": 45406,
+    "wall_ms": 45406,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-106\",\n  \"reasoning\": \"The requirement covers: (1) happy-path reset with valid token + 2FA, (2) rejection of an expired token (410), (3) password policy violation (422), (4) boundary at the 30-minute expiry edge, and (5) session invalidation post-reset. Tests are partitioned across EP (valid credentials partition), NEG (expired token, bad password), BVA (token age at 30-min boundary), STC (session state transition), and DT (2FA + policy decision table). Each test is self-contained via fixtures and helper placeholders.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reset_password_valid_token_and_2fa_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Employee account exists\",\n        \"A fresh reset token (age < 30 min) is available\",\n        \"Employee has 2FA device registered\",\n        \"New password satisfies policy\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with valid token, valid new password, and correct 2FA code\",\n        \"Assert HTTP 200 and success body\",\n        \"Assert old session cookies/tokens are invalidated\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body confirms password updated\",\n        \"All prior sessions for the employee are invalidated\",\n        \"Employee can log in with new password\"\n      ],\n      \"trace\": [\n        \"R-WEB-106: password updated on valid token\",\n        \"R-WEB-106: all sessions invalidated\",\n        \"R-WEB-106: 2FA confirmation required\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_reset_password_valid_token_and_2fa_succeeds(\\n    fresh_reset_token,   # <fixture> returns {'token': str, 'employee_id': str}\\n    valid_2fa_code,      # <fixture> returns current TOTP code for employee\\n    compliant_password,  # <fixture> returns policy-compliant password string\\n    active_session_token # <fixture> returns a pre-existing session token\\n):\\n    payload = {\\n        \\\"token\\\": fresh_reset_token[\\\"token\\\"],\\n        \\\"new_password\\\": compliant_password,\\n        \\\"totp_code\\\": valid_2fa_code\\n    }\\n    resp = requests.post(\\n        \\\"http://hr-app/password/reset\\\",\\n        json=payload\\n    )\\n    assert resp.status_code == 200\\n    assert resp.json().get(\\\"status\\\") == \\\"password_updated\\\"\\n\\n    # Verify old session is invalidated\\n    session_check = requests.get(\\n        \\\"http://hr-app/api/me\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {active_session_token}\\\"}\\n    )\\n    assert session_check.status_code == 401\\n\\n    # Verify new password works\\n    login_resp = <helper_fn>.login(\\n        fresh_reset_token[\\\"employee_id\\\"], compliant_password\\n    )\\n    assert login_resp.status_code == 200\\n\"\n    },\n    {\n      \"name\": \"test_reset_password_expired_token_returns_410\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A reset token older than 30 minutes exists for an employee\",\n        \"Employee provides a valid 2FA code\",\n        \"New password satisfies policy\"\n      ],\n      \"actions\": [\n        \"POST /password/reset with the expired token, valid 2FA code, and compliant password\",\n        \"Assert HTTP 410 is returned\",\n        \"Assert error body indicates token expiry\"\n      ],\n      \"expected\": [\n        \"HTTP 410 returned\",\n        \"Response body contains error code 'token_expired'\",\n        \"Password is NOT changed\"\n      ],\n      \"trace\": [\n        \"R-WEB-106: expired links must be rejected\",\n        \"R-WEB-106: 410 when token expired\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_reset_password_expired_token_returns_410(\\n    expired_reset_token, # <fixture> returns token created > 30 min ago\\n    valid_2fa_code,\\n    compliant_password\\n):\\n    payload = {\\n        \\\"token\\\": expired_reset_token[\\\"token\\\"],\\n        \\\"new_password\\\": compliant_password,\\n        \\\"totp_code\\\": valid_2fa_code\\n    }\\n    resp = requests.post(\\n        \\\"http://hr-app/password/res"
+  }
+}

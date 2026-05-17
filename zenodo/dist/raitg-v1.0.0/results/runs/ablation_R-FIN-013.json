@@ -1,0 +1,172 @@
+{
+  "req": {
+    "id": "R-FIN-013",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Fraud alert response",
+    "statement": "A customer shall confirm or deny a suspected-fraud alert within 24 hours; unacknowledged alerts shall auto-freeze the account.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "alert active"
+    ],
+    "triggers": [
+      "customer responds"
+    ],
+    "expected_outcomes": [
+      "alert closed",
+      "card reissued if fraud"
+    ],
+    "error_pathways": [
+      "410 when alert expired"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/alerts/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-013",
+    "reasoning": "R-FIN-013 defines three distinct behavioral paths: (1) a customer confirms fraud within 24h \u2192 alert closes and card is reissued; (2) a customer denies fraud within 24h \u2192 alert closes, no reissue; (3) the alert expires (24h elapsed, unacknowledged) \u2192 account auto-freezes and any subsequent PATCH returns 410. Test design covers: EP for valid confirm/deny responses, STC for the active\u2192closed state transition on confirm, DT for the confirm-vs-deny decision branch, BVA for the 24h expiry boundary, and NEG for the 410 expired-alert error path. Each test uses a fresh alert fixture to guarantee idempotency.",
+    "tests": [
+      {
+        "name": "test_confirm_fraud_alert_closes_alert_and_reissues_card",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "A fraud alert exists in ACTIVE state for the test account",
+          "The alert was created less than 24 hours ago",
+          "Customer auth token is valid"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"confirm\"}",
+          "GET /alerts/{id} to verify final state",
+          "GET /cards?account_id={account_id} to verify card reissue"
+        ],
+        "expected": [
+          "PATCH returns HTTP 200",
+          "Response body contains status=closed and response=confirm",
+          "GET alert returns status=closed",
+          "A new card record exists with status=pending_reissue or issued"
+        ],
+        "trace": [
+          "R-FIN-013: customer confirms suspected-fraud \u2192 alert closed; card reissued if fraud"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_confirm_fraud_alert_closes_alert_and_reissues_card(\n    active_alert_fixture,   # <fixture>: yields {\"alert_id\": str, \"account_id\": str}\n    auth_headers,           # <fixture>: yields {\"Authorization\": \"Bearer <token>\"}\n    api_base_url,           # <fixture>: yields base URL string\n):\n    alert_id = active_alert_fixture[\"alert_id\"]\n    account_id = active_alert_fixture[\"account_id\"]\n\n    patch_resp = requests.patch(\n        f\"{api_base_url}/alerts/{alert_id}\",\n        json={\"response\": \"confirm\"},\n        headers=auth_headers,\n    )\n    assert patch_resp.status_code == 200\n    body = patch_resp.json()\n    assert body[\"status\"] == \"closed\"\n    assert body[\"response\"] == \"confirm\"\n\n    get_alert = requests.get(\n        f\"{api_base_url}/alerts/{alert_id}\", headers=auth_headers\n    )\n    assert get_alert.json()[\"status\"] == \"closed\"\n\n    cards_resp = requests.get(\n        f\"{api_base_url}/cards\",\n        params={\"account_id\": account_id},\n        headers=auth_headers,\n    )\n    assert cards_resp.status_code == 200\n    cards = cards_resp.json()[\"cards\"]\n    reissued = [c for c in cards if c[\"status\"] in (\"pending_reissue\", \"issued\")]\n    assert len(reissued) >= 1, \"Expected at least one reissued card\""
+      },
+      {
+        "name": "test_deny_fraud_alert_closes_alert_without_card_reissue",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "A fraud alert exists in ACTIVE state for the test account",
+          "The alert was created less than 24 hours ago",
+          "Customer auth token is valid"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"deny\"}",
+          "GET /alerts/{id} to verify final state",
+          "GET /cards?account_id={account_id} to verify no new reissue"
+        ],
+        "expected": [
+          "PATCH returns HTTP 200",
+          "Response body contains status=closed and response=deny",
+          "No card record with status=pending_reissue created after denial"
+        ],
+        "trace": [
+          "R-FIN-013: alert closed on any acknowledgement; card reissued ONLY if fraud confirmed"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_deny_fraud_alert_closes_alert_without_card_reissue(\n    active_alert_fixture,\n    auth_headers,\n    api_base_url,\n):\n    alert_id = active_alert_fixture[\"alert_id\"]\n    account_id = active_alert_fixture[\"account_id\"]\n\n    cards_before = requests.get(\n        f\"{api_base_url}/cards\",\n        params={\"account_id\": account_id},\n        headers=auth_headers,\n    ).json()[\"cards\"]\n    reissue_ids_before = {c[\"id\"] for c in cards_before if c[\"status\"] == \"pending_reissue\"}\n\n    patch_resp = requests.patch(\n        f\"{api_base_url}/alerts/{alert_id}\",\n        json={\"response\": \"deny\"},\n        headers=auth_headers,\n    )\n    assert patch_resp.status_code == 200\n    body = patch_resp.json()\n    assert body[\"status\"] == \"closed\"\n    assert body[\"response\"] == \"deny\"\n\n    cards_after = requests.get(\n        f\"{api_base_url}/cards\",\n        params={\"account_id\": account_id},\n        headers=auth_headers,\n    ).json()[\"cards\"]\n    reissue_ids_after = {c[\"id\"] for c in cards_after if c[\"status\"] == \"pending_reissue\"}\n    new_reissues = reissue_ids_after - reissue_ids_before\n    assert len(new_reissues) == 0, f\"Unexpected card reissue on deny: {new_reissues}\""
+      },
+      {
+        "name": "test_patch_expired_alert_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A fraud alert exists that has already expired (created >24h ago, unacknowledged)",
+          "Account is auto-frozen as per R-FIN-013",
+          "Customer auth token is valid"
+        ],
+        "actions": [
+          "PATCH /alerts/{expired_id} with body {\"response\": \"confirm\"}"
+        ],
+        "expected": [
+          "HTTP 410 Gone is returned",
+          "Response body contains an error code indicating alert expiry"
+        ],
+        "trace": [
+          "R-FIN-013 error pathway: 410 when alert expired"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_patch_expired_alert_returns_410(\n    expired_alert_fixture,  # <fixture>: yields {\"alert_id\": str} for a >24h-old alert\n    auth_headers,\n    api_base_url,\n):\n    alert_id = expired_alert_fixture[\"alert_id\"]\n\n    resp = requests.patch(\n        f\"{api_base_url}/alerts/{alert_id}\",\n        json={\"response\": \"confirm\"},\n        headers=auth_headers,\n    )\n    assert resp.status_code == 410, (\n        f\"Expected 410 for expired alert, got {resp.status_code}: {resp.text}\"\n    )\n    error_body = resp.json()\n    assert \"error\" in error_body or \"code\" in error_body, (\n        \"Response body must contain an error descriptor\"\n    )\n    error_text = str(error_body).lower()\n    assert any(kw in error_text for kw in (\"expired\", \"gone\", \"410\")), (\n        f\"Error body does not reference expiry: {error_body}\"\n    )"
+      },
+      {
+        "name": "test_alert_auto_freezes_account_at_24h_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A fraud alert was created exactly 24 hours ago (boundary instant)",
+          "The alert has NOT been acknowledged by the customer",
+          "Account freeze job has run (simulated or real)"
+        ],
+        "actions": [
+          "GET /accounts/{account_id} to check freeze status after 24h boundary",
+          "Attempt PATCH /alerts/{id} with {\"response\": \"deny\"} to confirm expiry"
+        ],
+        "expected": [
+          "Account status is frozen",
+          "PATCH returns 410, confirming the alert is expired at the boundary"
+        ],
+        "trace": [
+          "R-FIN-013: unacknowledged alerts shall auto-freeze the account (24h boundary)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_alert_auto_freezes_account_at_24h_boundary(\n    boundary_alert_fixture,  # <fixture>: yields {\"alert_id\": str, \"account_id\": str}\n                             #   alert age == 24h, freeze job already executed\n    auth_headers,\n    api_base_url,\n    trigger_freeze_job,      # <helper_fn>: forces the auto-freeze scheduler to run\n):\n    alert_id = boundary_alert_fixture[\"alert_id\"]\n    account_id = boundary_alert_fixture[\"account_id\"]\n\n    trigger_freeze_job(account_id)  # ensure scheduler ran at/after 24h mark\n\n    account_resp = requests.get(\n        f\"{api_base_url}/accounts/{account_id}\",\n        headers=auth_headers,\n    )\n    assert account_resp.status_code == 200\n    assert account_resp.json()[\"status\"] == \"frozen\", (\n        \"Account must be frozen when alert unacknowledged at 24h boundary\"\n    )\n\n    patch_resp = requests.patch(\n        f\"{api_base_url}/alerts/{alert_id}\",\n        json={\"response\": \"deny\"},\n        headers=auth_headers,\n    )\n    assert patch_resp.status_code == 410, (\n        f\"Expected 410 at 24h boundary, got {patch_resp.status_code}\"\n    )"
+      },
+      {
+        "name": "test_invalid_response_value_returns_422",
+        "kind": "negative",
+        "heuristic": "EP",
+        "preconditions": [
+          "A fraud alert exists in ACTIVE state",
+          "Customer auth token is valid"
+        ],
+        "actions": [
+          "PATCH /alerts/{id} with body {\"response\": \"maybe\"} (invalid enum value)"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity (or 400 Bad Request) is returned",
+          "Alert remains in ACTIVE state",
+          "Response body describes the validation error"
+        ],
+        "trace": [
+          "R-FIN-013: only confirm or deny are valid responses; invalid values must be rejected"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_invalid_response_value_returns_422(\n    active_alert_fixture,\n    auth_headers,\n    api_base_url,\n):\n    alert_id = active_alert_fixture[\"alert_id\"]\n\n    patch_resp = requests.patch(\n        f\"{api_base_url}/alerts/{alert_id}\",\n        json={\"response\": \"maybe\"},\n        headers=auth_headers,\n    )\n    assert patch_resp.status_code in (400, 422), (\n        f\"Expected 400/422 for invalid response value, got {patch_resp.status_code}\"\n    )\n\n    get_resp = requests.get(\n        f\"{api_base_url}/alerts/{alert_id}\",\n        headers=auth_headers,\n    )\n    assert get_resp.status_code == 200\n    assert get_resp.json()[\"status\"] == \"active\", (\n        \"Alert must remain active after a rejected invalid response\"\n    )"
+      }
+    ]
+  },
+  "req_id": "R-FIN-013",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[4] negative kind but heuristic=EP"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 984,
+    "output_tokens": 3269,
+    "latency_ms": 35177,
+    "wall_ms": 35177,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-013\",\n  \"reasoning\": \"R-FIN-013 defines three distinct behavioral paths: (1) a customer confirms fraud within 24h \u2192 alert closes and card is reissued; (2) a customer denies fraud within 24h \u2192 alert closes, no reissue; (3) the alert expires (24h elapsed, unacknowledged) \u2192 account auto-freezes and any subsequent PATCH returns 410. Test design covers: EP for valid confirm/deny responses, STC for the active\u2192closed state transition on confirm, DT for the confirm-vs-deny decision branch, BVA for the 24h expiry boundary, and NEG for the 410 expired-alert error path. Each test uses a fresh alert fixture to guarantee idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_confirm_fraud_alert_closes_alert_and_reissues_card\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"A fraud alert exists in ACTIVE state for the test account\",\n        \"The alert was created less than 24 hours ago\",\n        \"Customer auth token is valid\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"confirm\\\"}\",\n        \"GET /alerts/{id} to verify final state\",\n        \"GET /cards?account_id={account_id} to verify card reissue\"\n      ],\n      \"expected\": [\n        \"PATCH returns HTTP 200\",\n        \"Response body contains status=closed and response=confirm\",\n        \"GET alert returns status=closed\",\n        \"A new card record exists with status=pending_reissue or issued\"\n      ],\n      \"trace\": [\n        \"R-FIN-013: customer confirms suspected-fraud \u2192 alert closed; card reissued if fraud\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_confirm_fraud_alert_closes_alert_and_reissues_card(\\n    active_alert_fixture,   # <fixture>: yields {\\\"alert_id\\\": str, \\\"account_id\\\": str}\\n    auth_headers,           # <fixture>: yields {\\\"Authorization\\\": \\\"Bearer <token>\\\"}\\n    api_base_url,           # <fixture>: yields base URL string\\n):\\n    alert_id = active_alert_fixture[\\\"alert_id\\\"]\\n    account_id = active_alert_fixture[\\\"account_id\\\"]\\n\\n    patch_resp = requests.patch(\\n        f\\\"{api_base_url}/alerts/{alert_id}\\\",\\n        json={\\\"response\\\": \\\"confirm\\\"},\\n        headers=auth_headers,\\n    )\\n    assert patch_resp.status_code == 200\\n    body = patch_resp.json()\\n    assert body[\\\"status\\\"] == \\\"closed\\\"\\n    assert body[\\\"response\\\"] == \\\"confirm\\\"\\n\\n    get_alert = requests.get(\\n        f\\\"{api_base_url}/alerts/{alert_id}\\\", headers=auth_headers\\n    )\\n    assert get_alert.json()[\\\"status\\\"] == \\\"closed\\\"\\n\\n    cards_resp = requests.get(\\n        f\\\"{api_base_url}/cards\\\",\\n        params={\\\"account_id\\\": account_id},\\n        headers=auth_headers,\\n    )\\n    assert cards_resp.status_code == 200\\n    cards = cards_resp.json()[\\\"cards\\\"]\\n    reissued = [c for c in cards if c[\\\"status\\\"] in (\\\"pending_reissue\\\", \\\"issued\\\")]\\n    assert len(reissued) >= 1, \\\"Expected at least one reissued card\\\"\"\n    },\n    {\n      \"name\": \"test_deny_fraud_alert_closes_alert_without_card_reissue\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"DT\",\n      \"preconditions\": [\n        \"A fraud alert exists in ACTIVE state for the test account\",\n        \"The alert was created less than 24 hours ago\",\n        \"Customer auth token is valid\"\n      ],\n      \"actions\": [\n        \"PATCH /alerts/{id} with body {\\\"response\\\": \\\"deny\\\"}\",\n        \"GET /alerts/{id} to verify final state\",\n        \"GET /cards?account_id={account_id} to verify no new reissue\"\n      ],\n      \"expected\": [\n        \"PATCH returns HTTP 200\",\n        \"Response body contains status=closed and response=deny\",\n        \"No card record with status=pending_reissue created after denial\"\n      ],\n      \"trace\": [\n        \"R-FIN-013: alert closed on any acknowledgement; card reissued ONLY if fraud confirmed\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_deny_fraud_alert_closes_alert_without_card_reissue(\\n    active_alert_fixture,\\n    auth_headers,\\n    api_base"
+  }
+}

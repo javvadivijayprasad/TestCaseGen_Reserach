@@ -1,0 +1,182 @@
+{
+  "req": {
+    "id": "R-WEB-086",
+    "domain": "commercial_web",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Export employee directory \u2014 variant 5",
+    "statement": "An hr-admin shall export the employee directory as CSV with PII redacted for employees who opted out of public directory. Additionally, the action requires two-factor authentication confirmation.",
+    "actors": [
+      "hr-admin"
+    ],
+    "preconditions": [
+      "role:hr-admin"
+    ],
+    "triggers": [
+      "admin requests export"
+    ],
+    "expected_outcomes": [
+      "CSV streamed",
+      "PII redacted per opt-out",
+      "additional variant semantics honoured"
+    ],
+    "error_pathways": [
+      "403 if not hr-admin",
+      "429 if rate-limited"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/api/employees/export.csv"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-086",
+    "reasoning": "The violation was that test[2] had kind=negative but heuristic=STC. The STC (State Transition Coverage) heuristic is a structural/design technique that is not inherently negative; the test exercises the 2FA state machine where the transition to export-authorised is blocked by missing OTP \u2014 this is correctly a negative scenario, but STC is the wrong heuristic label for a negative kind. The fix is to change the heuristic for test[2] from STC to NEG, which correctly classifies it as a negative/error-pathway test (role or precondition violation). The 2FA state-machine rationale is preserved in the trace and description. All other tests are preserved exactly as they passed validation.",
+    "tests": [
+      {
+        "name": "test_hr_admin_export_csv_pii_redacted_for_optout_employees",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "2FA OTP is valid and unused",
+          "At least one employee has opted out of public directory",
+          "At least one employee has not opted out"
+        ],
+        "actions": [
+          "Obtain hr-admin session token via <get_hr_admin_token>",
+          "Complete 2FA and obtain otp_token via <complete_2fa>",
+          "GET /api/employees/export.csv with Authorization and X-OTP-Token headers"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Content-Type header contains text/csv",
+          "Content-Disposition suggests a file attachment",
+          "Opted-out employee rows have PII fields replaced with REDACTED",
+          "Non-opted-out employee rows contain real PII"
+        ],
+        "trace": [
+          "R-WEB-086: hr-admin export triggers CSV stream",
+          "R-WEB-086: PII redacted for opted-out employees",
+          "R-WEB-086: 2FA confirmation required"
+        ],
+        "executable": "import pytest\nimport csv, io\n\ndef test_hr_admin_export_csv_pii_redacted_for_optout_employees(base_url, get_hr_admin_token, complete_2fa, opted_out_employee_id, non_opted_out_employee_id):\n    token = get_hr_admin_token()\n    otp = complete_2fa(token)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"X-OTP-Token\": otp}\n    resp = <http_client>.get(f\"{base_url}/api/employees/export.csv\", headers=headers)\n    assert resp.status_code == 200\n    assert \"text/csv\" in resp.headers.get(\"Content-Type\", \"\")\n    assert \"attachment\" in resp.headers.get(\"Content-Disposition\", \"\")\n    reader = csv.DictReader(io.StringIO(resp.text))\n    rows = {r[\"employee_id\"]: r for r in reader}\n    opted_out_row = rows[str(opted_out_employee_id)]\n    non_opted_row = rows[str(non_opted_out_employee_id)]\n    for pii_field in (\"email\", \"phone\", \"address\"):\n        assert opted_out_row[pii_field] == \"REDACTED\", f\"{pii_field} must be redacted\"\n        assert non_opted_row[pii_field] != \"REDACTED\", f\"{pii_field} must be visible\"\n"
+      },
+      {
+        "name": "test_non_admin_role_receives_403_on_export",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as a standard employee (role: employee, not hr-admin)",
+          "2FA token is technically valid but irrelevant"
+        ],
+        "actions": [
+          "Obtain employee-role session token via <get_employee_token>",
+          "Attempt GET /api/employees/export.csv with that token"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an error message indicating insufficient privileges"
+        ],
+        "trace": [
+          "R-WEB-086: error pathway \u2014 403 if not hr-admin"
+        ],
+        "executable": "def test_non_admin_role_receives_403_on_export(base_url, get_employee_token):\n    token = get_employee_token()\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    resp = <http_client>.get(f\"{base_url}/api/employees/export.csv\", headers=headers)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body\n    error_text = body.get(\"error\", body.get(\"message\", \"\")).lower()\n    assert any(kw in error_text for kw in (\"forbidden\", \"unauthorized\", \"privilege\", \"role\"))\n"
+      },
+      {
+        "name": "test_export_blocked_when_2fa_not_confirmed",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "2FA step has NOT been completed (no OTP token presented)"
+        ],
+        "actions": [
+          "Obtain hr-admin session token via <get_hr_admin_token>",
+          "GET /api/employees/export.csv WITHOUT X-OTP-Token header"
+        ],
+        "expected": [
+          "HTTP 403 or 401",
+          "Response body indicates 2FA confirmation is required"
+        ],
+        "trace": [
+          "R-WEB-086: 2FA confirmation required \u2014 absent OTP must be rejected",
+          "R-WEB-086: NEG \u2014 precondition violation: export-authorised state requires completed 2FA step"
+        ],
+        "executable": "def test_export_blocked_when_2fa_not_confirmed(base_url, get_hr_admin_token):\n    token = get_hr_admin_token()\n    headers = {\"Authorization\": f\"Bearer {token}\"}\n    # Deliberately omit X-OTP-Token\n    resp = <http_client>.get(f\"{base_url}/api/employees/export.csv\", headers=headers)\n    assert resp.status_code in (401, 403)\n    body = resp.json()\n    combined = str(body).lower()\n    assert any(kw in combined for kw in (\"2fa\", \"otp\", \"two-factor\", \"mfa\", \"verification\"))\n"
+      },
+      {
+        "name": "test_rate_limit_429_on_excessive_export_requests",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Caller is authenticated as hr-admin",
+          "2FA OTP is valid",
+          "Rate-limit window is fresh (counter at zero)",
+          "Rate limit for this endpoint is known (injected via rate_limit_threshold fixture)"
+        ],
+        "actions": [
+          "Obtain hr-admin session token and OTP via <get_hr_admin_token> and <complete_2fa>",
+          "Send exactly rate_limit_threshold requests \u2014 all should succeed",
+          "Send one additional request (threshold + 1)"
+        ],
+        "expected": [
+          "First N requests (up to threshold) return HTTP 200",
+          "The (threshold + 1)-th request returns HTTP 429",
+          "429 response includes Retry-After header"
+        ],
+        "trace": [
+          "R-WEB-086: error pathway \u2014 429 if rate-limited",
+          "R-WEB-086: BVA boundary at rate-limit threshold N and N+1"
+        ],
+        "executable": "def test_rate_limit_429_on_excessive_export_requests(base_url, get_hr_admin_token, complete_2fa, rate_limit_threshold, reset_rate_limit):\n    reset_rate_limit(\"export_csv\")\n    token = get_hr_admin_token()\n    otp = complete_2fa(token)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"X-OTP-Token\": otp}\n    url = f\"{base_url}/api/employees/export.csv\"\n    for i in range(rate_limit_threshold):\n        r = <http_client>.get(url, headers=headers)\n        assert r.status_code == 200, f\"Request {i+1} expected 200, got {r.status_code}\"\n    over_limit = <http_client>.get(url, headers=headers)\n    assert over_limit.status_code == 429\n    assert \"Retry-After\" in over_limit.headers\n"
+      },
+      {
+        "name": "test_optout_decision_table_mixed_employee_set",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Caller is authenticated as hr-admin with valid 2FA OTP",
+          "Employee A: opted_out=True, active=True",
+          "Employee B: opted_out=False, active=True",
+          "Employee C: opted_out=True, active=False"
+        ],
+        "actions": [
+          "Obtain hr-admin token and 2FA OTP",
+          "GET /api/employees/export.csv",
+          "Parse the CSV and locate rows for employees A, B, C"
+        ],
+        "expected": [
+          "Employee A row: PII fields are REDACTED (opted out, active)",
+          "Employee B row: PII fields are real values (not opted out)",
+          "Employee C row: PII fields are REDACTED (opted out, regardless of active status)"
+        ],
+        "trace": [
+          "R-WEB-086: PII redacted per opt-out \u2014 decision table covering opted_out x active combinations"
+        ],
+        "executable": "def test_optout_decision_table_mixed_employee_set(base_url, get_hr_admin_token, complete_2fa, employee_ids_by_scenario):\n    token = get_hr_admin_token()\n    otp = complete_2fa(token)\n    headers = {\"Authorization\": f\"Bearer {token}\", \"X-OTP-Token\": otp}\n    resp = <http_client>.get(f\"{base_url}/api/employees/export.csv\", headers=headers)\n    assert resp.status_code == 200\n    import csv, io\n    rows = {r[\"employee_id\"]: r for r in csv.DictReader(io.StringIO(resp.text))}\n    id_a = str(employee_ids_by_scenario[\"opted_out_active\"])\n    id_b = str(employee_ids_by_scenario[\"not_opted_out_active\"])\n    id_c = str(employee_ids_by_scenario[\"opted_out_inactive\"])\n    for pii in (\"email\", \"phone\", \"address\"):\n        assert rows[id_a][pii] == \"REDACTED\", f\"Employee A {pii} must be redacted\"\n        assert rows[id_b][pii] != \"REDACTED\", f\"Employee B {pii} must not be redacted\"\n        assert rows[id_c][pii] == \"REDACTED\", f\"Employee C {pii} must be redacted\"\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-086",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1022,
+    "output_tokens": 2889,
+    "latency_ms": 37883,
+    "wall_ms": 37883,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-086\",\n  \"reasoning\": \"The requirement has four distinct testable dimensions: (1) happy-path export by an hr-admin with 2FA confirmation producing a CSV where opted-out employees have PII redacted; (2) authorization failure when the caller lacks the hr-admin role; (3) rate-limiting boundary at the 429 threshold; (4) state transition where the 2FA step is skipped/incomplete, blocking the export. These map cleanly to EP (valid partition), NEG (role enforcement), BVA (rate-limit boundary), and STC (2FA state machine). A DT case covers the opt-out redaction logic decision table.\",\n  \"tests\": [\n    {\n      \"name\": \"test_hr_admin_export_csv_pii_redacted_for_optout_employees\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Caller is authenticated as hr-admin\",\n        \"2FA OTP is valid and unused\",\n        \"At least one employee has opted out of public directory\",\n        \"At least one employee has not opted out\"\n      ],\n      \"actions\": [\n        \"Obtain hr-admin session token via <get_hr_admin_token>\",\n        \"Complete 2FA and obtain otp_token via <complete_2fa>\",\n        \"GET /api/employees/export.csv with Authorization and X-OTP-Token headers\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Content-Type header contains text/csv\",\n        \"Content-Disposition suggests a file attachment\",\n        \"Opted-out employee rows have PII fields replaced with REDACTED\",\n        \"Non-opted-out employee rows contain real PII\"\n      ],\n      \"trace\": [\n        \"R-WEB-086: hr-admin export triggers CSV stream\",\n        \"R-WEB-086: PII redacted for opted-out employees\",\n        \"R-WEB-086: 2FA confirmation required\"\n      ],\n      \"executable\": \"import pytest\\nimport csv, io\\n\\ndef test_hr_admin_export_csv_pii_redacted_for_optout_employees(base_url, get_hr_admin_token, complete_2fa, opted_out_employee_id, non_opted_out_employee_id):\\n    token = get_hr_admin_token()\\n    otp = complete_2fa(token)\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\", \\\"X-OTP-Token\\\": otp}\\n    resp = <http_client>.get(f\\\"{base_url}/api/employees/export.csv\\\", headers=headers)\\n    assert resp.status_code == 200\\n    assert \\\"text/csv\\\" in resp.headers.get(\\\"Content-Type\\\", \\\"\\\")\\n    assert \\\"attachment\\\" in resp.headers.get(\\\"Content-Disposition\\\", \\\"\\\")\\n    reader = csv.DictReader(io.StringIO(resp.text))\\n    rows = {r[\\\"employee_id\\\"]: r for r in reader}\\n    opted_out_row = rows[str(opted_out_employee_id)]\\n    non_opted_row = rows[str(non_opted_out_employee_id)]\\n    for pii_field in (\\\"email\\\", \\\"phone\\\", \\\"address\\\"):\\n        assert opted_out_row[pii_field] == \\\"REDACTED\\\", f\\\"{pii_field} must be redacted\\\"\\n        assert non_opted_row[pii_field] != \\\"REDACTED\\\", f\\\"{pii_field} must be visible\\\"\\n\"\n    },\n    {\n      \"name\": \"test_non_admin_role_receives_403_on_export\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Caller is authenticated as a standard employee (role: employee, not hr-admin)\",\n        \"2FA token is technically valid but irrelevant\"\n      ],\n      \"actions\": [\n        \"Obtain employee-role session token via <get_employee_token>\",\n        \"Attempt GET /api/employees/export.csv with that token\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an error message indicating insufficient privileges\"\n      ],\n      \"trace\": [\n        \"R-WEB-086: error pathway \u2014 403 if not hr-admin\"\n      ],\n      \"executable\": \"def test_non_admin_role_receives_403_on_export(base_url, get_employee_token):\\n    token = get_employee_token()\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {token}\\\"}\\n    resp = <http_client>.get(f\\\"{base_url}/api/employees/export.csv\\\", headers=headers)\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"message\\\" in body\\n    error_text = body.get(\\\"error\\\", body.get(\\\"message\\\", \\\"\\\")).lower()\\n    assert any(kw in error_text"
+  }
+}

@@ -1,0 +1,194 @@
+{
+  "req": {
+    "id": "R-HLT-008",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Create medication request",
+    "statement": "A prescribing clinician shall issue a MedicationRequest; requests for controlled substances shall require schedule verification.",
+    "actors": [
+      "prescriber"
+    ],
+    "preconditions": [
+      "role:prescriber"
+    ],
+    "triggers": [
+      "clinician prescribes"
+    ],
+    "expected_outcomes": [
+      "request stored",
+      "pharmacy notified"
+    ],
+    "error_pathways": [
+      "403 without schedule verification for CII"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/MedicationRequest"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-008",
+    "reasoning": "R-HLT-008 requires that prescribers issue MedicationRequests with mandatory schedule verification for controlled substances (CII). The test suite uses Equivalence Partitioning to partition requests into non-controlled vs. controlled classes; Boundary Value Analysis to test schedule verification thresholds; Decision Table to verify the auth-schedule matrix; and Negative Path testing to confirm 403 rejection when schedule verification is absent. All tests are idempotent, self-contained, and deterministic.",
+    "tests": [
+      {
+        "name": "test_medication_request_non_controlled_success",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "authenticated as prescriber",
+          "authorization token valid",
+          "medication is non-controlled (Schedule IV or unscheduled)"
+        ],
+        "actions": [
+          "POST /MedicationRequest with non-controlled medication (aspirin)",
+          "include patient reference, prescriber ID, dosage, frequency",
+          "omit schedule verification field"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "response body contains id and status=active",
+          "pharmacy receives notification event",
+          "request persisted in database"
+        ],
+        "trace": [
+          "R-HLT-008: request stored",
+          "R-HLT-008: pharmacy notified",
+          "precondition: role:prescriber satisfied"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime\n\ndef test_medication_request_non_controlled_success():\n    headers = {'Authorization': 'Bearer <valid_prescriber_token>'}\n    payload = {\n        'resourceType': 'MedicationRequest',\n        'status': 'active',\n        'intent': 'order',\n        'medicationCodeableConcept': {'coding': [{'code': '243516', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm'}]},\n        'subject': {'reference': 'Patient/12345'},\n        'authoredOn': datetime.now().isoformat(),\n        'requester': {'reference': 'Practitioner/67890'}\n    }\n    resp = requests.post('http://localhost:8080/MedicationRequest', json=payload, headers=headers)\n    assert resp.status_code == 201, f'Expected 201, got {resp.status_code}'\n    body = resp.json()\n    assert 'id' in body and body.get('status') == 'active'\n    assert <notification_service_received_event>(body['id'])"
+      },
+      {
+        "name": "test_medication_request_controlled_cii_without_schedule_verification_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated as prescriber",
+          "authorization token valid",
+          "medication is CII controlled substance (morphine)",
+          "schedule verification NOT provided"
+        ],
+        "actions": [
+          "POST /MedicationRequest with CII medication (morphine, schedule code=II)",
+          "include patient reference, prescriber ID, dosage",
+          "explicitly omit scheduleVerification field"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "error response contains code=SCHEDULE_VERIFICATION_REQUIRED",
+          "request NOT persisted",
+          "pharmacy NOT notified"
+        ],
+        "trace": [
+          "R-HLT-008: requests for controlled substances shall require schedule verification",
+          "R-HLT-008 error pathway: 403 without schedule verification for CII",
+          "decision: medication is CII AND scheduleVerification absent \u2192 reject"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime\n\ndef test_medication_request_controlled_cii_without_schedule_verification_403():\n    headers = {'Authorization': 'Bearer <valid_prescriber_token>'}\n    payload = {\n        'resourceType': 'MedicationRequest',\n        'status': 'active',\n        'intent': 'order',\n        'medicationCodeableConcept': {'coding': [{'code': '10437', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm', 'display': 'morphine'}]},\n        'subject': {'reference': 'Patient/12345'},\n        'authoredOn': datetime.now().isoformat(),\n        'requester': {'reference': 'Practitioner/67890'},\n        'dosageInstruction': [{'doseAndRate': {'doseQuantity': {'value': 10, 'unit': 'mg'}}}]\n    }\n    resp = requests.post('http://localhost:8080/MedicationRequest', json=payload, headers=headers)\n    assert resp.status_code == 403, f'Expected 403, got {resp.status_code}'\n    body = resp.json()\n    assert body.get('issue', [{}])[0].get('code') == 'SCHEDULE_VERIFICATION_REQUIRED'\n    assert not <request_persisted_in_db>()\n    assert not <pharmacy_notification_sent>()"
+      },
+      {
+        "name": "test_medication_request_controlled_cii_with_valid_schedule_verification_201",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "authenticated as prescriber",
+          "authorization token valid",
+          "medication is CII controlled substance (hydrocodone)",
+          "prescriber has valid DEA schedule verification credential"
+        ],
+        "actions": [
+          "POST /MedicationRequest with CII medication (hydrocodone, schedule=II)",
+          "include valid scheduleVerification object with dea_credential_id and verification_timestamp",
+          "include patient reference, prescriber ID, dosage"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "response body contains id and status=active",
+          "scheduleVerification echoed in response",
+          "pharmacy notified with schedule metadata",
+          "audit log records verification credential used"
+        ],
+        "trace": [
+          "R-HLT-008: requests for controlled substances shall require schedule verification",
+          "R-HLT-008: request stored",
+          "R-HLT-008: pharmacy notified",
+          "decision table: CII + valid scheduleVerification \u2192 allow"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime\n\ndef test_medication_request_controlled_cii_with_valid_schedule_verification_201():\n    headers = {'Authorization': 'Bearer <valid_prescriber_token>'}\n    payload = {\n        'resourceType': 'MedicationRequest',\n        'status': 'active',\n        'intent': 'order',\n        'medicationCodeableConcept': {'coding': [{'code': '5489', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm', 'display': 'hydrocodone'}]},\n        'subject': {'reference': 'Patient/12345'},\n        'authoredOn': datetime.now().isoformat(),\n        'requester': {'reference': 'Practitioner/67890'},\n        'extension': [{'url': 'http://fhir-lite.local/scheduleVerification', 'valueString': 'DEA-12345:CII:2025-01-15T12:00:00Z'}]\n    }\n    resp = requests.post('http://localhost:8080/MedicationRequest', json=payload, headers=headers)\n    assert resp.status_code == 201, f'Expected 201, got {resp.status_code}'\n    body = resp.json()\n    assert 'id' in body and body.get('status') == 'active'\n    assert any(ext.get('url') == 'http://fhir-lite.local/scheduleVerification' for ext in body.get('extension', []))\n    assert <pharmacy_notification_includes_schedule_metadata>(body['id'])"
+      },
+      {
+        "name": "test_medication_request_controlled_ciii_boundary_missing_verification",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "authenticated as prescriber",
+          "authorization token valid",
+          "medication is CIII (boundary: lowest controlled schedule)",
+          "schedule verification NOT provided"
+        ],
+        "actions": [
+          "POST /MedicationRequest with CIII medication (codeine, schedule=III)",
+          "omit scheduleVerification field",
+          "include standard request fields"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden (same boundary rule as CII)",
+          "error code=SCHEDULE_VERIFICATION_REQUIRED",
+          "request NOT persisted"
+        ],
+        "trace": [
+          "R-HLT-008: boundary test\u2014CIII is lowest controlled schedule requiring verification",
+          "R-HLT-008 error pathway: 403 without schedule verification for CII (and CIII implies same rule)",
+          "BVA: test boundary between unscheduled (no verification) and CIII (verification required)"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime\n\ndef test_medication_request_controlled_ciii_boundary_missing_verification():\n    headers = {'Authorization': 'Bearer <valid_prescriber_token>'}\n    payload = {\n        'resourceType': 'MedicationRequest',\n        'status': 'active',\n        'intent': 'order',\n        'medicationCodeableConcept': {'coding': [{'code': '2670', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm', 'display': 'codeine'}]},\n        'subject': {'reference': 'Patient/12345'},\n        'authoredOn': datetime.now().isoformat(),\n        'requester': {'reference': 'Practitioner/67890'}\n    }\n    resp = requests.post('http://localhost:8080/MedicationRequest', json=payload, headers=headers)\n    assert resp.status_code == 403, f'Expected 403 at CIII boundary, got {resp.status_code}'\n    body = resp.json()\n    assert body.get('issue', [{}])[0].get('code') == 'SCHEDULE_VERIFICATION_REQUIRED'"
+      },
+      {
+        "name": "test_medication_request_non_prescriber_role_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "authenticated as nurse (non-prescriber role)",
+          "authorization token valid for nurse role",
+          "medication is non-controlled"
+        ],
+        "actions": [
+          "POST /MedicationRequest with non-controlled medication",
+          "use nurse authorization token"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "error code=INSUFFICIENT_PERMISSION or INVALID_ROLE",
+          "request NOT persisted"
+        ],
+        "trace": [
+          "R-HLT-008 precondition: role:prescriber",
+          "actor: prescriber only\u2014nurse cannot create MedicationRequest",
+          "NEG: enforce role-based access control"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime\n\ndef test_medication_request_non_prescriber_role_403():\n    headers = {'Authorization': 'Bearer <valid_nurse_token>'}\n    payload = {\n        'resourceType': 'MedicationRequest',\n        'status': 'active',\n        'intent': 'order',\n        'medicationCodeableConcept': {'coding': [{'code': '243516', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm'}]},\n        'subject': {'reference': 'Patient/12345'},\n        'authoredOn': datetime.now().isoformat(),\n        'requester': {'reference': 'Practitioner/67890'}\n    }\n    resp = requests.post('http://localhost:8080/MedicationRequest', json=payload, headers=headers)\n    assert resp.status_code == 403, f'Expected 403, got {resp.status_code}'\n    body = resp.json()\n    assert body.get('issue', [{}])[0].get('code') in ['INSUFFICIENT_PERMISSION', 'INVALID_ROLE']"
+      }
+    ]
+  },
+  "req_id": "R-HLT-008",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1026,
+    "output_tokens": 3214,
+    "latency_ms": 17195,
+    "wall_ms": 17195,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-008\",\n  \"reasoning\": \"R-HLT-008 requires that prescribers issue MedicationRequests with mandatory schedule verification for controlled substances (CII). The test suite uses Equivalence Partitioning to partition requests into non-controlled vs. controlled classes; Boundary Value Analysis to test schedule verification thresholds; Decision Table to verify the auth-schedule matrix; and Negative Path testing to confirm 403 rejection when schedule verification is absent. All tests are idempotent, self-contained, and deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_medication_request_non_controlled_success\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"authenticated as prescriber\",\n        \"authorization token valid\",\n        \"medication is non-controlled (Schedule IV or unscheduled)\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with non-controlled medication (aspirin)\",\n        \"include patient reference, prescriber ID, dosage, frequency\",\n        \"omit schedule verification field\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"response body contains id and status=active\",\n        \"pharmacy receives notification event\",\n        \"request persisted in database\"\n      ],\n      \"trace\": [\n        \"R-HLT-008: request stored\",\n        \"R-HLT-008: pharmacy notified\",\n        \"precondition: role:prescriber satisfied\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom datetime import datetime\\n\\ndef test_medication_request_non_controlled_success():\\n    headers = {'Authorization': 'Bearer <valid_prescriber_token>'}\\n    payload = {\\n        'resourceType': 'MedicationRequest',\\n        'status': 'active',\\n        'intent': 'order',\\n        'medicationCodeableConcept': {'coding': [{'code': '243516', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm'}]},\\n        'subject': {'reference': 'Patient/12345'},\\n        'authoredOn': datetime.now().isoformat(),\\n        'requester': {'reference': 'Practitioner/67890'}\\n    }\\n    resp = requests.post('http://localhost:8080/MedicationRequest', json=payload, headers=headers)\\n    assert resp.status_code == 201, f'Expected 201, got {resp.status_code}'\\n    body = resp.json()\\n    assert 'id' in body and body.get('status') == 'active'\\n    assert <notification_service_received_event>(body['id'])\"\n    },\n    {\n      \"name\": \"test_medication_request_controlled_cii_without_schedule_verification_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"authenticated as prescriber\",\n        \"authorization token valid\",\n        \"medication is CII controlled substance (morphine)\",\n        \"schedule verification NOT provided\"\n      ],\n      \"actions\": [\n        \"POST /MedicationRequest with CII medication (morphine, schedule code=II)\",\n        \"include patient reference, prescriber ID, dosage\",\n        \"explicitly omit scheduleVerification field\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"error response contains code=SCHEDULE_VERIFICATION_REQUIRED\",\n        \"request NOT persisted\",\n        \"pharmacy NOT notified\"\n      ],\n      \"trace\": [\n        \"R-HLT-008: requests for controlled substances shall require schedule verification\",\n        \"R-HLT-008 error pathway: 403 without schedule verification for CII\",\n        \"decision: medication is CII AND scheduleVerification absent \u2192 reject\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom datetime import datetime\\n\\ndef test_medication_request_controlled_cii_without_schedule_verification_403():\\n    headers = {'Authorization': 'Bearer <valid_prescriber_token>'}\\n    payload = {\\n        'resourceType': 'MedicationRequest',\\n        'status': 'active',\\n        'intent': 'order',\\n        'medicationCodeableConcept': {'coding': [{'code': '10437', 'system': 'http://www.nlm.nih.gov/research/umls/rxnorm', 'display': 'morphine'}]},\\n        'subject': {'referenc"
+  }
+}

@@ -1,0 +1,219 @@
+{
+  "req": {
+    "id": "R-WEB-017",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Manager creates timesheet",
+    "statement": "An authenticated manager shall be able to create a timesheet through the UI form. Mandatory fields must be validated and an audit record must be written on success.",
+    "actors": [
+      "manager"
+    ],
+    "preconditions": [
+      "authenticated",
+      "role:manager",
+      "timesheet module is enabled"
+    ],
+    "triggers": [
+      "manager creates a timesheet"
+    ],
+    "expected_outcomes": [
+      "timesheet is created",
+      "audit record written",
+      "response 200 or 201 with entity id"
+    ],
+    "error_pathways": [
+      "400 on validation error",
+      "401 if unauthenticated",
+      "403 if role forbidden"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/timesheets"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-017",
+    "reasoning": "The requirement covers UI-driven timesheet creation for managers. I designed tests using EP (valid manager creates timesheet), NEG (missing mandatory fields, unauthenticated, forbidden role), BVA (description at max allowed length), STC (state transition from draft to submitted), and DT (decision table over role x auth combinations). Each test targets /timesheets via Playwright for UI interaction and a lightweight API check for audit record verification. Fixtures and helpers are kept as placeholders to stay within line limits.",
+    "tests": [
+      {
+        "name": "test_manager_creates_timesheet_with_valid_data",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Timesheet module is enabled",
+          "No duplicate timesheet exists for the target period"
+        ],
+        "actions": [
+          "Navigate to /timesheets",
+          "Click 'Create Timesheet' button",
+          "Fill all mandatory fields with valid equivalence-class values",
+          "Submit the form",
+          "Capture the returned entity ID",
+          "Query the audit log API for that entity ID"
+        ],
+        "expected": [
+          "HTTP response status is 200 or 201",
+          "Response body contains a non-empty entity ID",
+          "Timesheet row appears in the /timesheets list",
+          "Audit record exists for the created timesheet"
+        ],
+        "trace": [
+          "R-WEB-017: positive path - timesheet created",
+          "R-WEB-017: audit record written on success",
+          "R-WEB-017: response 200 or 201 with entity id"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_manager_creates_timesheet_with_valid_data(\n    manager_page,        # <fixture>: authenticated Playwright Page as manager\n    audit_api_client,    # <fixture>: requests.Session with manager credentials\n    valid_timesheet_payload,  # <fixture>: dict of valid mandatory field values\n    cleanup_timesheet,   # <fixture>: deletes created timesheet after test\n):\n    page = manager_page\n    page.goto(\"/timesheets\")\n    page.click(\"[data-testid='btn-create-timesheet']\")\n\n    fill_timesheet_form(page, valid_timesheet_payload)  # <helper_fn>\n    page.click(\"[data-testid='btn-submit']\")\n\n    success_banner = page.locator(\"[data-testid='alert-success']\")\n    expect(success_banner).to_be_visible(timeout=5000)\n\n    entity_id = page.locator(\"[data-testid='timesheet-id']\").inner_text()\n    assert entity_id, \"Entity ID must be non-empty\"\n    cleanup_timesheet(entity_id)\n\n    resp = audit_api_client.get(f\"/audit?entity_id={entity_id}&action=CREATE\")\n    assert resp.status_code == 200\n    records = resp.json().get(\"records\", [])\n    assert any(r[\"entity_id\"] == entity_id for r in records), \"Audit record missing\"\n"
+      },
+      {
+        "name": "test_create_timesheet_missing_mandatory_fields_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Timesheet module is enabled"
+        ],
+        "actions": [
+          "Navigate to /timesheets",
+          "Click 'Create Timesheet' button",
+          "Leave all mandatory fields blank",
+          "Click Submit"
+        ],
+        "expected": [
+          "Form submission is blocked or server returns 400",
+          "Validation error messages are displayed for each mandatory field",
+          "No timesheet entity is created",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-017: 400 on validation error",
+          "R-WEB-017: mandatory fields must be validated"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_create_timesheet_missing_mandatory_fields_returns_400(\n    manager_page,       # <fixture>: authenticated Playwright Page as manager\n    api_client_manager, # <fixture>: requests.Session with manager credentials\n):\n    page = manager_page\n    page.goto(\"/timesheets\")\n    page.click(\"[data-testid='btn-create-timesheet']\")\n\n    # Deliberately skip filling any fields\n    page.click(\"[data-testid='btn-submit']\")\n\n    error_locators = page.locator(\"[data-testid='field-error']\")\n    expect(error_locators.first).to_be_visible(timeout=3000)\n    error_count = error_locators.count()\n    assert error_count >= 1, f\"Expected validation errors, got {error_count}\"\n\n    # Confirm no entity was persisted via API\n    resp = api_client_manager.get(\"/timesheets?sort=created_at:desc&limit=1\")\n    assert resp.status_code == 200\n    items = resp.json().get(\"items\", [])\n    # Ensure most recent record is not from this test run\n    assert_no_incomplete_timesheet_created(items)  # <helper_fn>\n"
+      },
+      {
+        "name": "test_create_timesheet_description_at_max_boundary_length",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Timesheet module is enabled",
+          "Max allowed description length is known (e.g. 500 characters)"
+        ],
+        "actions": [
+          "Navigate to /timesheets",
+          "Click 'Create Timesheet' button",
+          "Fill all mandatory fields; set description to exactly 500 characters",
+          "Submit the form",
+          "Capture entity ID",
+          "Also submit with 501-character description and verify rejection"
+        ],
+        "expected": [
+          "500-character description: form submits, HTTP 200/201, entity created",
+          "501-character description: validation error displayed, HTTP 400, no entity created"
+        ],
+        "trace": [
+          "R-WEB-017: mandatory field validation",
+          "R-WEB-017: boundary on description field max length"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\nMAX_LEN = 500\n\ndef test_create_timesheet_description_at_max_boundary_length(\n    manager_page,\n    valid_timesheet_payload,  # <fixture>\n    cleanup_timesheet,        # <fixture>\n):\n    page = manager_page\n\n    # --- At boundary: exactly MAX_LEN chars ---\n    page.goto(\"/timesheets\")\n    page.click(\"[data-testid='btn-create-timesheet']\")\n    payload_max = {**valid_timesheet_payload, \"description\": \"A\" * MAX_LEN}\n    fill_timesheet_form(page, payload_max)  # <helper_fn>\n    page.click(\"[data-testid='btn-submit']\")\n    expect(page.locator(\"[data-testid='alert-success']\")).to_be_visible(timeout=5000)\n    entity_id = page.locator(\"[data-testid='timesheet-id']\").inner_text()\n    assert entity_id\n    cleanup_timesheet(entity_id)\n\n    # --- Beyond boundary: MAX_LEN + 1 chars ---\n    page.goto(\"/timesheets\")\n    page.click(\"[data-testid='btn-create-timesheet']\")\n    payload_over = {**valid_timesheet_payload, \"description\": \"A\" * (MAX_LEN + 1)}\n    fill_timesheet_form(page, payload_over)  # <helper_fn>\n    page.click(\"[data-testid='btn-submit']\")\n    error_loc = page.locator(\"[data-testid='field-error-description']\")\n    expect(error_loc).to_be_visible(timeout=3000)\n"
+      },
+      {
+        "name": "test_unauthenticated_user_cannot_create_timesheet",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No active session / user is not authenticated"
+        ],
+        "actions": [
+          "Navigate directly to /timesheets without logging in",
+          "Attempt to POST to /timesheets API endpoint without auth token"
+        ],
+        "expected": [
+          "UI redirects to login page or shows 401 error",
+          "API returns HTTP 401",
+          "No timesheet entity is created"
+        ],
+        "trace": [
+          "R-WEB-017: 401 if unauthenticated"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\nimport requests\n\ndef test_unauthenticated_user_cannot_create_timesheet(\n    browser_context_no_auth,  # <fixture>: Playwright BrowserContext with no session\n    base_url,                 # <fixture>: str, e.g. \"https://hr-app.example.com\"\n    valid_timesheet_payload,  # <fixture>\n):\n    page = browser_context_no_auth.new_page()\n    page.goto(f\"{base_url}/timesheets\")\n\n    # UI should redirect to login\n    expect(page).to_have_url(url_pattern_login(base_url), timeout=5000)  # <helper_fn>\n\n    # Direct API call without token should return 401\n    resp = requests.post(\n        f\"{base_url}/timesheets\",\n        json=valid_timesheet_payload,\n        timeout=10,\n    )\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}\"\n    page.close()\n"
+      },
+      {
+        "name": "test_forbidden_role_cannot_create_timesheet",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "User is authenticated with role 'employee' (not manager)",
+          "Timesheet module is enabled"
+        ],
+        "actions": [
+          "Authenticate as a user with role 'employee'",
+          "Attempt POST to /timesheets API with employee credentials",
+          "Navigate to /timesheets in UI and check for create button visibility"
+        ],
+        "expected": [
+          "API returns HTTP 403",
+          "UI does not expose the 'Create Timesheet' button or shows access-denied message",
+          "No timesheet entity is created",
+          "No audit record is written"
+        ],
+        "trace": [
+          "R-WEB-017: 403 if role forbidden",
+          "R-WEB-017: precondition role:manager"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_forbidden_role_cannot_create_timesheet(\n    employee_page,           # <fixture>: authenticated Playwright Page as employee\n    api_client_employee,     # <fixture>: requests.Session with employee credentials\n    valid_timesheet_payload, # <fixture>\n):\n    # UI check: create button must not be present\n    page = employee_page\n    page.goto(\"/timesheets\")\n    create_btn = page.locator(\"[data-testid='btn-create-timesheet']\")\n    expect(create_btn).not_to_be_visible(timeout=3000)\n\n    # API check: direct POST must return 403\n    resp = api_client_employee.post(\"/timesheets\", json=valid_timesheet_payload)\n    assert resp.status_code == 403, f\"Expected 403, got {resp.status_code}\"\n\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, \"Response must contain error detail\"\n"
+      },
+      {
+        "name": "test_timesheet_state_transition_draft_to_submitted",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "User is authenticated as a manager",
+          "Timesheet module is enabled",
+          "A timesheet in DRAFT state exists for the manager"
+        ],
+        "actions": [
+          "Navigate to /timesheets",
+          "Open the existing DRAFT timesheet",
+          "Click 'Submit' to transition state from DRAFT to SUBMITTED",
+          "Verify state change in UI and via API",
+          "Verify audit record records the state transition"
+        ],
+        "expected": [
+          "Timesheet status changes from DRAFT to SUBMITTED",
+          "API GET /timesheets/{id} returns status=SUBMITTED",
+          "Audit record contains action=STATE_CHANGE with from=DRAFT and to=SUBMITTED",
+          "HTTP 200 returned on transition"
+        ],
+        "trace": [
+          "R-WEB-017: audit record written on success",
+          "R-WEB-017: state transition coverage DRAFT->SUBMITTED"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import expect\n\ndef test_timesheet_state_transition_draft_to_submitted(\n    manager_page,\n    api_client_manager,    # <fixture>\n    draft_timesheet_id,    # <fixture>: creates a DRAFT timesheet, returns its ID\n    audit_api_client,      # <fixture>\n    cleanup_timesheet,     # <fixture>\n):\n    page = manager_page\n    ts_id = draft_timesheet_id\n    page.goto(f\"/timesheets/{ts_id}\")\n\n    status_badge = page.locator(\"[data-testid='status-badge']\")\n    expect(status_badge).to_have_text(\"DRAFT\", timeout=3000)\n\n    page.click(\"[data-testid='btn-submit-timesheet']\")\n    expect(status_badge).to_have_text(\"SUBMITTED\", timeout=5000)\n\n    resp = api_client_manager.get(f\"/timesheets/{ts_id}\")\n    assert resp.status_code == 200\n    assert resp.json()[\"status\"] == \"SUBMITTED\"\n\n    audit_resp = audit_api_client.get(\n        f\"/audit?entity_id={ts_id}&action=STATE_CHANGE\"\n    )\n    assert audit_resp.status_code == 200\n    records = audit_resp.json().get(\"records\", [])\n    transition = next((r for r in records if r.get(\"to\") == \"SUBMITTED\"), None)\n    assert transition is not None, \"State-change audit record missing\"\n    assert transition[\"from\"] == \"DRAFT\"\n    cleanup_timesheet(ts_id)\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-017",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1025,
+    "output_tokens": 3915,
+    "latency_ms": 42680,
+    "wall_ms": 42680,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-017\",\n  \"reasoning\": \"The requirement covers UI-driven timesheet creation for managers. I designed tests using EP (valid manager creates timesheet), NEG (missing mandatory fields, unauthenticated, forbidden role), BVA (description at max allowed length), STC (state transition from draft to submitted), and DT (decision table over role x auth combinations). Each test targets /timesheets via Playwright for UI interaction and a lightweight API check for audit record verification. Fixtures and helpers are kept as placeholders to stay within line limits.\",\n  \"tests\": [\n    {\n      \"name\": \"test_manager_creates_timesheet_with_valid_data\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"User is authenticated as a manager\",\n        \"Timesheet module is enabled\",\n        \"No duplicate timesheet exists for the target period\"\n      ],\n      \"actions\": [\n        \"Navigate to /timesheets\",\n        \"Click 'Create Timesheet' button\",\n        \"Fill all mandatory fields with valid equivalence-class values\",\n        \"Submit the form\",\n        \"Capture the returned entity ID\",\n        \"Query the audit log API for that entity ID\"\n      ],\n      \"expected\": [\n        \"HTTP response status is 200 or 201\",\n        \"Response body contains a non-empty entity ID\",\n        \"Timesheet row appears in the /timesheets list\",\n        \"Audit record exists for the created timesheet\"\n      ],\n      \"trace\": [\n        \"R-WEB-017: positive path - timesheet created\",\n        \"R-WEB-017: audit record written on success\",\n        \"R-WEB-017: response 200 or 201 with entity id\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_manager_creates_timesheet_with_valid_data(\\n    manager_page,        # <fixture>: authenticated Playwright Page as manager\\n    audit_api_client,    # <fixture>: requests.Session with manager credentials\\n    valid_timesheet_payload,  # <fixture>: dict of valid mandatory field values\\n    cleanup_timesheet,   # <fixture>: deletes created timesheet after test\\n):\\n    page = manager_page\\n    page.goto(\\\"/timesheets\\\")\\n    page.click(\\\"[data-testid='btn-create-timesheet']\\\")\\n\\n    fill_timesheet_form(page, valid_timesheet_payload)  # <helper_fn>\\n    page.click(\\\"[data-testid='btn-submit']\\\")\\n\\n    success_banner = page.locator(\\\"[data-testid='alert-success']\\\")\\n    expect(success_banner).to_be_visible(timeout=5000)\\n\\n    entity_id = page.locator(\\\"[data-testid='timesheet-id']\\\").inner_text()\\n    assert entity_id, \\\"Entity ID must be non-empty\\\"\\n    cleanup_timesheet(entity_id)\\n\\n    resp = audit_api_client.get(f\\\"/audit?entity_id={entity_id}&action=CREATE\\\")\\n    assert resp.status_code == 200\\n    records = resp.json().get(\\\"records\\\", [])\\n    assert any(r[\\\"entity_id\\\"] == entity_id for r in records), \\\"Audit record missing\\\"\\n\"\n    },\n    {\n      \"name\": \"test_create_timesheet_missing_mandatory_fields_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"User is authenticated as a manager\",\n        \"Timesheet module is enabled\"\n      ],\n      \"actions\": [\n        \"Navigate to /timesheets\",\n        \"Click 'Create Timesheet' button\",\n        \"Leave all mandatory fields blank\",\n        \"Click Submit\"\n      ],\n      \"expected\": [\n        \"Form submission is blocked or server returns 400\",\n        \"Validation error messages are displayed for each mandatory field\",\n        \"No timesheet entity is created\",\n        \"No audit record is written\"\n      ],\n      \"trace\": [\n        \"R-WEB-017: 400 on validation error\",\n        \"R-WEB-017: mandatory fields must be validated\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import expect\\n\\ndef test_create_timesheet_missing_mandatory_fields_returns_400(\\n    manager_page,       # <fixture>: authenticated Playwright Page as manager\\n    api_client_manager, # <fixture>: requests.Session with manager credentials\\n):\\"
+  }
+}

@@ -1,0 +1,202 @@
+{
+  "req": {
+    "id": "R-HLT-049",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "validation",
+    "title": "Appointment scheduling (boundary)",
+    "statement": "A patient shall schedule an appointment at least 24 hours in advance during provider's available slots. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "authenticated patient"
+    ],
+    "triggers": [
+      "patient books slot"
+    ],
+    "expected_outcomes": [
+      "appointment created",
+      "provider notified"
+    ],
+    "error_pathways": [
+      "422 when slot unavailable or in past"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/appointments"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-049",
+    "reasoning": "R-HLT-049 mandates a 24-hour advance booking rule against provider-available slots. The critical boundaries are: exactly 24 h in advance (valid), exactly 24 h minus 1 second (invalid), and a slot well inside the future (nominal valid). Equivalence partitions are: future slots \u226524 h (valid), slots <24 h or past (invalid). State transitions cover the appointment lifecycle: unauthenticated \u2192 authenticated \u2192 slot-selected \u2192 confirmed. A decision table captures the cross-product of slot-availability \u00d7 lead-time. The violation in test[5] was heuristic=STC on a negative kind \u2014 STC is reserved for state-transition coverage which is a structural/positive traversal heuristic; the unavailable-slot scenario is a decision-table negative row, so heuristic is corrected to DT. All tests hit the REST API at /appointments, are idempotent via teardown fixtures, and use ISO-8601 timestamps computed at runtime relative to utcnow() to remain deterministic.",
+    "tests": [
+      {
+        "name": "test_schedule_appointment_48h_in_advance_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Patient is authenticated (valid JWT in session)",
+          "Provider has an available slot 48 hours from now",
+          "No existing appointment occupies that slot"
+        ],
+        "actions": [
+          "Compute slot_start = utcnow() + 48 h, rounded to next provider slot boundary",
+          "POST /appointments with patient_id, provider_id, slot_start",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains appointment_id",
+          "Response body contains status = 'booked'",
+          "Provider notification event is recorded"
+        ],
+        "trace": [
+          "R-HLT-049: appointment created when slot is available and \u226524 h in advance",
+          "R-HLT-049: provider notified on successful booking"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_48h_in_advance_succeeds(\n    auth_client,        # <fixture>: returns authenticated requests.Session\n    provider_slot,      # <fixture>: ensures provider slot exists, yields slot_id\n    cleanup_appointment # <fixture>: deletes created appointment after test\n):\n    slot_start = (\n        datetime.now(timezone.utc) + timedelta(hours=48)\n    ).replace(minute=0, second=0, microsecond=0).isoformat()\n\n    payload = {\n        \"patient_id\": \"<test_patient_id>\",\n        \"provider_id\": \"<test_provider_id>\",\n        \"slot_start\": slot_start,\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"appointment_id\" in body\n    assert body.get(\"status\") == \"booked\"\n\n    notification = <helper_fn>.get_notification(body[\"appointment_id\"])\n    assert notification is not None, \"Provider notification not recorded\"\n\n    cleanup_appointment(body[\"appointment_id\"])\n"
+      },
+      {
+        "name": "test_schedule_appointment_less_than_24h_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Patient is authenticated (valid JWT in session)",
+          "A provider slot exists 12 hours from now (less than 24 h lead time)"
+        ],
+        "actions": [
+          "Compute slot_start = utcnow() + 12 h",
+          "POST /appointments with patient_id, provider_id, slot_start",
+          "Capture HTTP status and error body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Error body contains code indicating slot is in the past or inside 24-h window",
+          "No appointment record created"
+        ],
+        "trace": [
+          "R-HLT-049: error pathway \u2014 422 when slot is within 24-h advance window",
+          "R-HLT-049: appointment must NOT be created"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_less_than_24h_returns_422(\n    auth_client,   # <fixture>\n    provider_slot  # <fixture>\n):\n    slot_start = (\n        datetime.now(timezone.utc) + timedelta(hours=12)\n    ).replace(minute=0, second=0, microsecond=0).isoformat()\n\n    payload = {\n        \"patient_id\": \"<test_patient_id>\",\n        \"provider_id\": \"<test_provider_id>\",\n        \"slot_start\": slot_start,\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body, \"Response must contain error detail\"\n    error_text = str(body).lower()\n    assert any(k in error_text for k in (\"advance\", \"24\", \"past\", \"unavailable\"))\n"
+      },
+      {
+        "name": "test_schedule_appointment_exactly_24h_minus_1s_returns_422",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated (valid JWT in session)",
+          "A provider slot exists at exactly utcnow() + 24 h - 1 s"
+        ],
+        "actions": [
+          "Compute slot_start = utcnow() + 24 h - 1 second (ISO-8601 with seconds)",
+          "POST /appointments with patient_id, provider_id, slot_start",
+          "Capture HTTP status"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Booking is rejected because timestamp is strictly less than the 24-h threshold"
+        ],
+        "trace": [
+          "R-HLT-049: boundary \u2014 one second below the 24-h advance rule must be rejected",
+          "R-HLT-049: boundary value analysis on timestamp numeric element"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_exactly_24h_minus_1s_returns_422(\n    auth_client,   # <fixture>\n    provider_slot  # <fixture>\n):\n    now = datetime.now(timezone.utc)\n    slot_start = (now + timedelta(hours=24) - timedelta(seconds=1)).isoformat()\n\n    payload = {\n        \"patient_id\": \"<test_patient_id>\",\n        \"provider_id\": \"<test_provider_id>\",\n        \"slot_start\": slot_start,\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n\n    assert resp.status_code == 422, (\n        f\"BVA lower bound (24h-1s) must be rejected; got {resp.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_schedule_appointment_exactly_24h_in_advance_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Patient is authenticated (valid JWT in session)",
+          "Provider has a slot available at exactly utcnow() + 24 h"
+        ],
+        "actions": [
+          "Compute slot_start = utcnow() + 24 h exactly (ISO-8601 with seconds)",
+          "POST /appointments with patient_id, provider_id, slot_start",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains appointment_id and status = 'booked'",
+          "Exactly-24-h boundary is treated as valid"
+        ],
+        "trace": [
+          "R-HLT-049: boundary \u2014 exactly 24 h in advance is the minimum valid value",
+          "R-HLT-049: boundary value analysis on timestamp numeric element"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_exactly_24h_in_advance_succeeds(\n    auth_client,        # <fixture>\n    provider_slot,      # <fixture>\n    cleanup_appointment # <fixture>\n):\n    now = datetime.now(timezone.utc)\n    slot_start = (now + timedelta(hours=24)).isoformat()\n\n    payload = {\n        \"patient_id\": \"<test_patient_id>\",\n        \"provider_id\": \"<test_provider_id>\",\n        \"slot_start\": slot_start,\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n\n    assert resp.status_code == 201, (\n        f\"BVA exact lower bound (24h) must be accepted; got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert body.get(\"status\") == \"booked\"\n    cleanup_appointment(body[\"appointment_id\"])\n"
+      },
+      {
+        "name": "test_schedule_appointment_unavailable_slot_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Patient is authenticated (valid JWT in session)",
+          "Target slot is 48 h from now but already booked by another patient"
+        ],
+        "actions": [
+          "Pre-book the target slot via helper_fn.force_book_slot(slot_id)",
+          "Attempt to POST /appointments for the same slot_id",
+          "Capture HTTP status and error body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Error body indicates slot is unavailable",
+          "No duplicate appointment record created"
+        ],
+        "trace": [
+          "R-HLT-049: error pathway \u2014 422 when slot is unavailable",
+          "R-HLT-049: decision table row: lead_time=OK, availability=TAKEN => reject"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_unavailable_slot_returns_422(\n    auth_client,          # <fixture>\n    provider_slot,        # <fixture>: yields slot_id for a slot 48 h from now\n    force_book_slot,      # <fixture/helper>: pre-books the given slot_id\n    cleanup_appointment   # <fixture>: cleans up the pre-booked appointment\n):\n    slot_id = provider_slot\n    pre_booked_id = force_book_slot(slot_id)\n\n    slot_start = (\n        datetime.now(timezone.utc) + timedelta(hours=48)\n    ).replace(minute=0, second=0, microsecond=0).isoformat()\n\n    payload = {\n        \"patient_id\": \"<test_patient_id_2>\",\n        \"provider_id\": \"<test_provider_id>\",\n        \"slot_start\": slot_start,\n        \"slot_id\": slot_id,\n    }\n\n    resp = auth_client.post(\"/appointments\", json=payload)\n\n    assert resp.status_code == 422, f\"Expected 422 for taken slot, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n    error_text = str(body).lower()\n    assert any(k in error_text for k in (\"unavailable\", \"taken\", \"conflict\", \"booked\"))\n\n    cleanup_appointment(pre_booked_id)\n"
+      },
+      {
+        "name": "test_schedule_appointment_unauthenticated_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "No authentication token is present in the session",
+          "Provider has an available slot 48 hours from now"
+        ],
+        "actions": [
+          "Compute slot_start = utcnow() + 48 h",
+          "POST /appointments without Authorization header",
+          "Capture HTTP status and error body"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized",
+          "Response body contains authentication error detail",
+          "No appointment record created"
+        ],
+        "trace": [
+          "R-HLT-049: precondition \u2014 only authenticated patients may book",
+          "R-HLT-049: unauthenticated request must be rejected before slot logic is evaluated"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_schedule_appointment_unauthenticated_returns_401(\n    anon_client  # <fixture>: returns unauthenticated requests.Session\n):\n    slot_start = (\n        datetime.now(timezone.utc) + timedelta(hours=48)\n    ).replace(minute=0, second=0, microsecond=0).isoformat()\n\n    payload = {\n        \"patient_id\": \"<test_patient_id>\",\n        \"provider_id\": \"<test_provider_id>\",\n        \"slot_start\": slot_start,\n    }\n\n    resp = anon_client.post(\"/appointments\", json=payload)\n\n    assert resp.status_code == 401, f\"Expected 401 for unauthenticated request, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-049",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 988,
+    "output_tokens": 3493,
+    "latency_ms": 44868,
+    "wall_ms": 44868,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-049\",\n  \"reasoning\": \"R-HLT-049 mandates a 24-hour advance booking rule against provider-available slots. The critical boundaries are: exactly 24 h in advance (valid), exactly 24 h minus 1 second (invalid), and a slot well inside the future (nominal valid). Equivalence partitions are: future slots \u226524 h (valid), slots <24 h or past (invalid). State transitions cover the appointment lifecycle: unauthenticated \u2192 authenticated \u2192 slot-selected \u2192 confirmed. A decision table captures the cross-product of slot-availability \u00d7 lead-time. All tests hit the REST API at /appointments, are idempotent via teardown fixtures, and use ISO-8601 timestamps computed at runtime relative to utcnow() to remain deterministic.\",\n  \"tests\": [\n    {\n      \"name\": \"test_schedule_appointment_48h_in_advance_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Patient is authenticated (valid JWT in session)\",\n        \"Provider has an available slot 48 hours from now\",\n        \"No existing appointment occupies that slot\"\n      ],\n      \"actions\": [\n        \"Compute slot_start = utcnow() + 48 h, rounded to next provider slot boundary\",\n        \"POST /appointments with patient_id, provider_id, slot_start\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains appointment_id\",\n        \"Response body contains status = 'booked'\",\n        \"Provider notification event is recorded\"\n      ],\n      \"trace\": [\n        \"R-HLT-049: appointment created when slot is available and \u226524 h in advance\",\n        \"R-HLT-049: provider notified on successful booking\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_schedule_appointment_48h_in_advance_succeeds(\\n    auth_client,        # <fixture>: returns authenticated requests.Session\\n    provider_slot,      # <fixture>: ensures provider slot exists, yields slot_id\\n    cleanup_appointment # <fixture>: deletes created appointment after test\\n):\\n    slot_start = (\\n        datetime.now(timezone.utc) + timedelta(hours=48)\\n    ).replace(minute=0, second=0, microsecond=0).isoformat()\\n\\n    payload = {\\n        \\\"patient_id\\\": \\\"<test_patient_id>\\\",\\n        \\\"provider_id\\\": \\\"<test_provider_id>\\\",\\n        \\\"slot_start\\\": slot_start,\\n    }\\n\\n    resp = auth_client.post(\\\"/appointments\\\", json=payload)\\n\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"appointment_id\\\" in body\\n    assert body.get(\\\"status\\\") == \\\"booked\\\"\\n\\n    notification = <helper_fn>.get_notification(body[\\\"appointment_id\\\"])\\n    assert notification is not None, \\\"Provider notification not recorded\\\"\\n\\n    cleanup_appointment(body[\\\"appointment_id\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_schedule_appointment_less_than_24h_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Patient is authenticated (valid JWT in session)\",\n        \"A provider slot exists 12 hours from now (less than 24 h lead time)\"\n      ],\n      \"actions\": [\n        \"Compute slot_start = utcnow() + 12 h\",\n        \"POST /appointments with patient_id, provider_id, slot_start\",\n        \"Capture HTTP status and error body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Error body contains code indicating slot is in the past or inside 24-h window\",\n        \"No appointment record created\"\n      ],\n      \"trace\": [\n        \"R-HLT-049: error pathway \u2014 422 when slot is within 24-h advance window\",\n        \"R-HLT-049: appointment must NOT be created\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_schedule_appointment_less_than_24h_returns_422(\\n    auth_client,   # <fixture>\\n    provider_slot  # <fixture>\\n):\\n    slot_start = (\\n        datetime.now(timezone.ut"
+  }
+}

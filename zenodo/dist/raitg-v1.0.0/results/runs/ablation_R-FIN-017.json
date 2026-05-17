@@ -1,0 +1,176 @@
+{
+  "req": {
+    "id": "R-FIN-017",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Account-level transaction limits",
+    "statement": "A customer shall configure daily per-channel limits within regulatory caps; changes take effect after a 2-hour cool-down.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "customer submits limits"
+    ],
+    "expected_outcomes": [
+      "pending limit stored",
+      "effective after cool-down"
+    ],
+    "error_pathways": [
+      "422 when over regulatory cap"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/limits"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-017",
+    "reasoning": "The requirement covers three key behaviours: (1) a valid limit update within regulatory caps stores a pending limit and activates after 2 hours (positive / EP), (2) a limit above the regulatory cap is rejected with HTTP 422 (negative / NEG), (3) a limit exactly at the regulatory cap boundary is accepted (boundary / BVA), (4) the state transition from 'pending' to 'active' after the cool-down elapses (STC), and (5) conflicting rule combinations via a decision table covering channel \u00d7 cap combos (DT). This gives five tests, covering all three required kinds and all five heuristics.",
+    "tests": [
+      {
+        "name": "test_valid_limit_update_stores_pending_and_returns_202",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated (valid JWT in fixture)",
+          "Account ID exists and belongs to the authenticated customer",
+          "Requested daily limit is within the regulatory cap for the channel"
+        ],
+        "actions": [
+          "PATCH /accounts/{id}/limits with a daily_limit well below the regulatory cap for channel 'online'",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status='pending'",
+          "Response body contains an effective_at timestamp approximately 2 hours in the future"
+        ],
+        "trace": [
+          "R-FIN-017: customer shall configure daily per-channel limits",
+          "R-FIN-017: changes take effect after a 2-hour cool-down",
+          "R-FIN-017: pending limit stored"
+        ],
+        "executable": "def test_valid_limit_update_stores_pending_and_returns_202(auth_headers, account_id, base_url, regulatory_cap):\n    import requests, datetime\n    daily_limit = regulatory_cap(\"online\") // 2\n    payload = {\"channel\": \"online\", \"daily_limit\": daily_limit}\n    resp = requests.patch(\n        f\"{base_url}/accounts/{account_id}/limits\",\n        json=payload,\n        headers=auth_headers,\n    )\n    assert resp.status_code == 202, f\"Expected 202, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    effective_at = datetime.datetime.fromisoformat(body[\"effective_at\"])\n    now = datetime.datetime.utcnow()\n    delta_hours = (effective_at - now).total_seconds() / 3600\n    assert 1.9 <= delta_hours <= 2.1, f\"Cool-down window unexpected: {delta_hours}h\"\n"
+      },
+      {
+        "name": "test_limit_above_regulatory_cap_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account ID exists and belongs to the authenticated customer",
+          "Requested daily limit exceeds the regulatory cap for the channel"
+        ],
+        "actions": [
+          "PATCH /accounts/{id}/limits with daily_limit set to regulatory_cap + 1 for channel 'online'",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an error code referencing the regulatory cap violation"
+        ],
+        "trace": [
+          "R-FIN-017: 422 when over regulatory cap",
+          "R-FIN-017: changes take effect within regulatory caps"
+        ],
+        "executable": "def test_limit_above_regulatory_cap_returns_422(auth_headers, account_id, base_url, regulatory_cap):\n    import requests\n    over_cap = regulatory_cap(\"online\") + 1\n    payload = {\"channel\": \"online\", \"daily_limit\": over_cap}\n    resp = requests.patch(\n        f\"{base_url}/accounts/{account_id}/limits\",\n        json=payload,\n        headers=auth_headers,\n    )\n    assert resp.status_code == 422, f\"Expected 422, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert \"regulatory_cap\" in body.get(\"error_code\", \"\").lower() or \\\n           \"cap\" in body.get(\"detail\", \"\").lower(), \\\n           f\"Expected cap-related error, got: {body}\"\n"
+      },
+      {
+        "name": "test_limit_exactly_at_regulatory_cap_is_accepted",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account ID exists and belongs to the authenticated customer",
+          "Requested daily limit is exactly equal to the regulatory cap for the channel"
+        ],
+        "actions": [
+          "PATCH /accounts/{id}/limits with daily_limit equal to regulatory_cap exactly for channel 'online'",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted (boundary value is inclusive)",
+          "Response body contains status='pending'"
+        ],
+        "trace": [
+          "R-FIN-017: changes take effect within regulatory caps (inclusive boundary)",
+          "R-FIN-017: pending limit stored"
+        ],
+        "executable": "def test_limit_exactly_at_regulatory_cap_is_accepted(auth_headers, account_id, base_url, regulatory_cap):\n    import requests\n    cap = regulatory_cap(\"online\")\n    payload = {\"channel\": \"online\", \"daily_limit\": cap}\n    resp = requests.patch(\n        f\"{base_url}/accounts/{account_id}/limits\",\n        json=payload,\n        headers=auth_headers,\n    )\n    assert resp.status_code == 202, f\"Expected 202 at cap boundary, got {resp.status_code}: {resp.text}\"\n    body = resp.json()\n    assert body[\"status\"] == \"pending\", f\"Expected pending, got: {body['status']}\"\n"
+      },
+      {
+        "name": "test_pending_limit_becomes_active_after_cooldown",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account ID exists and belongs to the authenticated customer",
+          "A pending limit update has been submitted (pre-seeded via test fixture)",
+          "System clock has been advanced past the 2-hour cool-down (time-travel fixture)"
+        ],
+        "actions": [
+          "Seed a pending limit via helper fixture with effective_at set to now - 1 second",
+          "GET /accounts/{id}/limits to read current effective limit"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body shows the previously pending limit is now status='active'",
+          "active daily_limit matches the seeded value"
+        ],
+        "trace": [
+          "R-FIN-017: effective after cool-down",
+          "R-FIN-017: state transition pending -> active"
+        ],
+        "executable": "def test_pending_limit_becomes_active_after_cooldown(\n    auth_headers, account_id, base_url, seed_expired_pending_limit\n):\n    import requests\n    seeded_limit = seed_expired_pending_limit(\n        account_id=account_id,\n        channel=\"online\",\n        daily_limit=5000,\n        offset_seconds=-1,\n    )\n    resp = requests.get(\n        f\"{base_url}/accounts/{account_id}/limits\",\n        headers=auth_headers,\n    )\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}: {resp.text}\"\n    limits = resp.json().get(\"limits\", [])\n    online = next((l for l in limits if l[\"channel\"] == \"online\"), None)\n    assert online is not None, \"No limit entry for channel 'online'\"\n    assert online[\"status\"] == \"active\", f\"Expected active, got: {online['status']}\"\n    assert online[\"daily_limit\"] == seeded_limit, \\\n        f\"Expected {seeded_limit}, got {online['daily_limit']}\"\n"
+      },
+      {
+        "name": "test_decision_table_channel_cap_combinations",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated",
+          "Account ID exists and belongs to the authenticated customer",
+          "Regulatory caps differ per channel (online, atm, branch)"
+        ],
+        "actions": [
+          "For each channel in [online, atm, branch], submit daily_limit = regulatory_cap + 1",
+          "Collect HTTP status codes and error responses"
+        ],
+        "expected": [
+          "HTTP 422 for every over-cap submission across all channels",
+          "Each error response references the respective channel's regulatory cap"
+        ],
+        "trace": [
+          "R-FIN-017: 422 when over regulatory cap",
+          "R-FIN-017: per-channel limits within regulatory caps"
+        ],
+        "executable": "def test_decision_table_channel_cap_combinations(auth_headers, account_id, base_url, regulatory_cap):\n    import requests\n    channels = [\"online\", \"atm\", \"branch\"]\n    failures = []\n    for channel in channels:\n        over_cap = regulatory_cap(channel) + 1\n        payload = {\"channel\": channel, \"daily_limit\": over_cap}\n        resp = requests.patch(\n            f\"{base_url}/accounts/{account_id}/limits\",\n            json=payload,\n            headers=auth_headers,\n        )\n        if resp.status_code != 422:\n            failures.append(\n                f\"channel={channel} limit={over_cap}: expected 422 got {resp.status_code}\"\n            )\n    assert not failures, \"Cap enforcement failed for: \" + \"; \".join(failures)\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-017",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 984,
+    "output_tokens": 2646,
+    "latency_ms": 28257,
+    "wall_ms": 28257,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-017\",\n  \"reasoning\": \"The requirement covers three key behaviours: (1) a valid limit update within regulatory caps stores a pending limit and activates after 2 hours (positive / EP), (2) a limit above the regulatory cap is rejected with HTTP 422 (negative / NEG), (3) a limit exactly at the regulatory cap boundary is accepted (boundary / BVA), (4) the state transition from 'pending' to 'active' after the cool-down elapses (STC), and (5) conflicting rule combinations via a decision table covering channel \u00d7 cap combos (DT). This gives five tests, covering all three required kinds and all five heuristics.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_limit_update_stores_pending_and_returns_202\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated (valid JWT in fixture)\",\n        \"Account ID exists and belongs to the authenticated customer\",\n        \"Requested daily limit is within the regulatory cap for the channel\"\n      ],\n      \"actions\": [\n        \"PATCH /accounts/{id}/limits with a daily_limit well below the regulatory cap for channel 'online'\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains status='pending'\",\n        \"Response body contains an effective_at timestamp approximately 2 hours in the future\"\n      ],\n      \"trace\": [\n        \"R-FIN-017: customer shall configure daily per-channel limits\",\n        \"R-FIN-017: changes take effect after a 2-hour cool-down\",\n        \"R-FIN-017: pending limit stored\"\n      ],\n      \"executable\": \"def test_valid_limit_update_stores_pending_and_returns_202(auth_headers, account_id, base_url, regulatory_cap):\\n    import requests, datetime\\n    daily_limit = regulatory_cap(\\\"online\\\") // 2\\n    payload = {\\\"channel\\\": \\\"online\\\", \\\"daily_limit\\\": daily_limit}\\n    resp = requests.patch(\\n        f\\\"{base_url}/accounts/{account_id}/limits\\\",\\n        json=payload,\\n        headers=auth_headers,\\n    )\\n    assert resp.status_code == 202, f\\\"Expected 202, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    effective_at = datetime.datetime.fromisoformat(body[\\\"effective_at\\\"])\\n    now = datetime.datetime.utcnow()\\n    delta_hours = (effective_at - now).total_seconds() / 3600\\n    assert 1.9 <= delta_hours <= 2.1, f\\\"Cool-down window unexpected: {delta_hours}h\\\"\\n\"\n    },\n    {\n      \"name\": \"test_limit_above_regulatory_cap_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated\",\n        \"Account ID exists and belongs to the authenticated customer\",\n        \"Requested daily limit exceeds the regulatory cap for the channel\"\n      ],\n      \"actions\": [\n        \"PATCH /accounts/{id}/limits with daily_limit set to regulatory_cap + 1 for channel 'online'\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an error code referencing the regulatory cap violation\"\n      ],\n      \"trace\": [\n        \"R-FIN-017: 422 when over regulatory cap\",\n        \"R-FIN-017: changes take effect within regulatory caps\"\n      ],\n      \"executable\": \"def test_limit_above_regulatory_cap_returns_422(auth_headers, account_id, base_url, regulatory_cap):\\n    import requests\\n    over_cap = regulatory_cap(\\\"online\\\") + 1\\n    payload = {\\\"channel\\\": \\\"online\\\", \\\"daily_limit\\\": over_cap}\\n    resp = requests.patch(\\n        f\\\"{base_url}/accounts/{account_id}/limits\\\",\\n        json=payload,\\n        headers=auth_headers,\\n    )\\n    assert resp.status_code == 422, f\\\"Expected 422, got {resp.status_code}: {resp.text}\\\"\\n    body = resp.json()\\n    assert \\\"regulatory_cap\\\" in body.get(\\\"error_code\\\", \\\"\\\").lower() or \\\\\\n           \\\"cap\\\" in body.get(\\\"detail\\\", \\\"\\\").lower(), \\\\\\n           f\\\"Expected "
+  }
+}

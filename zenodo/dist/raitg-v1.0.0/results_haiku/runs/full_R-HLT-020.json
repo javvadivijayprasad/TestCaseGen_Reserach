@@ -1,0 +1,195 @@
+{
+  "req": {
+    "id": "R-HLT-020",
+    "domain": "healthcare",
+    "layer": "INTEGRATION",
+    "category": "auth",
+    "title": "Data retention",
+    "statement": "Resources shall be retained per policy; expired resources shall be purged on a nightly job with full audit trail.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "nightly job runs"
+    ],
+    "expected_outcomes": [
+      "expired resources purged",
+      "audit log written"
+    ],
+    "error_pathways": [
+      "incident raised on policy mismatch"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/cron/retention"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-020",
+    "reasoning": "Data retention and purging is a critical healthcare compliance function. The requirement mandates that expired resources be purged nightly with full audit trail and incident escalation on policy mismatch. Test coverage must verify: (1) successful purge of expired resources with audit logging (positive), (2) failure modes when policy rules are violated or audit fails (negative), (3) boundary conditions around retention window edges and policy thresholds (boundary). All tests target the /cron/retention endpoint and validate both data state changes and audit trail creation, per HIPAA compliance obligations.",
+    "tests": [
+      {
+        "name": "test_retention_positive_expired_resources_purged_with_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Database contains 3 resources: 2 expired (creation_date > retention_days ago), 1 current",
+          "Retention policy configured: 30 days",
+          "Audit log table is empty",
+          "System job scheduler is active"
+        ],
+        "actions": [
+          "POST /cron/retention with policy_id=default",
+          "Query database for resource count",
+          "Query audit log for purge events"
+        ],
+        "expected": [
+          "HTTP 200 response with message \"purge_job_completed\"",
+          "Exactly 2 resources deleted from database",
+          "1 current resource remains untouched",
+          "Audit log contains 2 entries with action=\"PURGE\" and resource_ids matching deleted resources",
+          "Each audit entry includes timestamp, actor=\"system_job\", and policy_version"
+        ],
+        "trace": [
+          "R-HLT-020: Resources shall be retained per policy",
+          "R-HLT-020: expired resources shall be purged on a nightly job",
+          "R-HLT-020: full audit trail"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime, timedelta\n\ndef test_retention_positive_expired_resources_purged_with_audit(api_base_url, db_connection):\n    # Setup: insert expired and current resources\n    expired_date = (datetime.utcnow() - timedelta(days=35)).isoformat()\n    current_date = (datetime.utcnow() - timedelta(days=5)).isoformat()\n    <setup_resources_in_db>(\n        db_connection, \n        [(\"res-001\", expired_date), (\"res-002\", expired_date), (\"res-003\", current_date)]\n    )\n    \n    response = requests.post(\n        f\"{api_base_url}/cron/retention\",\n        json={\"policy_id\": \"default\"},\n        headers={\"Authorization\": \"Bearer <system_token>\"}\n    )\n    assert response.status_code == 200\n    assert response.json()[\"status\"] == \"purge_job_completed\"\n    \n    remaining = <query_resource_count>(db_connection)\n    assert remaining == 1\n    \n    audit_entries = <query_audit_log>(db_connection, action=\"PURGE\")\n    assert len(audit_entries) == 2\n    assert all(e[\"actor\"] == \"system_job\" for e in audit_entries)"
+      },
+      {
+        "name": "test_retention_negative_policy_mismatch_raises_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Database contains 5 resources with mixed expiry dates",
+          "Retention policy configured with retention_days=30",
+          "Audit log write permission is REVOKED for system_job user",
+          "Incident escalation service is configured"
+        ],
+        "actions": [
+          "POST /cron/retention with policy_id=default",
+          "Monitor incident queue for raised incidents",
+          "Query database for resource state"
+        ],
+        "expected": [
+          "HTTP 500 response with error code \"AUDIT_WRITE_FAILED\"",
+          "Response includes error message mentioning policy mismatch or audit failure",
+          "Incident raised in incident queue with severity=\"HIGH\" and category=\"compliance\"",
+          "Database transaction rolled back; all 5 resources remain intact",
+          "No purge audit entries created"
+        ],
+        "trace": [
+          "R-HLT-020: incident raised on policy mismatch",
+          "R-HLT-020: full audit trail"
+        ],
+        "executable": "import requests\nimport json\n\ndef test_retention_negative_policy_mismatch_raises_incident(api_base_url, db_connection, incident_client):\n    initial_count = <query_resource_count>(db_connection)\n    \n    response = requests.post(\n        f\"{api_base_url}/cron/retention\",\n        json={\"policy_id\": \"default\"},\n        headers={\"Authorization\": \"Bearer <system_token>\"}\n    )\n    assert response.status_code == 500\n    assert \"AUDIT_WRITE_FAILED\" in response.json()[\"error_code\"]\n    \n    final_count = <query_resource_count>(db_connection)\n    assert final_count == initial_count\n    \n    incidents = incident_client.list_incidents()\n    assert len(incidents) >= 1\n    assert any(\n        i[\"severity\"] == \"HIGH\" and i[\"category\"] == \"compliance\" \n        for i in incidents\n    )"
+      },
+      {
+        "name": "test_retention_boundary_resource_at_exact_retention_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Retention policy configured: 30 days",
+          "Database contains resources with creation timestamps:",
+          "  - Resource A: exactly 30 days ago",
+          "  - Resource B: 30 days + 1 second ago",
+          "  - Resource C: 29 days + 59 minutes ago"
+        ],
+        "actions": [
+          "POST /cron/retention with policy_id=default and current_utc_timestamp",
+          "Query database for remaining resources",
+          "Verify audit log entries"
+        ],
+        "expected": [
+          "HTTP 200 response",
+          "Resource A (at threshold): retained (exclusive boundary)",
+          "Resource B (past threshold): purged",
+          "Resource C (before threshold): retained",
+          "Audit log shows exactly 1 purge entry for Resource B",
+          "Purge timestamp in audit is recorded with millisecond precision"
+        ],
+        "trace": [
+          "R-HLT-020: expired resources shall be purged",
+          "ISO/IEC/IEEE 29119-4: Boundary Value Analysis for retention window edge cases"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_retention_boundary_resource_at_exact_retention_threshold(api_base_url, db_connection):\n    now = datetime.utcnow()\n    retention_days = 30\n    \n    <setup_resources_in_db>(db_connection, [\n        (\"res-at-threshold\", (now - timedelta(days=30)).isoformat()),\n        (\"res-past-threshold\", (now - timedelta(days=30, seconds=1)).isoformat()),\n        (\"res-before-threshold\", (now - timedelta(days=29, minutes=59)).isoformat())\n    ])\n    \n    response = requests.post(\n        f\"{api_base_url}/cron/retention\",\n        json={\"policy_id\": \"default\"},\n        headers={\"Authorization\": \"Bearer <system_token>\"}\n    )\n    assert response.status_code == 200\n    \n    remaining = <query_resources_by_id>(db_connection, \n                  [\"res-at-threshold\", \"res-past-threshold\", \"res-before-threshold\"])\n    assert len(remaining) == 2\n    assert \"res-at-threshold\" in [r[\"id\"] for r in remaining]\n    assert \"res-past-threshold\" not in [r[\"id\"] for r in remaining]\n    assert \"res-before-threshold\" in [r[\"id\"] for r in remaining]\n    \n    audit_entries = <query_audit_log>(db_connection, action=\"PURGE\")\n    assert len(audit_entries) == 1\n    assert audit_entries[0][\"resource_id\"] == \"res-past-threshold\""
+      },
+      {
+        "name": "test_retention_boundary_empty_database_no_purge_needed",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Database is empty (no resources exist)",
+          "Retention policy is configured",
+          "Audit log table is accessible"
+        ],
+        "actions": [
+          "POST /cron/retention with policy_id=default",
+          "Query audit log",
+          "Verify response status"
+        ],
+        "expected": [
+          "HTTP 200 response with status \"purge_job_completed\"",
+          "Response includes resources_purged_count=0",
+          "Single audit entry created with action=\"PURGE_JOB_RUN\" and purged_count=0",
+          "No error incidents raised"
+        ],
+        "trace": [
+          "R-HLT-020: nightly job runs successfully with no work",
+          "ISO/IEC/IEEE 29119-4: Empty set boundary condition"
+        ],
+        "executable": "import requests\n\ndef test_retention_boundary_empty_database_no_purge_needed(api_base_url, db_connection):\n    <clear_all_resources>(db_connection)\n    <clear_audit_log>(db_connection)\n    \n    response = requests.post(\n        f\"{api_base_url}/cron/retention\",\n        json={\"policy_id\": \"default\"},\n        headers={\"Authorization\": \"Bearer <system_token>\"}\n    )\n    assert response.status_code == 200\n    assert response.json()[\"status\"] == \"purge_job_completed\"\n    assert response.json()[\"resources_purged_count\"] == 0\n    \n    audit_entries = <query_audit_log>(db_connection, action=\"PURGE_JOB_RUN\")\n    assert len(audit_entries) == 1\n    assert audit_entries[0][\"purged_count\"] == 0"
+      },
+      {
+        "name": "test_retention_negative_malformed_policy_id_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Retention policy endpoint requires valid policy_id parameter",
+          "Request validation is enabled",
+          "Database contains test resources"
+        ],
+        "actions": [
+          "POST /cron/retention with policy_id=\"invalid@policy#id\"",
+          "Inspect response status and error details"
+        ],
+        "expected": [
+          "HTTP 400 response with error_code=\"INVALID_POLICY_ID\"",
+          "Error message describes validation failure",
+          "Database is unchanged",
+          "No audit entries created"
+        ],
+        "trace": [
+          "R-HLT-020: policy validation prior to purge job execution",
+          "ISO/IEC/IEEE 29119-4: Decision Table for invalid input combinations"
+        ],
+        "executable": "import requests\n\ndef test_retention_negative_malformed_policy_id_rejected(api_base_url, db_connection):\n    initial_count = <query_resource_count>(db_connection)\n    \n    response = requests.post(\n        f\"{api_base_url}/cron/retention\",\n        json={\"policy_id\": \"invalid@policy#id\"},\n        headers={\"Authorization\": \"Bearer <system_token>\"}\n    )\n    assert response.status_code == 400\n    assert \"INVALID_POLICY_ID\" in response.json()[\"error_code\"]\n    \n    final_count = <query_resource_count>(db_connection)\n    assert final_count == initial_count\n    \n    audit_entries = <query_audit_log>(db_connection)\n    assert len(audit_entries) == 0"
+      }
+    ]
+  },
+  "req_id": "R-HLT-020",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1022,
+    "output_tokens": 3166,
+    "latency_ms": 19576,
+    "wall_ms": 19576,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-020\",\n  \"reasoning\": \"Data retention and purging is a critical healthcare compliance function. The requirement mandates that expired resources be purged nightly with full audit trail and incident escalation on policy mismatch. Test coverage must verify: (1) successful purge of expired resources with audit logging (positive), (2) failure modes when policy rules are violated or audit fails (negative), (3) boundary conditions around retention window edges and policy thresholds (boundary). All tests target the /cron/retention endpoint and validate both data state changes and audit trail creation, per HIPAA compliance obligations.\",\n  \"tests\": [\n    {\n      \"name\": \"test_retention_positive_expired_resources_purged_with_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Database contains 3 resources: 2 expired (creation_date > retention_days ago), 1 current\",\n        \"Retention policy configured: 30 days\",\n        \"Audit log table is empty\",\n        \"System job scheduler is active\"\n      ],\n      \"actions\": [\n        \"POST /cron/retention with policy_id=default\",\n        \"Query database for resource count\",\n        \"Query audit log for purge events\"\n      ],\n      \"expected\": [\n        \"HTTP 200 response with message \\\"purge_job_completed\\\"\",\n        \"Exactly 2 resources deleted from database\",\n        \"1 current resource remains untouched\",\n        \"Audit log contains 2 entries with action=\\\"PURGE\\\" and resource_ids matching deleted resources\",\n        \"Each audit entry includes timestamp, actor=\\\"system_job\\\", and policy_version\"\n      ],\n      \"trace\": [\n        \"R-HLT-020: Resources shall be retained per policy\",\n        \"R-HLT-020: expired resources shall be purged on a nightly job\",\n        \"R-HLT-020: full audit trail\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom datetime import datetime, timedelta\\n\\ndef test_retention_positive_expired_resources_purged_with_audit(api_base_url, db_connection):\\n    # Setup: insert expired and current resources\\n    expired_date = (datetime.utcnow() - timedelta(days=35)).isoformat()\\n    current_date = (datetime.utcnow() - timedelta(days=5)).isoformat()\\n    <setup_resources_in_db>(\\n        db_connection, \\n        [(\\\"res-001\\\", expired_date), (\\\"res-002\\\", expired_date), (\\\"res-003\\\", current_date)]\\n    )\\n    \\n    response = requests.post(\\n        f\\\"{api_base_url}/cron/retention\\\",\\n        json={\\\"policy_id\\\": \\\"default\\\"},\\n        headers={\\\"Authorization\\\": \\\"Bearer <system_token>\\\"}\\n    )\\n    assert response.status_code == 200\\n    assert response.json()[\\\"status\\\"] == \\\"purge_job_completed\\\"\\n    \\n    remaining = <query_resource_count>(db_connection)\\n    assert remaining == 1\\n    \\n    audit_entries = <query_audit_log>(db_connection, action=\\\"PURGE\\\")\\n    assert len(audit_entries) == 2\\n    assert all(e[\\\"actor\\\"] == \\\"system_job\\\" for e in audit_entries)\"\n    },\n    {\n      \"name\": \"test_retention_negative_policy_mismatch_raises_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Database contains 5 resources with mixed expiry dates\",\n        \"Retention policy configured with retention_days=30\",\n        \"Audit log write permission is REVOKED for system_job user\",\n        \"Incident escalation service is configured\"\n      ],\n      \"actions\": [\n        \"POST /cron/retention with policy_id=default\",\n        \"Monitor incident queue for raised incidents\",\n        \"Query database for resource state\"\n      ],\n      \"expected\": [\n        \"HTTP 500 response with error code \\\"AUDIT_WRITE_FAILED\\\"\",\n        \"Response includes error message mentioning policy mismatch or audit failure\",\n        \"Incident raised in incident queue with severity=\\\"HIGH\\\" and category=\\\"compliance\\\"\",\n        \"Database transaction rolled back; all 5 resources remain intact\",\n        \"No purge audit entries created\"\n      ],\n      \"trace\": [\n        \"R-HLT-020: incid"
+  }
+}

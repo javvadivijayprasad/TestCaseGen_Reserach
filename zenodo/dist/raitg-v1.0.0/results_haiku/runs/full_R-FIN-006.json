@@ -1,0 +1,188 @@
+{
+  "req": {
+    "id": "R-FIN-006",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "transaction",
+    "title": "Wire transfer",
+    "statement": "A customer shall initiate a wire transfer requiring two-factor authentication; transfers above $100,000 require manual review.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "2fa verified in last 5 min"
+    ],
+    "triggers": [
+      "customer submits wire"
+    ],
+    "expected_outcomes": [
+      "wire queued",
+      "compliance check started"
+    ],
+    "error_pathways": [
+      "401 when 2fa stale",
+      "202 when manual review required"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/transfers/wire"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-006",
+    "reasoning": "Wire transfer initiation requires 2FA verification (fresh within 5min) and conditional manual review for high-value transfers (>$100k). Test suite covers: (1) positive case with valid 2FA and transfer within threshold, (2) negative case with stale 2FA, (3) boundary case at $100k threshold triggering manual review. Heuristics applied: EP partitions by amount thresholds, BVA tests boundary at $100k, NEG exercises auth failure, STC validates state transitions (2FA\u2192queued/review), DT combines 2FA freshness and amount conditions.",
+    "tests": [
+      {
+        "name": "test_wire_transfer_valid_2fa_under_threshold",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer identity verified",
+          "2FA credential validated within last 5 minutes",
+          "Transfer amount $50,000 (below $100k threshold)",
+          "Customer account in good standing"
+        ],
+        "actions": [
+          "POST /transfers/wire with valid bearer token",
+          "Payload: {\"amount\": 50000, \"currency\": \"USD\", \"beneficiary_account\": \"valid_iban\", \"2fa_verified_at\": \"<recent_timestamp>\"}"
+        ],
+        "expected": [
+          "HTTP 200 response code",
+          "Response body contains wire_id (UUID format)",
+          "Response body contains state: \"queued\"",
+          "Response body contains compliance_check_id"
+        ],
+        "trace": [
+          "R-FIN-006: wire transfer initiated with valid 2FA",
+          "R-FIN-006: amount $50k below manual review threshold",
+          "R-FIN-006: expected outcome 'wire queued' achieved"
+        ],
+        "executable": "import requests\nimport json\nfrom datetime import datetime, timedelta\n\ndef test_wire_transfer_valid_2fa_under_threshold(base_url, valid_token):\n    headers = {\"Authorization\": f\"Bearer {valid_token}\"}\n    payload = {\n        \"amount\": 50000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"DE89370400440532013000\",\n        \"2fa_verified_at\": datetime.utcnow().isoformat()\n    }\n    resp = requests.post(\n        f\"{base_url}/transfers/wire\",\n        json=payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert \"wire_id\" in body\n    assert body[\"state\"] == \"queued\"\n    assert \"compliance_check_id\" in body"
+      },
+      {
+        "name": "test_wire_transfer_stale_2fa_returns_401",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer identity verified",
+          "2FA credential validated 10 minutes ago (beyond 5-min window)",
+          "Transfer amount $75,000 (below threshold)"
+        ],
+        "actions": [
+          "POST /transfers/wire with bearer token from stale 2FA",
+          "Payload includes 2fa_verified_at timestamp 10 minutes in past"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized response code",
+          "Response body contains error_code: \"2fa_expired\"",
+          "Response body contains error message referencing 5-minute window",
+          "No wire_id generated"
+        ],
+        "trace": [
+          "R-FIN-006: precondition '2fa verified in last 5 min' violated",
+          "R-FIN-006: error pathway '401 when 2fa stale' executed",
+          "R-FIN-006: wire transfer rejected due to stale authentication"
+        ],
+        "executable": "import requests\nfrom datetime import datetime, timedelta\n\ndef test_wire_transfer_stale_2fa_returns_401(base_url, valid_token):\n    headers = {\"Authorization\": f\"Bearer {valid_token}\"}\n    stale_time = datetime.utcnow() - timedelta(minutes=10)\n    payload = {\n        \"amount\": 75000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"DE89370400440532013000\",\n        \"2fa_verified_at\": stale_time.isoformat()\n    }\n    resp = requests.post(\n        f\"{base_url}/transfers/wire\",\n        json=payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 401\n    body = resp.json()\n    assert body[\"error_code\"] == \"2fa_expired\"\n    assert \"5 minute\" in body[\"error_message\"].lower()\n    assert \"wire_id\" not in body"
+      },
+      {
+        "name": "test_wire_transfer_at_boundary_100k_triggers_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer identity verified",
+          "2FA credential validated within last 5 minutes",
+          "Transfer amount exactly $100,000 (at boundary threshold)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount exactly 100000",
+          "Payload: {\"amount\": 100000, \"currency\": \"USD\", \"beneficiary_account\": \"valid_iban\", \"2fa_verified_at\": \"<recent_timestamp>\"}"
+        ],
+        "expected": [
+          "HTTP 202 Accepted response code",
+          "Response body contains state: \"pending_manual_review\"",
+          "Response body contains wire_id",
+          "Compliance review workflow initiated"
+        ],
+        "trace": [
+          "R-FIN-006: boundary condition amount >= $100k detected",
+          "R-FIN-006: error pathway '202 when manual review required' executed",
+          "R-FIN-006: expected outcome 'compliance check started' achieved",
+          "R-FIN-006: wire transitioned to manual review state"
+        ],
+        "executable": "import requests\nfrom datetime import datetime\n\ndef test_wire_transfer_at_boundary_100k_triggers_manual_review(base_url, valid_token):\n    headers = {\"Authorization\": f\"Bearer {valid_token}\"}\n    payload = {\n        \"amount\": 100000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"DE89370400440532013000\",\n        \"2fa_verified_at\": datetime.utcnow().isoformat()\n    }\n    resp = requests.post(\n        f\"{base_url}/transfers/wire\",\n        json=payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 202\n    body = resp.json()\n    assert \"wire_id\" in body\n    assert body[\"state\"] == \"pending_manual_review\"\n    assert \"compliance_check_id\" in body"
+      },
+      {
+        "name": "test_wire_transfer_above_threshold_requires_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer identity verified",
+          "2FA credential validated within last 5 minutes",
+          "Transfer amount $150,000 (above $100k threshold)"
+        ],
+        "actions": [
+          "POST /transfers/wire with amount 150000",
+          "Payload includes valid 2FA timestamp"
+        ],
+        "expected": [
+          "HTTP 202 Accepted response code",
+          "Response state: \"pending_manual_review\"",
+          "Compliance check initiated and documented"
+        ],
+        "trace": [
+          "R-FIN-006: amount exceeds $100k manual review threshold",
+          "R-FIN-006: expected outcome 'compliance check started'",
+          "R-FIN-006: wire queued for compliance officer review"
+        ],
+        "executable": "import requests\nfrom datetime import datetime\n\ndef test_wire_transfer_above_threshold_requires_review(base_url, valid_token):\n    headers = {\"Authorization\": f\"Bearer {valid_token}\"}\n    payload = {\n        \"amount\": 150000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"DE89370400440532013000\",\n        \"2fa_verified_at\": datetime.utcnow().isoformat()\n    }\n    resp = requests.post(\n        f\"{base_url}/transfers/wire\",\n        json=payload,\n        headers=headers,\n        timeout=10\n    )\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"state\"] == \"pending_manual_review\"\n    assert \"compliance_check_id\" in body"
+      },
+      {
+        "name": "test_wire_transfer_without_2fa_credential_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer identity verified",
+          "No valid 2FA credential provided in request",
+          "Transfer amount $50,000"
+        ],
+        "actions": [
+          "POST /transfers/wire without 2fa_verified_at field",
+          "Omit Authorization header or provide invalid token"
+        ],
+        "expected": [
+          "HTTP 401 Unauthorized response code",
+          "Response contains error_code: \"2fa_required\"",
+          "No wire_id generated"
+        ],
+        "trace": [
+          "R-FIN-006: precondition '2fa verified' not satisfied",
+          "R-FIN-006: error pathway authentication failure",
+          "R-FIN-006: wire transfer rejected"
+        ],
+        "executable": "import requests\nfrom datetime import datetime\n\ndef test_wire_transfer_without_2fa_credential_rejected(base_url):\n    payload = {\n        \"amount\": 50000,\n        \"currency\": \"USD\",\n        \"beneficiary_account\": \"DE89370400440532013000\"\n    }\n    resp = requests.post(\n        f\"{base_url}/transfers/wire\",\n        json=payload,\n        headers={},\n        timeout=10\n    )\n    assert resp.status_code == 401\n    body = resp.json()\n    assert body[\"error_code\"] == \"2fa_required\""
+      }
+    ]
+  },
+  "req_id": "R-FIN-006",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic-stdlib",
+    "model": "claude-haiku-4-5-20251001",
+    "input_tokens": 1038,
+    "output_tokens": 2763,
+    "latency_ms": 14335,
+    "wall_ms": 14335,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-006\",\n  \"reasoning\": \"Wire transfer initiation requires 2FA verification (fresh within 5min) and conditional manual review for high-value transfers (>$100k). Test suite covers: (1) positive case with valid 2FA and transfer within threshold, (2) negative case with stale 2FA, (3) boundary case at $100k threshold triggering manual review. Heuristics applied: EP partitions by amount thresholds, BVA tests boundary at $100k, NEG exercises auth failure, STC validates state transitions (2FA\u2192queued/review), DT combines 2FA freshness and amount conditions.\",\n  \"tests\": [\n    {\n      \"name\": \"test_wire_transfer_valid_2fa_under_threshold\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer identity verified\",\n        \"2FA credential validated within last 5 minutes\",\n        \"Transfer amount $50,000 (below $100k threshold)\",\n        \"Customer account in good standing\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with valid bearer token\",\n        \"Payload: {\\\"amount\\\": 50000, \\\"currency\\\": \\\"USD\\\", \\\"beneficiary_account\\\": \\\"valid_iban\\\", \\\"2fa_verified_at\\\": \\\"<recent_timestamp>\\\"}\"\n      ],\n      \"expected\": [\n        \"HTTP 200 response code\",\n        \"Response body contains wire_id (UUID format)\",\n        \"Response body contains state: \\\"queued\\\"\",\n        \"Response body contains compliance_check_id\"\n      ],\n      \"trace\": [\n        \"R-FIN-006: wire transfer initiated with valid 2FA\",\n        \"R-FIN-006: amount $50k below manual review threshold\",\n        \"R-FIN-006: expected outcome 'wire queued' achieved\"\n      ],\n      \"executable\": \"import requests\\nimport json\\nfrom datetime import datetime, timedelta\\n\\ndef test_wire_transfer_valid_2fa_under_threshold(base_url, valid_token):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {valid_token}\\\"}\\n    payload = {\\n        \\\"amount\\\": 50000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"beneficiary_account\\\": \\\"DE89370400440532013000\\\",\\n        \\\"2fa_verified_at\\\": datetime.utcnow().isoformat()\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/transfers/wire\\\",\\n        json=payload,\\n        headers=headers,\\n        timeout=10\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert \\\"wire_id\\\" in body\\n    assert body[\\\"state\\\"] == \\\"queued\\\"\\n    assert \\\"compliance_check_id\\\" in body\"\n    },\n    {\n      \"name\": \"test_wire_transfer_stale_2fa_returns_401\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer identity verified\",\n        \"2FA credential validated 10 minutes ago (beyond 5-min window)\",\n        \"Transfer amount $75,000 (below threshold)\"\n      ],\n      \"actions\": [\n        \"POST /transfers/wire with bearer token from stale 2FA\",\n        \"Payload includes 2fa_verified_at timestamp 10 minutes in past\"\n      ],\n      \"expected\": [\n        \"HTTP 401 Unauthorized response code\",\n        \"Response body contains error_code: \\\"2fa_expired\\\"\",\n        \"Response body contains error message referencing 5-minute window\",\n        \"No wire_id generated\"\n      ],\n      \"trace\": [\n        \"R-FIN-006: precondition '2fa verified in last 5 min' violated\",\n        \"R-FIN-006: error pathway '401 when 2fa stale' executed\",\n        \"R-FIN-006: wire transfer rejected due to stale authentication\"\n      ],\n      \"executable\": \"import requests\\nfrom datetime import datetime, timedelta\\n\\ndef test_wire_transfer_stale_2fa_returns_401(base_url, valid_token):\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {valid_token}\\\"}\\n    stale_time = datetime.utcnow() - timedelta(minutes=10)\\n    payload = {\\n        \\\"amount\\\": 75000,\\n        \\\"currency\\\": \\\"USD\\\",\\n        \\\"beneficiary_account\\\": \\\"DE89370400440532013000\\\",\\n        \\\"2fa_verified_at\\\": stale_time.isoformat()\\n    }\\n    resp = requests.post(\\n        f\\\"{base_url}/transfers/wire\\\",\\n        json=payload,\\n        headers=headers,\\n        timeout=10\\n    )\\n    assert resp.status_code == 4"
+  }
+}

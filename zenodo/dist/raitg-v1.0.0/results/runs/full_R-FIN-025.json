@@ -1,0 +1,182 @@
+{
+  "req": {
+    "id": "R-FIN-025",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Reconciliation report",
+    "statement": "The system shall produce a daily reconciliation report comparing internal ledger to correspondent bank; non-zero variance shall open an incident.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "EOD trigger"
+    ],
+    "expected_outcomes": [
+      "report stored",
+      "incidents opened on variance"
+    ],
+    "error_pathways": [
+      "incident severity based on variance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/reconcile"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-025",
+    "reasoning": "R-FIN-025 requires three observable behaviours: (1) a report is stored after each EOD trigger, (2) a non-zero variance opens an incident whose severity scales with the variance magnitude, and (3) a zero-variance run produces no incident. The violation in the previous response was test[1] being kind=negative with heuristic=EP \u2014 a negative test exercising an invalid/error partition must use heuristic=NEG, not EP. EP is reserved for valid equivalence partitions (positive). Fix: change test[1] (large variance opens incident) from kind=negative/heuristic=EP to kind=positive/heuristic=EP because a large variance is a valid, expected input that exercises the normal incident-creation path \u2014 it is a positive equivalence partition of the non-zero-variance class. The unauthenticated request test retains kind=negative/heuristic=NEG. All other tests are preserved unchanged.",
+    "tests": [
+      {
+        "name": "test_reconcile_zero_variance_stores_report_no_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is running and reachable",
+          "Internal ledger and correspondent bank balances are seeded to identical values",
+          "EOD cron job credentials are available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with a payload seeding zero variance via <helper_fn: seed_balanced_ledger>",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body contains report_id",
+          "Response body field incident_opened equals false",
+          "Report retrievable via <helper_fn: fetch_report(report_id)>"
+        ],
+        "trace": [
+          "R-FIN-025: report stored",
+          "R-FIN-025: no incident on zero variance"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api/cron/reconcile\"\n\ndef test_reconcile_zero_variance_stores_report_no_incident(cron_auth_headers, seed_balanced_ledger, fetch_report):\n    seed_balanced_ledger(variance=0)\n    resp = requests.post(BASE_URL, headers=cron_auth_headers, json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n    body = resp.json()\n    assert \"report_id\" in body, \"report_id missing from response\"\n    assert body[\"incident_opened\"] is False, \"incident must not open on zero variance\"\n    report = fetch_report(body[\"report_id\"])\n    assert report is not None, \"report must be persisted\"\n    assert report[\"variance\"] == 0\n"
+      },
+      {
+        "name": "test_reconcile_large_variance_opens_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is running and reachable",
+          "Internal ledger seeded with a balance 10000.00 higher than correspondent bank via <helper_fn: seed_unbalanced_ledger>",
+          "EOD cron job credentials available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with EOD trigger",
+          "Capture HTTP response",
+          "Query incident store via <helper_fn: fetch_latest_incident>"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body field incident_opened equals true",
+          "Incident record exists with variance equal to 10000.00",
+          "Incident severity is HIGH or CRITICAL"
+        ],
+        "trace": [
+          "R-FIN-025: non-zero variance shall open an incident",
+          "R-FIN-025: incident severity based on variance"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api/cron/reconcile\"\nHIGH_VARIANCE = 10000.00\n\ndef test_reconcile_large_variance_opens_incident(cron_auth_headers, seed_unbalanced_ledger, fetch_latest_incident):\n    seed_unbalanced_ledger(variance=HIGH_VARIANCE)\n    resp = requests.post(BASE_URL, headers=cron_auth_headers, json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"incident_opened\"] is True, \"incident must be opened for non-zero variance\"\n    incident = fetch_latest_incident(body[\"report_id\"])\n    assert incident is not None, \"incident record must exist\"\n    assert incident[\"variance\"] == HIGH_VARIANCE\n    assert incident[\"severity\"] in (\"HIGH\", \"CRITICAL\"), f\"unexpected severity: {incident['severity']}\"\n"
+      },
+      {
+        "name": "test_reconcile_minimum_nonzero_variance_opens_incident",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is running and reachable",
+          "Internal ledger seeded with exactly 0.01 difference from correspondent bank via <helper_fn: seed_unbalanced_ledger>",
+          "EOD cron job credentials available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with EOD trigger and variance seeded at 0.01",
+          "Capture HTTP response",
+          "Query incident store via <helper_fn: fetch_latest_incident>"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Response body field incident_opened equals true",
+          "Incident variance equals 0.01",
+          "Report stored with variance 0.01"
+        ],
+        "trace": [
+          "R-FIN-025: non-zero variance (boundary: smallest representable cent) shall open an incident",
+          "R-FIN-025: report stored"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api/cron/reconcile\"\nMIN_VARIANCE = 0.01\n\ndef test_reconcile_minimum_nonzero_variance_opens_incident(cron_auth_headers, seed_unbalanced_ledger, fetch_latest_incident, fetch_report):\n    seed_unbalanced_ledger(variance=MIN_VARIANCE)\n    resp = requests.post(BASE_URL, headers=cron_auth_headers, json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"incident_opened\"] is True, \"incident must open even for minimum variance\"\n    incident = fetch_latest_incident(body[\"report_id\"])\n    assert incident is not None\n    assert abs(incident[\"variance\"] - MIN_VARIANCE) < 1e-9, \"variance mismatch\"\n    report = fetch_report(body[\"report_id\"])\n    assert abs(report[\"variance\"] - MIN_VARIANCE) < 1e-9\n"
+      },
+      {
+        "name": "test_reconcile_incident_severity_tiers",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "banking-api is running and reachable",
+          "EOD cron job credentials available via <fixture: cron_auth_headers>",
+          "<helper_fn: seed_unbalanced_ledger> accepts arbitrary variance values"
+        ],
+        "actions": [
+          "For each (variance, expected_severity) pair in decision table, seed ledger and POST /cron/reconcile",
+          "Capture incident severity from incident store"
+        ],
+        "expected": [
+          "Variance 0.01-99.99 maps to severity LOW",
+          "Variance 100.00-9999.99 maps to severity MEDIUM or HIGH",
+          "Variance >= 10000.00 maps to severity CRITICAL"
+        ],
+        "trace": [
+          "R-FIN-025: incident severity based on variance",
+          "R-FIN-025: non-zero variance shall open an incident"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api/cron/reconcile\"\n\nDECISION_TABLE = [\n    (0.01,     \"LOW\"),\n    (50.00,    \"LOW\"),\n    (99.99,    \"LOW\"),\n    (100.00,   \"MEDIUM\"),\n    (5000.00,  \"HIGH\"),\n    (9999.99,  \"HIGH\"),\n    (10000.00, \"CRITICAL\"),\n    (99999.99, \"CRITICAL\"),\n]\n\n@pytest.mark.parametrize(\"variance,expected_sev\", DECISION_TABLE)\ndef test_reconcile_incident_severity_tiers(variance, expected_sev, cron_auth_headers, seed_unbalanced_ledger, fetch_latest_incident):\n    seed_unbalanced_ledger(variance=variance)\n    resp = requests.post(BASE_URL, headers=cron_auth_headers, json={\"trigger\": \"EOD\"})\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"incident_opened\"] is True\n    incident = fetch_latest_incident(body[\"report_id\"])\n    assert incident[\"severity\"] == expected_sev, (\n        f\"variance={variance}: expected {expected_sev}, got {incident['severity']}\"\n    )\n"
+      },
+      {
+        "name": "test_reconcile_rejects_unauthenticated_request",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is running and reachable",
+          "No valid authentication credentials provided"
+        ],
+        "actions": [
+          "POST /cron/reconcile without Authorization header",
+          "Capture HTTP response"
+        ],
+        "expected": [
+          "HTTP 401 or 403 returned",
+          "Response body contains an error message",
+          "No report stored",
+          "No incident opened"
+        ],
+        "trace": [
+          "R-FIN-025: system job precondition \u2014 only authorised EOD trigger should execute reconciliation",
+          "R-FIN-025: error pathway \u2014 unauthenticated call must not mutate state"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api/cron/reconcile\"\n\ndef test_reconcile_rejects_unauthenticated_request():\n    resp = requests.post(BASE_URL, json={\"trigger\": \"EOD\"})\n    assert resp.status_code in (401, 403), (\n        f\"expected 401 or 403 for unauthenticated request, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, \"error message must be present in response\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-025",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 980,
+    "output_tokens": 2918,
+    "latency_ms": 30732,
+    "wall_ms": 30732,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-025\",\n  \"reasoning\": \"R-FIN-025 requires three observable behaviours: (1) a report is stored after each EOD trigger, (2) a non-zero variance opens an incident whose severity scales with the variance magnitude, and (3) a zero-variance run produces no incident. I chose five tests covering: EP-positive (zero variance \u2192 report stored, no incident), EP-negative (large variance \u2192 incident created), BVA (smallest non-zero variance of 0.01 \u2192 incident opened), DT (multiple variance bands \u2192 correct severity mapping), NEG (endpoint invoked without auth / with malformed body \u2192 graceful error). Each test hits POST /cron/reconcile, inspects the JSON response and queries a downstream incident store via a lightweight helper fixture.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reconcile_zero_variance_stores_report_no_incident\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is running and reachable\",\n        \"Internal ledger and correspondent bank balances are seeded to identical values\",\n        \"EOD cron job credentials are available via <fixture: cron_auth_headers>\"\n      ],\n      \"actions\": [\n        \"POST /cron/reconcile with a payload seeding zero variance via <helper_fn: seed_balanced_ledger>\",\n        \"Capture HTTP response\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body contains report_id\",\n        \"Response body field incident_opened equals false\",\n        \"Report retrievable via <helper_fn: fetch_report(report_id)>\"\n      ],\n      \"trace\": [\n        \"R-FIN-025: report stored\",\n        \"R-FIN-025: no incident on zero variance\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api/cron/reconcile\\\"\\n\\ndef test_reconcile_zero_variance_stores_report_no_incident(cron_auth_headers, seed_balanced_ledger, fetch_report):\\n    seed_balanced_ledger(variance=0)\\n    resp = requests.post(BASE_URL, headers=cron_auth_headers, json={\\\"trigger\\\": \\\"EOD\\\"})\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert \\\"report_id\\\" in body, \\\"report_id missing from response\\\"\\n    assert body[\\\"incident_opened\\\"] is False, \\\"incident must not open on zero variance\\\"\\n    report = fetch_report(body[\\\"report_id\\\"])\\n    assert report is not None, \\\"report must be persisted\\\"\\n    assert report[\\\"variance\\\"] == 0\\n\"\n    },\n    {\n      \"name\": \"test_reconcile_large_variance_opens_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is running and reachable\",\n        \"Internal ledger seeded with a balance 10000.00 higher than correspondent bank via <helper_fn: seed_unbalanced_ledger>\",\n        \"EOD cron job credentials available via <fixture: cron_auth_headers>\"\n      ],\n      \"actions\": [\n        \"POST /cron/reconcile with EOD trigger\",\n        \"Capture HTTP response\",\n        \"Query incident store via <helper_fn: fetch_latest_incident>\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Response body field incident_opened equals true\",\n        \"Incident record exists with variance equal to 10000.00\",\n        \"Incident severity is HIGH or CRITICAL\"\n      ],\n      \"trace\": [\n        \"R-FIN-025: non-zero variance shall open an incident\",\n        \"R-FIN-025: incident severity based on variance\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api/cron/reconcile\\\"\\nHIGH_VARIANCE = 10000.00\\n\\ndef test_reconcile_large_variance_opens_incident(cron_auth_headers, seed_unbalanced_ledger, fetch_latest_incident):\\n    seed_unbalanced_ledger(variance=HIGH_VARIANCE)\\n    resp = requests.post(BASE_URL, headers=cron_auth_headers, json={\\\"trigger\\\": \\\"EOD\\\"})\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"incident_opened\\\"] is True, \\\"incident must be opened for non-zero variance\\\"\\n    incident = fetch_latest_incident(body[\\\"report_id\\\"])\\n    assert incident "
+  }
+}

@@ -1,0 +1,230 @@
+{
+  "req": {
+    "id": "R-FIN-064",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Account close (negative variant)",
+    "statement": "A customer shall close an account with zero balance; closing with non-zero balance shall require sweep to another account. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "account.owner == caller"
+    ],
+    "triggers": [
+      "customer closes account"
+    ],
+    "expected_outcomes": [
+      "account state=closed",
+      "final statement generated"
+    ],
+    "error_pathways": [
+      "409 when balance != 0 without sweep"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/close"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-064",
+    "reasoning": "The requirement covers account closure across multiple conditions: zero-balance (happy path), non-zero balance without sweep (conflict), non-zero balance with valid sweep (positive variant), unauthorised caller (security negative), and a boundary at exactly zero balance. We apply EP to partition valid/invalid balance states, BVA at the zero boundary, STC to confirm state transitions from active to closed, DT to model the sweep/no-sweep decision matrix, and NEG for unauthorised and limit-exceeded paths. Each test is self-contained via fixtures that create and later clean up accounts, ensuring idempotency.",
+    "tests": [
+      {
+        "name": "test_close_account_zero_balance_succeeds",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Account exists with state=active and balance=0.00",
+          "Caller is the authenticated account owner",
+          "Auth token is valid"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with owner credentials and no sweep payload",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned",
+          "Account state transitions to closed",
+          "Response body or linked resource confirms final statement generated"
+        ],
+        "trace": [
+          "R-FIN-064: zero-balance closure shall succeed",
+          "R-FIN-064: expected outcome account state=closed",
+          "R-FIN-064: expected outcome final statement generated"
+        ],
+        "executable": "import pytest\n\ndef test_close_account_zero_balance_succeeds(api_client, zero_balance_account):\n    account_id = zero_balance_account[\"id\"]\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        json={},\n    )\n    assert resp.status_code in (200, 204), (\n        f\"Expected 200/204, got {resp.status_code}: {resp.text}\"\n    )\n    detail = api_client.get(f\"/accounts/{account_id}\")\n    assert detail.json()[\"state\"] == \"closed\"\n    statements = api_client.get(f\"/accounts/{account_id}/statements\")\n    data = statements.json()\n    assert any(\n        s.get(\"type\") == \"final\" for s in data.get(\"items\", [])\n    ), \"Final statement not found\"\n"
+      },
+      {
+        "name": "test_close_account_nonzero_balance_without_sweep_returns_409",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Account exists with state=active and balance > 0.00 (e.g. 150.00)",
+          "Caller is the authenticated account owner",
+          "No sweep target account provided in request"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with owner credentials and no sweep payload",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 409 Conflict returned",
+          "Response body contains error code indicating non-zero balance without sweep",
+          "Account state remains active"
+        ],
+        "trace": [
+          "R-FIN-064: closing with non-zero balance shall require sweep",
+          "R-FIN-064: error pathway 409 when balance != 0 without sweep"
+        ],
+        "executable": "import pytest\n\ndef test_close_account_nonzero_balance_without_sweep_returns_409(\n    api_client, funded_account\n):\n    account_id = funded_account[\"id\"]\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        json={},\n    )\n    assert resp.status_code == 409, (\n        f\"Expected 409, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"code\" in body, \"Missing error descriptor in body\"\n    detail = api_client.get(f\"/accounts/{account_id}\")\n    assert detail.json()[\"state\"] == \"active\", \"Account must remain active after failed close\"\n"
+      },
+      {
+        "name": "test_close_account_balance_exactly_zero_is_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Account exists with state=active and balance exactly 0.00 (boundary point)",
+          "Caller is the authenticated account owner",
+          "Auth token is valid"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with owner credentials and no sweep payload",
+          "Capture HTTP response status and body",
+          "Verify account state after request"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned (zero is the exact threshold permitting closure without sweep)",
+          "Account state transitions to closed",
+          "Final statement generated"
+        ],
+        "trace": [
+          "R-FIN-064: BVA at balance=0.00 \u2014 the exact boundary between sweep-required and no-sweep-required"
+        ],
+        "executable": "import pytest\nfrom decimal import Decimal\n\ndef test_close_account_balance_exactly_zero_is_boundary(\n    api_client, create_account_with_balance\n):\n    account = create_account_with_balance(balance=Decimal(\"0.00\"))\n    account_id = account[\"id\"]\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        json={},\n    )\n    assert resp.status_code in (200, 204), (\n        f\"Boundary 0.00 must allow closure, got {resp.status_code}: {resp.text}\"\n    )\n    detail = api_client.get(f\"/accounts/{account_id}\")\n    assert detail.json()[\"state\"] == \"closed\"\n"
+      },
+      {
+        "name": "test_close_account_nonzero_balance_with_valid_sweep_succeeds",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Source account exists with state=active and balance=500.00",
+          "Target sweep account exists, is owned by same customer, and is active",
+          "Caller is the authenticated account owner",
+          "Auth token is valid"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with sweep_to_account_id in request body",
+          "Capture HTTP response status and body",
+          "Verify source account closed and target account balance increased"
+        ],
+        "expected": [
+          "HTTP 200 or 204 returned",
+          "Source account state transitions to closed",
+          "Target account balance increased by 500.00",
+          "Final statement generated on source account"
+        ],
+        "trace": [
+          "R-FIN-064: non-zero balance closure shall require sweep to another account",
+          "R-FIN-064: decision table row \u2014 balance>0, sweep provided => success"
+        ],
+        "executable": "import pytest\n\ndef test_close_account_nonzero_balance_with_valid_sweep_succeeds(\n    api_client, funded_account, sweep_target_account\n):\n    src_id = funded_account[\"id\"]\n    tgt_id = sweep_target_account[\"id\"]\n    tgt_before = api_client.get(f\"/accounts/{tgt_id}\").json()[\"balance\"]\n    src_balance = funded_account[\"balance\"]\n    resp = api_client.post(\n        f\"/accounts/{src_id}/close\",\n        json={\"sweep_to_account_id\": tgt_id},\n    )\n    assert resp.status_code in (200, 204), (\n        f\"Expected 200/204, got {resp.status_code}: {resp.text}\"\n    )\n    src_detail = api_client.get(f\"/accounts/{src_id}\").json()\n    assert src_detail[\"state\"] == \"closed\"\n    tgt_after = api_client.get(f\"/accounts/{tgt_id}\").json()[\"balance\"]\n    assert float(tgt_after) == pytest.approx(\n        float(tgt_before) + float(src_balance), abs=0.01\n    )\n"
+      },
+      {
+        "name": "test_close_account_unauthorised_caller_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Account exists with state=active, owned by customer-A",
+          "Caller is authenticated as customer-B (different owner)",
+          "Auth token for customer-B is valid"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close using customer-B credentials",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden returned",
+          "Response body contains authorisation error",
+          "Account state remains active"
+        ],
+        "trace": [
+          "R-FIN-064: precondition account.owner == caller",
+          "R-FIN-064: error pathway unauthorised"
+        ],
+        "executable": "import pytest\n\ndef test_close_account_unauthorised_caller_returns_403(\n    api_client_owner_a, api_client_owner_b, account_owned_by_a\n):\n    account_id = account_owned_by_a[\"id\"]\n    resp = api_client_owner_b.post(\n        f\"/accounts/{account_id}/close\",\n        json={},\n    )\n    assert resp.status_code == 403, (\n        f\"Expected 403, got {resp.status_code}: {resp.text}\"\n    )\n    detail = api_client_owner_a.get(f\"/accounts/{account_id}\")\n    assert detail.json()[\"state\"] == \"active\", (\n        \"Account must remain active after unauthorised close attempt\"\n    )\n"
+      },
+      {
+        "name": "test_close_already_closed_account_returns_409_or_422",
+        "kind": "negative",
+        "heuristic": "STC",
+        "preconditions": [
+          "Account exists with state=closed (already closed)",
+          "Caller is the authenticated account owner",
+          "Auth token is valid"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close on an already-closed account",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 409 or 422 returned (invalid state transition)",
+          "Account state remains closed",
+          "Response body indicates account is already closed"
+        ],
+        "trace": [
+          "R-FIN-064: STC \u2014 transition closed->closed is invalid",
+          "R-FIN-064: error pathway invalid state"
+        ],
+        "executable": "import pytest\n\ndef test_close_already_closed_account_returns_409_or_422(\n    api_client, closed_account\n):\n    account_id = closed_account[\"id\"]\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        json={},\n    )\n    assert resp.status_code in (409, 422), (\n        f\"Expected 409 or 422 for already-closed account, got {resp.status_code}: {resp.text}\"\n    )\n    body = resp.json()\n    assert \"error\" in body or \"message\" in body, (\n        \"Response must contain an error descriptor\"\n    )\n    detail = api_client.get(f\"/accounts/{account_id}\")\n    assert detail.json()[\"state\"] == \"closed\"\n"
+      },
+      {
+        "name": "test_close_account_balance_one_cent_above_zero_requires_sweep",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Account exists with state=active and balance=0.01 (one cent above zero boundary)",
+          "Caller is the authenticated account owner",
+          "No sweep target provided"
+        ],
+        "actions": [
+          "POST /accounts/{id}/close with no sweep payload",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 409 returned (balance > 0 and no sweep provided)",
+          "Account state remains active"
+        ],
+        "trace": [
+          "R-FIN-064: BVA at balance=0.01 \u2014 one unit above zero boundary requires sweep",
+          "R-FIN-064: error pathway 409 when balance != 0 without sweep"
+        ],
+        "executable": "import pytest\nfrom decimal import Decimal\n\ndef test_close_account_balance_one_cent_above_zero_requires_sweep(\n    api_client, create_account_with_balance\n):\n    account = create_account_with_balance(balance=Decimal(\"0.01\"))\n    account_id = account[\"id\"]\n    resp = api_client.post(\n        f\"/accounts/{account_id}/close\",\n        json={},\n    )\n    assert resp.status_code == 409, (\n        f\"0.01 balance without sweep must yield 409, got {resp.status_code}: {resp.text}\"\n    )\n    detail = api_client.get(f\"/accounts/{account_id}\")\n    assert detail.json()[\"state\"] == \"active\", (\n        \"Account must remain active after rejected close\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-064",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[5] negative kind but heuristic=STC"
+  ],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1005,
+    "output_tokens": 3530,
+    "latency_ms": 36422,
+    "wall_ms": 36422,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-064\",\n  \"reasoning\": \"The requirement covers account closure across multiple conditions: zero-balance (happy path), non-zero balance without sweep (conflict), non-zero balance with valid sweep (positive variant), unauthorised caller (security negative), and a boundary at exactly zero balance. We apply EP to partition valid/invalid balance states, BVA at the zero boundary, STC to confirm state transitions from active to closed, DT to model the sweep/no-sweep decision matrix, and NEG for unauthorised and limit-exceeded paths. Each test is self-contained via fixtures that create and later clean up accounts, ensuring idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_close_account_zero_balance_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"STC\",\n      \"preconditions\": [\n        \"Account exists with state=active and balance=0.00\",\n        \"Caller is the authenticated account owner\",\n        \"Auth token is valid\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/close with owner credentials and no sweep payload\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 204 returned\",\n        \"Account state transitions to closed\",\n        \"Response body or linked resource confirms final statement generated\"\n      ],\n      \"trace\": [\n        \"R-FIN-064: zero-balance closure shall succeed\",\n        \"R-FIN-064: expected outcome account state=closed\",\n        \"R-FIN-064: expected outcome final statement generated\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_close_account_zero_balance_succeeds(api_client, zero_balance_account):\\n    account_id = zero_balance_account[\\\"id\\\"]\\n    resp = api_client.post(\\n        f\\\"/accounts/{account_id}/close\\\",\\n        json={},\\n    )\\n    assert resp.status_code in (200, 204), (\\n        f\\\"Expected 200/204, got {resp.status_code}: {resp.text}\\\"\\n    )\\n    detail = api_client.get(f\\\"/accounts/{account_id}\\\")\\n    assert detail.json()[\\\"state\\\"] == \\\"closed\\\"\\n    statements = api_client.get(f\\\"/accounts/{account_id}/statements\\\")\\n    data = statements.json()\\n    assert any(\\n        s.get(\\\"type\\\") == \\\"final\\\" for s in data.get(\\\"items\\\", [])\\n    ), \\\"Final statement not found\\\"\\n\"\n    },\n    {\n      \"name\": \"test_close_account_nonzero_balance_without_sweep_returns_409\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Account exists with state=active and balance > 0.00 (e.g. 150.00)\",\n        \"Caller is the authenticated account owner\",\n        \"No sweep target account provided in request\"\n      ],\n      \"actions\": [\n        \"POST /accounts/{id}/close with owner credentials and no sweep payload\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 409 Conflict returned\",\n        \"Response body contains error code indicating non-zero balance without sweep\",\n        \"Account state remains active\"\n      ],\n      \"trace\": [\n        \"R-FIN-064: closing with non-zero balance shall require sweep\",\n        \"R-FIN-064: error pathway 409 when balance != 0 without sweep\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_close_account_nonzero_balance_without_sweep_returns_409(\\n    api_client, funded_account\\n):\\n    account_id = funded_account[\\\"id\\\"]\\n    resp = api_client.post(\\n        f\\\"/accounts/{account_id}/close\\\",\\n        json={},\\n    )\\n    assert resp.status_code == 409, (\\n        f\\\"Expected 409, got {resp.status_code}: {resp.text}\\\"\\n    )\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"code\\\" in body, \\\"Missing error descriptor in body\\\"\\n    detail = api_client.get(f\\\"/accounts/{account_id}\\\")\\n    assert detail.json()[\\\"state\\\"] == \\\"active\\\", \\\"Account must remain active after failed close\\\"\\n\"\n    },\n    {\n      \"name\": \"test_close_account_balance_exactly_zero_is_boundary\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"Account exists with state=act"
+  }
+}

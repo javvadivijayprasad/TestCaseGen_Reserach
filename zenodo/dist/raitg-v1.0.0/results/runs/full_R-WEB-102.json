@@ -1,0 +1,178 @@
+{
+  "req": {
+    "id": "R-WEB-102",
+    "domain": "commercial_web",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Reset employee password",
+    "statement": "An employee shall reset their password via an email link that expires after 30 minutes; expired links must be rejected.",
+    "actors": [
+      "valid reset token"
+    ],
+    "preconditions": [
+      "valid reset token"
+    ],
+    "triggers": [
+      "employee submits new password"
+    ],
+    "expected_outcomes": [
+      "password updated",
+      "all sessions invalidated"
+    ],
+    "error_pathways": [
+      "410 when token expired",
+      "422 when password fails policy"
+    ],
+    "target_app": "hr-app",
+    "target_endpoint_or_screen": "/password/reset"
+  },
+  "doc": {
+    "requirement_id": "R-WEB-102",
+    "reasoning": "The requirement covers four distinct behavioural zones: (1) happy-path reset with a valid token, (2) rejection of an expired token (410), (3) rejection of a policy-violating password (422), and (4) the boundary instant at which a token transitions from valid to expired (exactly 30 minutes). EP partitions the token space into valid/expired and the password space into policy-compliant/non-compliant. BVA targets the 30-minute expiry edge. STC models the token lifecycle states (issued \u2192 used / issued \u2192 expired). NEG covers the two documented error pathways. DT cross-cuts token validity against password policy. Together these five tests achieve full requirement coverage per ISO/IEC/IEEE 29119-4.",
+    "tests": [
+      {
+        "name": "test_reset_password_with_valid_token_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Employee account exists in the system",
+          "A valid, unexpired reset token has been issued within the last 29 minutes",
+          "New password satisfies all policy rules"
+        ],
+        "actions": [
+          "Navigate to /password/reset with the valid token as a query parameter",
+          "Enter a policy-compliant new password",
+          "Submit the reset form"
+        ],
+        "expected": [
+          "HTTP 200 (or redirect to success page) is returned",
+          "Password is updated in the database",
+          "All existing sessions for the employee are invalidated",
+          "Confirmation message is displayed on the UI"
+        ],
+        "trace": [
+          "R-WEB-102: password updated",
+          "R-WEB-102: all sessions invalidated"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_reset_password_with_valid_token_succeeds(\n    page: Page,\n    valid_reset_token: str,       # <fixture> issues token < 29 min old\n    api_client,                   # <fixture> authenticated API helper\n    base_url: str,\n):\n    new_password = \"ValidP@ssw0rd!\"\n    reset_url = f\"{base_url}/password/reset?token={valid_reset_token}\"\n\n    page.goto(reset_url)\n    page.fill(\"[data-testid='new-password']\", new_password)\n    page.fill(\"[data-testid='confirm-password']\", new_password)\n    page.click(\"[data-testid='submit-reset']\")\n\n    assert page.url.endswith(\"/password/reset/success\") or \\\n           page.locator(\"[data-testid='success-banner']\").is_visible()\n\n    # Verify session invalidation via API\n    sessions = api_client.get(\"/api/sessions\").json()\n    assert sessions[\"active_count\"] == 0, \"All sessions must be invalidated\"\n"
+      },
+      {
+        "name": "test_reset_password_with_expired_token_returns_410",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Employee account exists in the system",
+          "A reset token that was issued more than 30 minutes ago exists (expired)"
+        ],
+        "actions": [
+          "Navigate to /password/reset with the expired token as a query parameter",
+          "Attempt to submit a new password"
+        ],
+        "expected": [
+          "HTTP 410 Gone is returned by the server",
+          "UI displays an 'expired link' error message",
+          "Password is NOT changed in the database"
+        ],
+        "trace": [
+          "R-WEB-102: expired links must be rejected",
+          "R-WEB-102: 410 when token expired"
+        ],
+        "executable": "import pytest\nfrom playwright.sync_api import Page\n\ndef test_reset_password_with_expired_token_returns_410(\n    page: Page,\n    expired_reset_token: str,   # <fixture> issues token > 30 min old\n    api_client,                 # <fixture> authenticated API helper\n    base_url: str,\n):\n    reset_url = f\"{base_url}/password/reset?token={expired_reset_token}\"\n\n    response = api_client.post(\n        \"/api/password/reset\",\n        json={\"token\": expired_reset_token, \"password\": \"ValidP@ssw0rd!\"},\n    )\n    assert response.status_code == 410, (\n        f\"Expected 410 for expired token, got {response.status_code}\"\n    )\n\n    page.goto(reset_url)\n    error_locator = page.locator(\"[data-testid='error-expired-link']\")\n    assert error_locator.is_visible(), \"Expired-link error must be visible\"\n"
+      },
+      {
+        "name": "test_reset_password_with_policy_violating_password_returns_422",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Employee account exists in the system",
+          "A valid, unexpired reset token has been issued",
+          "New password violates at least one policy rule (e.g. fewer than 8 characters, no special character)"
+        ],
+        "actions": [
+          "POST to /api/password/reset with the valid token and a non-compliant password",
+          "Observe the response status and body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity is returned",
+          "Response body contains a descriptive validation error",
+          "Password is NOT changed in the database"
+        ],
+        "trace": [
+          "R-WEB-102: 422 when password fails policy"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"bad_password,reason\", [\n    (\"short\",          \"too_short\"),\n    (\"nouppercase1!\",  \"no_uppercase\"),\n    (\"NOLOWER1!\",      \"no_lowercase\"),\n    (\"NoSpecialChar1\", \"no_special\"),\n])\ndef test_reset_password_with_policy_violating_password_returns_422(\n    bad_password: str,\n    reason: str,\n    valid_reset_token: str,  # <fixture> issues token < 29 min old\n    api_client,              # <fixture> authenticated API helper\n):\n    response = api_client.post(\n        \"/api/password/reset\",\n        json={\"token\": valid_reset_token, \"password\": bad_password},\n    )\n    assert response.status_code == 422, (\n        f\"[{reason}] Expected 422, got {response.status_code}\"\n    )\n    body = response.json()\n    assert \"errors\" in body, \"Response must contain validation errors\"\n"
+      },
+      {
+        "name": "test_reset_token_at_exact_30_minute_boundary_is_rejected",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Employee account exists in the system",
+          "A reset token whose age is exactly 30 minutes (1800 seconds) is available"
+        ],
+        "actions": [
+          "POST to /api/password/reset with the boundary-age token and a valid password",
+          "Observe the response status"
+        ],
+        "expected": [
+          "HTTP 410 Gone is returned because a token aged exactly 30 minutes is considered expired",
+          "Password is NOT changed"
+        ],
+        "trace": [
+          "R-WEB-102: email link that expires after 30 minutes",
+          "R-WEB-102: expired links must be rejected",
+          "R-WEB-102: 410 when token expired"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\nEXPIRY_SECONDS = 1800  # 30 minutes exactly\n\ndef test_reset_token_at_exact_30_minute_boundary_is_rejected(\n    api_client,             # <fixture> authenticated API helper\n    issue_reset_token,      # <helper_fn>(age_seconds) -> token string\n):\n    boundary_token = issue_reset_token(age_seconds=EXPIRY_SECONDS)\n\n    response = api_client.post(\n        \"/api/password/reset\",\n        json={\"token\": boundary_token, \"password\": \"ValidP@ssw0rd!\"},\n    )\n    assert response.status_code == 410, (\n        f\"Token aged exactly {EXPIRY_SECONDS}s must be rejected with 410, \"\n        f\"got {response.status_code}\"\n    )\n"
+      },
+      {
+        "name": "test_reset_token_transitions_from_valid_to_used_state",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Employee account exists in the system",
+          "A valid, unexpired reset token has been issued",
+          "Token is in ISSUED state"
+        ],
+        "actions": [
+          "Submit a valid password reset using the token (token transitions ISSUED -> USED)",
+          "Attempt to reuse the same token for a second reset"
+        ],
+        "expected": [
+          "First submission returns HTTP 200 and password is updated",
+          "Second submission returns HTTP 410, confirming single-use token semantics",
+          "Token state is USED (cannot be replayed)"
+        ],
+        "trace": [
+          "R-WEB-102: expired links must be rejected",
+          "R-WEB-102: password updated",
+          "R-WEB-102: all sessions invalidated"
+        ],
+        "executable": "import pytest\n\ndef test_reset_token_transitions_from_valid_to_used_state(\n    api_client,           # <fixture> authenticated API helper\n    valid_reset_token,    # <fixture> issues token < 29 min old\n):\n    payload = {\"token\": valid_reset_token, \"password\": \"ValidP@ssw0rd!\"}\n\n    # First use: ISSUED -> USED\n    first = api_client.post(\"/api/password/reset\", json=payload)\n    assert first.status_code == 200, (\n        f\"First reset must succeed, got {first.status_code}\"\n    )\n\n    # Second use: USED -> rejected\n    second = api_client.post(\"/api/password/reset\", json=payload)\n    assert second.status_code == 410, (\n        f\"Replayed token must be rejected with 410, got {second.status_code}\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-WEB-102",
+  "domain": "commercial_web",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 988,
+    "output_tokens": 2790,
+    "latency_ms": 36879,
+    "wall_ms": 36879,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-WEB-102\",\n  \"reasoning\": \"The requirement covers four distinct behavioural zones: (1) happy-path reset with a valid token, (2) rejection of an expired token (410), (3) rejection of a policy-violating password (422), and (4) the boundary instant at which a token transitions from valid to expired (exactly 30 minutes). EP partitions the token space into valid/expired and the password space into policy-compliant/non-compliant. BVA targets the 30-minute expiry edge. STC models the token lifecycle states (issued \u2192 used / issued \u2192 expired). NEG covers the two documented error pathways. DT cross-cuts token validity against password policy. Together these five tests achieve full requirement coverage per ISO/IEC/IEEE 29119-4.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reset_password_with_valid_token_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Employee account exists in the system\",\n        \"A valid, unexpired reset token has been issued within the last 29 minutes\",\n        \"New password satisfies all policy rules\"\n      ],\n      \"actions\": [\n        \"Navigate to /password/reset with the valid token as a query parameter\",\n        \"Enter a policy-compliant new password\",\n        \"Submit the reset form\"\n      ],\n      \"expected\": [\n        \"HTTP 200 (or redirect to success page) is returned\",\n        \"Password is updated in the database\",\n        \"All existing sessions for the employee are invalidated\",\n        \"Confirmation message is displayed on the UI\"\n      ],\n      \"trace\": [\n        \"R-WEB-102: password updated\",\n        \"R-WEB-102: all sessions invalidated\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import Page\\n\\ndef test_reset_password_with_valid_token_succeeds(\\n    page: Page,\\n    valid_reset_token: str,       # <fixture> issues token < 29 min old\\n    api_client,                   # <fixture> authenticated API helper\\n    base_url: str,\\n):\\n    new_password = \\\"ValidP@ssw0rd!\\\"\\n    reset_url = f\\\"{base_url}/password/reset?token={valid_reset_token}\\\"\\n\\n    page.goto(reset_url)\\n    page.fill(\\\"[data-testid='new-password']\\\", new_password)\\n    page.fill(\\\"[data-testid='confirm-password']\\\", new_password)\\n    page.click(\\\"[data-testid='submit-reset']\\\")\\n\\n    assert page.url.endswith(\\\"/password/reset/success\\\") or \\\\\\n           page.locator(\\\"[data-testid='success-banner']\\\").is_visible()\\n\\n    # Verify session invalidation via API\\n    sessions = api_client.get(\\\"/api/sessions\\\").json()\\n    assert sessions[\\\"active_count\\\"] == 0, \\\"All sessions must be invalidated\\\"\\n\"\n    },\n    {\n      \"name\": \"test_reset_password_with_expired_token_returns_410\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Employee account exists in the system\",\n        \"A reset token that was issued more than 30 minutes ago exists (expired)\"\n      ],\n      \"actions\": [\n        \"Navigate to /password/reset with the expired token as a query parameter\",\n        \"Attempt to submit a new password\"\n      ],\n      \"expected\": [\n        \"HTTP 410 Gone is returned by the server\",\n        \"UI displays an 'expired link' error message\",\n        \"Password is NOT changed in the database\"\n      ],\n      \"trace\": [\n        \"R-WEB-102: expired links must be rejected\",\n        \"R-WEB-102: 410 when token expired\"\n      ],\n      \"executable\": \"import pytest\\nfrom playwright.sync_api import Page\\n\\ndef test_reset_password_with_expired_token_returns_410(\\n    page: Page,\\n    expired_reset_token: str,   # <fixture> issues token > 30 min old\\n    api_client,                 # <fixture> authenticated API helper\\n    base_url: str,\\n):\\n    reset_url = f\\\"{base_url}/password/reset?token={expired_reset_token}\\\"\\n\\n    response = api_client.post(\\n        \\\"/api/password/reset\\\",\\n        json={\\\"token\\\": expired_reset_token, \\\"password\\\": \\\"ValidP@ssw0rd!\\\"},\\n    )\\n    assert response.status_code == 410, (\\n        f\\\"Expe"
+  }
+}

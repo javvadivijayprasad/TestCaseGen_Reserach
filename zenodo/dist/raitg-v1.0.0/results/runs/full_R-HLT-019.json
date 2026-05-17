@@ -1,0 +1,161 @@
+{
+  "req": {
+    "id": "R-HLT-019",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "validation",
+    "title": "Vital signs validation",
+    "statement": "An Observation with category vital-signs shall have value in clinically plausible range; out-of-range shall be flagged for review.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician records vitals"
+    ],
+    "expected_outcomes": [
+      "observation stored",
+      "flag raised if out of range"
+    ],
+    "error_pathways": [
+      "review task created"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Observation"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-019",
+    "reasoning": "R-HLT-019 mandates that vital-signs Observations are stored when values are clinically plausible, and that a review flag/task is raised when values fall outside plausible range. I selected heart-rate as the representative vital sign (normal range 40-200 bpm per common clinical thresholds). Four tests cover: (1) EP positive \u2013 mid-range value stored, no flag; (2) NEG negative \u2013 grossly out-of-range value triggers review task; (3) BVA boundary-low \u2013 value exactly at the accepted lower boundary stored without flag; (4) DT boundary-high \u2013 value one unit above upper boundary flags review. This satisfies the minimum three-test requirement while providing strong heuristic coverage.",
+    "tests": [
+      {
+        "name": "test_vital_signs_normal_value_stored_no_flag",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "fhir-lite /Observation endpoint is reachable",
+          "Heart-rate normal partition: 40-200 bpm (representative value 80)"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=80",
+          "Capture HTTP response status and body",
+          "Query review tasks linked to the created Observation ID"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType='Observation'",
+          "status field equals 'final'",
+          "No review Task exists referencing this Observation"
+        ],
+        "trace": [
+          "R-HLT-019: observation stored (normal range)",
+          "R-HLT-019: flag NOT raised for in-range value"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_normal_value_stored_no_flag(clinician_auth_fixture, fhir_base_url):\n    headers = clinician_auth_fixture\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 80, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{fhir_base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    assert body.get(\"status\") == \"final\"\n    obs_id = body[\"id\"]\n    task_resp = requests.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"focus\": f\"Observation/{obs_id}\", \"code\": \"review\"},\n        headers=headers\n    )\n    assert task_resp.status_code == 200\n    bundle = task_resp.json()\n    assert bundle.get(\"total\", 0) == 0, \"No review task expected for normal vital\"\n"
+      },
+      {
+        "name": "test_vital_signs_out_of_range_triggers_review_task",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "fhir-lite /Observation endpoint is reachable",
+          "Heart-rate grossly out-of-range value: 300 bpm (above 200 upper bound)"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=300",
+          "Capture HTTP response status and body",
+          "Query /Task for review tasks linked to the created Observation ID"
+        ],
+        "expected": [
+          "HTTP 201 Created (observation is still persisted per requirement)",
+          "Response body contains resourceType='Observation'",
+          "A review Task exists referencing this Observation",
+          "Task.status is 'requested' or 'in-progress'"
+        ],
+        "trace": [
+          "R-HLT-019: observation stored even when out-of-range",
+          "R-HLT-019: flag raised; review task created (error pathway)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_out_of_range_triggers_review_task(clinician_auth_fixture, fhir_base_url):\n    headers = clinician_auth_fixture\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 300, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{fhir_base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    obs_id = body[\"id\"]\n    task_resp = requests.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"focus\": f\"Observation/{obs_id}\", \"code\": \"review\"},\n        headers=headers\n    )\n    assert task_resp.status_code == 200\n    bundle = task_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"Expected review task for out-of-range vital\"\n    task_status = bundle[\"entry\"][0][\"resource\"][\"status\"]\n    assert task_status in (\"requested\", \"in-progress\"), f\"Unexpected task status: {task_status}\"\n"
+      },
+      {
+        "name": "test_vital_signs_lower_boundary_value_stored_no_flag",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "fhir-lite /Observation endpoint is reachable",
+          "Heart-rate lower boundary: exactly 40 bpm (lowest plausible value)"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=40",
+          "Capture HTTP response status and body",
+          "Query /Task for review tasks linked to the created Observation ID"
+        ],
+        "expected": [
+          "HTTP 201 Created",
+          "Response body contains resourceType='Observation'",
+          "No review Task exists referencing this Observation (40 is within valid range)"
+        ],
+        "trace": [
+          "R-HLT-019: lower boundary of valid range must NOT raise flag",
+          "BVA: exact lower bound 40 bpm"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_lower_boundary_value_stored_no_flag(clinician_auth_fixture, fhir_base_url):\n    headers = clinician_auth_fixture\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 40, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{fhir_base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    obs_id = body[\"id\"]\n    task_resp = requests.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"focus\": f\"Observation/{obs_id}\", \"code\": \"review\"},\n        headers=headers\n    )\n    assert task_resp.status_code == 200\n    bundle = task_resp.json()\n    assert bundle.get(\"total\", 0) == 0, \"No review task expected at lower boundary (40 bpm)\"\n"
+      },
+      {
+        "name": "test_vital_signs_just_above_upper_boundary_flags_review",
+        "kind": "boundary",
+        "heuristic": "DT",
+        "preconditions": [
+          "Authenticated clinician token available via <clinician_auth_fixture>",
+          "fhir-lite /Observation endpoint is reachable",
+          "Heart-rate upper boundary + 1: exactly 201 bpm (one unit above accepted maximum)"
+        ],
+        "actions": [
+          "POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=201",
+          "Capture HTTP response status and body",
+          "Query /Task for review tasks linked to the created Observation ID"
+        ],
+        "expected": [
+          "HTTP 201 Created (observation persisted)",
+          "Response body contains resourceType='Observation'",
+          "A review Task exists referencing this Observation",
+          "Task.status is 'requested' or 'in-progress'"
+        ],
+        "trace": [
+          "R-HLT-019: value immediately above upper bound must raise flag",
+          "DT: decision condition \u2013 value > 200 => flag=true",
+          "BVA: upper bound +1 probe (201 bpm)"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_vital_signs_just_above_upper_boundary_flags_review(clinician_auth_fixture, fhir_base_url):\n    headers = clinician_auth_fixture\n    payload = {\n        \"resourceType\": \"Observation\",\n        \"status\": \"final\",\n        \"category\": [{\"coding\": [{\"system\": \"http://terminology.hl7.org/CodeSystem/observation-category\", \"code\": \"vital-signs\"}]}],\n        \"code\": {\"coding\": [{\"system\": \"http://loinc.org\", \"code\": \"8867-4\", \"display\": \"Heart rate\"}]},\n        \"valueQuantity\": {\"value\": 201, \"unit\": \"bpm\", \"system\": \"http://unitsofmeasure.org\", \"code\": \"/min\"}\n    }\n    resp = requests.post(f\"{fhir_base_url}/Observation\", json=payload, headers=headers)\n    assert resp.status_code == 201, f\"Expected 201, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Observation\"\n    obs_id = body[\"id\"]\n    task_resp = requests.get(\n        f\"{fhir_base_url}/Task\",\n        params={\"focus\": f\"Observation/{obs_id}\", \"code\": \"review\"},\n        headers=headers\n    )\n    assert task_resp.status_code == 200\n    bundle = task_resp.json()\n    assert bundle.get(\"total\", 0) >= 1, \"Expected review task for value just above upper boundary (201 bpm)\"\n    task_status = bundle[\"entry\"][0][\"resource\"][\"status\"]\n    assert task_status in (\"requested\", \"in-progress\"), f\"Unexpected task status: {task_status}\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-019",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 987,
+    "output_tokens": 3371,
+    "latency_ms": 30759,
+    "wall_ms": 30759,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-019\",\n  \"reasoning\": \"R-HLT-019 mandates that vital-signs Observations are stored when values are clinically plausible, and that a review flag/task is raised when values fall outside plausible range. I selected heart-rate as the representative vital sign (normal range 40-200 bpm per common clinical thresholds). Four tests cover: (1) EP positive \u2013 mid-range value stored, no flag; (2) NEG negative \u2013 grossly out-of-range value triggers review task; (3) BVA boundary-low \u2013 value exactly at the accepted lower boundary stored without flag; (4) DT boundary-high \u2013 value one unit above upper boundary flags review. This satisfies the minimum three-test requirement while providing strong heuristic coverage.\",\n  \"tests\": [\n    {\n      \"name\": \"test_vital_signs_normal_value_stored_no_flag\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\",\n        \"fhir-lite /Observation endpoint is reachable\",\n        \"Heart-rate normal partition: 40-200 bpm (representative value 80)\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=80\",\n        \"Capture HTTP response status and body\",\n        \"Query review tasks linked to the created Observation ID\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created\",\n        \"Response body contains resourceType='Observation'\",\n        \"status field equals 'final'\",\n        \"No review Task exists referencing this Observation\"\n      ],\n      \"trace\": [\n        \"R-HLT-019: observation stored (normal range)\",\n        \"R-HLT-019: flag NOT raised for in-range value\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_vital_signs_normal_value_stored_no_flag(clinician_auth_fixture, fhir_base_url):\\n    headers = clinician_auth_fixture\\n    payload = {\\n        \\\"resourceType\\\": \\\"Observation\\\",\\n        \\\"status\\\": \\\"final\\\",\\n        \\\"category\\\": [{\\\"coding\\\": [{\\\"system\\\": \\\"http://terminology.hl7.org/CodeSystem/observation-category\\\", \\\"code\\\": \\\"vital-signs\\\"}]}],\\n        \\\"code\\\": {\\\"coding\\\": [{\\\"system\\\": \\\"http://loinc.org\\\", \\\"code\\\": \\\"8867-4\\\", \\\"display\\\": \\\"Heart rate\\\"}]},\\n        \\\"valueQuantity\\\": {\\\"value\\\": 80, \\\"unit\\\": \\\"bpm\\\", \\\"system\\\": \\\"http://unitsofmeasure.org\\\", \\\"code\\\": \\\"/min\\\"}\\n    }\\n    resp = requests.post(f\\\"{fhir_base_url}/Observation\\\", json=payload, headers=headers)\\n    assert resp.status_code == 201, f\\\"Expected 201, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Observation\\\"\\n    assert body.get(\\\"status\\\") == \\\"final\\\"\\n    obs_id = body[\\\"id\\\"]\\n    task_resp = requests.get(\\n        f\\\"{fhir_base_url}/Task\\\",\\n        params={\\\"focus\\\": f\\\"Observation/{obs_id}\\\", \\\"code\\\": \\\"review\\\"},\\n        headers=headers\\n    )\\n    assert task_resp.status_code == 200\\n    bundle = task_resp.json()\\n    assert bundle.get(\\\"total\\\", 0) == 0, \\\"No review task expected for normal vital\\\"\\n\"\n    },\n    {\n      \"name\": \"test_vital_signs_out_of_range_triggers_review_task\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token available via <clinician_auth_fixture>\",\n        \"fhir-lite /Observation endpoint is reachable\",\n        \"Heart-rate grossly out-of-range value: 300 bpm (above 200 upper bound)\"\n      ],\n      \"actions\": [\n        \"POST /Observation with category=vital-signs, code=heart-rate, valueQuantity.value=300\",\n        \"Capture HTTP response status and body\",\n        \"Query /Task for review tasks linked to the created Observation ID\"\n      ],\n      \"expected\": [\n        \"HTTP 201 Created (observation is still persisted per requirement)\",\n        \"Response body contains resourceType='Observation'\",\n        \"A review Task exists referencing this Observation\",\n        \"Task.status is 'requested' or 'in-progress'\"\n      ],\n      \"trace\": [\n        \""
+  }
+}

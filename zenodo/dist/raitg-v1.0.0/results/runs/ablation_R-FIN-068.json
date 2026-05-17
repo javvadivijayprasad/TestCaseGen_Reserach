@@ -1,0 +1,178 @@
+{
+  "req": {
+    "id": "R-FIN-068",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "Joint account operations (negative variant)",
+    "statement": "A joint-account holder shall perform transactions; the secondary holder shall not be able to modify ownership. Negative paths (insufficient funds, unauthorised, exceeded limits) must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "holder is joint"
+    ],
+    "triggers": [
+      "holder performs operation"
+    ],
+    "expected_outcomes": [
+      "operation applied"
+    ],
+    "error_pathways": [
+      "403 when secondary holder attempts ownership change"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/accounts/{id}/joint"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-068",
+    "reasoning": "R-FIN-068 covers joint-account operations with four distinct risk areas: (1) valid primary-holder transactions, (2) secondary-holder ownership-change attempts, (3) insufficient-funds rejections, and (4) limit-boundary transactions. I model these with EP (valid partition for primary holder), NEG (secondary holder ownership change \u2192 403, insufficient funds \u2192 422/400), BVA (transaction exactly at daily limit), and DT (decision table pairing holder role \u00d7 operation type). Each test is self-contained via fixtures that create and tear down account state, and idempotent because every test uses a fresh account ID scoped to its run.",
+    "tests": [
+      {
+        "name": "test_primary_holder_transaction_succeeds",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "A joint account exists with sufficient balance (>=100.00)",
+          "Primary holder credentials are available",
+          "Account is in ACTIVE state"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with a valid debit transaction of 100.00"
+        ],
+        "expected": [
+          "HTTP 200 or 201 is returned",
+          "Response body contains updated balance reflecting the debit",
+          "Transaction ID is present in the response"
+        ],
+        "trace": [
+          "R-FIN-068: joint-account holder shall perform transactions",
+          "EP: primary holder with valid amount belongs to the 'authorised + sufficient funds' equivalence class"
+        ],
+        "executable": "import pytest\nimport requests\n\ndef test_primary_holder_transaction_succeeds(joint_account_fixture, primary_holder_token):\n    account_id = joint_account_fixture[\"account_id\"]\n    headers = {\"Authorization\": f\"Bearer {primary_holder_token}\"}\n    payload = {\"type\": \"debit\", \"amount\": 100.00, \"currency\": \"USD\"}\n\n    response = requests.post(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert response.status_code in (200, 201), (\n        f\"Expected 200/201, got {response.status_code}: {response.text}\"\n    )\n    body = response.json()\n    assert \"transaction_id\" in body, \"Response missing transaction_id\"\n    assert \"balance\" in body, \"Response missing balance\"\n    assert body[\"balance\"] == pytest.approx(\n        joint_account_fixture[\"initial_balance\"] - 100.00, abs=0.01\n    )\n"
+      },
+      {
+        "name": "test_secondary_holder_ownership_change_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A joint account exists",
+          "Secondary holder credentials are available",
+          "A different user ID is available to act as a new owner candidate"
+        ],
+        "actions": [
+          "Authenticate as the secondary holder",
+          "PATCH /accounts/{id}/joint with an ownership-change payload targeting a new primary owner"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden is returned",
+          "Response body contains an error code indicating insufficient privileges",
+          "Account ownership is unchanged"
+        ],
+        "trace": [
+          "R-FIN-068: secondary holder shall NOT be able to modify ownership",
+          "R-FIN-068 error pathway: 403 when secondary holder attempts ownership change",
+          "NEG: unauthorised actor in the 'disallowed operation' partition"
+        ],
+        "executable": "import requests\n\ndef test_secondary_holder_ownership_change_returns_403(\n    joint_account_fixture, secondary_holder_token, alternate_user_id\n):\n    account_id = joint_account_fixture[\"account_id\"]\n    headers = {\"Authorization\": f\"Bearer {secondary_holder_token}\"}\n    payload = {\"new_primary_owner_id\": alternate_user_id}\n\n    response = requests.patch(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert response.status_code == 403, (\n        f\"Expected 403, got {response.status_code}: {response.text}\"\n    )\n    body = response.json()\n    assert \"error\" in body or \"code\" in body, \"Response missing error descriptor\"\n\n    verify = requests.get(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        headers={\"Authorization\": f\"Bearer {<ADMIN_TOKEN>}\"},\n    )\n    assert verify.json()[\"primary_owner_id\"] == joint_account_fixture[\"primary_owner_id\"]\n"
+      },
+      {
+        "name": "test_transaction_at_exact_daily_limit_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "A joint account exists with balance equal to the per-day limit (e.g. 10000.00)",
+          "Primary holder credentials are available",
+          "No prior transactions have been made today on this account"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with a debit equal to the exact daily limit (10000.00)",
+          "Attempt a second POST /accounts/{id}/joint with amount 0.01 (limit + 1 cent)"
+        ],
+        "expected": [
+          "First request returns HTTP 200/201 and the transaction succeeds",
+          "Second request returns HTTP 422 or 429 indicating limit exceeded",
+          "Balance after first transaction reflects the full debit"
+        ],
+        "trace": [
+          "R-FIN-068: exceeded limits must be tested",
+          "BVA: at-limit value (10000.00) and just-over-limit value (10000.01) bracket the daily cap boundary"
+        ],
+        "executable": "import requests\nimport pytest\n\nDAILY_LIMIT = 10_000.00\n\ndef test_transaction_at_exact_daily_limit_boundary(\n    joint_account_at_limit_fixture, primary_holder_token\n):\n    account_id = joint_account_at_limit_fixture[\"account_id\"]\n    headers = {\"Authorization\": f\"Bearer {primary_holder_token}\"}\n\n    at_limit_payload = {\"type\": \"debit\", \"amount\": DAILY_LIMIT, \"currency\": \"USD\"}\n    r1 = requests.post(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        json=at_limit_payload,\n        headers=headers,\n    )\n    assert r1.status_code in (200, 201), (\n        f\"At-limit debit failed: {r1.status_code} {r1.text}\"\n    )\n    assert r1.json()[\"balance\"] == pytest.approx(0.00, abs=0.01)\n\n    over_limit_payload = {\"type\": \"debit\", \"amount\": 0.01, \"currency\": \"USD\"}\n    r2 = requests.post(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        json=over_limit_payload,\n        headers=headers,\n    )\n    assert r2.status_code in (422, 429), (\n        f\"Expected limit-exceeded error, got {r2.status_code}: {r2.text}\"\n    )\n"
+      },
+      {
+        "name": "test_insufficient_funds_debit_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "A joint account exists with a balance of 50.00",
+          "Primary holder credentials are available"
+        ],
+        "actions": [
+          "Authenticate as the primary holder",
+          "POST /accounts/{id}/joint with a debit of 100.00 (exceeds balance)"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity or 400 Bad Request is returned",
+          "Response body contains an error code for insufficient funds",
+          "Account balance remains unchanged at 50.00"
+        ],
+        "trace": [
+          "R-FIN-068: insufficient funds negative path must be tested",
+          "NEG: debit amount > current balance belongs to the 'insufficient funds' error partition"
+        ],
+        "executable": "import requests\nimport pytest\n\ndef test_insufficient_funds_debit_rejected(\n    joint_account_low_balance_fixture, primary_holder_token\n):\n    account_id = joint_account_low_balance_fixture[\"account_id\"]\n    initial_balance = joint_account_low_balance_fixture[\"initial_balance\"]\n    headers = {\"Authorization\": f\"Bearer {primary_holder_token}\"}\n    payload = {\"type\": \"debit\", \"amount\": initial_balance + 50.00, \"currency\": \"USD\"}\n\n    response = requests.post(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        json=payload,\n        headers=headers,\n    )\n\n    assert response.status_code in (400, 422), (\n        f\"Expected 400/422, got {response.status_code}: {response.text}\"\n    )\n    body = response.json()\n    assert \"error\" in body or \"code\" in body, \"Missing error descriptor in response\"\n\n    balance_check = requests.get(\n        f\"{<BASE_URL>}/accounts/{account_id}/joint\",\n        headers={\"Authorization\": f\"Bearer {<ADMIN_TOKEN>}\"},\n    )\n    assert balance_check.json()[\"balance\"] == pytest.approx(initial_balance, abs=0.01)\n"
+      },
+      {
+        "name": "test_decision_table_holder_role_vs_operation",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "A joint account exists",
+          "Both primary and secondary holder credentials are available",
+          "Account has sufficient balance for valid transactions"
+        ],
+        "actions": [
+          "For each (role, operation) pair in the decision table, send the corresponding API request",
+          "Collect HTTP status codes and compare against expected outcomes"
+        ],
+        "expected": [
+          "Primary + debit \u2192 200/201",
+          "Secondary + debit \u2192 200/201",
+          "Primary + ownership-change \u2192 200/201",
+          "Secondary + ownership-change \u2192 403"
+        ],
+        "trace": [
+          "R-FIN-068: joint-account holder shall perform transactions; secondary shall not modify ownership",
+          "DT: exhaustive pairing of {primary, secondary} x {debit, ownership-change} decision columns"
+        ],
+        "executable": "import requests\n\ndef test_decision_table_holder_role_vs_operation(\n    joint_account_fixture, primary_holder_token, secondary_holder_token, alternate_user_id\n):\n    account_id = joint_account_fixture[\"account_id\"]\n    primary_hdrs = {\"Authorization\": f\"Bearer {primary_holder_token}\"}\n    secondary_hdrs = {\"Authorization\": f\"Bearer {secondary_holder_token}\"}\n    base = <BASE_URL>\n\n    cases = [\n        (primary_hdrs, \"POST\", {\"type\": \"debit\", \"amount\": 10.00, \"currency\": \"USD\"}, (200, 201)),\n        (secondary_hdrs, \"POST\", {\"type\": \"debit\", \"amount\": 10.00, \"currency\": \"USD\"}, (200, 201)),\n        (primary_hdrs, \"PATCH\", {\"new_primary_owner_id\": alternate_user_id}, (200, 201, 204)),\n        (secondary_hdrs, \"PATCH\", {\"new_primary_owner_id\": alternate_user_id}, (403,)),\n    ]\n\n    for hdrs, method, payload, expected_codes in cases:\n        r = requests.request(\n            method,\n            f\"{base}/accounts/{account_id}/joint\",\n            json=payload,\n            headers=hdrs,\n        )\n        assert r.status_code in expected_codes, (\n            f\"{method} with role {'primary' if hdrs is primary_hdrs else 'secondary'} \"\n            f\"got {r.status_code}, expected one of {expected_codes}: {r.text}\"\n        )\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-068",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 993,
+    "output_tokens": 3297,
+    "latency_ms": 41597,
+    "wall_ms": 41597,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-068\",\n  \"reasoning\": \"R-FIN-068 covers joint-account operations with four distinct risk areas: (1) valid primary-holder transactions, (2) secondary-holder ownership-change attempts, (3) insufficient-funds rejections, and (4) limit-boundary transactions. I model these with EP (valid partition for primary holder), NEG (secondary holder ownership change \u2192 403, insufficient funds \u2192 422/400), BVA (transaction exactly at daily limit), and DT (decision table pairing holder role \u00d7 operation type). Each test is self-contained via fixtures that create and tear down account state, and idempotent because every test uses a fresh account ID scoped to its run.\",\n  \"tests\": [\n    {\n      \"name\": \"test_primary_holder_transaction_succeeds\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"A joint account exists with sufficient balance (>=100.00)\",\n        \"Primary holder credentials are available\",\n        \"Account is in ACTIVE state\"\n      ],\n      \"actions\": [\n        \"Authenticate as the primary holder\",\n        \"POST /accounts/{id}/joint with a valid debit transaction of 100.00\"\n      ],\n      \"expected\": [\n        \"HTTP 200 or 201 is returned\",\n        \"Response body contains updated balance reflecting the debit\",\n        \"Transaction ID is present in the response\"\n      ],\n      \"trace\": [\n        \"R-FIN-068: joint-account holder shall perform transactions\",\n        \"EP: primary holder with valid amount belongs to the 'authorised + sufficient funds' equivalence class\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\ndef test_primary_holder_transaction_succeeds(joint_account_fixture, primary_holder_token):\\n    account_id = joint_account_fixture[\\\"account_id\\\"]\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {primary_holder_token}\\\"}\\n    payload = {\\\"type\\\": \\\"debit\\\", \\\"amount\\\": 100.00, \\\"currency\\\": \\\"USD\\\"}\\n\\n    response = requests.post(\\n        f\\\"{<BASE_URL>}/accounts/{account_id}/joint\\\",\\n        json=payload,\\n        headers=headers,\\n    )\\n\\n    assert response.status_code in (200, 201), (\\n        f\\\"Expected 200/201, got {response.status_code}: {response.text}\\\"\\n    )\\n    body = response.json()\\n    assert \\\"transaction_id\\\" in body, \\\"Response missing transaction_id\\\"\\n    assert \\\"balance\\\" in body, \\\"Response missing balance\\\"\\n    assert body[\\\"balance\\\"] == pytest.approx(\\n        joint_account_fixture[\\\"initial_balance\\\"] - 100.00, abs=0.01\\n    )\\n\"\n    },\n    {\n      \"name\": \"test_secondary_holder_ownership_change_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"A joint account exists\",\n        \"Secondary holder credentials are available\",\n        \"A different user ID is available to act as a new owner candidate\"\n      ],\n      \"actions\": [\n        \"Authenticate as the secondary holder\",\n        \"PATCH /accounts/{id}/joint with an ownership-change payload targeting a new primary owner\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden is returned\",\n        \"Response body contains an error code indicating insufficient privileges\",\n        \"Account ownership is unchanged\"\n      ],\n      \"trace\": [\n        \"R-FIN-068: secondary holder shall NOT be able to modify ownership\",\n        \"R-FIN-068 error pathway: 403 when secondary holder attempts ownership change\",\n        \"NEG: unauthorised actor in the 'disallowed operation' partition\"\n      ],\n      \"executable\": \"import requests\\n\\ndef test_secondary_holder_ownership_change_returns_403(\\n    joint_account_fixture, secondary_holder_token, alternate_user_id\\n):\\n    account_id = joint_account_fixture[\\\"account_id\\\"]\\n    headers = {\\\"Authorization\\\": f\\\"Bearer {secondary_holder_token}\\\"}\\n    payload = {\\\"new_primary_owner_id\\\": alternate_user_id}\\n\\n    response = requests.patch(\\n        f\\\"{<BASE_URL>}/accounts/{account_id}/joint\\\",\\n        json=payload,\\n        headers=headers,\\n    )\\n\\n    assert response.status_code =="
+  }
+}

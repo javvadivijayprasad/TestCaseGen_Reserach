@@ -1,0 +1,185 @@
+{
+  "req": {
+    "id": "R-HLT-063",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients (negative)",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-063",
+    "reasoning": "The requirement covers patient search by name/MRN/DOB with care-team scoping, access logging, and error handling. Violation fix: test[4] had kind=negative but heuristic=STC. STC (State Transition Coverage) is a structural/positive heuristic that exercises valid state transitions; the test verifies a legitimate state change (IN_CARE_TEAM -> REMOVED) and its effect on system behaviour, which is a state-transition coverage test. The fix changes kind from 'negative' to 'positive' to match heuristic=STC. All other tests are preserved unchanged.",
+    "tests": [
+      {
+        "name": "test_search_by_mrn_returns_only_assigned_patient",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Authenticated clinician token exists for user assigned to patient P001",
+          "Patient P001 with MRN MRN-001 exists and is under the clinician's care",
+          "Patient P002 with MRN MRN-002 exists but is NOT under the clinician's care"
+        ],
+        "actions": [
+          "GET /Patient?search with query param mrn=MRN-001 and clinician auth header",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Response is a FHIR Bundle",
+          "Bundle contains exactly 1 entry matching MRN-001",
+          "Bundle does NOT contain MRN-002",
+          "Access log entry created for this search"
+        ],
+        "trace": [
+          "R-HLT-063: filtered bundle returned",
+          "R-HLT-063: only patients in their care shall be returned",
+          "R-HLT-063: access logged"
+        ],
+        "executable": "import pytest\n\ndef test_search_by_mrn_returns_only_assigned_patient(\n    clinician_auth_header,\n    assigned_patient_mrn,\n    unassigned_patient_mrn,\n    api_client,\n    assert_access_log,\n):\n    resp = api_client.get(\n        \"/Patient\",\n        params={\"search\": \"\", \"mrn\": assigned_patient_mrn},\n        headers=clinician_auth_header,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    mrns = [e[\"resource\"][\"identifier\"][0][\"value\"] for e in entries]\n    assert assigned_patient_mrn in mrns\n    assert unassigned_patient_mrn not in mrns\n    assert len(entries) == 1\n    assert_access_log(clinician_auth_header, \"/Patient\", \"search\")\n"
+      },
+      {
+        "name": "test_search_returns_no_data_for_patient_outside_care_team",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token exists for clinician A",
+          "Patient P003 exists and is assigned exclusively to clinician B, not clinician A"
+        ],
+        "actions": [
+          "GET /Patient?search with query param mrn=MRN-003 using clinician A auth header",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 200 with empty Bundle OR HTTP 403 Forbidden",
+          "If 200, Bundle entry list is empty (no patient data leaked)",
+          "If 403, OperationOutcome returned with issue code 'forbidden'",
+          "Patient P003 data is NOT present in response"
+        ],
+        "trace": [
+          "R-HLT-063: only patients in their care shall be returned",
+          "R-HLT-063: permission denial must be tested"
+        ],
+        "executable": "import pytest\n\ndef test_search_returns_no_data_for_patient_outside_care_team(\n    clinician_a_auth_header,\n    unassigned_to_a_mrn,\n    api_client,\n):\n    resp = api_client.get(\n        \"/Patient\",\n        params={\"search\": \"\", \"mrn\": unassigned_to_a_mrn},\n        headers=clinician_a_auth_header,\n    )\n    assert resp.status_code in (200, 403)\n    body = resp.json()\n    if resp.status_code == 200:\n        entries = body.get(\"entry\", [])\n        assert entries == [], \"Patient outside care team must not be returned\"\n    else:\n        assert body[\"resourceType\"] == \"OperationOutcome\"\n        issues = [i[\"code\"] for i in body.get(\"issue\", [])]\n        assert \"forbidden\" in issues\n"
+      },
+      {
+        "name": "test_malformed_query_parameter_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Authenticated clinician token exists",
+          "Server is operational"
+        ],
+        "actions": [
+          "GET /Patient?search with a syntactically invalid query param value (e.g. dob=not-a-date)",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 400 Bad Request",
+          "Response body contains FHIR OperationOutcome",
+          "OperationOutcome issue severity is 'error'",
+          "OperationOutcome issue details reference the invalid parameter"
+        ],
+        "trace": [
+          "R-HLT-063: 400 when query malformed",
+          "R-HLT-063: missing mandatory elements must be tested"
+        ],
+        "executable": "import pytest\n\ndef test_malformed_query_parameter_returns_400(\n    clinician_auth_header,\n    api_client,\n):\n    resp = api_client.get(\n        \"/Patient\",\n        params={\"search\": \"\", \"dob\": \"not-a-date\"},\n        headers=clinician_auth_header,\n    )\n    assert resp.status_code == 400\n    body = resp.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i[\"severity\"] == \"error\" for i in issues)\n    diagnostics = \" \".join(i.get(\"diagnostics\", \"\") for i in issues)\n    assert \"dob\" in diagnostics.lower() or \"date\" in diagnostics.lower()\n"
+      },
+      {
+        "name": "test_search_by_dob_on_boundary_today_returns_correct_bundle",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Authenticated clinician token exists",
+          "A patient P_TODAY exists with DOB equal to today's date and is assigned to the clinician",
+          "No other patients assigned to this clinician share today's DOB"
+        ],
+        "actions": [
+          "Compute today's date in YYYY-MM-DD format at test runtime",
+          "GET /Patient?search with query param dob=<today> using clinician auth header",
+          "Capture HTTP status and response body"
+        ],
+        "expected": [
+          "HTTP 200",
+          "Bundle contains exactly 1 entry whose birthDate equals today",
+          "Bundle entry count is 1 (boundary value is included)"
+        ],
+        "trace": [
+          "R-HLT-063: search by DOB",
+          "R-HLT-063: filtered bundle returned",
+          "BVA: DOB boundary \u2013 exact current date as edge value"
+        ],
+        "executable": "import pytest\nfrom datetime import date\n\ndef test_search_by_dob_on_boundary_today_returns_correct_bundle(\n    clinician_auth_header,\n    patient_with_dob_today,\n    api_client,\n):\n    today_str = date.today().isoformat()\n    resp = api_client.get(\n        \"/Patient\",\n        params={\"search\": \"\", \"dob\": today_str},\n        headers=clinician_auth_header,\n    )\n    assert resp.status_code == 200\n    bundle = resp.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 1\n    assert entries[0][\"resource\"][\"birthDate\"] == today_str\n"
+      },
+      {
+        "name": "test_search_after_clinician_removed_from_care_team_returns_empty",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician C is currently assigned to patient P004 (state: IN_CARE_TEAM)",
+          "A valid auth token for clinician C exists",
+          "Admin API is available to remove care-team membership"
+        ],
+        "actions": [
+          "GET /Patient?search mrn=MRN-004 as clinician C \u2013 confirm patient is returned (pre-state)",
+          "Admin removes clinician C from patient P004 care team (state transition: IN_CARE_TEAM -> REMOVED)",
+          "GET /Patient?search mrn=MRN-004 as clinician C again (post-state)",
+          "Capture status and bundle for both calls"
+        ],
+        "expected": [
+          "First search returns HTTP 200 with 1 entry for MRN-004",
+          "After removal, second search returns HTTP 200 with empty Bundle OR HTTP 403",
+          "No patient data for P004 leaked in post-state response"
+        ],
+        "trace": [
+          "R-HLT-063: only patients in their care shall be returned",
+          "R-HLT-063: conflicting state transitions must be tested",
+          "STC: transition IN_CARE_TEAM -> REMOVED affects search visibility"
+        ],
+        "executable": "import pytest\n\ndef test_search_after_clinician_removed_from_care_team_returns_empty(\n    clinician_c_auth_header,\n    patient_mrn_p004,\n    api_client,\n    admin_remove_care_team_member,\n    clinician_c_id,\n    patient_p004_id,\n):\n    # Pre-state: clinician C can see P004\n    pre = api_client.get(\n        \"/Patient\",\n        params={\"search\": \"\", \"mrn\": patient_mrn_p004},\n        headers=clinician_c_auth_header,\n    )\n    assert pre.status_code == 200\n    pre_bundle = pre.json()\n    pre_entries = pre_bundle.get(\"entry\", [])\n    assert len(pre_entries) == 1, \"Pre-state: P004 must be visible to clinician C\"\n\n    # State transition: remove clinician C from care team\n    admin_remove_care_team_member(clinician_c_id, patient_p004_id)\n\n    # Post-state: clinician C must no longer see P004\n    post = api_client.get(\n        \"/Patient\",\n        params={\"search\": \"\", \"mrn\": patient_mrn_p004},\n        headers=clinician_c_auth_header,\n    )\n    assert post.status_code in (200, 403)\n    if post.status_code == 200:\n        post_entries = post.json().get(\"entry\", [])\n        assert post_entries == [], \"Post-state: P004 must not be visible after care-team removal\"\n    else:\n        body = post.json()\n        assert body[\"resourceType\"] == \"OperationOutcome\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-063",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 2981,
+    "latency_ms": 32932,
+    "wall_ms": 32932,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-063\",\n  \"reasoning\": \"The requirement covers patient search by name/MRN/DOB with care-team scoping, access logging, and error handling. I selected: (1) EP positive \u2013 valid MRN search returns only assigned patients; (2) NEG \u2013 clinician queries a patient outside their care team, expects 403 or empty bundle with no leak; (3) NEG \u2013 malformed query parameter triggers 400; (4) BVA \u2013 DOB on exact boundary (today's date) as an edge value; (5) STC \u2013 clinician loses care-team membership mid-session and subsequent search reflects the state change. Each test is self-contained via fixtures and hits /Patient?search.\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_by_mrn_returns_only_assigned_patient\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Authenticated clinician token exists for user assigned to patient P001\",\n        \"Patient P001 with MRN MRN-001 exists and is under the clinician's care\",\n        \"Patient P002 with MRN MRN-002 exists but is NOT under the clinician's care\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param mrn=MRN-001 and clinician auth header\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 200\",\n        \"Response is a FHIR Bundle\",\n        \"Bundle contains exactly 1 entry matching MRN-001\",\n        \"Bundle does NOT contain MRN-002\",\n        \"Access log entry created for this search\"\n      ],\n      \"trace\": [\n        \"R-HLT-063: filtered bundle returned\",\n        \"R-HLT-063: only patients in their care shall be returned\",\n        \"R-HLT-063: access logged\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_search_by_mrn_returns_only_assigned_patient(\\n    clinician_auth_header,\\n    assigned_patient_mrn,\\n    unassigned_patient_mrn,\\n    api_client,\\n    assert_access_log,\\n):\\n    resp = api_client.get(\\n        \\\"/Patient\\\",\\n        params={\\\"search\\\": \\\"\\\", \\\"mrn\\\": assigned_patient_mrn},\\n        headers=clinician_auth_header,\\n    )\\n    assert resp.status_code == 200\\n    bundle = resp.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n    entries = bundle.get(\\\"entry\\\", [])\\n    mrns = [e[\\\"resource\\\"][\\\"identifier\\\"][0][\\\"value\\\"] for e in entries]\\n    assert assigned_patient_mrn in mrns\\n    assert unassigned_patient_mrn not in mrns\\n    assert len(entries) == 1\\n    assert_access_log(clinician_auth_header, \\\"/Patient\\\", \\\"search\\\")\\n\"\n    },\n    {\n      \"name\": \"test_search_returns_no_data_for_patient_outside_care_team\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Authenticated clinician token exists for clinician A\",\n        \"Patient P003 exists and is assigned exclusively to clinician B, not clinician A\"\n      ],\n      \"actions\": [\n        \"GET /Patient?search with query param mrn=MRN-003 using clinician A auth header\",\n        \"Capture HTTP status and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 with empty Bundle OR HTTP 403 Forbidden\",\n        \"If 200, Bundle entry list is empty (no patient data leaked)\",\n        \"If 403, OperationOutcome returned with issue code 'forbidden'\",\n        \"Patient P003 data is NOT present in response\"\n      ],\n      \"trace\": [\n        \"R-HLT-063: only patients in their care shall be returned\",\n        \"R-HLT-063: permission denial must be tested\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_search_returns_no_data_for_patient_outside_care_team(\\n    clinician_a_auth_header,\\n    unassigned_to_a_mrn,\\n    api_client,\\n):\\n    resp = api_client.get(\\n        \\\"/Patient\\\",\\n        params={\\\"search\\\": \\\"\\\", \\\"mrn\\\": unassigned_to_a_mrn},\\n        headers=clinician_a_auth_header,\\n    )\\n    assert resp.status_code in (200, 403)\\n    body = resp.json()\\n    if resp.status_code == 200:\\n        entries = body.get(\\\"entry\\\", [])\\n        assert entries == [], \\\"Patient outside care team must not be returned\\\"\\n    else:\\n        assert body[\\\"resourceTyp"
+  }
+}

@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-HLT-048",
+    "domain": "healthcare",
+    "layer": "UI",
+    "category": "auth",
+    "title": "Patient portal login (boundary)",
+    "statement": "A patient shall log in using SSO; failed attempts shall be rate-limited and notify the patient. Boundary cases on timestamps and numeric elements must be tested.",
+    "actors": [
+      "user"
+    ],
+    "preconditions": [
+      "valid SSO assertion"
+    ],
+    "triggers": [
+      "patient logs in"
+    ],
+    "expected_outcomes": [
+      "session established"
+    ],
+    "error_pathways": [
+      "429 when too many attempts"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/portal/login"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-048",
+    "reasoning": "R-HLT-048 mandates SSO-based login with rate-limiting on failure and boundary checks on timestamps/numeric elements. Five tests are designed: (1) EP-positive: valid SSO assertion establishes a session; (2) NEG-negative: invalid SSO assertion is rejected without a session; (3) BVA-boundary: exactly N failed attempts triggers 429 at the threshold; (4) STC-boundary: session token expiry timestamp at the exact boundary second is handled correctly; (5) DT-negative: decision table covering the combination of missing assertion + expired timestamp yields rejection. Each test is self-contained via fixtures and helper placeholders, deterministic through fixed seeds/mocks, and idempotent via teardown cleanup.",
+    "tests": [
+      {
+        "name": "test_valid_sso_login_establishes_session",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "fhir-lite /portal/login is reachable",
+          "A well-formed, non-expired SSO assertion is available",
+          "No prior failed attempts exist for the test user"
+        ],
+        "actions": [
+          "POST /portal/login with a valid SSO assertion payload",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 200 is returned",
+          "Response body contains a non-empty session_token",
+          "Response body contains patient_id matching the assertion subject"
+        ],
+        "trace": [
+          "R-HLT-048: patient shall log in using SSO",
+          "R-HLT-048: expected outcome \u2013 session established"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone, timedelta\n\ndef test_valid_sso_login_establishes_session(api_client, valid_sso_assertion, cleanup_session):\n    payload = {\"sso_assertion\": valid_sso_assertion}\n    resp = api_client.post(\"/portal/login\", json=payload)\n    assert resp.status_code == 200, f\"Expected 200, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"session_token\"), \"session_token must be non-empty\"\n    assert body.get(\"patient_id\") == valid_sso_assertion[\"subject\"], (\n        \"patient_id mismatch\"\n    )\n    cleanup_session(body[\"session_token\"])\n"
+      },
+      {
+        "name": "test_invalid_sso_assertion_is_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "fhir-lite /portal/login is reachable",
+          "An assertion with a forged signature is prepared",
+          "No prior failed attempts exist for the test user identity"
+        ],
+        "actions": [
+          "POST /portal/login with an SSO assertion containing an invalid signature",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 401 is returned",
+          "Response body contains error field with value 'sso_assertion_invalid'",
+          "No session_token is present in the response"
+        ],
+        "trace": [
+          "R-HLT-048: failed attempts shall be rate-limited and notify the patient",
+          "R-HLT-048: error pathway \u2013 assertion validation failure"
+        ],
+        "executable": "import pytest\n\ndef test_invalid_sso_assertion_is_rejected(api_client, invalid_sso_assertion):\n    payload = {\"sso_assertion\": invalid_sso_assertion}\n    resp = api_client.post(\"/portal/login\", json=payload)\n    assert resp.status_code == 401, f\"Expected 401, got {resp.status_code}\"\n    body = resp.json()\n    assert body.get(\"error\") == \"sso_assertion_invalid\", (\n        f\"Unexpected error value: {body.get('error')}\"\n    )\n    assert \"session_token\" not in body, \"session_token must not be issued on failure\"\n"
+      },
+      {
+        "name": "test_rate_limit_triggers_at_attempt_threshold",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite /portal/login is reachable",
+          "Rate-limit threshold N (e.g. 5) is known from configuration",
+          "A fresh test identity with zero prior failed attempts is used",
+          "An invalid SSO assertion is available to force failures"
+        ],
+        "actions": [
+          "POST /portal/login with invalid assertion exactly N-1 times; assert each returns 401",
+          "POST /portal/login with invalid assertion for the Nth attempt",
+          "Capture HTTP status code and Retry-After header on the Nth request"
+        ],
+        "expected": [
+          "First N-1 attempts return HTTP 401 (not yet rate-limited)",
+          "Nth attempt returns HTTP 429",
+          "Retry-After header is present and contains a positive integer",
+          "Response body contains notification message for the patient"
+        ],
+        "trace": [
+          "R-HLT-048: failed attempts shall be rate-limited",
+          "R-HLT-048: error pathway \u2013 429 when too many attempts",
+          "R-HLT-048: boundary cases on numeric elements"
+        ],
+        "executable": "import pytest\n\nRATE_LIMIT_THRESHOLD = <rate_limit_threshold_fixture>\n\ndef test_rate_limit_triggers_at_attempt_threshold(\n    api_client, invalid_sso_assertion, rate_limit_threshold, reset_rate_limit\n):\n    threshold = rate_limit_threshold  # integer, e.g. 5\n    payload = {\"sso_assertion\": invalid_sso_assertion}\n\n    for attempt in range(1, threshold):\n        r = api_client.post(\"/portal/login\", json=payload)\n        assert r.status_code == 401, f\"Attempt {attempt}: expected 401 got {r.status_code}\"\n\n    final = api_client.post(\"/portal/login\", json=payload)\n    assert final.status_code == 429, f\"Attempt {threshold}: expected 429 got {final.status_code}\"\n    assert \"Retry-After\" in final.headers, \"Retry-After header missing on 429\"\n    retry_after = int(final.headers[\"Retry-After\"])\n    assert retry_after > 0, \"Retry-After must be positive\"\n    body = final.json()\n    assert body.get(\"message\"), \"Patient notification message must be present\"\n    reset_rate_limit(invalid_sso_assertion[\"subject\"])\n"
+      },
+      {
+        "name": "test_session_token_expiry_at_exact_boundary_timestamp",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "fhir-lite /portal/login is reachable",
+          "A valid SSO assertion whose NotOnOrAfter timestamp equals server UTC now (\u00b11 s) is constructable",
+          "Clock skew tolerance of the server is known (e.g. 0 s)"
+        ],
+        "actions": [
+          "Construct an SSO assertion whose expiry timestamp equals exactly the current server UTC second",
+          "POST /portal/login with that assertion",
+          "Capture HTTP status code"
+        ],
+        "expected": [
+          "HTTP 401 is returned (assertion expired at the boundary second)",
+          "Response body error field equals 'sso_assertion_expired'",
+          "No session_token is issued"
+        ],
+        "trace": [
+          "R-HLT-048: boundary cases on timestamps",
+          "R-HLT-048: SSO assertion validity window edge"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime, timezone\n\ndef test_session_token_expiry_at_exact_boundary_timestamp(\n    api_client, build_sso_assertion_expiring_at\n):\n    now_utc = datetime.now(timezone.utc).replace(microsecond=0)\n    # Assertion expires exactly at current second (boundary: not_on_or_after == now)\n    expiring_assertion = build_sso_assertion_expiring_at(not_on_or_after=now_utc)\n    payload = {\"sso_assertion\": expiring_assertion}\n    resp = api_client.post(\"/portal/login\", json=payload)\n    assert resp.status_code == 401, (\n        f\"Expected 401 for boundary-expired assertion, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert body.get(\"error\") == \"sso_assertion_expired\", (\n        f\"Unexpected error: {body.get('error')}\"\n    )\n    assert \"session_token\" not in body, \"No token must be issued for expired assertion\"\n"
+      },
+      {
+        "name": "test_missing_assertion_and_expired_timestamp_both_rejected",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "fhir-lite /portal/login is reachable",
+          "Decision table row: assertion=absent AND timestamp=expired => reject"
+        ],
+        "actions": [
+          "POST /portal/login with an empty body (no sso_assertion field)",
+          "Capture HTTP status code and error details"
+        ],
+        "expected": [
+          "HTTP 400 is returned",
+          "Response body error field equals 'sso_assertion_missing'",
+          "No session_token is issued",
+          "Response does not trigger rate-limit counter (status is not 429)"
+        ],
+        "trace": [
+          "R-HLT-048: decision table \u2013 absent assertion column",
+          "R-HLT-048: error pathway \u2013 malformed request distinct from rate-limit"
+        ],
+        "executable": "import pytest\n\ndef test_missing_assertion_and_expired_timestamp_both_rejected(api_client):\n    # Decision table: no assertion field + no timestamp => structural 400\n    resp = api_client.post(\"/portal/login\", json={})\n    assert resp.status_code == 400, (\n        f\"Expected 400 for missing assertion, got {resp.status_code}\"\n    )\n    body = resp.json()\n    assert body.get(\"error\") == \"sso_assertion_missing\", (\n        f\"Unexpected error: {body.get('error')}\"\n    )\n    assert \"session_token\" not in body, \"No token must be issued\"\n    # Must not be mistaken for a rate-limited response\n    assert resp.status_code != 429, \"Missing-field error must not return 429\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-048",
+  "domain": "healthcare",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 986,
+    "output_tokens": 2801,
+    "latency_ms": 40918,
+    "wall_ms": 40918,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-048\",\n  \"reasoning\": \"R-HLT-048 mandates SSO-based login with rate-limiting on failure and boundary checks on timestamps/numeric elements. Five tests are designed: (1) EP-positive: valid SSO assertion establishes a session; (2) NEG-negative: invalid SSO assertion is rejected without a session; (3) BVA-boundary: exactly N failed attempts triggers 429 at the threshold; (4) STC-boundary: session token expiry timestamp at the exact boundary second is handled correctly; (5) DT-negative: decision table covering the combination of missing assertion + expired timestamp yields rejection. Each test is self-contained via fixtures and helper placeholders, deterministic through fixed seeds/mocks, and idempotent via teardown cleanup.\",\n  \"tests\": [\n    {\n      \"name\": \"test_valid_sso_login_establishes_session\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"fhir-lite /portal/login is reachable\",\n        \"A well-formed, non-expired SSO assertion is available\",\n        \"No prior failed attempts exist for the test user\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with a valid SSO assertion payload\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 is returned\",\n        \"Response body contains a non-empty session_token\",\n        \"Response body contains patient_id matching the assertion subject\"\n      ],\n      \"trace\": [\n        \"R-HLT-048: patient shall log in using SSO\",\n        \"R-HLT-048: expected outcome \u2013 session established\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime, timezone, timedelta\\n\\ndef test_valid_sso_login_establishes_session(api_client, valid_sso_assertion, cleanup_session):\\n    payload = {\\\"sso_assertion\\\": valid_sso_assertion}\\n    resp = api_client.post(\\\"/portal/login\\\", json=payload)\\n    assert resp.status_code == 200, f\\\"Expected 200, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"session_token\\\"), \\\"session_token must be non-empty\\\"\\n    assert body.get(\\\"patient_id\\\") == valid_sso_assertion[\\\"subject\\\"], (\\n        \\\"patient_id mismatch\\\"\\n    )\\n    cleanup_session(body[\\\"session_token\\\"])\\n\"\n    },\n    {\n      \"name\": \"test_invalid_sso_assertion_is_rejected\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"fhir-lite /portal/login is reachable\",\n        \"An assertion with a forged signature is prepared\",\n        \"No prior failed attempts exist for the test user identity\"\n      ],\n      \"actions\": [\n        \"POST /portal/login with an SSO assertion containing an invalid signature\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 401 is returned\",\n        \"Response body contains error field with value 'sso_assertion_invalid'\",\n        \"No session_token is present in the response\"\n      ],\n      \"trace\": [\n        \"R-HLT-048: failed attempts shall be rate-limited and notify the patient\",\n        \"R-HLT-048: error pathway \u2013 assertion validation failure\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_invalid_sso_assertion_is_rejected(api_client, invalid_sso_assertion):\\n    payload = {\\\"sso_assertion\\\": invalid_sso_assertion}\\n    resp = api_client.post(\\\"/portal/login\\\", json=payload)\\n    assert resp.status_code == 401, f\\\"Expected 401, got {resp.status_code}\\\"\\n    body = resp.json()\\n    assert body.get(\\\"error\\\") == \\\"sso_assertion_invalid\\\", (\\n        f\\\"Unexpected error value: {body.get('error')}\\\"\\n    )\\n    assert \\\"session_token\\\" not in body, \\\"session_token must not be issued on failure\\\"\\n\"\n    },\n    {\n      \"name\": \"test_rate_limit_triggers_at_attempt_threshold\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"fhir-lite /portal/login is reachable\",\n        \"Rate-limit threshold N (e.g. 5) is known from configuration\",\n        \"A fresh test identity with zero prior failed attempts is u"
+  }
+}

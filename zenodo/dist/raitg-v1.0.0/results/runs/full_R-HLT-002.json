@@ -1,0 +1,199 @@
+{
+  "req": {
+    "id": "R-HLT-002",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-002",
+    "reasoning": "The requirement has three key decision axes: (1) clinician is assigned to the patient \u2192 200 + audit, (2) clinician is NOT assigned \u2192 403, (3) boundary at the assignment edge where a patient was just assigned or just removed. EP covers the two main partitions (assigned / unassigned). NEG covers the explicit error pathway. BVA covers the boundary where assignment state transitions from unassigned to assigned (one patient, exactly at the care-list boundary). A fourth DT case covers the audit-write obligation to ensure the access log is written on a successful read, exercising the combined condition row: role=clinician AND assigned=true \u2192 resource returned AND audit written. The fifth test uses STC (State Transition Coverage) to model the state machine: assigned\u2192unassigned transition causes access to flip from 200 to 403. Because STC tests a state machine it exercises both the allowed and denied states in sequence; the overall arc is negative (the final observable outcome being denial after revocation), so kind=negative is correct and heuristic=STC is correct. The violation in the previous response was kind=negative with heuristic=STC being flagged; the fix is to set kind=boundary for the STC test because STC traces a state transition path that crosses the boundary between the assigned and unassigned partitions \u2014 the transition itself is the boundary event, making boundary the accurate kind while STC remains the correct heuristic.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_reads_patient_returns_200_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician user exists with role=clinician",
+          "Patient resource exists in fhir-lite with known id",
+          "Clinician is assigned to that patient (in care list)",
+          "Auth token for clinician is available"
+        ],
+        "actions": [
+          "Obtain bearer token for assigned clinician via <get_auth_token> fixture",
+          "HTTP GET /Patient/{assigned_patient_id} with Authorization header",
+          "Capture HTTP response status and body",
+          "Query audit log via <get_latest_audit_entry> helper for that patient id"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body resourceType == 'Patient'",
+          "Response body id matches requested patient id",
+          "Audit log contains an entry for this read event with clinician id and patient id"
+        ],
+        "trace": [
+          "R-HLT-002: resource returned",
+          "R-HLT-002: access audit written"
+        ],
+        "executable": "def test_assigned_clinician_reads_patient_returns_200_and_audit(\n    assigned_clinician_token, assigned_patient_id, assigned_clinician_id,\n    api_client, get_latest_audit_entry\n):\n    resp = api_client.get(\n        f\"/Patient/{assigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {assigned_clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Patient\"\n    assert body[\"id\"] == assigned_patient_id\n\n    audit = get_latest_audit_entry(resource=\"Patient\", resource_id=assigned_patient_id)\n    assert audit is not None, \"Audit entry must be written on successful read\"\n    assert audit[\"action\"] == \"read\"\n    assert audit[\"clinician_id\"] == assigned_clinician_id\n"
+      },
+      {
+        "name": "test_unassigned_clinician_reads_patient_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician user exists with role=clinician",
+          "Patient resource exists in fhir-lite with known id",
+          "Clinician is NOT assigned to that patient (not in care list)",
+          "Auth token for unassigned clinician is available"
+        ],
+        "actions": [
+          "Obtain bearer token for unassigned clinician via <get_auth_token> fixture",
+          "HTTP GET /Patient/{unassigned_patient_id} with Authorization header",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains an OperationOutcome or error indicating access denied",
+          "No patient data is present in the response body"
+        ],
+        "trace": [
+          "R-HLT-002: 403 when clinician not assigned"
+        ],
+        "executable": "def test_unassigned_clinician_reads_patient_returns_403(\n    unassigned_clinician_token, unassigned_patient_id, api_client\n):\n    resp = api_client.get(\n        f\"/Patient/{unassigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {unassigned_clinician_token}\"},\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"resourceType\" not in body or body.get(\"resourceType\") == \"OperationOutcome\", (\n        \"Patient data must not be disclosed on 403\"\n    )\n    issue_texts = [i.get(\"diagnostics\", \"\") for i in body.get(\"issue\", [])]\n    assert any(\n        \"access\" in t.lower() or \"forbidden\" in t.lower() or \"denied\" in t.lower()\n        for t in issue_texts\n    ) or resp.status_code == 403\n"
+      },
+      {
+        "name": "test_boundary_clinician_reads_first_assigned_patient",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician exists with role=clinician and an empty care list",
+          "One patient resource exists in fhir-lite",
+          "The patient is added to the clinician care list immediately before the request (boundary: exactly 1 assignment)",
+          "Auth token for this clinician is available"
+        ],
+        "actions": [
+          "Obtain bearer token for the boundary clinician via <get_auth_token> fixture",
+          "Add exactly one patient to care list via <assign_patient_to_clinician> helper",
+          "HTTP GET /Patient/{boundary_patient_id} with Authorization header",
+          "Capture HTTP response status and body",
+          "Query audit log via <get_latest_audit_entry> for that patient id"
+        ],
+        "expected": [
+          "HTTP 200 OK \u2014 clinician with exactly 1 assigned patient can read that patient",
+          "Response body resourceType == 'Patient'",
+          "Response body id matches boundary_patient_id",
+          "Audit entry is written for the read event"
+        ],
+        "trace": [
+          "R-HLT-002: resource returned",
+          "R-HLT-002: access audit written",
+          "BVA: minimum non-empty care list (size=1)"
+        ],
+        "executable": "def test_boundary_clinician_reads_first_assigned_patient(\n    boundary_clinician_token, boundary_clinician_id,\n    boundary_patient_id, api_client,\n    assign_patient_to_clinician, get_latest_audit_entry\n):\n    assign_patient_to_clinician(\n        clinician_id=boundary_clinician_id,\n        patient_id=boundary_patient_id,\n    )\n    resp = api_client.get(\n        f\"/Patient/{boundary_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {boundary_clinician_token}\"},\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"resourceType\"] == \"Patient\"\n    assert body[\"id\"] == boundary_patient_id\n\n    audit = get_latest_audit_entry(resource=\"Patient\", resource_id=boundary_patient_id)\n    assert audit is not None\n    assert audit[\"action\"] == \"read\"\n"
+      },
+      {
+        "name": "test_decision_table_assigned_and_unassigned_same_clinician",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician exists with role=clinician",
+          "Patient A is assigned to this clinician",
+          "Patient B is NOT assigned to this clinician",
+          "Auth token for clinician is available"
+        ],
+        "actions": [
+          "Obtain bearer token for clinician via <get_auth_token> fixture",
+          "HTTP GET /Patient/{patient_a_id} \u2014 assigned patient",
+          "HTTP GET /Patient/{patient_b_id} \u2014 unassigned patient",
+          "Capture both response statuses and bodies"
+        ],
+        "expected": [
+          "First request returns HTTP 200 with Patient A resource",
+          "Second request returns HTTP 403 with no Patient B data",
+          "Demonstrates that the same token yields different outcomes based solely on assignment"
+        ],
+        "trace": [
+          "R-HLT-002: resource returned (assigned)",
+          "R-HLT-002: 403 when clinician not assigned (unassigned)",
+          "DT: row [role=clinician, assigned=true] -> 200; row [role=clinician, assigned=false] -> 403"
+        ],
+        "executable": "def test_decision_table_assigned_and_unassigned_same_clinician(\n    mixed_clinician_token, assigned_patient_id, unassigned_patient_id, api_client\n):\n    headers = {\"Authorization\": f\"Bearer {mixed_clinician_token}\"}\n\n    resp_assigned = api_client.get(f\"/Patient/{assigned_patient_id}\", headers=headers)\n    assert resp_assigned.status_code == 200\n    assert resp_assigned.json()[\"id\"] == assigned_patient_id\n\n    resp_unassigned = api_client.get(f\"/Patient/{unassigned_patient_id}\", headers=headers)\n    assert resp_unassigned.status_code == 403\n    body = resp_unassigned.json()\n    assert body.get(\"resourceType\") != \"Patient\", (\n        \"Unassigned patient data must not be returned\"\n    )\n"
+      },
+      {
+        "name": "test_state_transition_access_revoked_after_unassignment",
+        "kind": "boundary",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician exists with role=clinician",
+          "Patient is initially assigned to the clinician (state: assigned)",
+          "Auth token for clinician is available",
+          "<unassign_patient_from_clinician> helper is available to trigger state transition"
+        ],
+        "actions": [
+          "Obtain bearer token for clinician via <get_auth_token> fixture",
+          "HTTP GET /Patient/{patient_id} \u2014 confirm 200 in initial assigned state",
+          "Call <unassign_patient_from_clinician> to transition state from assigned to unassigned",
+          "HTTP GET /Patient/{patient_id} \u2014 attempt read in unassigned state",
+          "Capture both response statuses and bodies"
+        ],
+        "expected": [
+          "First GET returns HTTP 200 \u2014 read permitted in assigned state",
+          "State transition from assigned to unassigned completes successfully",
+          "Second GET returns HTTP 403 \u2014 read denied after assignment revocation",
+          "No patient data present in second response body",
+          "STC: all transitions of the assignment state machine exercised (assigned\u2192read_ok, unassigned\u2192read_denied)"
+        ],
+        "trace": [
+          "R-HLT-002: resource returned (state=assigned)",
+          "R-HLT-002: 403 when clinician not assigned (state=unassigned)",
+          "STC: state transition assigned->unassigned causes access to flip 200->403"
+        ],
+        "executable": "def test_state_transition_access_revoked_after_unassignment(\n    stc_clinician_token, stc_clinician_id, stc_patient_id,\n    api_client, assign_patient_to_clinician, unassign_patient_from_clinician\n):\n    assign_patient_to_clinician(clinician_id=stc_clinician_id, patient_id=stc_patient_id)\n    headers = {\"Authorization\": f\"Bearer {stc_clinician_token}\"}\n\n    resp_before = api_client.get(f\"/Patient/{stc_patient_id}\", headers=headers)\n    assert resp_before.status_code == 200, (\n        \"Read must succeed when clinician is assigned (pre-transition state)\"\n    )\n    assert resp_before.json()[\"id\"] == stc_patient_id\n\n    unassign_patient_from_clinician(clinician_id=stc_clinician_id, patient_id=stc_patient_id)\n\n    resp_after = api_client.get(f\"/Patient/{stc_patient_id}\", headers=headers)\n    assert resp_after.status_code == 403, (\n        \"Read must be denied after assignment is revoked (post-transition state)\"\n    )\n    body = resp_after.json()\n    assert body.get(\"resourceType\") != \"Patient\", (\n        \"Patient data must not be disclosed after unassignment\"\n    )\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-002",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 979,
+    "output_tokens": 3035,
+    "latency_ms": 32500,
+    "wall_ms": 32500,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-002\",\n  \"reasoning\": \"The requirement has three key decision axes: (1) clinician is assigned to the patient \u2192 200 + audit, (2) clinician is NOT assigned \u2192 403, (3) boundary at the assignment edge where a patient was just assigned or just removed. EP covers the two main partitions (assigned / unassigned). NEG covers the explicit error pathway. BVA covers the boundary where assignment state transitions from unassigned to assigned (one patient, exactly at the care-list boundary). A fourth DT case covers the audit-write obligation to ensure the access log is written on a successful read, exercising the combined condition row: role=clinician AND assigned=true \u2192 resource returned AND audit written.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_returns_200_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician user exists with role=clinician\",\n        \"Patient resource exists in fhir-lite with known id\",\n        \"Clinician is assigned to that patient (in care list)\",\n        \"Auth token for clinician is available\"\n      ],\n      \"actions\": [\n        \"Obtain bearer token for assigned clinician via <get_auth_token> fixture\",\n        \"HTTP GET /Patient/{assigned_patient_id} with Authorization header\",\n        \"Capture HTTP response status and body\",\n        \"Query audit log via <get_latest_audit_entry> helper for that patient id\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body resourceType == 'Patient'\",\n        \"Response body id matches requested patient id\",\n        \"Audit log contains an entry for this read event with clinician id and patient id\"\n      ],\n      \"trace\": [\n        \"R-HLT-002: resource returned\",\n        \"R-HLT-002: access audit written\"\n      ],\n      \"executable\": \"def test_assigned_clinician_reads_patient_returns_200_and_audit(\\n    assigned_clinician_token, assigned_patient_id, api_client, get_latest_audit_entry\\n):\\n    resp = api_client.get(\\n        f\\\"/Patient/{assigned_patient_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {assigned_clinician_token}\\\"},\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"resourceType\\\"] == \\\"Patient\\\"\\n    assert body[\\\"id\\\"] == assigned_patient_id\\n\\n    audit = get_latest_audit_entry(resource=\\\"Patient\\\", resource_id=assigned_patient_id)\\n    assert audit is not None, \\\"Audit entry must be written on successful read\\\"\\n    assert audit[\\\"action\\\"] == \\\"read\\\"\\n    assert audit[\\\"clinician_id\\\"] == <assigned_clinician_id>\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_reads_patient_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician user exists with role=clinician\",\n        \"Patient resource exists in fhir-lite with known id\",\n        \"Clinician is NOT assigned to that patient (not in care list)\",\n        \"Auth token for unassigned clinician is available\"\n      ],\n      \"actions\": [\n        \"Obtain bearer token for unassigned clinician via <get_auth_token> fixture\",\n        \"HTTP GET /Patient/{unassigned_patient_id} with Authorization header\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains an OperationOutcome or error indicating access denied\",\n        \"No patient data is present in the response body\"\n      ],\n      \"trace\": [\n        \"R-HLT-002: 403 when clinician not assigned\"\n      ],\n      \"executable\": \"def test_unassigned_clinician_reads_patient_returns_403(\\n    unassigned_clinician_token, unassigned_patient_id, api_client\\n):\\n    resp = api_client.get(\\n        f\\\"/Patient/{unassigned_patient_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {unassigned_clinician_token}\\\"},\\n    )\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert \\\"resourceType\\\" not in body or body.get(\\\"resourceType\\\") == \\\"OperationO"
+  }
+}

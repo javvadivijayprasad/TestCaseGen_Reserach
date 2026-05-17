@@ -1,0 +1,153 @@
+{
+  "req": {
+    "id": "R-FIN-049",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "integration",
+    "title": "Rate limiting (boundary variant)",
+    "statement": "The API shall enforce 60 requests per minute per user; overages shall return 429 with retry-after. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "any endpoint"
+    ],
+    "triggers": [
+      "burst requests"
+    ],
+    "expected_outcomes": [
+      "429 with retry-after"
+    ],
+    "error_pathways": [
+      "request tail rejected"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/*"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-049",
+    "reasoning": "R-FIN-049 mandates a 60 req/min/user rate limit with 429+Retry-After on overage. Four tests are designed: (1) EP-positive: 59 requests within one minute all succeed with 2xx; (2) BVA-boundary-lower: exactly 60 requests succeed (the inclusive upper threshold of the allowed window); (3) BVA-boundary-upper: the 61st request triggers 429+Retry-After (one past the limit); (4) NEG-negative: a burst of 80 requests confirms the tail is consistently rejected. Each test resets state via a fresh authenticated user/token fixture and uses a monotonic clock to stay within a single 60-second window, ensuring determinism and idempotency.",
+    "tests": [
+      {
+        "name": "test_requests_below_limit_succeed",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is reachable",
+          "A valid user token is provisioned via <fixture: fresh_user_token>",
+          "Rate-limit counter for the user is at zero (new token per test)"
+        ],
+        "actions": [
+          "Send 59 sequential GET /api/v1/accounts requests within one 60-second window",
+          "Record the HTTP status code of each response"
+        ],
+        "expected": [
+          "All 59 responses return HTTP 2xx",
+          "No response contains a Retry-After header"
+        ],
+        "trace": [
+          "R-FIN-049: requests below the 60 req/min threshold must not be rate-limited",
+          "EP partition: request count in [1, 59] -> allowed"
+        ],
+        "executable": "import pytest\nimport time\nfrom <helper_fn> import make_authed_request\n\n@pytest.fixture\ndef token(fresh_user_token):\n    return fresh_user_token\n\ndef test_requests_below_limit_succeed(token):\n    responses = []\n    start = time.monotonic()\n    for _ in range(59):\n        r = make_authed_request(\"GET\", \"/api/v1/accounts\", token=token)\n        responses.append(r)\n    elapsed = time.monotonic() - start\n    assert elapsed < 60, \"59 requests must complete within one window\"\n    for i, r in enumerate(responses):\n        assert r.status_code in range(200, 300), (\n            f\"Request {i+1} expected 2xx, got {r.status_code}\"\n        )\n        assert \"Retry-After\" not in r.headers, (\n            f\"Request {i+1} must not carry Retry-After\"\n        )"
+      },
+      {
+        "name": "test_exactly_60_requests_succeed",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "A valid user token is provisioned via <fixture: fresh_user_token>",
+          "Rate-limit counter for the user is at zero (new token per test)"
+        ],
+        "actions": [
+          "Send exactly 60 sequential GET /api/v1/accounts requests within one 60-second window",
+          "Record the HTTP status code of each response"
+        ],
+        "expected": [
+          "All 60 responses return HTTP 2xx",
+          "No response contains a Retry-After header"
+        ],
+        "trace": [
+          "R-FIN-049: boundary at exactly 60 requests must be permitted",
+          "BVA: test the inclusive upper boundary of the allowed partition (N=60)"
+        ],
+        "executable": "import pytest\nimport time\nfrom <helper_fn> import make_authed_request\n\n@pytest.fixture\ndef token(fresh_user_token):\n    return fresh_user_token\n\ndef test_exactly_60_requests_succeed(token):\n    responses = []\n    start = time.monotonic()\n    for _ in range(60):\n        r = make_authed_request(\"GET\", \"/api/v1/accounts\", token=token)\n        responses.append(r)\n    elapsed = time.monotonic() - start\n    assert elapsed < 60, \"60 requests must complete within one window\"\n    for i, r in enumerate(responses):\n        assert r.status_code in range(200, 300), (\n            f\"Request {i+1} expected 2xx, got {r.status_code}\"\n        )\n        assert \"Retry-After\" not in r.headers, (\n            f\"Request {i+1} must not carry Retry-After\"\n        )"
+      },
+      {
+        "name": "test_61st_request_returns_429_with_retry_after",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "A valid user token is provisioned via <fixture: fresh_user_token>",
+          "Rate-limit counter for the user is at zero (new token per test)"
+        ],
+        "actions": [
+          "Send 60 sequential GET /api/v1/accounts requests within one 60-second window to exhaust the quota",
+          "Send a 61st GET /api/v1/accounts request in the same window",
+          "Inspect the status code and headers of the 61st response"
+        ],
+        "expected": [
+          "Requests 1-60 return HTTP 2xx",
+          "Request 61 returns HTTP 429",
+          "Response 61 contains a Retry-After header with a positive integer value"
+        ],
+        "trace": [
+          "R-FIN-049: the first request beyond the 60-per-minute limit must be rejected with 429",
+          "BVA: test N=61, one past the inclusive upper boundary"
+        ],
+        "executable": "import pytest\nimport time\nfrom <helper_fn> import make_authed_request\n\n@pytest.fixture\ndef token(fresh_user_token):\n    return fresh_user_token\n\ndef test_61st_request_returns_429_with_retry_after(token):\n    start = time.monotonic()\n    for i in range(60):\n        r = make_authed_request(\"GET\", \"/api/v1/accounts\", token=token)\n        assert r.status_code in range(200, 300), (\n            f\"Setup request {i+1} expected 2xx, got {r.status_code}\"\n        )\n    assert time.monotonic() - start < 60, \"Quota exhaustion must stay in one window\"\n    r61 = make_authed_request(\"GET\", \"/api/v1/accounts\", token=token)\n    assert r61.status_code == 429, (\n        f\"Expected 429, got {r61.status_code}\"\n    )\n    assert \"Retry-After\" in r61.headers, \"429 response must include Retry-After header\"\n    retry_after = int(r61.headers[\"Retry-After\"])\n    assert retry_after > 0, \"Retry-After must be a positive integer (seconds)\""
+      },
+      {
+        "name": "test_burst_beyond_limit_tail_rejected",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "A valid user token is provisioned via <fixture: fresh_user_token>",
+          "Rate-limit counter for the user is at zero (new token per test)"
+        ],
+        "actions": [
+          "Send 80 rapid GET /api/v1/accounts requests within one 60-second window",
+          "Partition responses into those with 2xx and those with 429",
+          "Validate the count of each partition and the presence of Retry-After on all 429s"
+        ],
+        "expected": [
+          "Exactly 60 responses return HTTP 2xx",
+          "Exactly 20 responses return HTTP 429",
+          "Every 429 response carries a Retry-After header with a positive integer value",
+          "No 2xx response carries a Retry-After header"
+        ],
+        "trace": [
+          "R-FIN-049: requests beyond the limit (error pathway: request tail rejected) must be denied",
+          "NEG: deliberate overage to verify enforcement across the entire tail"
+        ],
+        "executable": "import pytest\nimport time\nfrom <helper_fn> import make_authed_request\n\n@pytest.fixture\ndef token(fresh_user_token):\n    return fresh_user_token\n\ndef test_burst_beyond_limit_tail_rejected(token):\n    TOTAL, LIMIT = 80, 60\n    responses = []\n    start = time.monotonic()\n    for _ in range(TOTAL):\n        r = make_authed_request(\"GET\", \"/api/v1/accounts\", token=token)\n        responses.append(r)\n    assert time.monotonic() - start < 60, \"All 80 requests must fall in one window\"\n    ok = [r for r in responses if r.status_code in range(200, 300)]\n    rejected = [r for r in responses if r.status_code == 429]\n    assert len(ok) == LIMIT, f\"Expected {LIMIT} allowed, got {len(ok)}\"\n    assert len(rejected) == TOTAL - LIMIT, (\n        f\"Expected {TOTAL - LIMIT} rejections, got {len(rejected)}\"\n    )\n    for r in rejected:\n        assert \"Retry-After\" in r.headers\n        assert int(r.headers[\"Retry-After\"]) > 0\n    for r in ok:\n        assert \"Retry-After\" not in r.headers"
+      }
+    ]
+  },
+  "req_id": "R-FIN-049",
+  "domain": "financial_services",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 987,
+    "output_tokens": 2541,
+    "latency_ms": 32974,
+    "wall_ms": 32974,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-049\",\n  \"reasoning\": \"R-FIN-049 mandates a 60 req/min/user rate limit with 429+Retry-After on overage. Four tests are designed: (1) EP-positive: 59 requests within one minute all succeed with 2xx; (2) BVA-boundary-lower: exactly 60 requests succeed (the inclusive upper threshold of the allowed window); (3) BVA-boundary-upper: the 61st request triggers 429+Retry-After (one past the limit); (4) NEG-negative: a burst of 80 requests confirms the tail is consistently rejected. Each test resets state via a fresh authenticated user/token fixture and uses a monotonic clock to stay within a single 60-second window, ensuring determinism and idempotency.\",\n  \"tests\": [\n    {\n      \"name\": \"test_requests_below_limit_succeed\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"A valid user token is provisioned via <fixture: fresh_user_token>\",\n        \"Rate-limit counter for the user is at zero (new token per test)\"\n      ],\n      \"actions\": [\n        \"Send 59 sequential GET /api/v1/accounts requests within one 60-second window\",\n        \"Record the HTTP status code of each response\"\n      ],\n      \"expected\": [\n        \"All 59 responses return HTTP 2xx\",\n        \"No response contains a Retry-After header\"\n      ],\n      \"trace\": [\n        \"R-FIN-049: requests below the 60 req/min threshold must not be rate-limited\",\n        \"EP partition: request count in [1, 59] -> allowed\"\n      ],\n      \"executable\": \"import pytest\\nimport time\\nfrom <helper_fn> import make_authed_request\\n\\n@pytest.fixture\\ndef token(fresh_user_token):\\n    return fresh_user_token\\n\\ndef test_requests_below_limit_succeed(token):\\n    responses = []\\n    start = time.monotonic()\\n    for _ in range(59):\\n        r = make_authed_request(\\\"GET\\\", \\\"/api/v1/accounts\\\", token=token)\\n        responses.append(r)\\n    elapsed = time.monotonic() - start\\n    assert elapsed < 60, \\\"59 requests must complete within one window\\\"\\n    for i, r in enumerate(responses):\\n        assert r.status_code in range(200, 300), (\\n            f\\\"Request {i+1} expected 2xx, got {r.status_code}\\\"\\n        )\\n        assert \\\"Retry-After\\\" not in r.headers, (\\n            f\\\"Request {i+1} must not carry Retry-After\\\"\\n        )\"\n    },\n    {\n      \"name\": \"test_exactly_60_requests_succeed\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BVA\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"A valid user token is provisioned via <fixture: fresh_user_token>\",\n        \"Rate-limit counter for the user is at zero (new token per test)\"\n      ],\n      \"actions\": [\n        \"Send exactly 60 sequential GET /api/v1/accounts requests within one 60-second window\",\n        \"Record the HTTP status code of each response\"\n      ],\n      \"expected\": [\n        \"All 60 responses return HTTP 2xx\",\n        \"No response contains a Retry-After header\"\n      ],\n      \"trace\": [\n        \"R-FIN-049: boundary at exactly 60 requests must be permitted\",\n        \"BVA: test the inclusive upper boundary of the allowed partition (N=60)\"\n      ],\n      \"executable\": \"import pytest\\nimport time\\nfrom <helper_fn> import make_authed_request\\n\\n@pytest.fixture\\ndef token(fresh_user_token):\\n    return fresh_user_token\\n\\ndef test_exactly_60_requests_succeed(token):\\n    responses = []\\n    start = time.monotonic()\\n    for _ in range(60):\\n        r = make_authed_request(\\\"GET\\\", \\\"/api/v1/accounts\\\", token=token)\\n        responses.append(r)\\n    elapsed = time.monotonic() - start\\n    assert elapsed < 60, \\\"60 requests must complete within one window\\\"\\n    for i, r in enumerate(responses):\\n        assert r.status_code in range(200, 300), (\\n            f\\\"Request {i+1} expected 2xx, got {r.status_code}\\\"\\n        )\\n        assert \\\"Retry-After\\\" not in r.headers, (\\n            f\\\"Request {i+1} must not carry Retry-After\\\"\\n        )\"\n    },\n    {\n      \"name\": \"test_61st_request_returns_429_with_retry"
+  }
+}

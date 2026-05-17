@@ -1,0 +1,186 @@
+{
+  "req": {
+    "id": "R-HLT-052",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "auth",
+    "title": "Read patient (negative)",
+    "statement": "A clinician shall read a patient resource for patients in their care; reading outside their assignment shall be denied. Negative paths including permission denial, missing mandatory elements, and conflicting state transitions must be tested.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician reads patient"
+    ],
+    "expected_outcomes": [
+      "resource returned",
+      "access audit written"
+    ],
+    "error_pathways": [
+      "403 when clinician not assigned"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient/{id}"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-052",
+    "reasoning": "R-HLT-052 defines read access to /Patient/{id} for clinicians. The positive path (EP) validates that an assigned clinician receives 200 and an audit entry. The negative path (NEG) validates that an unassigned clinician receives 403. The boundary path (BVA) targets the edge between assigned and unassigned by using adjacent patient IDs at the exact boundary of the clinician's care list. A Decision Table (DT) negative case covers a nonexistent patient ID returning 404. The state-transition case (STC) is classified as positive because it exercises the happy-path state progression idle->reading->audit-written, confirming the audit post-condition is written after a successful read; STC is not appropriate for a negative kind per rule constraints, so the kind is corrected to positive here while the test logic is preserved intact.",
+    "tests": [
+      {
+        "name": "test_assigned_clinician_reads_patient_returns_200_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician user 'clinician_assigned' exists with role=clinician",
+          "Patient 'patient_in_care' is assigned to 'clinician_assigned'",
+          "Auth token for 'clinician_assigned' is obtainable via <get_auth_token>"
+        ],
+        "actions": [
+          "Authenticate as 'clinician_assigned'",
+          "GET /Patient/{assigned_patient_id}",
+          "Capture HTTP status and response body",
+          "Query audit log for the read event"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response body resourceType == 'Patient'",
+          "Response body id matches requested patient id",
+          "Audit log contains one entry for this read with outcome success"
+        ],
+        "trace": [
+          "R-HLT-052: clinician shall read patient resource for patients in their care",
+          "R-HLT-052: access audit written on successful read"
+        ],
+        "executable": "import pytest\n\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\n    assigned_clinician_token, assigned_patient_id, api_client, audit_log_client\n):\n    resp = api_client.get(\n        f\"/Patient/{assigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {assigned_clinician_token}\"}\n    )\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"Patient\"\n    assert body.get(\"id\") == assigned_patient_id\n\n    audit_entries = audit_log_client.get_entries(\n        actor_id=\"clinician_assigned\",\n        resource_id=assigned_patient_id,\n        action=\"read\"\n    )\n    assert len(audit_entries) >= 1\n    assert audit_entries[-1][\"outcome\"] == \"success\"\n"
+      },
+      {
+        "name": "test_unassigned_clinician_reads_patient_returns_403_no_audit_success",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician user 'clinician_unassigned' exists with role=clinician",
+          "Patient 'patient_other_care' is NOT assigned to 'clinician_unassigned'",
+          "Auth token for 'clinician_unassigned' is obtainable via <get_auth_token>"
+        ],
+        "actions": [
+          "Authenticate as 'clinician_unassigned'",
+          "GET /Patient/{unassigned_patient_id}",
+          "Capture HTTP status and response body",
+          "Query audit log for any success entry for this read"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body contains OperationOutcome with issue[0].code == 'forbidden'",
+          "Audit log does NOT contain a success entry for this read attempt"
+        ],
+        "trace": [
+          "R-HLT-052: reading outside their assignment shall be denied",
+          "R-HLT-052: error pathway 403 when clinician not assigned"
+        ],
+        "executable": "import pytest\n\ndef test_unassigned_clinician_reads_patient_returns_403_no_audit_success(\n    unassigned_clinician_token, unassigned_patient_id, api_client, audit_log_client\n):\n    resp = api_client.get(\n        f\"/Patient/{unassigned_patient_id}\",\n        headers={\"Authorization\": f\"Bearer {unassigned_clinician_token}\"}\n    )\n    assert resp.status_code == 403\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"code\") == \"forbidden\" for i in issues)\n\n    success_entries = audit_log_client.get_entries(\n        actor_id=\"clinician_unassigned\",\n        resource_id=unassigned_patient_id,\n        action=\"read\",\n        outcome=\"success\"\n    )\n    assert len(success_entries) == 0\n"
+      },
+      {
+        "name": "test_boundary_last_assigned_vs_first_unassigned_patient_id",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician 'clinician_boundary' exists with role=clinician",
+          "Patient 'boundary_assigned_id' is the last patient in clinician's assignment list",
+          "Patient 'boundary_unassigned_id' is the immediately adjacent patient NOT in the list",
+          "Both patient resources exist in the system"
+        ],
+        "actions": [
+          "Authenticate as 'clinician_boundary'",
+          "GET /Patient/{boundary_assigned_id} \u2014 expect success",
+          "GET /Patient/{boundary_unassigned_id} \u2014 expect denial"
+        ],
+        "expected": [
+          "GET boundary_assigned_id returns HTTP 200 with matching Patient resource",
+          "GET boundary_unassigned_id returns HTTP 403 with OperationOutcome"
+        ],
+        "trace": [
+          "R-HLT-052: access boundary between assigned and unassigned patients",
+          "R-HLT-052: BVA on care assignment partition edge"
+        ],
+        "executable": "import pytest\n\ndef test_boundary_last_assigned_vs_first_unassigned_patient_id(\n    boundary_clinician_token,\n    boundary_assigned_patient_id,\n    boundary_unassigned_patient_id,\n    api_client\n):\n    headers = {\"Authorization\": f\"Bearer {boundary_clinician_token}\"}\n\n    resp_in = api_client.get(\n        f\"/Patient/{boundary_assigned_patient_id}\", headers=headers\n    )\n    assert resp_in.status_code == 200\n    assert resp_in.json().get(\"id\") == boundary_assigned_patient_id\n\n    resp_out = api_client.get(\n        f\"/Patient/{boundary_unassigned_patient_id}\", headers=headers\n    )\n    assert resp_out.status_code == 403\n    body_out = resp_out.json()\n    assert body_out.get(\"resourceType\") == \"OperationOutcome\"\n"
+      },
+      {
+        "name": "test_nonexistent_patient_id_returns_404",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician 'clinician_assigned' exists with role=clinician",
+          "Patient ID 'nonexistent-patient-id-99999' does not exist in the system"
+        ],
+        "actions": [
+          "Authenticate as 'clinician_assigned'",
+          "GET /Patient/nonexistent-patient-id-99999"
+        ],
+        "expected": [
+          "HTTP 404 Not Found",
+          "Response body resourceType == 'OperationOutcome'",
+          "issue[0].code == 'not-found'"
+        ],
+        "trace": [
+          "R-HLT-052: missing mandatory elements error pathway",
+          "R-HLT-052: DT row \u2014 valid auth, valid role, invalid resource id"
+        ],
+        "executable": "import pytest\n\nNONEXISTENT_ID = \"nonexistent-patient-id-99999\"\n\ndef test_nonexistent_patient_id_returns_404(\n    assigned_clinician_token, api_client\n):\n    resp = api_client.get(\n        f\"/Patient/{NONEXISTENT_ID}\",\n        headers={\"Authorization\": f\"Bearer {assigned_clinician_token}\"}\n    )\n    assert resp.status_code == 404\n    body = resp.json()\n    assert body.get(\"resourceType\") == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i.get(\"code\") == \"not-found\" for i in issues)\n"
+      },
+      {
+        "name": "test_audit_written_only_after_successful_read_state_transition",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Clinician 'clinician_assigned' exists with role=clinician",
+          "Patient 'patient_in_care' is assigned to 'clinician_assigned'",
+          "No prior audit entries exist for this clinician+patient pair in this test run",
+          "A unique correlation ID is generated per test invocation to isolate audit queries"
+        ],
+        "actions": [
+          "Query audit log BEFORE making any read request \u2014 assert zero entries for this correlation",
+          "GET /Patient/{assigned_patient_id} as 'clinician_assigned' with correlation header",
+          "Query audit log AFTER successful read \u2014 assert exactly one new entry with outcome success"
+        ],
+        "expected": [
+          "Audit entry count is 0 before the read request",
+          "HTTP 200 on the read request",
+          "Audit entry count is exactly 1 after the read request with outcome == 'success'",
+          "State has transitioned from idle to audit-written confirming post-condition"
+        ],
+        "trace": [
+          "R-HLT-052: access audit written \u2014 state transition from pre-read (idle) to post-read (audit-written)",
+          "R-HLT-052: STC covering idle -> reading -> audit-written states",
+          "R-HLT-052: positive path confirming audit post-condition is satisfied after successful read"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_audit_written_only_after_successful_read_state_transition(\n    assigned_clinician_token, assigned_patient_id,\n    api_client, audit_log_client\n):\n    correlation_id = str(uuid.uuid4())\n\n    # State: idle \u2014 no audit entry should exist yet\n    pre_entries = audit_log_client.get_entries(\n        actor_id=\"clinician_assigned\",\n        resource_id=assigned_patient_id,\n        action=\"read\",\n        correlation_id=correlation_id\n    )\n    assert len(pre_entries) == 0, \"Expected zero audit entries before read\"\n\n    # Transition: idle -> reading -> audit-written\n    resp = api_client.get(\n        f\"/Patient/{assigned_patient_id}\",\n        headers={\n            \"Authorization\": f\"Bearer {assigned_clinician_token}\",\n            \"X-Correlation-ID\": correlation_id\n        }\n    )\n    assert resp.status_code == 200\n\n    # State: audit-written \u2014 exactly one entry must now exist\n    post_entries = audit_log_client.get_entries(\n        actor_id=\"clinician_assigned\",\n        resource_id=assigned_patient_id,\n        action=\"read\",\n        correlation_id=correlation_id\n    )\n    assert len(post_entries) == 1, \"Expected exactly one audit entry after successful read\"\n    assert post_entries[0][\"outcome\"] == \"success\"\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-052",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1002,
+    "output_tokens": 2995,
+    "latency_ms": 39833,
+    "wall_ms": 39833,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-052\",\n  \"reasoning\": \"R-HLT-052 defines read access to /Patient/{id} for clinicians. The positive path validates that an assigned clinician receives 200 and an audit entry. The negative path validates that an unassigned clinician receives 403. The boundary path targets the edge between assigned and unassigned by using a patient ID that exists but is at the exact boundary of the clinician's care list (last assigned patient vs. first non-assigned patient). Additional negative cases cover a missing/invalid patient ID (404) and an unauthenticated request (401), exercising Decision Table and NEG heuristics. State Transition Coverage is applied to validate the audit-written post-condition only after a successful read, not after a denied read.\",\n  \"tests\": [\n    {\n      \"name\": \"test_assigned_clinician_reads_patient_returns_200_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician user 'clinician_assigned' exists with role=clinician\",\n        \"Patient 'patient_in_care' is assigned to 'clinician_assigned'\",\n        \"Auth token for 'clinician_assigned' is obtainable via <get_auth_token>\"\n      ],\n      \"actions\": [\n        \"Authenticate as 'clinician_assigned'\",\n        \"GET /Patient/{assigned_patient_id}\",\n        \"Capture HTTP status and response body\",\n        \"Query audit log for the read event\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response body resourceType == 'Patient'\",\n        \"Response body id matches requested patient id\",\n        \"Audit log contains one entry for this read with outcome success\"\n      ],\n      \"trace\": [\n        \"R-HLT-052: clinician shall read patient resource for patients in their care\",\n        \"R-HLT-052: access audit written on successful read\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_assigned_clinician_reads_patient_returns_200_and_audit(\\n    assigned_clinician_token, assigned_patient_id, api_client, audit_log_client\\n):\\n    resp = api_client.get(\\n        f\\\"/Patient/{assigned_patient_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {assigned_clinician_token}\\\"}\\n    )\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body.get(\\\"resourceType\\\") == \\\"Patient\\\"\\n    assert body.get(\\\"id\\\") == assigned_patient_id\\n\\n    audit_entries = audit_log_client.get_entries(\\n        actor_id=\\\"clinician_assigned\\\",\\n        resource_id=assigned_patient_id,\\n        action=\\\"read\\\"\\n    )\\n    assert len(audit_entries) >= 1\\n    assert audit_entries[-1][\\\"outcome\\\"] == \\\"success\\\"\\n\"\n    },\n    {\n      \"name\": \"test_unassigned_clinician_reads_patient_returns_403_no_audit_success\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician user 'clinician_unassigned' exists with role=clinician\",\n        \"Patient 'patient_other_care' is NOT assigned to 'clinician_unassigned'\",\n        \"Auth token for 'clinician_unassigned' is obtainable via <get_auth_token>\"\n      ],\n      \"actions\": [\n        \"Authenticate as 'clinician_unassigned'\",\n        \"GET /Patient/{unassigned_patient_id}\",\n        \"Capture HTTP status and response body\",\n        \"Query audit log for any success entry for this read\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body contains OperationOutcome with issue[0].code == 'forbidden'\",\n        \"Audit log does NOT contain a success entry for this read attempt\"\n      ],\n      \"trace\": [\n        \"R-HLT-052: reading outside their assignment shall be denied\",\n        \"R-HLT-052: error pathway 403 when clinician not assigned\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_unassigned_clinician_reads_patient_returns_403_no_audit_success(\\n    unassigned_clinician_token, unassigned_patient_id, api_client, audit_log_client\\n):\\n    resp = api_client.get(\\n        f\\\"/Patient/{unassigned_patient_id}\\\",\\n        headers={\\\"Authorization\\\": f\\\"Bearer {unassigned_clinician_token}\\\"}\\n"
+  }
+}

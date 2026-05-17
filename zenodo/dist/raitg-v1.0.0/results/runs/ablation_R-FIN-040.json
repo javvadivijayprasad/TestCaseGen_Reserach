@@ -1,0 +1,182 @@
+{
+  "req": {
+    "id": "R-FIN-040",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "auth",
+    "title": "KYC refresh (boundary variant)",
+    "statement": "A customer shall complete a KYC refresh every 365 days; accounts beyond refresh window shall be restricted to inbound transactions only. Boundary behaviour at exact min/max thresholds must be tested.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "refresh form submitted"
+    ],
+    "expected_outcomes": [
+      "customer.verified=true refreshed"
+    ],
+    "error_pathways": [
+      "403 when submission fails compliance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/kyc/refresh"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-040",
+    "reasoning": "R-FIN-040 mandates KYC refresh every 365 days with account restriction beyond the window. Key test dimensions: (1) EP positive \u2014 customer within refresh window submits valid KYC and becomes verified; (2) NEG negative \u2014 submission with non-compliant data yields 403 and verified stays false; (3) BVA boundary at exactly day 364 (last valid day, should succeed); (4) BVA boundary at exactly day 365 (first restricted day, outbound blocked); (5) STC state transition \u2014 account moves from restricted to verified after successful refresh. BVA is critical per the requirement's explicit boundary-behaviour mandate. Each test uses a fixture to provide an authenticated session and a helper to seed account age, keeping executable code within 40 lines.",
+    "tests": [
+      {
+        "name": "test_kyc_refresh_valid_submission_within_window",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Customer account last KYC refresh was 180 days ago (well within 365-day window)",
+          "KYC form payload is fully compliant"
+        ],
+        "actions": [
+          "POST /kyc/refresh with compliant KYC payload and valid auth header",
+          "Assert HTTP 200 response",
+          "Assert response body contains customer.verified=true and refreshed timestamp"
+        ],
+        "expected": [
+          "HTTP 200 OK",
+          "Response JSON: customer.verified == true",
+          "Response JSON: refreshed field is a recent ISO-8601 timestamp"
+        ],
+        "trace": [
+          "R-FIN-040: customer.verified=true refreshed on successful submission",
+          "EP: selects representative value from valid-submission equivalence class (day 180)"
+        ],
+        "executable": "import pytest\nfrom datetime import datetime\n\ndef test_kyc_refresh_valid_submission_within_window(auth_session, seed_account_age, api_base_url):\n    seed_account_age(days_since_kyc=180)\n    payload = <compliant_kyc_payload>()\n    resp = auth_session.post(f\"{api_base_url}/kyc/refresh\", json=payload)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"customer\"][\"verified\"] is True\n    assert \"refreshed\" in body[\"customer\"]\n    refreshed_dt = datetime.fromisoformat(body[\"customer\"][\"refreshed\"])\n    assert (datetime.utcnow() - refreshed_dt).total_seconds() < 60\n"
+      },
+      {
+        "name": "test_kyc_refresh_non_compliant_payload_returns_403",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Customer account last KYC refresh was 30 days ago",
+          "KYC form payload contains non-compliant data (e.g. missing mandatory field)"
+        ],
+        "actions": [
+          "POST /kyc/refresh with non-compliant KYC payload and valid auth header",
+          "Assert HTTP 403 response",
+          "Assert customer.verified is not set to true in any error body"
+        ],
+        "expected": [
+          "HTTP 403 Forbidden",
+          "Response body indicates compliance failure reason",
+          "customer.verified remains false / unchanged"
+        ],
+        "trace": [
+          "R-FIN-040: error pathway \u2014 403 when submission fails compliance",
+          "NEG: exercises the invalid-submission partition to confirm rejection"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_non_compliant_payload_returns_403(auth_session, seed_account_age, api_base_url):\n    seed_account_age(days_since_kyc=30)\n    payload = <non_compliant_kyc_payload>()\n    resp = auth_session.post(f\"{api_base_url}/kyc/refresh\", json=payload)\n    assert resp.status_code == 403\n    body = resp.json()\n    assert \"error\" in body or \"detail\" in body\n    verified = body.get(\"customer\", {}).get(\"verified\", False)\n    assert verified is not True\n"
+      },
+      {
+        "name": "test_kyc_refresh_on_day_364_succeeds",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Customer account last KYC refresh was exactly 364 days ago (one day before window expires)",
+          "KYC form payload is fully compliant"
+        ],
+        "actions": [
+          "POST /kyc/refresh with compliant KYC payload",
+          "Assert HTTP 200 response",
+          "Assert customer.verified=true"
+        ],
+        "expected": [
+          "HTTP 200 OK \u2014 day 364 is still within the 365-day window",
+          "customer.verified == true",
+          "Account remains fully functional (outbound transactions permitted)"
+        ],
+        "trace": [
+          "R-FIN-040: boundary behaviour at exact min/max thresholds",
+          "BVA: upper boundary minus one \u2014 day 364 is last safe interior point"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_on_day_364_succeeds(auth_session, seed_account_age, api_base_url):\n    seed_account_age(days_since_kyc=364)\n    payload = <compliant_kyc_payload>()\n    resp = auth_session.post(f\"{api_base_url}/kyc/refresh\", json=payload)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"customer\"][\"verified\"] is True\n"
+      },
+      {
+        "name": "test_kyc_refresh_on_day_365_account_restricted_to_inbound_only",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Customer account last KYC refresh was exactly 365 days ago (first day beyond window)",
+          "Account restriction endpoint is accessible at /accounts/{id}/permissions"
+        ],
+        "actions": [
+          "GET /accounts/{id}/permissions to confirm outbound is restricted before refresh",
+          "POST /kyc/refresh with compliant payload",
+          "Assert refresh succeeds with HTTP 200",
+          "GET /accounts/{id}/permissions again to confirm restriction is lifted"
+        ],
+        "expected": [
+          "Before refresh: outbound_enabled == false, inbound_enabled == true",
+          "POST /kyc/refresh returns HTTP 200 and customer.verified == true",
+          "After refresh: outbound_enabled == true"
+        ],
+        "trace": [
+          "R-FIN-040: accounts beyond refresh window restricted to inbound only; boundary at day 365",
+          "BVA: upper boundary \u2014 exact threshold where restriction activates"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_on_day_365_account_restricted_to_inbound_only(\n    auth_session, seed_account_age, api_base_url, account_id\n):\n    seed_account_age(days_since_kyc=365)\n    perms_before = auth_session.get(f\"{api_base_url}/accounts/{account_id}/permissions\")\n    assert perms_before.status_code == 200\n    before = perms_before.json()\n    assert before[\"outbound_enabled\"] is False\n    assert before[\"inbound_enabled\"] is True\n    payload = <compliant_kyc_payload>()\n    refresh_resp = auth_session.post(f\"{api_base_url}/kyc/refresh\", json=payload)\n    assert refresh_resp.status_code == 200\n    assert refresh_resp.json()[\"customer\"][\"verified\"] is True\n    perms_after = auth_session.get(f\"{api_base_url}/accounts/{account_id}/permissions\")\n    assert perms_after.json()[\"outbound_enabled\"] is True\n"
+      },
+      {
+        "name": "test_kyc_refresh_state_transition_restricted_to_verified",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated with a valid bearer token",
+          "Customer account is currently in RESTRICTED state (kyc_status=restricted)",
+          "Customer account last KYC refresh was 400 days ago"
+        ],
+        "actions": [
+          "GET /kyc/status to confirm initial state is restricted",
+          "POST /kyc/refresh with compliant payload",
+          "GET /kyc/status to confirm final state is verified"
+        ],
+        "expected": [
+          "Initial GET /kyc/status returns kyc_status == restricted",
+          "POST /kyc/refresh returns HTTP 200 with customer.verified == true",
+          "Final GET /kyc/status returns kyc_status == verified"
+        ],
+        "trace": [
+          "R-FIN-040: expected outcome customer.verified=true refreshed after submission",
+          "STC: covers RESTRICTED -> VERIFIED state transition triggered by successful refresh"
+        ],
+        "executable": "import pytest\n\ndef test_kyc_refresh_state_transition_restricted_to_verified(\n    auth_session, seed_account_age, api_base_url\n):\n    seed_account_age(days_since_kyc=400)\n    status_before = auth_session.get(f\"{api_base_url}/kyc/status\")\n    assert status_before.status_code == 200\n    assert status_before.json()[\"kyc_status\"] == \"restricted\"\n    payload = <compliant_kyc_payload>()\n    refresh_resp = auth_session.post(f\"{api_base_url}/kyc/refresh\", json=payload)\n    assert refresh_resp.status_code == 200\n    assert refresh_resp.json()[\"customer\"][\"verified\"] is True\n    status_after = auth_session.get(f\"{api_base_url}/kyc/status\")\n    assert status_after.status_code == 200\n    assert status_after.json()[\"kyc_status\"] == \"verified\"\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-040",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 1.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1000,
+    "output_tokens": 2689,
+    "latency_ms": 34653,
+    "wall_ms": 34653,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-040\",\n  \"reasoning\": \"R-FIN-040 mandates KYC refresh every 365 days with account restriction beyond the window. Key test dimensions: (1) EP positive \u2014 customer within refresh window submits valid KYC and becomes verified; (2) NEG negative \u2014 submission with non-compliant data yields 403 and verified stays false; (3) BVA boundary at exactly day 364 (last valid day, should succeed); (4) BVA boundary at exactly day 365 (first restricted day, outbound blocked); (5) STC state transition \u2014 account moves from restricted to verified after successful refresh. BVA is critical per the requirement's explicit boundary-behaviour mandate. Each test uses a fixture to provide an authenticated session and a helper to seed account age, keeping executable code within 40 lines.\",\n  \"tests\": [\n    {\n      \"name\": \"test_kyc_refresh_valid_submission_within_window\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"Customer account last KYC refresh was 180 days ago (well within 365-day window)\",\n        \"KYC form payload is fully compliant\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with compliant KYC payload and valid auth header\",\n        \"Assert HTTP 200 response\",\n        \"Assert response body contains customer.verified=true and refreshed timestamp\"\n      ],\n      \"expected\": [\n        \"HTTP 200 OK\",\n        \"Response JSON: customer.verified == true\",\n        \"Response JSON: refreshed field is a recent ISO-8601 timestamp\"\n      ],\n      \"trace\": [\n        \"R-FIN-040: customer.verified=true refreshed on successful submission\",\n        \"EP: selects representative value from valid-submission equivalence class (day 180)\"\n      ],\n      \"executable\": \"import pytest\\nfrom datetime import datetime\\n\\ndef test_kyc_refresh_valid_submission_within_window(auth_session, seed_account_age, api_base_url):\\n    seed_account_age(days_since_kyc=180)\\n    payload = <compliant_kyc_payload>()\\n    resp = auth_session.post(f\\\"{api_base_url}/kyc/refresh\\\", json=payload)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"customer\\\"][\\\"verified\\\"] is True\\n    assert \\\"refreshed\\\" in body[\\\"customer\\\"]\\n    refreshed_dt = datetime.fromisoformat(body[\\\"customer\\\"][\\\"refreshed\\\"])\\n    assert (datetime.utcnow() - refreshed_dt).total_seconds() < 60\\n\"\n    },\n    {\n      \"name\": \"test_kyc_refresh_non_compliant_payload_returns_403\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated with a valid bearer token\",\n        \"Customer account last KYC refresh was 30 days ago\",\n        \"KYC form payload contains non-compliant data (e.g. missing mandatory field)\"\n      ],\n      \"actions\": [\n        \"POST /kyc/refresh with non-compliant KYC payload and valid auth header\",\n        \"Assert HTTP 403 response\",\n        \"Assert customer.verified is not set to true in any error body\"\n      ],\n      \"expected\": [\n        \"HTTP 403 Forbidden\",\n        \"Response body indicates compliance failure reason\",\n        \"customer.verified remains false / unchanged\"\n      ],\n      \"trace\": [\n        \"R-FIN-040: error pathway \u2014 403 when submission fails compliance\",\n        \"NEG: exercises the invalid-submission partition to confirm rejection\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_kyc_refresh_non_compliant_payload_returns_403(auth_session, seed_account_age, api_base_url):\\n    seed_account_age(days_since_kyc=30)\\n    payload = <non_compliant_kyc_payload>()\\n    resp = auth_session.post(f\\\"{api_base_url}/kyc/refresh\\\", json=payload)\\n    assert resp.status_code == 403\\n    body = resp.json()\\n    assert \\\"error\\\" in body or \\\"detail\\\" in body\\n    verified = body.get(\\\"customer\\\", {}).get(\\\"verified\\\", False)\\n    assert verified is not True\\n\"\n    },\n    {\n      \"name\": \"test_kyc_refresh_on_day_364_succeeds\",\n      \"kind\": \"boundary\",\n      \"heuristic\": \"BV"
+  }
+}

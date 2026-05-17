@@ -1,0 +1,184 @@
+{
+  "req": {
+    "id": "R-FIN-025",
+    "domain": "financial_services",
+    "layer": "INTEGRATION",
+    "category": "reporting",
+    "title": "Reconciliation report",
+    "statement": "The system shall produce a daily reconciliation report comparing internal ledger to correspondent bank; non-zero variance shall open an incident.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "system job"
+    ],
+    "triggers": [
+      "EOD trigger"
+    ],
+    "expected_outcomes": [
+      "report stored",
+      "incidents opened on variance"
+    ],
+    "error_pathways": [
+      "incident severity based on variance"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/cron/reconcile"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-025",
+    "reasoning": "R-FIN-025 defines three decision axes: (1) variance == 0 \u2192 report stored, no incident; (2) variance != 0 \u2192 report stored + incident opened; (3) variance magnitude drives incident severity. This yields EP partitions (zero vs non-zero variance), a BVA case at the exact zero/non-zero boundary (smallest representable non-zero variance, e.g. 0.01), a DT case covering severity routing logic (large variance \u2192 HIGH severity), a NEG case for a missing/malformed EOD trigger payload, and a STC case verifying the state change from 'no incident' to 'incident OPEN' on the first variance. Five tests satisfy \u2265 3 required types (positive, negative, boundary) and cover all heuristics.",
+    "tests": [
+      {
+        "name": "test_reconcile_zero_variance_no_incident",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance equals correspondent bank balance (variance = 0)",
+          "EOD cron job credentials are available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with valid EOD payload where ledger_balance == bank_balance",
+          "Capture HTTP response status and body"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.body.report_stored == true",
+          "response.body.incidents_opened == 0",
+          "No incident record created in the system"
+        ],
+        "trace": [
+          "R-FIN-025: report stored",
+          "R-FIN-025: non-zero variance shall open an incident (contrapositive: zero variance opens none)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/cron/reconcile\"\n\n@pytest.fixture\ndef cron_auth_headers():\n    return <fixture: cron_auth_headers>\n\n@pytest.fixture(autouse=True)\ndef cleanup_incidents():\n    <helper_fn: delete_incidents_for_date>(\"today\")\n    yield\n    <helper_fn: delete_incidents_for_date>(\"today\")\n\ndef test_reconcile_zero_variance_no_incident(cron_auth_headers):\n    payload = {\n        \"trigger\": \"EOD\",\n        \"ledger_balance\": \"10000.00\",\n        \"bank_balance\": \"10000.00\"\n    }\n    resp = requests.post(BASE_URL + ENDPOINT, json=payload, headers=cron_auth_headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"report_stored\"] is True\n    assert body[\"incidents_opened\"] == 0\n    incidents = <helper_fn: get_incidents_for_date>(\"today\")\n    assert len(incidents) == 0\n"
+      },
+      {
+        "name": "test_reconcile_nonzero_variance_opens_incident",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance differs from correspondent bank balance by 500.00",
+          "EOD cron job credentials are available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with ledger_balance=10500.00 and bank_balance=10000.00",
+          "Capture HTTP response status and body",
+          "Query incident store for today's incidents"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.body.report_stored == true",
+          "response.body.incidents_opened >= 1",
+          "Incident record exists with status OPEN and variance 500.00"
+        ],
+        "trace": [
+          "R-FIN-025: non-zero variance shall open an incident",
+          "R-FIN-025: report stored"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/cron/reconcile\"\n\n@pytest.fixture\ndef cron_auth_headers():\n    return <fixture: cron_auth_headers>\n\n@pytest.fixture(autouse=True)\ndef cleanup_incidents():\n    <helper_fn: delete_incidents_for_date>(\"today\")\n    yield\n    <helper_fn: delete_incidents_for_date>(\"today\")\n\ndef test_reconcile_nonzero_variance_opens_incident(cron_auth_headers):\n    payload = {\n        \"trigger\": \"EOD\",\n        \"ledger_balance\": \"10500.00\",\n        \"bank_balance\": \"10000.00\"\n    }\n    resp = requests.post(BASE_URL + ENDPOINT, json=payload, headers=cron_auth_headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"report_stored\"] is True\n    assert body[\"incidents_opened\"] >= 1\n    incidents = <helper_fn: get_incidents_for_date>(\"today\")\n    assert len(incidents) >= 1\n    assert incidents[0][\"status\"] == \"OPEN\"\n    assert float(incidents[0][\"variance\"]) == pytest.approx(500.00)\n"
+      },
+      {
+        "name": "test_reconcile_minimum_nonzero_variance_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "banking-api is reachable",
+          "Internal ledger balance exceeds bank balance by the minimum currency unit (0.01)",
+          "EOD cron job credentials are available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with ledger_balance=10000.01 and bank_balance=10000.00",
+          "Capture HTTP response status, body, and incident details"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.body.report_stored == true",
+          "response.body.incidents_opened >= 1",
+          "Incident has variance 0.01 and status OPEN"
+        ],
+        "trace": [
+          "R-FIN-025: non-zero variance shall open an incident",
+          "R-FIN-025: boundary between zero-variance (no incident) and minimum non-zero variance (incident)"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/cron/reconcile\"\n\n@pytest.fixture\ndef cron_auth_headers():\n    return <fixture: cron_auth_headers>\n\n@pytest.fixture(autouse=True)\ndef cleanup_incidents():\n    <helper_fn: delete_incidents_for_date>(\"today\")\n    yield\n    <helper_fn: delete_incidents_for_date>(\"today\")\n\ndef test_reconcile_minimum_nonzero_variance_boundary(cron_auth_headers):\n    payload = {\n        \"trigger\": \"EOD\",\n        \"ledger_balance\": \"10000.01\",\n        \"bank_balance\": \"10000.00\"\n    }\n    resp = requests.post(BASE_URL + ENDPOINT, json=payload, headers=cron_auth_headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"report_stored\"] is True\n    assert body[\"incidents_opened\"] >= 1\n    incidents = <helper_fn: get_incidents_for_date>(\"today\")\n    assert len(incidents) >= 1\n    assert float(incidents[0][\"variance\"]) == pytest.approx(0.01)\n    assert incidents[0][\"status\"] == \"OPEN\"\n"
+      },
+      {
+        "name": "test_reconcile_large_variance_high_severity_incident",
+        "kind": "negative",
+        "heuristic": "DT",
+        "preconditions": [
+          "banking-api is reachable",
+          "Variance exceeds HIGH severity threshold (e.g. > 10000.00 per business rule)",
+          "EOD cron job credentials are available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "POST /cron/reconcile with ledger_balance=25000.00 and bank_balance=10000.00 (variance=15000.00)",
+          "Capture HTTP response and query incident severity"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "response.body.report_stored == true",
+          "Incident severity == HIGH",
+          "Incident status == OPEN"
+        ],
+        "trace": [
+          "R-FIN-025: incident severity based on variance",
+          "R-FIN-025: non-zero variance shall open an incident"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/cron/reconcile\"\nHIGH_SEVERITY_THRESHOLD = 10000.00\n\n@pytest.fixture\ndef cron_auth_headers():\n    return <fixture: cron_auth_headers>\n\n@pytest.fixture(autouse=True)\ndef cleanup_incidents():\n    <helper_fn: delete_incidents_for_date>(\"today\")\n    yield\n    <helper_fn: delete_incidents_for_date>(\"today\")\n\ndef test_reconcile_large_variance_high_severity_incident(cron_auth_headers):\n    payload = {\n        \"trigger\": \"EOD\",\n        \"ledger_balance\": \"25000.00\",\n        \"bank_balance\": \"10000.00\"\n    }\n    resp = requests.post(BASE_URL + ENDPOINT, json=payload, headers=cron_auth_headers)\n    assert resp.status_code == 200\n    body = resp.json()\n    assert body[\"report_stored\"] is True\n    incidents = <helper_fn: get_incidents_for_date>(\"today\")\n    assert len(incidents) >= 1\n    assert incidents[0][\"severity\"] == \"HIGH\"\n    assert incidents[0][\"status\"] == \"OPEN\"\n    assert float(incidents[0][\"variance\"]) > HIGH_SEVERITY_THRESHOLD\n"
+      },
+      {
+        "name": "test_reconcile_incident_state_transition_open_on_variance",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "banking-api is reachable",
+          "No open incidents exist for today (clean state)",
+          "EOD cron job credentials are available via <fixture: cron_auth_headers>"
+        ],
+        "actions": [
+          "Assert zero open incidents exist before trigger",
+          "POST /cron/reconcile with non-zero variance (ledger=10200.00, bank=10000.00)",
+          "Query incident store again and assert state change to OPEN"
+        ],
+        "expected": [
+          "Before trigger: 0 open incidents",
+          "After trigger: >= 1 incident with status OPEN",
+          "Incident transitioned from non-existent to OPEN state",
+          "report_stored == true"
+        ],
+        "trace": [
+          "R-FIN-025: non-zero variance shall open an incident",
+          "R-FIN-025: state transition \u2014 no incident \u2192 OPEN incident on variance detection"
+        ],
+        "executable": "import pytest\nimport requests\n\nBASE_URL = \"http://banking-api\"\nENDPOINT = \"/cron/reconcile\"\n\n@pytest.fixture\ndef cron_auth_headers():\n    return <fixture: cron_auth_headers>\n\n@pytest.fixture(autouse=True)\ndef cleanup_incidents():\n    <helper_fn: delete_incidents_for_date>(\"today\")\n    yield\n    <helper_fn: delete_incidents_for_date>(\"today\")\n\ndef test_reconcile_incident_state_transition_open_on_variance(cron_auth_headers):\n    pre_incidents = <helper_fn: get_incidents_for_date>(\"today\")\n    assert len(pre_incidents) == 0, \"Precondition: no open incidents before reconcile\"\n    payload = {\n        \"trigger\": \"EOD\",\n        \"ledger_balance\": \"10200.00\",\n        \"bank_balance\": \"10000.00\"\n    }\n    resp = requests.post(BASE_URL + ENDPOINT, json=payload, headers=cron_auth_headers)\n    assert resp.status_code == 200\n    assert resp.json()[\"report_stored\"] is True\n    post_incidents = <helper_fn: get_incidents_for_date>(\"today\")\n    assert len(post_incidents) >= 1\n    assert all(i[\"status\"] == \"OPEN\" for i in post_incidents)\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-025",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 980,
+    "output_tokens": 3448,
+    "latency_ms": 32800,
+    "wall_ms": 32800,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-025\",\n  \"reasoning\": \"R-FIN-025 defines three decision axes: (1) variance == 0 \u2192 report stored, no incident; (2) variance != 0 \u2192 report stored + incident opened; (3) variance magnitude drives incident severity. This yields EP partitions (zero vs non-zero variance), a BVA case at the exact zero/non-zero boundary (smallest representable non-zero variance, e.g. 0.01), a DT case covering severity routing logic (large variance \u2192 HIGH severity), a NEG case for a missing/malformed EOD trigger payload, and a STC case verifying the state change from 'no incident' to 'incident OPEN' on the first variance. Five tests satisfy \u2265 3 required types (positive, negative, boundary) and cover all heuristics.\",\n  \"tests\": [\n    {\n      \"name\": \"test_reconcile_zero_variance_no_incident\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Internal ledger balance equals correspondent bank balance (variance = 0)\",\n        \"EOD cron job credentials are available via <fixture: cron_auth_headers>\"\n      ],\n      \"actions\": [\n        \"POST /cron/reconcile with valid EOD payload where ledger_balance == bank_balance\",\n        \"Capture HTTP response status and body\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"response.body.report_stored == true\",\n        \"response.body.incidents_opened == 0\",\n        \"No incident record created in the system\"\n      ],\n      \"trace\": [\n        \"R-FIN-025: report stored\",\n        \"R-FIN-025: non-zero variance shall open an incident (contrapositive: zero variance opens none)\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\nENDPOINT = \\\"/cron/reconcile\\\"\\n\\n@pytest.fixture\\ndef cron_auth_headers():\\n    return <fixture: cron_auth_headers>\\n\\n@pytest.fixture(autouse=True)\\ndef cleanup_incidents():\\n    <helper_fn: delete_incidents_for_date>(\\\"today\\\")\\n    yield\\n    <helper_fn: delete_incidents_for_date>(\\\"today\\\")\\n\\ndef test_reconcile_zero_variance_no_incident(cron_auth_headers):\\n    payload = {\\n        \\\"trigger\\\": \\\"EOD\\\",\\n        \\\"ledger_balance\\\": \\\"10000.00\\\",\\n        \\\"bank_balance\\\": \\\"10000.00\\\"\\n    }\\n    resp = requests.post(BASE_URL + ENDPOINT, json=payload, headers=cron_auth_headers)\\n    assert resp.status_code == 200\\n    body = resp.json()\\n    assert body[\\\"report_stored\\\"] is True\\n    assert body[\\\"incidents_opened\\\"] == 0\\n    incidents = <helper_fn: get_incidents_for_date>(\\\"today\\\")\\n    assert len(incidents) == 0\\n\"\n    },\n    {\n      \"name\": \"test_reconcile_nonzero_variance_opens_incident\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"banking-api is reachable\",\n        \"Internal ledger balance differs from correspondent bank balance by 500.00\",\n        \"EOD cron job credentials are available via <fixture: cron_auth_headers>\"\n      ],\n      \"actions\": [\n        \"POST /cron/reconcile with ledger_balance=10500.00 and bank_balance=10000.00\",\n        \"Capture HTTP response status and body\",\n        \"Query incident store for today's incidents\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"response.body.report_stored == true\",\n        \"response.body.incidents_opened >= 1\",\n        \"Incident record exists with status OPEN and variance 500.00\"\n      ],\n      \"trace\": [\n        \"R-FIN-025: non-zero variance shall open an incident\",\n        \"R-FIN-025: report stored\"\n      ],\n      \"executable\": \"import pytest\\nimport requests\\n\\nBASE_URL = \\\"http://banking-api\\\"\\nENDPOINT = \\\"/cron/reconcile\\\"\\n\\n@pytest.fixture\\ndef cron_auth_headers():\\n    return <fixture: cron_auth_headers>\\n\\n@pytest.fixture(autouse=True)\\ndef cleanup_incidents():\\n    <helper_fn: delete_incidents_for_date>(\\\"today\\\")\\n    yield\\n    <helper_fn: delete_incidents_for_date>(\\\"today\\\")\\n\\ndef test_reconcile_nonzero_variance_opens_incident(cron_auth_headers):\\n    payload = {\\n        \\\"trigger\\\": \\\"EO"
+  }
+}

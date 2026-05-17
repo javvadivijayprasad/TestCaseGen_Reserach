@@ -1,0 +1,191 @@
+{
+  "req": {
+    "id": "R-HLT-088",
+    "domain": "healthcare",
+    "layer": "API",
+    "category": "reporting",
+    "title": "Search patients (audit)",
+    "statement": "A clinician shall search patients by name, MRN, or DOB; only patients in their care shall be returned. An AuditEvent must be emitted for every operation and tested end-to-end.",
+    "actors": [
+      "clinician"
+    ],
+    "preconditions": [
+      "role:clinician"
+    ],
+    "triggers": [
+      "clinician searches"
+    ],
+    "expected_outcomes": [
+      "filtered bundle returned",
+      "access logged"
+    ],
+    "error_pathways": [
+      "400 when query malformed"
+    ],
+    "target_app": "fhir-lite",
+    "target_endpoint_or_screen": "/Patient?search"
+  },
+  "doc": {
+    "requirement_id": "R-HLT-088",
+    "reasoning": "R-HLT-088 requires: (1) clinicians can search patients by name/MRN/DOB, (2) only patients in their care are returned, (3) an AuditEvent is emitted per operation, (4) malformed queries return 400. Five tests are designed: EP-positive (valid name search returns care-scoped bundle + audit), NEG (malformed query returns 400), BVA (single-character name at minimum boundary), EP-negative corrected from STC (patient outside clinician's care is excluded \u2014 this is a scoping/access-control negative path best classified as EP with kind=negative, testing the equivalence partition of 'patient not in care'), and DT (multi-param search combining name+DOB). The violation was test[3] having kind=negative but heuristic=STC; STC is reserved for state-transition coverage and is inherently a positive structural heuristic. The fix is to change heuristic to EP (the out-of-care exclusion is a distinct equivalence partition of the care-scoping rule) which is valid for a negative kind test.",
+    "tests": [
+      {
+        "name": "test_search_patient_by_name_returns_scoped_bundle_and_audit",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "At least one patient assigned to this clinician exists with a known family name",
+          "AuditEvent log is accessible via /AuditEvent endpoint"
+        ],
+        "actions": [
+          "GET /Patient?name=<assigned_patient_family_name> with clinician auth header",
+          "Record response bundle",
+          "GET /AuditEvent?agent=<clinician_id>&entity=Patient with clinician auth header"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Bundle resourceType is 'Bundle'",
+          "All entries in bundle belong to clinician's care list",
+          "At least one AuditEvent recorded for this search operation",
+          "AuditEvent.action is 'E' (execute/query)"
+        ],
+        "trace": [
+          "R-HLT-088: clinician searches by name",
+          "R-HLT-088: filtered bundle returned",
+          "R-HLT-088: access logged via AuditEvent"
+        ],
+        "executable": "import pytest\n\ndef test_search_patient_by_name_returns_scoped_bundle_and_audit(\n    clinician_auth_headers, assigned_patient, fhir_client, audit_poller\n):\n    family = assigned_patient[\"name\"][0][\"family\"]\n    r = fhir_client.get(\"/Patient\", params={\"name\": family}, headers=clinician_auth_headers)\n    assert r.status_code == 200\n    bundle = r.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) >= 1\n    care_ids = {p[\"id\"] for p in assigned_patient[\"care_list\"]}\n    for entry in entries:\n        pid = entry[\"resource\"][\"id\"]\n        assert pid in care_ids, f\"{pid} not in clinician care list\"\n    audit = audit_poller(\"/AuditEvent\", entity_type=\"Patient\", action=\"E\")\n    assert len(audit) >= 1\n    assert audit[0][\"action\"] == \"E\"\n"
+      },
+      {
+        "name": "test_search_patient_malformed_query_returns_400",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "fhir-lite is running and reachable"
+        ],
+        "actions": [
+          "GET /Patient?name= (empty name param) with clinician auth header",
+          "GET /Patient?birthdate=not-a-date with clinician auth header",
+          "GET /Patient?identifier=!!INVALID!! with clinician auth header"
+        ],
+        "expected": [
+          "HTTP 400 returned for empty name",
+          "HTTP 400 returned for invalid date string",
+          "HTTP 400 returned for invalid MRN characters",
+          "Response body contains OperationOutcome resourceType for each case",
+          "OperationOutcome.issue[0].severity is 'error' for each case"
+        ],
+        "trace": [
+          "R-HLT-088: 400 when query malformed"
+        ],
+        "executable": "import pytest\n\n@pytest.mark.parametrize(\"params,label\", [\n    ({\"name\": \"\"}, \"empty_name\"),\n    ({\"birthdate\": \"not-a-date\"}, \"invalid_dob\"),\n    ({\"identifier\": \"!!INVALID!!\"}, \"invalid_mrn_chars\"),\n])\ndef test_search_patient_malformed_query_returns_400(\n    clinician_auth_headers, fhir_client, params, label\n):\n    r = fhir_client.get(\"/Patient\", params=params, headers=clinician_auth_headers)\n    assert r.status_code == 400, f\"Expected 400 for {label}, got {r.status_code}\"\n    body = r.json()\n    assert body[\"resourceType\"] == \"OperationOutcome\"\n    issues = body.get(\"issue\", [])\n    assert any(i[\"severity\"] == \"error\" for i in issues)\n"
+      },
+      {
+        "name": "test_search_patient_single_char_name_boundary",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "A patient whose family name starts with 'A' is assigned to the clinician",
+          "fhir-lite supports prefix-match on name parameter"
+        ],
+        "actions": [
+          "GET /Patient?name=A with clinician auth header (single-character boundary input)",
+          "Record HTTP status and bundle entry count"
+        ],
+        "expected": [
+          "HTTP 200 returned (single-char is valid minimum input)",
+          "Bundle resourceType is 'Bundle'",
+          "All returned patients belong to clinician's care",
+          "AuditEvent emitted for this query"
+        ],
+        "trace": [
+          "R-HLT-088: clinician searches by name",
+          "R-HLT-088: BVA min-length boundary for search term",
+          "R-HLT-088: access logged"
+        ],
+        "executable": "def test_search_patient_single_char_name_boundary(\n    clinician_auth_headers, fhir_client, audit_poller, assigned_patient_starting_with_a\n):\n    r = fhir_client.get(\"/Patient\", params={\"name\": \"A\"}, headers=clinician_auth_headers)\n    assert r.status_code == 200, f\"Single-char name should be valid, got {r.status_code}\"\n    bundle = r.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    care_ids = {p[\"id\"] for p in assigned_patient_starting_with_a[\"care_list\"]}\n    for entry in bundle.get(\"entry\", []):\n        pid = entry[\"resource\"][\"id\"]\n        assert pid in care_ids, f\"{pid} not in clinician care list\"\n    audit = audit_poller(\"/AuditEvent\", entity_type=\"Patient\", action=\"E\")\n    assert len(audit) >= 1\n"
+      },
+      {
+        "name": "test_search_patient_outside_care_excluded",
+        "kind": "negative",
+        "heuristic": "EP",
+        "preconditions": [
+          "Clinician A is authenticated with role:clinician",
+          "Patient X is assigned ONLY to Clinician B (not Clinician A)",
+          "Patient X's MRN is known and resolvable by the system"
+        ],
+        "actions": [
+          "GET /Patient?identifier=<patient_X_mrn> with Clinician A auth header",
+          "Inspect returned bundle entries for presence of Patient X"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Bundle contains zero entries (patient not in clinician's care)",
+          "AuditEvent still emitted (zero-result searches must be auditable)",
+          "No patient data from outside care scope is leaked in any field"
+        ],
+        "trace": [
+          "R-HLT-088: only patients in their care shall be returned",
+          "R-HLT-088: EP negative partition \u2014 out-of-care patient MRN search returns empty bundle",
+          "R-HLT-088: access logged for every operation including empty results"
+        ],
+        "executable": "def test_search_patient_outside_care_excluded(\n    clinician_a_auth_headers, patient_outside_care, fhir_client, audit_poller\n):\n    mrn = patient_outside_care[\"identifier\"][0][\"value\"]\n    r = fhir_client.get(\n        \"/Patient\",\n        params={\"identifier\": mrn},\n        headers=clinician_a_auth_headers\n    )\n    assert r.status_code == 200\n    bundle = r.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    entries = bundle.get(\"entry\", [])\n    assert len(entries) == 0, \"Out-of-care patient must not appear in results\"\n    audit = audit_poller(\"/AuditEvent\", entity_type=\"Patient\", action=\"E\")\n    assert len(audit) >= 1, \"Audit must be emitted even for zero-result queries\"\n"
+      },
+      {
+        "name": "test_search_patient_by_name_and_dob_combined",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Clinician is authenticated with role:clinician",
+          "Assigned patient with known family name AND known DOB exists",
+          "A second patient with same family name but different DOB also exists and is in clinician's care"
+        ],
+        "actions": [
+          "GET /Patient?name=<family>&birthdate=<dob> with clinician auth header",
+          "Verify only the patient matching BOTH criteria is returned",
+          "Confirm the same-name-different-DOB patient is absent from results"
+        ],
+        "expected": [
+          "HTTP 200 returned",
+          "Bundle entries contain exactly the patient matching both name AND DOB",
+          "Patient with same name but different DOB is NOT in results",
+          "AuditEvent emitted reflecting the combined search parameters"
+        ],
+        "trace": [
+          "R-HLT-088: clinician searches by name OR DOB (DT: both-param combination row)",
+          "R-HLT-088: filtered bundle returned",
+          "R-HLT-088: access logged"
+        ],
+        "executable": "def test_search_patient_by_name_and_dob_combined(\n    clinician_auth_headers, assigned_patient, same_name_different_dob_patient,\n    fhir_client, audit_poller\n):\n    family = assigned_patient[\"name\"][0][\"family\"]\n    dob = assigned_patient[\"birthDate\"]\n    r = fhir_client.get(\n        \"/Patient\",\n        params={\"name\": family, \"birthdate\": dob},\n        headers=clinician_auth_headers\n    )\n    assert r.status_code == 200\n    bundle = r.json()\n    assert bundle[\"resourceType\"] == \"Bundle\"\n    ids = [e[\"resource\"][\"id\"] for e in bundle.get(\"entry\", [])]\n    assert assigned_patient[\"id\"] in ids, \"Exact-match patient must be in results\"\n    assert same_name_different_dob_patient[\"id\"] not in ids, \"Different-DOB patient must be excluded\"\n    audit = audit_poller(\"/AuditEvent\", entity_type=\"Patient\", action=\"E\")\n    assert len(audit) >= 1\n"
+      }
+    ]
+  },
+  "req_id": "R-HLT-088",
+  "domain": "healthcare",
+  "condition": "full",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 0,
+  "verify_violations": [
+    "[logical] test[3] negative kind but heuristic=EP"
+  ],
+  "repair_attempts": 1,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1003,
+    "output_tokens": 2943,
+    "latency_ms": 34446,
+    "wall_ms": 34446,
+    "condition": "full",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-HLT-088\",\n  \"reasoning\": \"R-HLT-088 requires: (1) clinicians can search patients by name/MRN/DOB, (2) only patients in their care are returned, (3) an AuditEvent is emitted per operation, (4) malformed queries return 400. I designed five tests covering: EP-positive (valid name search returns care-scoped bundle + audit), NEG (malformed query returns 400), BVA (single-character name at minimum boundary), DT (multi-param search combining name+DOB), and STC (patient outside clinician's care is excluded). Each test is self-contained via fixtures and cleans up after itself.\",\n  \"tests\": [\n    {\n      \"name\": \"test_search_patient_by_name_returns_scoped_bundle_and_audit\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"At least one patient assigned to this clinician exists with a known family name\",\n        \"AuditEvent log is accessible via /AuditEvent endpoint\"\n      ],\n      \"actions\": [\n        \"GET /Patient?name=<assigned_patient_family_name> with clinician auth header\",\n        \"Record response bundle\",\n        \"GET /AuditEvent?agent=<clinician_id>&entity=Patient with clinician auth header\"\n      ],\n      \"expected\": [\n        \"HTTP 200 returned\",\n        \"Bundle resourceType is 'Bundle'\",\n        \"All entries in bundle belong to clinician's care list\",\n        \"At least one AuditEvent recorded for this search operation\",\n        \"AuditEvent.action is 'E' (execute/query)\"\n      ],\n      \"trace\": [\n        \"R-HLT-088: clinician searches by name\",\n        \"R-HLT-088: filtered bundle returned\",\n        \"R-HLT-088: access logged via AuditEvent\"\n      ],\n      \"executable\": \"import pytest\\n\\ndef test_search_patient_by_name_returns_scoped_bundle_and_audit(\\n    clinician_auth_headers, assigned_patient, fhir_client, audit_poller\\n):\\n    family = assigned_patient[\\\"name\\\"][0][\\\"family\\\"]\\n    r = fhir_client.get(\\\"/Patient\\\", params={\\\"name\\\": family}, headers=clinician_auth_headers)\\n    assert r.status_code == 200\\n    bundle = r.json()\\n    assert bundle[\\\"resourceType\\\"] == \\\"Bundle\\\"\\n    entries = bundle.get(\\\"entry\\\", [])\\n    assert len(entries) >= 1\\n    for entry in entries:\\n        pid = entry[\\\"resource\\\"][\\\"id\\\"]\\n        assert <is_patient_in_care>(pid, clinician_auth_headers), f\\\"{pid} not in care\\\"\\n    audit = audit_poller(\\\"/AuditEvent\\\", entity_type=\\\"Patient\\\", action=\\\"E\\\")\\n    assert len(audit) >= 1\\n    assert audit[0][\\\"action\\\"] == \\\"E\\\"\\n\"\n    },\n    {\n      \"name\": \"test_search_patient_malformed_query_returns_400\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Clinician is authenticated with role:clinician\",\n        \"fhir-lite is running and reachable\"\n      ],\n      \"actions\": [\n        \"GET /Patient?name= (empty name param) with clinician auth header\",\n        \"Also GET /Patient?dob=not-a-date with clinician auth header\"\n      ],\n      \"expected\": [\n        \"HTTP 400 returned for empty name\",\n        \"HTTP 400 returned for invalid date\",\n        \"Response body contains OperationOutcome resourceType\",\n        \"OperationOutcome.issue[0].severity is 'error'\"\n      ],\n      \"trace\": [\n        \"R-HLT-088: 400 when query malformed\"\n      ],\n      \"executable\": \"import pytest\\n\\n@pytest.mark.parametrize(\\\"params,label\\\", [\\n    ({\\\"name\\\": \\\"\\\"}, \\\"empty_name\\\"),\\n    ({\\\"birthdate\\\": \\\"not-a-date\\\"}, \\\"invalid_dob\\\"),\\n    ({\\\"mrn\\\": \\\"!!INVALID!!\\\"}, \\\"invalid_mrn_chars\\\"),\\n])\\ndef test_search_patient_malformed_query_returns_400(\\n    clinician_auth_headers, fhir_client, params, label\\n):\\n    r = fhir_client.get(\\\"/Patient\\\", params=params, headers=clinician_auth_headers)\\n    assert r.status_code == 400, f\\\"Expected 400 for {label}, got {r.status_code}\\\"\\n    body = r.json()\\n    assert body[\\\"resourceType\\\"] == \\\"OperationOutcome\\\"\\n    issues = body.get(\\\"issue\\\", [])\\n    assert any(i[\\\"severity\\\"] == \\\"error\\\" for i in issues)\\n\"\n    },\n  "
+  }
+}

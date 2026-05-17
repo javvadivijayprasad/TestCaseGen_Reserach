@@ -1,0 +1,181 @@
+{
+  "req": {
+    "id": "R-FIN-094",
+    "domain": "financial_services",
+    "layer": "API",
+    "category": "validation",
+    "title": "Cheque deposit by mobile (idempotency variant)",
+    "statement": "A customer shall deposit a cheque via mobile image; cheques above $5,000 shall require manual verification. The operation must be idempotent: duplicate submission with the same Idempotency-Key must return the original result.",
+    "actors": [
+      "customer"
+    ],
+    "preconditions": [
+      "authenticated"
+    ],
+    "triggers": [
+      "image uploaded"
+    ],
+    "expected_outcomes": [
+      "deposit pending",
+      "decisioning queued"
+    ],
+    "error_pathways": [
+      "422 when image fails MICR decode"
+    ],
+    "target_app": "banking-api",
+    "target_endpoint_or_screen": "/deposits/mobile-cheque"
+  },
+  "doc": {
+    "requirement_id": "R-FIN-094",
+    "reasoning": "The requirement defines three key decision axes: (1) amount threshold ($5,000 boundary for manual verification), (2) idempotency on duplicate Idempotency-Key submission, and (3) MICR decode failure returning 422. I selected EP to cover a normal below-threshold deposit (happy path), NEG for invalid MICR image, BVA for the $5,000 exact boundary, DT for the idempotency duplicate-key scenario (crossing state), and STC for the state transition from initial submission to duplicate replay. Together these achieve full requirement coverage per R-FIN-094.",
+    "tests": [
+      {
+        "name": "test_mobile_cheque_deposit_below_threshold_returns_pending",
+        "kind": "positive",
+        "heuristic": "EP",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A valid cheque image with decodable MICR is available",
+          "Cheque amount is $1,000 (well within the sub-$5,000 partition)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image payload, amount=1000, and unique Idempotency-Key",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status='pending'",
+          "Response body does NOT contain manual_review=true",
+          "A deposit_id is present in the response"
+        ],
+        "trace": [
+          "R-FIN-094: deposit pending outcome",
+          "R-FIN-094: amounts below $5,000 do not require manual verification"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_mobile_cheque_deposit_below_threshold_returns_pending(\n    auth_client,  # <fixture>: returns authenticated requests.Session\n    valid_cheque_image,  # <fixture>: returns bytes of a MICR-valid cheque image\n    api_base_url,  # <fixture>: returns base URL string\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = <build_multipart_payload>(valid_cheque_image, amount=1000)\n    headers = {\n        \"Authorization\": f\"Bearer {auth_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    resp = auth_client.post(\n        f\"{api_base_url}/deposits/mobile-cheque\",\n        files=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is not True\n    assert \"deposit_id\" in body\n"
+      },
+      {
+        "name": "test_mobile_cheque_deposit_invalid_micr_returns_422",
+        "kind": "negative",
+        "heuristic": "NEG",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A cheque image with corrupt/unreadable MICR line is available"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with the corrupt MICR image payload and a unique Idempotency-Key",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 422 Unprocessable Entity",
+          "Response body contains an error code referencing MICR decode failure",
+          "No deposit_id is present in the response"
+        ],
+        "trace": [
+          "R-FIN-094: error pathway - 422 when image fails MICR decode"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_mobile_cheque_deposit_invalid_micr_returns_422(\n    auth_client,  # <fixture>\n    corrupt_micr_image,  # <fixture>: returns bytes of a cheque image with bad MICR\n    api_base_url,  # <fixture>\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = <build_multipart_payload>(corrupt_micr_image, amount=500)\n    headers = {\n        \"Authorization\": f\"Bearer {auth_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    resp = auth_client.post(\n        f\"{api_base_url}/deposits/mobile-cheque\",\n        files=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 422\n    body = resp.json()\n    error_code = body.get(\"error\", {}).get(\"code\", \"\")\n    assert \"micr\" in error_code.lower() or \"decode\" in error_code.lower()\n    assert \"deposit_id\" not in body\n"
+      },
+      {
+        "name": "test_mobile_cheque_deposit_exactly_5000_requires_manual_review",
+        "kind": "boundary",
+        "heuristic": "BVA",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A valid cheque image with decodable MICR is available",
+          "Cheque amount is exactly $5,000 (the boundary value)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image, amount=5000, and unique Idempotency-Key",
+          "Capture HTTP status code and response body"
+        ],
+        "expected": [
+          "HTTP 202 Accepted",
+          "Response body contains status='pending'",
+          "Response body contains manual_review=true",
+          "Response body contains decisioning_queued=true or equivalent queue reference"
+        ],
+        "trace": [
+          "R-FIN-094: cheques above $5,000 shall require manual verification",
+          "R-FIN-094: boundary at $5,000 triggers decisioning queue"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_mobile_cheque_deposit_exactly_5000_requires_manual_review(\n    auth_client,  # <fixture>\n    valid_cheque_image,  # <fixture>\n    api_base_url,  # <fixture>\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = <build_multipart_payload>(valid_cheque_image, amount=5000)\n    headers = {\n        \"Authorization\": f\"Bearer {auth_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    resp = auth_client.post(\n        f\"{api_base_url}/deposits/mobile-cheque\",\n        files=payload,\n        headers=headers,\n    )\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is True\n    assert body.get(\"decisioning_queued\") is True or body.get(\"queue_ref\") is not None\n"
+      },
+      {
+        "name": "test_mobile_cheque_deposit_idempotent_duplicate_key_returns_original_result",
+        "kind": "positive",
+        "heuristic": "DT",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A valid cheque image with decodable MICR is available",
+          "The same Idempotency-Key has already been used in a prior successful submission"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque (first call) with valid image, amount=2000, fixed Idempotency-Key",
+          "Record first response deposit_id and status",
+          "POST /deposits/mobile-cheque (second call) with identical Idempotency-Key and same payload",
+          "Compare second response to first response"
+        ],
+        "expected": [
+          "Both calls return HTTP 202",
+          "Second response deposit_id equals first response deposit_id",
+          "Second response status equals first response status",
+          "No duplicate deposit record is created"
+        ],
+        "trace": [
+          "R-FIN-094: duplicate submission with same Idempotency-Key must return original result"
+        ],
+        "executable": "import pytest\nimport uuid\n\ndef test_mobile_cheque_deposit_idempotent_duplicate_key_returns_original_result(\n    auth_client,  # <fixture>\n    valid_cheque_image,  # <fixture>\n    api_base_url,  # <fixture>\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = <build_multipart_payload>(valid_cheque_image, amount=2000)\n    headers = {\n        \"Authorization\": f\"Bearer {auth_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    resp1 = auth_client.post(\n        f\"{api_base_url}/deposits/mobile-cheque\",\n        files=payload, headers=headers,\n    )\n    assert resp1.status_code == 202\n    body1 = resp1.json()\n    resp2 = auth_client.post(\n        f\"{api_base_url}/deposits/mobile-cheque\",\n        files=<build_multipart_payload>(valid_cheque_image, amount=2000),\n        headers=headers,\n    )\n    assert resp2.status_code == 202\n    body2 = resp2.json()\n    assert body2[\"deposit_id\"] == body1[\"deposit_id\"]\n    assert body2[\"status\"] == body1[\"status\"]\n"
+      },
+      {
+        "name": "test_mobile_cheque_deposit_state_transitions_pending_to_queued",
+        "kind": "positive",
+        "heuristic": "STC",
+        "preconditions": [
+          "Customer is authenticated and holds a valid JWT",
+          "A valid cheque image with decodable MICR is available",
+          "Cheque amount is $6,000 (above $5,000 threshold to force decisioning queue)"
+        ],
+        "actions": [
+          "POST /deposits/mobile-cheque with valid image, amount=6000, unique Idempotency-Key",
+          "Assert initial response state is 'pending' and manual_review=true",
+          "GET /deposits/{deposit_id} after a short poll delay to observe state transition",
+          "Assert deposit record reflects decisioning_queued state"
+        ],
+        "expected": [
+          "Initial POST returns HTTP 202 with status='pending' and manual_review=true",
+          "Subsequent GET returns status that is 'pending' or 'under_review' (decisioning queued)",
+          "State never regresses from a later state back to an earlier one"
+        ],
+        "trace": [
+          "R-FIN-094: decisioning queued as expected outcome",
+          "R-FIN-094: cheques above $5,000 require manual verification (state transition)"
+        ],
+        "executable": "import pytest\nimport time\nimport uuid\n\ndef test_mobile_cheque_deposit_state_transitions_pending_to_queued(\n    auth_client,  # <fixture>\n    valid_cheque_image,  # <fixture>\n    api_base_url,  # <fixture>\n):\n    idempotency_key = str(uuid.uuid4())\n    payload = <build_multipart_payload>(valid_cheque_image, amount=6000)\n    headers = {\n        \"Authorization\": f\"Bearer {auth_client.token}\",\n        \"Idempotency-Key\": idempotency_key,\n    }\n    resp = auth_client.post(\n        f\"{api_base_url}/deposits/mobile-cheque\",\n        files=payload, headers=headers,\n    )\n    assert resp.status_code == 202\n    body = resp.json()\n    assert body[\"status\"] == \"pending\"\n    assert body.get(\"manual_review\") is True\n    deposit_id = body[\"deposit_id\"]\n    time.sleep(2)  # allow async decisioning worker to enqueue\n    poll = auth_client.get(\n        f\"{api_base_url}/deposits/{deposit_id}\",\n        headers={\"Authorization\": f\"Bearer {auth_client.token}\"},\n    )\n    assert poll.status_code == 200\n    poll_status = poll.json()[\"status\"]\n    assert poll_status in (\"pending\", \"under_review\", \"decisioning_queued\")\n"
+      }
+    ]
+  },
+  "req_id": "R-FIN-094",
+  "domain": "financial_services",
+  "condition": "ablation",
+  "coverage": {
+    "positive": true,
+    "negative": true,
+    "boundary": true
+  },
+  "mutation_score": 0.0,
+  "verify_first_pass": 1,
+  "verify_violations": [],
+  "repair_attempts": 0,
+  "telemetry": {
+    "backend": "anthropic",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 1017,
+    "output_tokens": 3289,
+    "latency_ms": 39574,
+    "wall_ms": 39574,
+    "condition": "ablation",
+    "prompt_version": "raitg-prompt-v1.0.0",
+    "raw_response_head": "```json\n{\n  \"requirement_id\": \"R-FIN-094\",\n  \"reasoning\": \"The requirement defines three key decision axes: (1) amount threshold ($5,000 boundary for manual verification), (2) idempotency on duplicate Idempotency-Key submission, and (3) MICR decode failure returning 422. I selected EP to cover a normal below-threshold deposit (happy path), NEG for invalid MICR image, BVA for the $5,000 exact boundary, DT for the idempotency duplicate-key scenario (crossing state), and STC for the state transition from initial submission to duplicate replay. Together these achieve full requirement coverage per R-FIN-094.\",\n  \"tests\": [\n    {\n      \"name\": \"test_mobile_cheque_deposit_below_threshold_returns_pending\",\n      \"kind\": \"positive\",\n      \"heuristic\": \"EP\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"A valid cheque image with decodable MICR is available\",\n        \"Cheque amount is $1,000 (well within the sub-$5,000 partition)\"\n      ],\n      \"actions\": [\n        \"POST /deposits/mobile-cheque with valid image payload, amount=1000, and unique Idempotency-Key\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 202 Accepted\",\n        \"Response body contains status='pending'\",\n        \"Response body does NOT contain manual_review=true\",\n        \"A deposit_id is present in the response\"\n      ],\n      \"trace\": [\n        \"R-FIN-094: deposit pending outcome\",\n        \"R-FIN-094: amounts below $5,000 do not require manual verification\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_mobile_cheque_deposit_below_threshold_returns_pending(\\n    auth_client,  # <fixture>: returns authenticated requests.Session\\n    valid_cheque_image,  # <fixture>: returns bytes of a MICR-valid cheque image\\n    api_base_url,  # <fixture>: returns base URL string\\n):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = <build_multipart_payload>(valid_cheque_image, amount=1000)\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {auth_client.token}\\\",\\n        \\\"Idempotency-Key\\\": idempotency_key,\\n    }\\n    resp = auth_client.post(\\n        f\\\"{api_base_url}/deposits/mobile-cheque\\\",\\n        files=payload,\\n        headers=headers,\\n    )\\n    assert resp.status_code == 202\\n    body = resp.json()\\n    assert body[\\\"status\\\"] == \\\"pending\\\"\\n    assert body.get(\\\"manual_review\\\") is not True\\n    assert \\\"deposit_id\\\" in body\\n\"\n    },\n    {\n      \"name\": \"test_mobile_cheque_deposit_invalid_micr_returns_422\",\n      \"kind\": \"negative\",\n      \"heuristic\": \"NEG\",\n      \"preconditions\": [\n        \"Customer is authenticated and holds a valid JWT\",\n        \"A cheque image with corrupt/unreadable MICR line is available\"\n      ],\n      \"actions\": [\n        \"POST /deposits/mobile-cheque with the corrupt MICR image payload and a unique Idempotency-Key\",\n        \"Capture HTTP status code and response body\"\n      ],\n      \"expected\": [\n        \"HTTP 422 Unprocessable Entity\",\n        \"Response body contains an error code referencing MICR decode failure\",\n        \"No deposit_id is present in the response\"\n      ],\n      \"trace\": [\n        \"R-FIN-094: error pathway - 422 when image fails MICR decode\"\n      ],\n      \"executable\": \"import pytest\\nimport uuid\\n\\ndef test_mobile_cheque_deposit_invalid_micr_returns_422(\\n    auth_client,  # <fixture>\\n    corrupt_micr_image,  # <fixture>: returns bytes of a cheque image with bad MICR\\n    api_base_url,  # <fixture>\\n):\\n    idempotency_key = str(uuid.uuid4())\\n    payload = <build_multipart_payload>(corrupt_micr_image, amount=500)\\n    headers = {\\n        \\\"Authorization\\\": f\\\"Bearer {auth_client.token}\\\",\\n        \\\"Idempotency-Key\\\": idempotency_key,\\n    }\\n    resp = auth_client.post(\\n        f\\\"{api_base_url}/deposits/mobile-cheque\\\",\\n        files=payload,\\n        headers=headers,\\n    )\\n    assert resp.status_code == 422\\n    body = resp.json()\\n    error_code = body.get(\\\"error\\\", {}).get(\\\"code\\\", "
+  }
+}
