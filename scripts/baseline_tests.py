@@ -598,8 +598,125 @@ def run_hr_tests(*classes):
     assert HRApp.password_ok("LongEnoughPwNoDigit!") is False  # no digit
     assert HRApp.password_ok("ValidPassword1!") is True
     # Each symbol from the allowed set kills boolean-set mutations
+    # (need >= 10 chars per password_ok rule; "ValidPw12" + symbol = 10)
     for s in "!@#$%^&*()_-+=[]{}":
-        assert HRApp.password_ok(f"ValidPw1{s}") is True
+        assert HRApp.password_ok(f"ValidPw12{s}") is True
+
+
+# --------------------------------------------------------------- logistics-app
+def run_logistics_tests(LogisticsApp):
+    la = LogisticsApp()
+
+    # ---- create_shipment boundaries
+    sh = la.create_shipment("A", "B", 5.0, 30, 20, 15)
+    assert sh.id > 0 and sh.status == "created"
+    la.create_shipment("A", "B", 0.01, 10, 10, 10)
+    la.create_shipment("A", "B", 50.0, 10, 10, 10)
+    try: la.create_shipment("A", "B", 50.1, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+    try: la.create_shipment("A", "B", 0, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+    la.create_shipment("A", "B", 1.0, 200, 200, 200)
+    try: la.create_shipment("A", "B", 1.0, 201, 10, 10); raise AssertionError
+    except ValueError: pass
+    try: la.create_shipment("A", "A", 1.0, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+    try: la.create_shipment("", "B", 1.0, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+
+    # ---- register_driver
+    dr_b = la.register_driver("Alex Doe", "B", 50.0)
+    dr_c = la.register_driver("Bea Doe", "C", 200.0)
+    dr_haz = la.register_driver("Cee Haz", "C+haz", 500.0)
+    try: la.register_driver("Bad", "A", 100.0); raise AssertionError
+    except ValueError: pass
+    la.register_driver("Big", "C", 1000.0)
+    try: la.register_driver("Huge", "C", 1000.01); raise AssertionError
+    except ValueError: pass
+    try: la.register_driver("Zero", "C", 0); raise AssertionError
+    except ValueError: pass
+    try: la.register_driver("", "C", 100.0); raise AssertionError
+    except ValueError: pass
+
+    # ---- assign_driver
+    sh_ok = la.create_shipment("X", "Y", 5.0, 20, 20, 20)
+    la.assign_driver(sh_ok.id, dr_b.id)
+    assert la.shipments[sh_ok.id].status == "assigned"
+    try: la.assign_driver(sh_ok.id, dr_c.id); raise AssertionError
+    except ValueError: pass
+    sh_heavy = la.create_shipment("X", "Y", 30.0, 20, 20, 20)
+    dr_e = la.register_driver("Ed", "C", 25.0)
+    try: la.assign_driver(sh_heavy.id, dr_e.id); raise AssertionError
+    except ValueError: pass
+    sh_haz = la.create_shipment("X", "Y", 5.0, 10, 10, 10, hazmat=True)
+    try: la.assign_driver(sh_haz.id, dr_e.id); raise AssertionError
+    except ValueError: pass
+    la.assign_driver(sh_haz.id, dr_haz.id)
+    try: la.assign_driver(99999, dr_e.id); raise AssertionError
+    except KeyError: pass
+    try: la.assign_driver(sh_heavy.id, 99999); raise AssertionError
+    except KeyError: pass
+
+    # ---- cancel_shipment
+    sh_cx = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
+    assert la.cancel_shipment(sh_cx.id, "dispatcher") is True
+    assert la.shipments[sh_cx.id].status == "cancelled"
+    sh_cx2 = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
+    try: la.cancel_shipment(sh_cx2.id, "driver"); raise AssertionError
+    except PermissionError: pass
+    assert la.cancel_shipment(99999, "admin") is False
+    la.shipments[sh_cx2.id].status = "in_transit"
+    try: la.cancel_shipment(sh_cx2.id, "dispatcher"); raise AssertionError
+    except ValueError: pass
+
+    # ---- confirm_delivery
+    sh_d = la.create_shipment("P", "Q", 5.0, 20, 20, 20)
+    dr_f = la.register_driver("Fi", "C", 100.0)
+    la.assign_driver(sh_d.id, dr_f.id)
+    la.shipments[sh_d.id].status = "in_transit"
+    att = la.confirm_delivery(sh_d.id, "2026-06-17T10:00:00", "AB")
+    assert att.outcome == "delivered" and att.signature == "AB"
+    assert la.shipments[sh_d.id].status == "delivered"
+    assert la.drivers[dr_f.id].status == "available"
+    sh_d2 = la.create_shipment("P", "Q", 1.0, 10, 10, 10)
+    la.shipments[sh_d2.id].status = "in_transit"
+    try: la.confirm_delivery(sh_d2.id, "2026-06-17T11:00:00", "A"); raise AssertionError
+    except ValueError: pass
+    sh_d3 = la.create_shipment("P", "Q", 1.0, 10, 10, 10)
+    try: la.confirm_delivery(sh_d3.id, "2026-06-17T12:00:00", "OK"); raise AssertionError
+    except ValueError: pass
+    try: la.confirm_delivery(99999, "2026-06-17T12:00:00", "OK"); raise AssertionError
+    except KeyError: pass
+
+    # ---- report_exception
+    sh_e = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+    la.shipments[sh_e.id].status = "in_transit"
+    att_r = la.report_exception(sh_e.id, "2026-06-17T13:00:00", "refused")
+    assert att_r.outcome == "refused"
+    assert la.shipments[sh_e.id].status == "failed"
+    sh_e2 = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+    la.shipments[sh_e2.id].status = "in_transit"
+    try: la.report_exception(sh_e2.id, "2026-06-17T13:00:00", "bogus"); raise AssertionError
+    except ValueError: pass
+    sh_e3 = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+    try: la.report_exception(sh_e3.id, "2026-06-17T13:00:00", "damaged"); raise AssertionError
+    except ValueError: pass
+    for out in ("refused", "damaged", "wrong_address", "no_response"):
+        sh_x = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+        la.shipments[sh_x.id].status = "in_transit"
+        att_x = la.report_exception(sh_x.id, "2026-06-17T13:00:00", out)
+        assert att_x.outcome == out
+
+    # ---- Pure helpers
+    assert LogisticsApp.is_dimension_ok(1, 1, 1) is True
+    assert LogisticsApp.is_dimension_ok(200, 200, 200) is True
+    assert LogisticsApp.is_dimension_ok(201, 1, 1) is False
+    assert LogisticsApp.is_dimension_ok(1, 0, 1) is False
+    assert LogisticsApp.shipping_fee(1.0) == 7.5
+    assert LogisticsApp.shipping_fee(10.0) == 30.0
+    assert LogisticsApp.shipping_fee(1.0, hazmat=True) == 22.5
+    try: LogisticsApp.shipping_fee(0); raise AssertionError
+    except ValueError: pass
 
 
 def run_app(app_name, src_text):
@@ -620,6 +737,8 @@ def run_app(app_name, src_text):
         elif app_name == "hr-app":
             run_hr_tests(namespace["Employee"], namespace["LeaveRequest"],
                           namespace["Timesheet"], namespace["HRApp"])
+        elif app_name == "logistics-app":
+            run_logistics_tests(namespace["LogisticsApp"])
         else:
             return False
         return True
@@ -630,7 +749,7 @@ def run_app(app_name, src_text):
 if __name__ == "__main__":
     from pathlib import Path
     ROOT = Path(__file__).resolve().parent.parent
-    for app in ["banking-api", "fhir-lite", "hr-app"]:
+    for app in ["banking-api", "fhir-lite", "hr-app", "logistics-app"]:
         src = (ROOT / "repo" / app / "app.py").read_text()
         ok = run_app(app, src)
         print(f"  {app:14s}: baseline {'PASS' if ok else 'FAIL'}")

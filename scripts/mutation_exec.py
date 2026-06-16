@@ -41,11 +41,12 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 
-DOMAINS = ["commercial_web", "financial_services", "healthcare"]
+DOMAINS = ["commercial_web", "financial_services", "healthcare", "logistics"]
 APP_FOR_DOMAIN = {
     "commercial_web": ROOT / "repo" / "hr-app",
     "financial_services": ROOT / "repo" / "banking-api",
     "healthcare": ROOT / "repo" / "fhir-lite",
+    "logistics": ROOT / "repo" / "logistics-app",
 }
 
 

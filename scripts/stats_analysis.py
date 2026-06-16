@@ -35,7 +35,7 @@ TAB.mkdir(exist_ok=True)
 random.seed(20260421)
 
 CONDITIONS = ["unverified", "ablation", "full"]
-DOMAINS = ["commercial_web", "financial_services", "healthcare"]
+DOMAINS = ["commercial_web", "financial_services", "healthcare", "logistics"]
 
 
 def load_per_req() -> list[dict]:

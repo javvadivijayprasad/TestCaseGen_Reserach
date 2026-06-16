@@ -29,7 +29,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from baseline_tests import run_app
 
-APPS = ["banking-api", "fhir-lite", "hr-app"]
+APPS = ["banking-api", "fhir-lite", "hr-app", "logistics-app"]
 
 # AST-level mutation operators
 COMPARE_SWAPS = {

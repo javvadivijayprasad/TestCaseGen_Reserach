@@ -50,6 +50,7 @@ DOMAIN_LABELS = {
     "commercial_web": "Commercial Web",
     "financial_services": "Financial Services",
     "healthcare": "Healthcare",
+    "logistics": "Logistics",
 }
 
 
@@ -194,7 +195,7 @@ def fig_aggregate_results() -> None:
 # Figure: Coverage by domain (LLM conditions only — from run logs)
 # ---------------------------------------------------------------------------
 def fig_coverage_by_domain(per_dom: dict) -> None:
-    domains = ["commercial_web", "financial_services", "healthcare"]
+    domains = ["commercial_web", "financial_services", "healthcare", "logistics"]
     labels = [DOMAIN_LABELS[d] for d in domains]
 
     def series(cond: str) -> list[float]:
@@ -229,7 +230,7 @@ def fig_coverage_by_domain(per_dom: dict) -> None:
 # Figure: Mutation score by domain (LLM conditions only)
 # ---------------------------------------------------------------------------
 def fig_mutation_by_domain(per_dom: dict) -> None:
-    domains = ["commercial_web", "financial_services", "healthcare"]
+    domains = ["commercial_web", "financial_services", "healthcare", "logistics"]
     labels = [DOMAIN_LABELS[d] for d in domains]
 
     def series(cond: str) -> list[float]:

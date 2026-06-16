@@ -44,11 +44,12 @@ import llm_adapter  # noqa: E402
 from json_extract import extract_json  # noqa: E402
 
 CONDITIONS = ["unverified", "ablation", "full"]
-DOMAINS = ["commercial_web", "financial_services", "healthcare"]
+DOMAINS = ["commercial_web", "financial_services", "healthcare", "logistics"]
 APP_FOR_DOMAIN = {
     "commercial_web": ROOT / "repo" / "hr-app" / "app.py",
     "financial_services": ROOT / "repo" / "banking-api" / "app.py",
     "healthcare": ROOT / "repo" / "fhir-lite" / "app.py",
+    "logistics": ROOT / "repo" / "logistics-app" / "app.py",
 }
 
 
@@ -351,7 +352,8 @@ def main() -> int:
         per_dom_rows.append([
             {"commercial_web": "Commercial Web",
              "financial_services": "Financial Services",
-             "healthcare": "Healthcare"}[d],
+             "healthcare": "Healthcare",
+             "logistics": "Logistics"}[d],
             f"{rec['tokens'] / 1_000_000 * 0.6 + rec['requirements'] * setup_hours_per_req:.1f}",
             f"{rec['coverage_pct']:.1f}",
             f"{rec['mutation_score_pct']:.1f}",
