@@ -209,49 +209,21 @@ def main() -> int:
     ap.add_argument("--conditions", default="unverified,ablation,full",
                     help="Comma-separated list of conditions to run")
     ap.add_argument("--backend", default="auto",
-                    choices=["auto", "anthropic", "stub", "stdlib",
-                             "openai", "gemini", "groq", "llama"])
-    ap.add_argument("--model", default=None,
-                    help="Model id; if omitted a provider-appropriate default "
-                         "is chosen (Sonnet for anthropic/auto, gpt-4o-mini "
-                         "for openai, gemini-2.5-flash for gemini, "
-                         "llama-3.3-70b-versatile for groq/llama)")
+                    choices=["auto", "anthropic", "stub", "stdlib"])
+    ap.add_argument("--model", default="claude-sonnet-4-6")
     ap.add_argument("--out", default=str(ROOT / "results"))
-    ap.add_argument("--out-suffix", default="",
-                    help="Suffix appended to --out (e.g. '_openai' → "
-                         "results_openai/runs/). Lets cross-provider runs "
-                         "coexist without clobbering the Sonnet baseline.")
-    ap.add_argument("--seed", type=int, default=None,
-                    help="Optional integer seed passed to OpenAIAdapter for "
-                         "reproducibility. Ignored by non-OpenAI backends.")
     ap.add_argument("--resume", action="store_true", default=True,
                     help="Skip requirements that already have a run log (default)")
     ap.add_argument("--no-resume", dest="resume", action="store_false",
                     help="Force re-run of every requirement, ignoring run logs")
     args = ap.parse_args()
 
-    # Provider-appropriate default model
-    if args.model is None:
-        if args.backend in ("openai", "gpt"):
-            args.model = "gpt-4o-mini"
-        elif args.backend in ("gemini", "google"):
-            args.model = "gemini-2.5-flash"
-        elif args.backend in ("groq", "llama"):
-            args.model = "llama-3.3-70b-versatile"
-        else:
-            args.model = "claude-sonnet-4-6"
-
-    # Apply --out-suffix if provided (results → results_openai, etc.)
-    if args.out_suffix:
-        args.out = args.out + args.out_suffix
-
     pilot_n = args.pilot if args.pilot else None
     if not pilot_n and not args.full:
         pilot_n = 30  # default to a 30-requirement pilot
 
     reqs = load_dataset(pilot=pilot_n)
-    adapter = llm_adapter.build_adapter(args.backend, model=args.model,
-                                        seed=args.seed)
+    adapter = llm_adapter.build_adapter(args.backend, model=args.model)
     print(f"[run_experiment] loaded {len(reqs)} requirements; "
           f"backend={adapter.__class__.__name__}; "
           f"model={getattr(adapter, 'model', 'n/a')}")
@@ -412,9 +384,4 @@ def main() -> int:
     for row in agg_csv:
         print("  ", row)
     print("\nCSVs written to:", ROOT / "tables")
-    print("Run logs written to:", runs_dir)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    print("Run 

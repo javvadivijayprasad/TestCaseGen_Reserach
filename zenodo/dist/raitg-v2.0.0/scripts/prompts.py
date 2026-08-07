@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_VERSION = "raitg-prompt-v1.3.0-sut-grounded"
+PROMPT_VERSION = "raitg-prompt-v1.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -31,30 +31,6 @@ ROLE_SENIOR_QA = (
 # ---------------------------------------------------------------------------
 # Element 2: context injection
 # ---------------------------------------------------------------------------
-def _load_sut_source(target_app: str) -> str:
-    """Load the actual source of the target SUT (v1.3.0 grounding).
-
-    This eliminates attribute hallucination — Claude sees exactly what
-    methods and dataclass fields exist and cannot invent new ones.
-    """
-    import os
-    if not target_app:
-        return ""
-    # Resolve repo/<target_app>/app.py relative to this file
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.dirname(here)
-    src_path = os.path.join(root, "repo", target_app, "app.py")
-    try:
-        with open(src_path, "r", encoding="utf-8") as f:
-            src = f.read()
-        # Keep the whole file if <=6000 chars, else truncate around __init__
-        if len(src) <= 6000:
-            return src
-        return src[:6000] + "\n\n# ... (truncated; full source in repo/{}/app.py)".format(target_app)
-    except FileNotFoundError:
-        return ""
-
-
 def context_block(req: dict[str, Any], glossary: dict[str, str] | None = None,
                   exemplars: list[dict[str, Any]] | None = None) -> str:
     parts = ["[CONTEXT]"]
@@ -71,24 +47,6 @@ def context_block(req: dict[str, Any], glossary: dict[str, str] | None = None,
     parts.append(f"Error pathways: {'; '.join(req.get('error_pathways') or [])}")
     parts.append(f"Target app: {req.get('target_app')}")
     parts.append(f"Endpoint/screen: {req.get('target_endpoint_or_screen')}")
-
-    # v1.3.0: inject actual SUT source to eliminate attribute hallucination
-    sut_src = _load_sut_source(req.get("target_app", ""))
-    if sut_src:
-        parts.append("")
-        parts.append("[TARGET SUT SOURCE — use ONLY these methods and dataclass fields]")
-        parts.append("The target app is at repo/{}/app.py. Its full source is below.".format(
-            req.get("target_app")))
-        parts.append("CRITICAL: Only reference methods, class names, and dataclass fields")
-        parts.append("that EXIST in this source. Do NOT invent attributes like")
-        parts.append("`notification_sent`, `status`, `error_code`, or any other field")
-        parts.append("that is not visible in the source below. Hallucinated attributes")
-        parts.append("will cause AttributeError and your test will contribute ZERO to")
-        parts.append("mutation kill rate.")
-        parts.append("```python")
-        parts.append(sut_src)
-        parts.append("```")
-
     if glossary:
         parts.append(f"Glossary: {json.dumps(glossary)}")
     if exemplars:
@@ -332,29 +290,10 @@ def task_directive(target_framework: str) -> str:
         "Each test case must be self-contained, deterministic, and idempotent.\n\n"
         "IMPORTANT LIMITS:\n"
         "  - Keep each `executable` field to AT MOST 40 lines of code.\n"
-        "  - The `executable` field MUST be SELF-CONTAINED, runnable Python code.\n"
-        "    NO placeholders like <helper_fn>, <fixture>, <mock>, <TODO>.\n"
-        "    NO undefined function or class references.\n"
-        "  - For the target_app (indicated in [CONTEXT] as target_app), the SUT is\n"
-        "    a plain Python module at repo/<target_app>/app.py. Import DIRECTLY from\n"
-        "    it, e.g.:\n"
-        "      For target_app=\"banking-api\": from app import BankingAPI\n"
-        "      For target_app=\"hr-app\":      from app import HR\n"
-        "      For target_app=\"fhir-lite\":   from app import Fhir\n"
-        "      For target_app=\"logistics-app\": from app import Logistics\n"
-        "    Then call the API's public methods directly:\n"
-        "      api = BankingAPI()\n"
-        "      c = api.create_customer(verified=True, tier='standard')\n"
-        "      assert c.id > 0\n"
-        "  - The test body must be executable at MODULE-LEVEL (not inside `def test_*`),\n"
-        "    like the baseline test suite in scripts/baseline_tests.py.\n"
-        "    Use plain `assert` statements + try/except to trap expected errors.\n"
+        "  - Use placeholders (e.g. <helper_fn>, <fixture>) rather than full helper code.\n"
         "  - Do NOT include license headers, long import lists, or multi-line docstrings.\n"
         "  - Always properly escape internal double-quotes in JSON string values.\n"
-        "  - Prefer concise assertions over comprehensive setup/teardown.\n"
-        "  - Every test's `executable` code will be EXECUTED against mutants of the\n"
-        "    target app. If the code crashes with SyntaxError or NameError, the test\n"
-        "    contributes ZERO to mutation kill rate. Write code that actually runs."
+        "  - Prefer concise assertions over comprehensive setup/teardown."
         + hint_block
     )
 
@@ -375,80 +314,6 @@ HEURISTIC_SCAFFOLD = (
 
 
 # ---------------------------------------------------------------------------
-# Element 6: mutation resilience (added 2026-08-04 in response to Menzies R1 review)
-# ---------------------------------------------------------------------------
-MUTATION_RESILIENCE = (
-    "[MUTATION RESILIENCE]\n"
-    "Your tests will be scored by executable mutation testing (mutmut). A "
-    "MUTATION-RESILIENT test suite kills common mutation operators. Follow "
-    "these rules for every test you write:\n\n"
-    "  1. ASSERT EXACT VALUES, not existence.\n"
-    "     BAD:  assert result is not None\n"
-    "     BAD:  assert response.status_code >= 200\n"
-    "     GOOD: assert result == 42\n"
-    "     GOOD: assert response.status_code == 200\n"
-    "     GOOD: assert response.json() == {\"balance\": 500, \"currency\": \"USD\"}\n\n"
-    "  2. TEST BOTH SIDES of every comparison operator in the code under test.\n"
-    "     For x >= threshold, write:\n"
-    "       - a test where x == threshold-1 (should fail the condition)\n"
-    "       - a test where x == threshold (should pass — this catches > vs >=)\n"
-    "       - a test where x == threshold+1 (should pass)\n"
-    "     This catches mutations that flip <, <=, >, >=, ==, !=.\n\n"
-    "  3. TEST BOUNDARY ±1 for every numeric threshold, quantity, or index.\n"
-    "     If code uses limit=100, test at 99, 100, 101 (not just at 50).\n"
-    "     This catches off-by-one mutations (n -> n+1, n -> n-1).\n\n"
-    "  4. ASSERT ARITHMETIC OUTPUTS EXACTLY.\n"
-    "     For code that returns x + y, do not just check that a number is returned.\n"
-    "     Compute the expected value in the test and assert equality:\n"
-    "       assert calculate(3, 5) == 8    # catches + -> -, + -> *, etc.\n\n"
-    "  5. ASSERT ON BOOLEAN INVARIANTS both true AND false.\n"
-    "     If code has `if verified and tier == 'premium':`, write:\n"
-    "       - test with verified=True, tier='premium' (both branches true)\n"
-    "       - test with verified=False, tier='premium' (short-circuits on verified)\n"
-    "       - test with verified=True, tier='standard' (short-circuits on tier)\n"
-    "     This catches `and -> or` and boolean negation mutations.\n\n"
-    "  6. COVER NEGATIVE-PATH RETURN VALUES, not just exceptions.\n"
-    "     If a function returns None on invalid input, assert:\n"
-    "       assert function(bad_input) is None    # not just: with pytest.raises(...)\n"
-    "     This catches mutations that suppress the None-return path.\n\n"
-    "  7. FOR EVERY CONSTANT in the code (limits, thresholds, error codes, magic\n"
-    "     numbers), write a test whose ASSERTION uses that exact constant. If the\n"
-    "     constant is mutated (100 -> 101, \"ERR_001\" -> \"XX_001\"), your test\n"
-    "     must fail.\n\n"
-    "  8. AVOID GENERIC ASSERTIONS like `assert True`, `assert response`, or\n"
-    "     `assert isinstance(x, dict)` without also asserting the dict's contents.\n"
-    "     Every assertion should distinguish the correct implementation from a\n"
-    "     subtly wrong implementation.\n\n"
-    "The scoring rubric: a test that passes on the correct code but ALSO passes on\n"
-    "code with a small semantic change (operator flip, constant bump, boolean\n"
-    "negation) is a weak test. Aim for tests that FAIL when the code is subtly\n"
-    "wrong. Rate your own tests before returning: for each test, briefly note in\n"
-    "the `heuristic` field which mutation operator(s) it is designed to catch\n"
-    "(e.g. \"BVA + boundary-mutation\", \"EP + comparison-mutation\").\n\n"
-    "REFERENCE EXAMPLE — a mutation-resilient banking-api test:\n"
-    "```python\n"
-    "from app import BankingAPI\n"
-    "api = BankingAPI()\n"
-    "c = api.create_customer(verified=True, tier='standard')\n"
-    "assert c.id > 0 and c.verified is True                  # exact-value, boolean\n"
-    "# open_checking min-boundary: 2500 is allowed\n"
-    "a_min = api.open_checking(owner_id=c.id, initial_deposit_cents=2500)\n"
-    "assert a_min.balance == 2500                            # exact constant\n"
-    "# open_checking min-1: 2499 is rejected\n"
-    "try:\n"
-    "    api.open_checking(owner_id=c.id, initial_deposit_cents=2499)\n"
-    "    raise AssertionError('expected ValueError')\n"
-    "except ValueError: pass                                 # boundary -1 rejected\n"
-    "# open_checking min+1: 2501 is allowed (verifies > vs >=)\n"
-    "a_mp1 = api.open_checking(owner_id=c.id, initial_deposit_cents=2501)\n"
-    "assert a_mp1.balance == 2501                            # boundary +1\n"
-    "```\n"
-    "Notice: no placeholders, direct imports, exact-value assertions,\n"
-    "boundary ±1, both operand paths of any `or` short-circuit tested."
-)
-
-
-# ---------------------------------------------------------------------------
 # Element 5: output contract
 # ---------------------------------------------------------------------------
 OUTPUT_SCHEMA = {
@@ -463,7 +328,7 @@ OUTPUT_SCHEMA = {
             "items": {
                 "type": "object",
                 "required": ["name", "kind", "heuristic", "preconditions",
-                             "actions", "expected", "trace", "executable"],
+                             "actions", "expected", "trace"],
                 "properties": {
                     "name": {"type": "string"},
                     "kind": {"type": "string", "enum": ["positive", "negative", "boundary"]},
@@ -472,8 +337,7 @@ OUTPUT_SCHEMA = {
                     "actions": {"type": "array", "items": {"type": "string"}},
                     "expected": {"type": "array", "items": {"type": "string"}},
                     "trace": {"type": "array", "items": {"type": "string"}},
-                    "executable": {"type": "string",
-                                    "description": "Self-contained runnable Python code, module-level (no def test_* wrapper). Must import directly from `app` (the target SUT module) and use plain assert/try-except. NO placeholders."},
+                    "executable": {"type": "string"},
                 }
             }
         }
@@ -517,10 +381,6 @@ def compose_prompt(req: dict[str, Any], target_framework: str = "pytest",
              task_directive(target_framework)]
     if mode != "no-heuristic":
         parts.append(HEURISTIC_SCAFFOLD)
-    # v1.1.0: mutation-resilience element (added in R2 revision after Menzies' review)
-    # Enabled for "full" mode; ablation modes can be added later ("no-mutation").
-    if mode == "full":
-        parts.append(MUTATION_RESILIENCE)
     if mode != "no-contract":
         parts.append(output_contract(target_framework))
     return "\n\n".join(parts)

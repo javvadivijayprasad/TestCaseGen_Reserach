@@ -2,6 +2,9 @@
 
 Current adapters:
   - AnthropicAdapter: Claude (Sonnet / Haiku / Opus)
+  - OpenAIAdapter: GPT-4o-mini and other OpenAI chat models
+  - GeminiAdapter: Google Gemini 2.5 Flash (and other Gemini models)
+  - GroqAdapter: Groq-hosted Meta Llama 3.3 70B (and other Groq chat models)
   - DeterministicStubAdapter: offline replacement that returns plausible
     JSON responses for pipeline tests and for dry runs without an API key.
 """
@@ -97,6 +100,245 @@ class AnthropicAdapter(LLMAdapter):
         )
 
 
+class OpenAIAdapter(LLMAdapter):
+    """OpenAI chat-completion adapter (defaults to gpt-4o-mini).
+
+    Matches the AnthropicAdapter shape: temperature=0 for deterministic
+    decoding, same transient-error retry with exponential backoff. The
+    ``seed`` argument (optional) is forwarded to the OpenAI API for
+    reproducibility across runs; None means no explicit seed.
+    """
+
+    def __init__(self, model: str = "gpt-4o-mini",
+                 api_key: str | None = None,
+                 seed: int | None = None) -> None:
+        try:
+            import openai  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "openai SDK not installed. `pip install openai --break-system-packages`"
+            ) from e
+        self.model = model
+        self.seed = seed
+        self.client = openai.OpenAI(
+            api_key=api_key or os.environ.get("OPENAI_API_KEY")
+        )
+
+    def complete(self, prompt: str, *, max_output_tokens: int = 8000) -> LLMResponse:
+        start = time.perf_counter()
+        transient_codes = {429, 500, 502, 503}
+        max_attempts = 6
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    # Deterministic decoding to match Sonnet baseline as
+                    # closely as possible for the cross-provider comparison.
+                    temperature=0,
+                    # None = no seed; otherwise OpenAI attempts reproducibility.
+                    seed=self.seed,
+                    max_tokens=max_output_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                break
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                is_transient = status in transient_codes or "overloaded" in str(e).lower()
+                if not is_transient or attempt >= max_attempts:
+                    raise
+                delay = min(128, 2 ** (attempt + 1))
+                print(f"[OpenAIAdapter] transient error (status={status}); "
+                      f"retry {attempt}/{max_attempts} in {delay}s: {e}")
+                time.sleep(delay)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        text = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        return LLMResponse(
+            text=text,
+            backend="openai",
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            metadata={
+                "finish_reason": getattr(resp.choices[0], "finish_reason", None),
+                "system_fingerprint": getattr(resp, "system_fingerprint", None),
+                "seed": self.seed,
+            },
+        )
+
+
+class GeminiAdapter(LLMAdapter):
+    """Google Gemini adapter (defaults to gemini-2.5-flash).
+
+    Supports either ``google-generativeai`` (legacy SDK) or ``google-genai``
+    (new SDK) — whichever is installed. Note: the Gemini SDK does not
+    expose a first-class ``seed`` argument in generation_config, so seed
+    variance for reproducibility studies must be done on OpenAI only.
+    """
+
+    def __init__(self, model: str = "gemini-2.5-flash",
+                 api_key: str | None = None) -> None:
+        self.model = model
+        key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        # Try legacy SDK first, fall back to new SDK
+        self._impl = None
+        try:
+            import google.generativeai as genai  # type: ignore
+            genai.configure(api_key=key)
+            self._genai = genai
+            self._model = genai.GenerativeModel(model)
+            self._impl = "legacy"
+        except Exception:
+            try:
+                from google import genai as _genai2  # type: ignore
+                self._client = _genai2.Client(api_key=key)
+                self._impl = "new"
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError(
+                    "No Google Gemini SDK found. Install one of:\n"
+                    "  pip install google-generativeai\n"
+                    "  pip install google-genai"
+                ) from e
+
+    def complete(self, prompt: str, *, max_output_tokens: int = 8000) -> LLMResponse:
+        start = time.perf_counter()
+        transient_names = {"ResourceExhausted", "DeadlineExceeded",
+                           "InternalServerError", "ServiceUnavailable"}
+        max_attempts = 6
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if self._impl == "legacy":
+                    resp = self._model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0,
+                            "max_output_tokens": max_output_tokens,
+                        },
+                    )
+                else:
+                    resp = self._client.models.generate_content(
+                        model=self.model,
+                        contents=prompt,
+                        config={
+                            "temperature": 0,
+                            "max_output_tokens": max_output_tokens,
+                        },
+                    )
+                break
+            except Exception as e:
+                name = type(e).__name__
+                is_transient = (
+                    name in transient_names
+                    or "overloaded" in str(e).lower()
+                    or "rate" in str(e).lower()
+                )
+                if not is_transient or attempt >= max_attempts:
+                    raise
+                delay = min(128, 2 ** (attempt + 1))
+                print(f"[GeminiAdapter] transient error ({name}); "
+                      f"retry {attempt}/{max_attempts} in {delay}s: {e}")
+                time.sleep(delay)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        # ``response.text`` works on both SDKs for simple text output.
+        text = getattr(resp, "text", "") or ""
+        usage = getattr(resp, "usage_metadata", None)
+        input_tokens = getattr(usage, "prompt_token_count", 0) if usage else 0
+        output_tokens = getattr(usage, "candidates_token_count", 0) if usage else 0
+        return LLMResponse(
+            text=text,
+            backend="google",
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            metadata={"sdk": self._impl},
+        )
+
+
+class GroqAdapter(LLMAdapter):
+    """Groq chat-completion adapter (defaults to Meta Llama 3.3 70B versatile).
+
+    Groq's Python SDK is drop-in compatible with the OpenAI chat.completions
+    interface, so the shape here mirrors :class:`OpenAIAdapter`. The main
+    difference is the free-tier rate limit (~30 requests/minute, ~6000/day),
+    which motivates a slightly more generous exponential backoff on 429s.
+    ``temperature=0`` matches the deterministic decoding used by the Sonnet
+    baseline. ``seed`` is forwarded when non-None (Groq accepts the OpenAI
+    seed parameter).
+    """
+
+    def __init__(self, model: str = "llama-3.3-70b-versatile",
+                 api_key: str | None = None,
+                 seed: int | None = None) -> None:
+        try:
+            import groq  # type: ignore
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError(
+                "groq SDK not installed. `pip install groq --break-system-packages`"
+            ) from e
+        self.model = model
+        self.seed = seed
+        self.client = groq.Groq(
+            api_key=api_key or os.environ.get("GROQ_API_KEY")
+        )
+
+    def complete(self, prompt: str, *, max_output_tokens: int = 8000) -> LLMResponse:
+        start = time.perf_counter()
+        transient_codes = {429, 500, 502, 503}
+        max_attempts = 6
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    # Deterministic decoding to match Sonnet baseline as
+                    # closely as possible for the cross-provider comparison.
+                    temperature=0,
+                    seed=self.seed,
+                    max_tokens=max_output_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                break
+            except Exception as e:
+                status = getattr(e, "status_code", None)
+                is_transient = status in transient_codes or "rate" in str(e).lower()
+                if not is_transient or attempt >= max_attempts:
+                    raise
+                # Same shape as OpenAI/Anthropic backoff: 4s, 8s, 16s, 32s,
+                # 64s, 128s. Groq's free-tier limit is ~30 req/min, so
+                # 429s should clear within one or two of these steps.
+                delay = min(128, 2 ** (attempt + 1))
+                print(f"[GroqAdapter] transient error (status={status}); "
+                      f"retry {attempt}/{max_attempts} in {delay}s: {e}")
+                time.sleep(delay)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        text = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        return LLMResponse(
+            text=text,
+            backend="groq",
+            model=self.model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            metadata={
+                "finish_reason": getattr(resp.choices[0], "finish_reason", None)
+                                 if resp.choices else None,
+                "seed": self.seed,
+            },
+        )
+
+
 class DeterministicStubAdapter(LLMAdapter):
     """Deterministic stub for offline / CI runs.
 
@@ -164,13 +406,99 @@ class DeterministicStubAdapter(LLMAdapter):
 
 
 def build_adapter(backend: str = "auto",
-                  model: str = "claude-sonnet-4-6") -> LLMAdapter:
+                  model: str = "claude-sonnet-4-6",
+                  seed: int | None = None) -> LLMAdapter:
     backend = backend.lower()
     if backend == "stub":
         return DeterministicStubAdapter()
     if backend == "stdlib":
         from llm_adapter_stdlib import StdlibAnthropicAdapter  # type: ignore
         return StdlibAnthropicAdapter(model=model)  # type: ignore[return-value]
+
+    if backend in ("openai", "gpt"):
+        try:
+            import openai  # type: ignore  # noqa: F401
+            has_sdk = True
+        except Exception:
+            has_sdk = False
+        has_key = bool(os.environ.get("OPENAI_API_KEY"))
+        problems = []
+        if not has_key:
+            problems.append(
+                "OPENAI_API_KEY env var is not set. "
+                "Set it with: $env:OPENAI_API_KEY='sk-...' (PowerShell)"
+            )
+        if not has_sdk:
+            problems.append(
+                "openai SDK is not installed. Install it with: pip install openai"
+            )
+        if problems:
+            raise RuntimeError(
+                "OpenAI backend requested but unavailable:\n  - "
+                + "\n  - ".join(problems)
+            )
+        return OpenAIAdapter(model=model, seed=seed)
+
+    if backend in ("groq", "llama"):
+        try:
+            import groq  # type: ignore  # noqa: F401
+            has_sdk = True
+        except Exception:
+            has_sdk = False
+        has_key = bool(os.environ.get("GROQ_API_KEY"))
+        problems = []
+        if not has_key:
+            problems.append(
+                "GROQ_API_KEY env var is not set. "
+                "Set it with: $env:GROQ_API_KEY='gsk_...' (PowerShell)"
+            )
+        if not has_sdk:
+            problems.append(
+                "groq SDK is not installed. Install it with: pip install groq"
+            )
+        if problems:
+            raise RuntimeError(
+                "Groq backend requested but unavailable:\n  - "
+                + "\n  - ".join(problems)
+            )
+        return GroqAdapter(model=model, seed=seed)
+
+    if backend in ("gemini", "google"):
+        has_sdk = False
+        try:
+            import google.generativeai  # type: ignore  # noqa: F401
+            has_sdk = True
+        except Exception:
+            try:
+                from google import genai  # type: ignore  # noqa: F401
+                has_sdk = True
+            except Exception:
+                has_sdk = False
+        has_key = bool(
+            os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        )
+        problems = []
+        if not has_key:
+            problems.append(
+                "GEMINI_API_KEY (or GOOGLE_API_KEY) env var is not set. "
+                "Set it with: $env:GEMINI_API_KEY='...' (PowerShell)"
+            )
+        if not has_sdk:
+            problems.append(
+                "Google Gemini SDK is not installed. Install one of:\n"
+                "      pip install google-generativeai\n"
+                "      pip install google-genai"
+            )
+        if problems:
+            raise RuntimeError(
+                "Gemini backend requested but unavailable:\n  - "
+                + "\n  - ".join(problems)
+            )
+        # NOTE: Gemini SDK has no first-class ``seed`` argument in
+        # generation_config, so the seed parameter is intentionally ignored
+        # here. Reproducibility variance studies use OpenAI only.
+        return GeminiAdapter(model=model)
+
     if backend in ("auto", "anthropic", "claude"):
         has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
         has_sdk = anthropic is not None

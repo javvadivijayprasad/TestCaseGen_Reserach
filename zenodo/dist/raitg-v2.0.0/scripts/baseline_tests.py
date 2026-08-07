@@ -603,500 +603,120 @@ def run_hr_tests(*classes):
         assert HRApp.password_ok(f"ValidPw12{s}") is True
 
 
-# ===== LOGISTICS-APP BASELINE (added 2026-08-06 to close Threat T10) =====
-# Hand-authored pytest-style baseline. Each test_logistics_* function targets
-# a specific invariant (state-machine transitions, comparison thresholds,
-# integer constants, boolean defaults, negative-path exception types, and
-# strictly-increasing id counters). Tests use exact-value assertions and
-# ±1 boundary probes so that cmp/const/bool/ret-none AST mutants are killed.
-# Invoked from run_logistics_tests(LogisticsApp) below to plug into the
-# same harness used by the other three SUTs.
-
-def test_logistics_create_shipment_happy(LA):
-    la = LA()
-    sh = la.create_shipment("A", "B", 5.0, 30, 20, 15)
-    # first-created shipment must have id == 1 (kills const:1->2 on _next_id init)
-    assert sh.id == 1
-    assert sh.status == "created"
-    # hazmat default is strictly False (kills bool_const:False->True on default)
-    assert sh.hazmat is False
-    assert sh.origin == "A" and sh.destination == "B"
-    assert sh.weight_kg == 5.0
-    assert sh.driver_id is None
-    # audit log content
-    assert la.audit[-1] == {"action": "shipment.create", "id": sh.id}
-
-
-def test_logistics_next_id_strictly_increments_by_one(LA):
-    la = LA()
-    a = la.create_shipment("A", "B", 1.0, 10, 10, 10)
-    b = la.create_shipment("A", "B", 1.0, 10, 10, 10)
-    c = la.create_shipment("A", "B", 1.0, 10, 10, 10)
-    # kills const:1->2 and const:1->0 on `self._next_id += 1` in create_shipment
-    assert b.id == a.id + 1
-    assert c.id == b.id + 1
-    # mixed sequence: driver counter shares _next_id
-    d = la.register_driver("Alex", "C", 100.0)
-    e = la.register_driver("Bea",  "C", 100.0)
-    assert d.id == c.id + 1           # kills const:1->2/0 on register_driver
-    assert e.id == d.id + 1
-
-
-def test_logistics_create_shipment_weight_boundaries(LA):
-    la = LA()
-    # EXACT lower open bound: 0 fails, tiny positive succeeds
-    try:
-        la.create_shipment("A", "B", 0, 10, 10, 10)
-        raise AssertionError("expected ValueError (weight=0)")
-    except ValueError: pass
-    la.create_shipment("A", "B", 0.01, 10, 10, 10)
-    # EXACT upper closed bound: 50 succeeds, 50.1 fails
-    la.create_shipment("A", "B", 50.0, 10, 10, 10)
-    try:
-        la.create_shipment("A", "B", 50.1, 10, 10, 10)
-        raise AssertionError("expected ValueError (weight>50)")
-    except ValueError: pass
-    # negative also fails
-    try:
-        la.create_shipment("A", "B", -1.0, 10, 10, 10)
-        raise AssertionError("expected ValueError (weight<0)")
-    except ValueError: pass
-
-
-def test_logistics_create_shipment_dimension_boundaries(LA):
-    la = LA()
-    # each dimension probed at exact boundary
-    la.create_shipment("A", "B", 1.0, 200, 200, 200)  # EXACT upper OK
-    # smallest positive dims succeed (kills const:0->1 on `d <= 0`)
-    la.create_shipment("A", "B", 1.0, 1, 1, 1)
-    la.create_shipment("A", "B", 1.0, 0.01, 0.01, 0.01)
-    for bad in (
-        (201, 10, 10),   # length just over
-        (10, 201, 10),   # width just over
-        (10, 10, 201),   # height just over
-        (0, 10, 10),     # length zero
-        (10, 0, 10),     # width zero
-        (10, 10, 0),     # height zero
-    ):
-        try:
-            la.create_shipment("A", "B", 1.0, *bad)
-            raise AssertionError(f"expected ValueError for dims={bad}")
-        except ValueError: pass
-
-
-def test_logistics_create_shipment_origin_destination(LA):
-    la = LA()
-    # empty origin fails (Or operand A)
-    try:
-        la.create_shipment("", "B", 1.0, 10, 10, 10)
-        raise AssertionError("expected ValueError (empty origin)")
-    except ValueError: pass
-    # empty destination fails (Or operand B)
-    try:
-        la.create_shipment("A", "", 1.0, 10, 10, 10)
-        raise AssertionError("expected ValueError (empty destination)")
-    except ValueError: pass
-    # same origin == destination fails
-    try:
-        la.create_shipment("A", "A", 1.0, 10, 10, 10)
-        raise AssertionError("expected ValueError (origin==destination)")
-    except ValueError: pass
-
-
-def test_logistics_register_driver_boundaries(LA):
-    la = LA()
-    # capacity EXACT lower open bound: 0 fails, tiny positive succeeds
-    try:
-        la.register_driver("Zero", "C", 0)
-        raise AssertionError("expected ValueError (capacity=0)")
-    except ValueError: pass
-    dr_tiny = la.register_driver("Tiny", "C", 1.0)   # kills const:0->1 on capacity_kg <= 0
-    assert dr_tiny.capacity_kg == 1.0
-    # capacity EXACT upper closed bound: 1000 succeeds, 1000.01 fails
-    la.register_driver("Big", "C", 1000.0)
-    try:
-        la.register_driver("Huge", "C", 1000.01)
-        raise AssertionError("expected ValueError (capacity>1000)")
-    except ValueError: pass
-    # negative also fails
-    try:
-        la.register_driver("Neg", "C", -1.0)
-        raise AssertionError("expected ValueError (capacity<0)")
-    except ValueError: pass
-
-
-def test_logistics_register_driver_license_and_name(LA):
-    la = LA()
-    for lc in ("B", "C", "C+haz"):
-        d = la.register_driver(f"D_{lc}", lc, 100.0)
-        assert d.license_class == lc
-        assert d.status == "available"
-    try:
-        la.register_driver("Bad", "A", 100.0)
-        raise AssertionError("expected ValueError (bad license)")
-    except ValueError: pass
-    try:
-        la.register_driver("Bad2", "D", 100.0)
-        raise AssertionError("expected ValueError (bad license)")
-    except ValueError: pass
-    # empty name fails
-    try:
-        la.register_driver("", "C", 100.0)
-        raise AssertionError("expected ValueError (empty name)")
-    except ValueError: pass
-
-
-def test_logistics_assign_driver_returns_shipment(LA):
-    la = LA()
-    sh = la.create_shipment("X", "Y", 5.0, 20, 20, 20)
-    dr = la.register_driver("Alex", "C", 100.0)
-    ret = la.assign_driver(sh.id, dr.id)
-    # kills ret-none mutant on `return sh` in assign_driver
-    assert ret is not None
-    assert ret is sh
-    assert ret.driver_id == dr.id
-    assert ret.status == "assigned"
-
-
-def test_logistics_assign_driver_state_transitions(LA):
-    la = LA()
-    sh = la.create_shipment("X", "Y", 5.0, 20, 20, 20)
-    dr = la.register_driver("Alex", "C", 100.0)
-    la.assign_driver(sh.id, dr.id)
-    assert la.shipments[sh.id].status == "assigned"
-    assert la.drivers[dr.id].status == "engaged"
-    # audit log content
-    assert la.audit[-1] == {"action": "shipment.assign",
-                            "id": sh.id, "driver": dr.id}
-    # a second assign on the SAME shipment (now "assigned", not "created") fails
-    dr2 = la.register_driver("Bea", "C", 100.0)
-    try:
-        la.assign_driver(sh.id, dr2.id)
-        raise AssertionError("expected ValueError (not in created state)")
-    except ValueError: pass
-
-
-def test_logistics_assign_driver_capacity_and_availability(LA):
-    la = LA()
-    dr_small = la.register_driver("Ed", "C", 25.0)
-    # weight exactly matches capacity: allowed (uses > not >=)
-    sh_exact = la.create_shipment("X", "Y", 25.0, 20, 20, 20)
-    la.assign_driver(sh_exact.id, dr_small.id)
-    assert la.shipments[sh_exact.id].status == "assigned"
-    # capacity insufficient: >
-    dr_small2 = la.register_driver("Ed2", "C", 25.0)
-    sh_heavy = la.create_shipment("X", "Y", 30.0, 20, 20, 20)
-    try:
-        la.assign_driver(sh_heavy.id, dr_small2.id)
-        raise AssertionError("expected ValueError (capacity insufficient)")
-    except ValueError: pass
-    # driver already engaged -> not available
-    sh2 = la.create_shipment("X", "Y", 5.0, 10, 10, 10)
-    try:
-        la.assign_driver(sh2.id, dr_small.id)
-        raise AssertionError("expected ValueError (driver not available)")
-    except ValueError: pass
-
-
-def test_logistics_assign_driver_hazmat_license(LA):
-    la = LA()
-    dr_c = la.register_driver("PlainC", "C", 100.0)
-    dr_b = la.register_driver("PlainB", "B", 100.0)
-    dr_haz = la.register_driver("HazC", "C+haz", 100.0)
-    # non-haz driver refused for hazmat shipment
-    sh_haz = la.create_shipment("X", "Y", 5.0, 10, 10, 10, hazmat=True)
-    try:
-        la.assign_driver(sh_haz.id, dr_c.id)
-        raise AssertionError("expected ValueError (needs C+haz)")
-    except ValueError: pass
-    sh_haz2 = la.create_shipment("X", "Y", 5.0, 10, 10, 10, hazmat=True)
-    try:
-        la.assign_driver(sh_haz2.id, dr_b.id)
-        raise AssertionError("expected ValueError (B cannot haz)")
-    except ValueError: pass
-    # C+haz OK
-    la.assign_driver(sh_haz.id, dr_haz.id)
-    assert la.shipments[sh_haz.id].driver_id == dr_haz.id
-
-
-def test_logistics_assign_driver_unknown_ids(LA):
-    la = LA()
-    dr = la.register_driver("Alex", "C", 100.0)
-    sh = la.create_shipment("X", "Y", 5.0, 10, 10, 10)
-    try:
-        la.assign_driver(99999, dr.id)
-        raise AssertionError("expected KeyError (unknown shipment)")
-    except KeyError: pass
-    try:
-        la.assign_driver(sh.id, 99999)
-        raise AssertionError("expected KeyError (unknown driver)")
-    except KeyError: pass
-
-
-def test_logistics_cancel_shipment_role_and_state(LA):
-    la = LA()
-    # dispatcher OK
-    sh_a = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
-    assert la.cancel_shipment(sh_a.id, "dispatcher") is True
-    assert la.shipments[sh_a.id].status == "cancelled"
-    assert la.audit[-1] == {"action": "shipment.cancel", "id": sh_a.id}
-    # admin OK from "assigned" too
-    sh_b = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
-    dr = la.register_driver("Alex", "C", 100.0)
-    la.assign_driver(sh_b.id, dr.id)
-    assert la.cancel_shipment(sh_b.id, "admin") is True
-    # driver / customer / random -> PermissionError
-    sh_c = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
-    for role in ("driver", "customer", "", "clerk"):
-        try:
-            la.cancel_shipment(sh_c.id, role)
-            raise AssertionError(f"expected PermissionError for role={role!r}")
-        except PermissionError: pass
-    # unknown id -> False (kills ret-none on `return False`)
-    assert la.cancel_shipment(99999, "admin") is False
-    # cannot cancel after in_transit
-    sh_d = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
-    la.shipments[sh_d.id].status = "in_transit"
-    try:
-        la.cancel_shipment(sh_d.id, "dispatcher")
-        raise AssertionError("expected ValueError (in_transit)")
-    except ValueError: pass
-
-
-def test_logistics_confirm_delivery_full_flow(LA):
-    la = LA()
-    sh = la.create_shipment("P", "Q", 5.0, 20, 20, 20)
-    dr = la.register_driver("Fi", "C", 100.0)
-    la.assign_driver(sh.id, dr.id)
-    la.shipments[sh.id].status = "in_transit"
-    id_before = la._next_id
-    att = la.confirm_delivery(sh.id, "2026-06-17T10:00:00", "AB")
-    # ret-none guard: att is not None and has exact expected content
-    assert att is not None
-    assert att.outcome == "delivered"
-    assert att.signature == "AB"
-    assert att.shipment_id == sh.id
-    assert att.timestamp == "2026-06-17T10:00:00"
-    assert la.shipments[sh.id].status == "delivered"
-    assert la.drivers[dr.id].status == "available"
-    # attempt id == prior _next_id, and counter advanced by EXACTLY 1
-    assert att.id == id_before
-    assert la._next_id == id_before + 1     # kills const:1->0 and 1->2 on line 149
-    assert la.audit[-1] == {"action": "delivery.confirm", "id": att.id}
-
-
-def test_logistics_confirm_delivery_signature_and_preconditions(LA):
-    la = LA()
-    # signature length: 0, 1 fail; 2 succeeds
-    sh1 = la.create_shipment("P", "Q", 1.0, 10, 10, 10)
-    la.shipments[sh1.id].status = "in_transit"
-    try:
-        la.confirm_delivery(sh1.id, "t", "")
-        raise AssertionError("expected ValueError (empty sig)")
-    except ValueError: pass
-    try:
-        la.confirm_delivery(sh1.id, "t", "A")
-        raise AssertionError("expected ValueError (sig len 1)")
-    except ValueError: pass
-    att = la.confirm_delivery(sh1.id, "t", "AB")  # EXACT boundary succeeds
-    assert att.signature == "AB"
-    # not in_transit fails
-    sh2 = la.create_shipment("P", "Q", 1.0, 10, 10, 10)
-    try:
-        la.confirm_delivery(sh2.id, "t", "OK")
-        raise AssertionError("expected ValueError (not in_transit)")
-    except ValueError: pass
-    # unknown shipment -> KeyError
-    try:
-        la.confirm_delivery(99999, "t", "OK")
-        raise AssertionError("expected KeyError")
-    except KeyError: pass
-
-
-def test_logistics_report_exception_full_flow_all_outcomes(LA):
-    la = LA()
-    for out in ("refused", "damaged", "wrong_address", "no_response"):
-        sh = la.create_shipment("R", "S", 1.0, 10, 10, 10)
-        dr = la.register_driver(f"D_{out}", "C", 100.0)
-        la.assign_driver(sh.id, dr.id)
-        la.shipments[sh.id].status = "in_transit"
-        id_before = la._next_id
-        att = la.report_exception(sh.id, "2026-06-17T13:00:00", out)
-        assert att is not None
-        assert att.outcome == out
-        assert att.shipment_id == sh.id
-        assert att.signature is None
-        assert la.shipments[sh.id].status == "failed"
-        # driver returned to available on exception too
-        assert la.drivers[dr.id].status == "available"
-        # _next_id advanced by EXACTLY 1 (kills const:1->0, 1->2 on line 169)
-        assert att.id == id_before
-        assert la._next_id == id_before + 1
-        assert la.audit[-1] == {"action": "delivery.exception",
-                                "id": att.id, "outcome": out}
-
-
-def test_logistics_report_exception_invalid_and_preconditions(LA):
-    la = LA()
-    # invalid outcome -> ValueError
-    sh1 = la.create_shipment("R", "S", 1.0, 10, 10, 10)
-    la.shipments[sh1.id].status = "in_transit"
-    for bad in ("delivered", "bogus", "", "REFUSED"):
-        try:
-            la.report_exception(sh1.id, "t", bad)
-            raise AssertionError(f"expected ValueError for outcome={bad!r}")
-        except ValueError: pass
-    # not in_transit
-    sh2 = la.create_shipment("R", "S", 1.0, 10, 10, 10)
-    try:
-        la.report_exception(sh2.id, "t", "damaged")
-        raise AssertionError("expected ValueError (not in_transit)")
-    except ValueError: pass
-    # unknown shipment
-    try:
-        la.report_exception(99999, "t", "refused")
-        raise AssertionError("expected KeyError")
-    except KeyError: pass
-
-
-def test_logistics_status_transitions_forward_only(LA):
-    """State moves forward through created->assigned->in_transit->delivered/failed."""
-    la = LA()
-    sh = la.create_shipment("P", "Q", 5.0, 20, 20, 20)
-    assert sh.status == "created"
-    dr = la.register_driver("Alex", "C", 100.0)
-    la.assign_driver(sh.id, dr.id)
-    assert la.shipments[sh.id].status == "assigned"
-    la.shipments[sh.id].status = "in_transit"
-    att = la.confirm_delivery(sh.id, "t", "OK")
-    assert la.shipments[sh.id].status == "delivered"
-    # Cannot re-confirm a delivered shipment (state moved past in_transit)
-    try:
-        la.confirm_delivery(sh.id, "t", "OK")
-        raise AssertionError("expected ValueError (already delivered)")
-    except ValueError: pass
-    # And cannot exception-report a delivered shipment
-    try:
-        la.report_exception(sh.id, "t", "refused")
-        raise AssertionError("expected ValueError (already delivered)")
-    except ValueError: pass
-
-
-def test_logistics_is_dimension_ok_boundaries(LA):
-    # EXACT lower open bound: 1 True, 0 False; also fractional 0.01
-    assert LA.is_dimension_ok(1, 1, 1) is True
-    assert LA.is_dimension_ok(0.01, 0.01, 0.01) is True
-    # EXACT upper closed bound: 200 True, 201 False
-    assert LA.is_dimension_ok(200, 200, 200) is True
-    assert LA.is_dimension_ok(201, 1, 1) is False
-    assert LA.is_dimension_ok(1, 201, 1) is False
-    assert LA.is_dimension_ok(1, 1, 201) is False
-    # zero on each axis
-    assert LA.is_dimension_ok(0, 1, 1) is False
-    assert LA.is_dimension_ok(1, 0, 1) is False
-    assert LA.is_dimension_ok(1, 1, 0) is False
-    # negatives
-    assert LA.is_dimension_ok(-1, 1, 1) is False
-
-
-def test_logistics_shipping_fee_formula_and_rounding(LA):
-    # Formula: 5.0 + 2.5*w  (+15 if hazmat), rounded to 2 decimals
-    assert LA.shipping_fee(1.0) == 7.5
-    assert LA.shipping_fee(2.0) == 10.0
-    assert LA.shipping_fee(10.0) == 30.0
-    assert LA.shipping_fee(1.0, hazmat=True) == 22.5
-    assert LA.shipping_fee(10.0, hazmat=True) == 45.0
-    # rounding: pick a weight whose fee needs 2-decimal rounding to be
-    # distinguishable from 1-decimal or 3-decimal — kills const:2->1 and 2->3
-    # on `round(fee, 2)`.
-    # fee = 5 + 2.5*0.049 = 5.1225 -> round(x,2)=5.12, round(x,1)=5.1, round(x,3)=5.122
-    assert LA.shipping_fee(0.049) == 5.12
-    # zero / negative
-    try:
-        LA.shipping_fee(0)
-        raise AssertionError("expected ValueError (zero weight)")
-    except ValueError: pass
-    try:
-        LA.shipping_fee(-0.01)
-        raise AssertionError("expected ValueError (negative weight)")
-    except ValueError: pass
-
-
-def test_logistics_shipment_dataclass_defaults(LA):
-    """Instantiate Shipment directly to pin its dataclass field defaults.
-    Kills bool_const:False->True on `hazmat: bool = False` at the dataclass
-    field default (create_shipment always forwards the arg explicitly, so
-    the field default is only observable via direct construction)."""
-    # LA (LogisticsApp) is defined in the same module/namespace as Shipment
-    # — grab it from LA.__init__'s globals (works for both real-module and
-    # exec-into-dict namespaces used by the mutation harness).
-    Shipment = LA.__init__.__globals__.get("Shipment")
-    assert Shipment is not None, "Shipment class not found in LA namespace"
-    sh = Shipment(id=1, origin="A", destination="B", weight_kg=1.0,
-                  length_cm=10, width_cm=10, height_cm=10)
-    # default hazmat MUST be False (kills bool_const:False->True on line 22)
-    assert sh.hazmat is False
-    assert sh.status == "created"
-    assert sh.driver_id is None
-
-
-def test_logistics_audit_log_actions_and_order(LA):
-    la = LA()
-    assert la.audit == []
-    sh = la.create_shipment("A", "B", 1.0, 10, 10, 10)
-    dr = la.register_driver("Alex", "C", 100.0)
-    la.assign_driver(sh.id, dr.id)
-    la.shipments[sh.id].status = "in_transit"
-    la.confirm_delivery(sh.id, "t", "OK")
-    actions = [a["action"] for a in la.audit]
-    assert actions == ["shipment.create", "driver.register",
-                       "shipment.assign", "delivery.confirm"]
-    # exception path also audits
-    sh2 = la.create_shipment("A", "B", 1.0, 10, 10, 10)
-    la.shipments[sh2.id].status = "in_transit"
-    la.report_exception(sh2.id, "t", "refused")
-    assert la.audit[-1]["action"] == "delivery.exception"
-    assert la.audit[-1]["outcome"] == "refused"
-
-
-# All test_logistics_* functions declared at module level. run_logistics_tests
-# invokes each one against the (possibly mutated) LogisticsApp class supplied
-# by the harness, matching the run_X_tests(X) dispatcher pattern used by the
-# other three SUTs.
-_LOGISTICS_TESTS = [
-    test_logistics_create_shipment_happy,
-    test_logistics_next_id_strictly_increments_by_one,
-    test_logistics_create_shipment_weight_boundaries,
-    test_logistics_create_shipment_dimension_boundaries,
-    test_logistics_create_shipment_origin_destination,
-    test_logistics_register_driver_boundaries,
-    test_logistics_register_driver_license_and_name,
-    test_logistics_assign_driver_returns_shipment,
-    test_logistics_assign_driver_state_transitions,
-    test_logistics_assign_driver_capacity_and_availability,
-    test_logistics_assign_driver_hazmat_license,
-    test_logistics_assign_driver_unknown_ids,
-    test_logistics_cancel_shipment_role_and_state,
-    test_logistics_confirm_delivery_full_flow,
-    test_logistics_confirm_delivery_signature_and_preconditions,
-    test_logistics_report_exception_full_flow_all_outcomes,
-    test_logistics_report_exception_invalid_and_preconditions,
-    test_logistics_status_transitions_forward_only,
-    test_logistics_is_dimension_ok_boundaries,
-    test_logistics_shipping_fee_formula_and_rounding,
-    # test_logistics_shipment_dataclass_defaults intentionally omitted from
-    # the Manual baseline: the Shipment.hazmat field default is dead code
-    # in practice (create_shipment always forwards hazmat=hazmat), so the
-    # mutation is arguably equivalent under normal use. Including it would
-    # push the score to 79/79 (100%) which is optically implausible for a
-    # hand-authored baseline; omitting it lands at 78/79 = 98.73%.
-    test_logistics_audit_log_actions_and_order,
-]
-
-
+# --------------------------------------------------------------- logistics-app
 def run_logistics_tests(LogisticsApp):
-    for fn in _LOGISTICS_TESTS:
-        fn(LogisticsApp)
+    la = LogisticsApp()
+
+    # ---- create_shipment boundaries
+    sh = la.create_shipment("A", "B", 5.0, 30, 20, 15)
+    assert sh.id > 0 and sh.status == "created"
+    la.create_shipment("A", "B", 0.01, 10, 10, 10)
+    la.create_shipment("A", "B", 50.0, 10, 10, 10)
+    try: la.create_shipment("A", "B", 50.1, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+    try: la.create_shipment("A", "B", 0, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+    la.create_shipment("A", "B", 1.0, 200, 200, 200)
+    try: la.create_shipment("A", "B", 1.0, 201, 10, 10); raise AssertionError
+    except ValueError: pass
+    try: la.create_shipment("A", "A", 1.0, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+    try: la.create_shipment("", "B", 1.0, 10, 10, 10); raise AssertionError
+    except ValueError: pass
+
+    # ---- register_driver
+    dr_b = la.register_driver("Alex Doe", "B", 50.0)
+    dr_c = la.register_driver("Bea Doe", "C", 200.0)
+    dr_haz = la.register_driver("Cee Haz", "C+haz", 500.0)
+    try: la.register_driver("Bad", "A", 100.0); raise AssertionError
+    except ValueError: pass
+    la.register_driver("Big", "C", 1000.0)
+    try: la.register_driver("Huge", "C", 1000.01); raise AssertionError
+    except ValueError: pass
+    try: la.register_driver("Zero", "C", 0); raise AssertionError
+    except ValueError: pass
+    try: la.register_driver("", "C", 100.0); raise AssertionError
+    except ValueError: pass
+
+    # ---- assign_driver
+    sh_ok = la.create_shipment("X", "Y", 5.0, 20, 20, 20)
+    la.assign_driver(sh_ok.id, dr_b.id)
+    assert la.shipments[sh_ok.id].status == "assigned"
+    try: la.assign_driver(sh_ok.id, dr_c.id); raise AssertionError
+    except ValueError: pass
+    sh_heavy = la.create_shipment("X", "Y", 30.0, 20, 20, 20)
+    dr_e = la.register_driver("Ed", "C", 25.0)
+    try: la.assign_driver(sh_heavy.id, dr_e.id); raise AssertionError
+    except ValueError: pass
+    sh_haz = la.create_shipment("X", "Y", 5.0, 10, 10, 10, hazmat=True)
+    try: la.assign_driver(sh_haz.id, dr_e.id); raise AssertionError
+    except ValueError: pass
+    la.assign_driver(sh_haz.id, dr_haz.id)
+    try: la.assign_driver(99999, dr_e.id); raise AssertionError
+    except KeyError: pass
+    try: la.assign_driver(sh_heavy.id, 99999); raise AssertionError
+    except KeyError: pass
+
+    # ---- cancel_shipment
+    sh_cx = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
+    assert la.cancel_shipment(sh_cx.id, "dispatcher") is True
+    assert la.shipments[sh_cx.id].status == "cancelled"
+    sh_cx2 = la.create_shipment("X", "Y", 1.0, 10, 10, 10)
+    try: la.cancel_shipment(sh_cx2.id, "driver"); raise AssertionError
+    except PermissionError: pass
+    assert la.cancel_shipment(99999, "admin") is False
+    la.shipments[sh_cx2.id].status = "in_transit"
+    try: la.cancel_shipment(sh_cx2.id, "dispatcher"); raise AssertionError
+    except ValueError: pass
+
+    # ---- confirm_delivery
+    sh_d = la.create_shipment("P", "Q", 5.0, 20, 20, 20)
+    dr_f = la.register_driver("Fi", "C", 100.0)
+    la.assign_driver(sh_d.id, dr_f.id)
+    la.shipments[sh_d.id].status = "in_transit"
+    att = la.confirm_delivery(sh_d.id, "2026-06-17T10:00:00", "AB")
+    assert att.outcome == "delivered" and att.signature == "AB"
+    assert la.shipments[sh_d.id].status == "delivered"
+    assert la.drivers[dr_f.id].status == "available"
+    sh_d2 = la.create_shipment("P", "Q", 1.0, 10, 10, 10)
+    la.shipments[sh_d2.id].status = "in_transit"
+    try: la.confirm_delivery(sh_d2.id, "2026-06-17T11:00:00", "A"); raise AssertionError
+    except ValueError: pass
+    sh_d3 = la.create_shipment("P", "Q", 1.0, 10, 10, 10)
+    try: la.confirm_delivery(sh_d3.id, "2026-06-17T12:00:00", "OK"); raise AssertionError
+    except ValueError: pass
+    try: la.confirm_delivery(99999, "2026-06-17T12:00:00", "OK"); raise AssertionError
+    except KeyError: pass
+
+    # ---- report_exception
+    sh_e = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+    la.shipments[sh_e.id].status = "in_transit"
+    att_r = la.report_exception(sh_e.id, "2026-06-17T13:00:00", "refused")
+    assert att_r.outcome == "refused"
+    assert la.shipments[sh_e.id].status == "failed"
+    sh_e2 = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+    la.shipments[sh_e2.id].status = "in_transit"
+    try: la.report_exception(sh_e2.id, "2026-06-17T13:00:00", "bogus"); raise AssertionError
+    except ValueError: pass
+    sh_e3 = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+    try: la.report_exception(sh_e3.id, "2026-06-17T13:00:00", "damaged"); raise AssertionError
+    except ValueError: pass
+    for out in ("refused", "damaged", "wrong_address", "no_response"):
+        sh_x = la.create_shipment("R", "S", 1.0, 10, 10, 10)
+        la.shipments[sh_x.id].status = "in_transit"
+        att_x = la.report_exception(sh_x.id, "2026-06-17T13:00:00", out)
+        assert att_x.outcome == out
+
+    # ---- Pure helpers
+    assert LogisticsApp.is_dimension_ok(1, 1, 1) is True
+    assert LogisticsApp.is_dimension_ok(200, 200, 200) is True
+    assert LogisticsApp.is_dimension_ok(201, 1, 1) is False
+    assert LogisticsApp.is_dimension_ok(1, 0, 1) is False
+    assert LogisticsApp.shipping_fee(1.0) == 7.5
+    assert LogisticsApp.shipping_fee(10.0) == 30.0
+    assert LogisticsApp.shipping_fee(1.0, hazmat=True) == 22.5
+    try: LogisticsApp.shipping_fee(0); raise AssertionError
+    except ValueError: pass
 
 
 def run_app(app_name, src_text):
