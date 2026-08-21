@@ -1,0 +1,174 @@
+"""
+API routes for managing Player resources.
+
+Provides CRUD endpoints to create, read, update, and delete Player entities.
+
+Features:
+- Caching with in-memory cache to optimize retrieval performance.
+- Async database session dependency injection.
+- Standard HTTP status codes and error handling.
+
+Endpoints:
+- POST /players/                          : Create a new Player.
+- GET /players/                           : Retrieve all Players.
+- GET /players/{player_id}                : Retrieve Player by UUID
+                                            (surrogate key, internal).
+- GET /players/squadnumber/{squad_number} : Retrieve Player by Squad Number
+                                            (natural key, domain).
+- PUT /players/squadnumber/{squad_number} : Update an existing Player.
+- DELETE /players/squadnumber/{squad_number} : Delete an existing Player.
+"""
+from typing import Annotated, List
+from uuid import UUID
+from fastapi import APIRouter, Body, Depends, HTTPException, status, Path, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+from aiocache import SimpleMemoryCache
+from databases.player_database import generate_async_session
+from models.player_model import PlayerRequestModel, PlayerResponseModel
+from services import player_service
+api_router = APIRouter()
+simple_memory_cache = SimpleMemoryCache()
+CACHE_KEY = 'players'
+CACHE_TTL = 599
+SQUAD_NUMBER_TITLE = 'The Squad Number of the Player'
+
+@api_router.post('/players/', response_model=PlayerResponseModel, status_code=status.HTTP_201_CREATED, summary='Creates a new Player', tags=['Players'], responses={422: {'description': 'Unprocessable Entity - request body validation failed'}})
+async def post_async(player_model: Annotated[PlayerRequestModel, Body(...)], async_session: Annotated[AsyncSession, Depends(generate_async_session)], response: Response) -> PlayerResponseModel:
+    """
+    Endpoint to create a new player.
+
+    Args:
+        player_model (PlayerRequestModel): The Pydantic model representing the Player
+        to create.
+        async_session (AsyncSession): The async version of a SQLAlchemy ORM session.
+
+    Returns:
+        PlayerResponseModel: The created Player with its generated UUID.
+
+    Raises:
+        HTTPException: HTTP 409 Conflict error if the Player already exists.
+        HTTPException: HTTP 422 Unprocessable Entity if request body fails Pydantic
+        validation (missing or invalid required fields).
+    """
+    existing = await player_service.retrieve_by_squad_number_async(async_session, player_model.squad_number)
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='A Player with this squad number already exists.')
+    player = await player_service.create_async(async_session, player_model)
+    if player is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Failed to create the Player due to a database error.')
+    await simple_memory_cache.clear(CACHE_KEY)
+    response.headers['Location'] = f'/players/squadnumber/{player.squad_number}'
+    return player
+
+@api_router.get('/players/', response_model=List[PlayerResponseModel], status_code=status.HTTP_200_OK, summary='Retrieves a collection of Players', tags=['Players'])
+async def get_all_async(response: Response, async_session: Annotated[AsyncSession, Depends(generate_async_session)]) -> List[PlayerResponseModel]:
+    """
+    Endpoint to retrieve all players.
+
+    Args:
+        async_session (AsyncSession): The async version of a SQLAlchemy ORM session.
+
+    Returns:
+        List[PlayerResponseModel]: A list of Pydantic models representing all players.
+    """
+    players = await simple_memory_cache.get(CACHE_KEY)
+    response.headers['X-Cache'] = 'HIT'
+    if players is None:
+        players = await player_service.retrieve_all_async(async_session)
+        await simple_memory_cache.set(CACHE_KEY, players, ttl=CACHE_TTL)
+        response.headers['X-Cache'] = 'MISS'
+    return players
+
+@api_router.get('/players/{player_id}', response_model=PlayerResponseModel, status_code=status.HTTP_200_OK, summary='Retrieves a Player by its UUID', tags=['Players'])
+async def get_by_id_async(player_id: Annotated[UUID, Path(..., title='The UUID of the Player')], async_session: Annotated[AsyncSession, Depends(generate_async_session)]):
+    """
+    Endpoint to retrieve a Player by its UUID.
+
+    Args:
+        player_id (UUID): The UUID of the Player to retrieve.
+        async_session (AsyncSession): The async version of a SQLAlchemy ORM session.
+
+    Returns:
+        PlayerResponseModel: The Pydantic model representing the matching Player.
+
+    Raises:
+        HTTPException: Not found error if the Player with the specified UUID does not
+        exist.
+    """
+    player = await player_service.retrieve_by_id_async(async_session, player_id)
+    if not player:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return player
+
+@api_router.get('/players/squadnumber/{squad_number}', response_model=PlayerResponseModel, status_code=status.HTTP_200_OK, summary='Retrieves a Player by its Squad Number', tags=['Players'])
+async def get_by_squad_number_async(squad_number: Annotated[int, Path(..., title=SQUAD_NUMBER_TITLE)], async_session: Annotated[AsyncSession, Depends(generate_async_session)]):
+    """
+    Endpoint to retrieve a Player by its Squad Number.
+
+    Args:
+        squad_number (int): The Squad Number of the Player to retrieve.
+        async_session (AsyncSession): The async version of a SQLAlchemy ORM session.
+
+    Returns:
+        PlayerResponseModel: The Pydantic model representing the matching Player.
+
+    Raises:
+        HTTPException: HTTP 404 Not Found error if the Player with the specified
+        Squad Number does not exist.
+    """
+    player = await player_service.retrieve_by_squad_number_async(async_session, squad_number)
+    if not player:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return player
+
+@api_router.put('/players/squadnumber/{squad_number}', status_code=status.HTTP_204_NO_CONTENT, summary='Updates an existing Player', tags=['Players'], responses={422: {'description': 'Unprocessable Entity - request body validation failed'}})
+async def put_async(squad_number: Annotated[int, Path(..., title=SQUAD_NUMBER_TITLE)], player_model: Annotated[PlayerRequestModel, Body(...)], async_session: Annotated[AsyncSession, Depends(generate_async_session)]):
+    """
+    Endpoint to entirely update an existing Player.
+
+    Args:
+        squad_number (int): The Squad Number of the Player to update.
+        player_model (PlayerRequestModel): The Pydantic model representing the Player
+        to update.
+        async_session (AsyncSession): The async version of a SQLAlchemy ORM session.
+
+    Raises:
+        HTTPException: HTTP 400 Bad Request if squad_number in the request body does
+        not match the path parameter. The path parameter is the authoritative source
+        of identity on PUT; a mismatch makes the request semantically ambiguous (not
+        a validation failure).
+        HTTPException: HTTP 404 Not Found error if the Player with the specified Squad
+        Number does not exist.
+        HTTPException: HTTP 422 Unprocessable Entity if request body fails Pydantic
+        validation (missing or invalid required fields).
+    """
+    if player_model.squad_number != squad_number:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+    player = await player_service.retrieve_by_squad_number_async(async_session, squad_number)
+    if not player:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    updated = await player_service.update_by_squad_number_async(async_session, squad_number, player_model)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Failed to update the Player due to a database error.')
+    await simple_memory_cache.clear(CACHE_KEY)
+
+@api_router.delete('/players/squadnumber/{squad_number}', status_code=status.HTTP_204_NO_CONTENT, summary='Deletes an existing Player', tags=['Players'])
+async def delete_async(squad_number: Annotated[int, Path(..., title=SQUAD_NUMBER_TITLE)], async_session: Annotated[AsyncSession, Depends(generate_async_session)]):
+    """
+    Endpoint to delete an existing Player.
+
+    Args:
+        squad_number (int): The Squad Number of the Player to delete.
+        async_session (AsyncSession): The async version of a SQLAlchemy ORM session.
+
+    Raises:
+        HTTPException: HTTP 404 Not Found error if the Player with the specified Squad
+        Number does not exist.
+    """
+    player = await player_service.retrieve_by_squad_number_async(async_session, squad_number)
+    if not player:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    deleted = await player_service.delete_by_squad_number_async(async_session, squad_number)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Failed to delete the Player due to a database error.')
+    await simple_memory_cache.clear(CACHE_KEY)

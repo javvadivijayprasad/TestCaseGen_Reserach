@@ -44,12 +44,14 @@ import llm_adapter  # noqa: E402
 from json_extract import extract_json  # noqa: E402
 
 CONDITIONS = ["unverified", "ablation", "full"]
-DOMAINS = ["commercial_web", "financial_services", "healthcare", "logistics"]
+# OSS benchmark (2026-08-19): 4 community-authored Python microservices replaced
+# the earlier self-authored SUTs. See BENCHMARK_MANIFEST.md at repo root.
+DOMAINS = ["http_utilities", "sports_players", "blogging", "task_management"]
 APP_FOR_DOMAIN = {
-    "commercial_web": ROOT / "repo" / "hr-app" / "app.py",
-    "financial_services": ROOT / "repo" / "banking-api" / "app.py",
-    "healthcare": ROOT / "repo" / "fhir-lite" / "app.py",
-    "logistics": ROOT / "repo" / "logistics-app" / "app.py",
+    "http_utilities":  ROOT / "repo" / "httpbin" / "httpbin" / "core.py",
+    "sports_players":  ROOT / "repo" / "fastapi-restful" / "main.py",
+    "blogging":        ROOT / "repo" / "flaskr" / "flaskr" / "__init__.py",
+    "task_management": ROOT / "repo" / "fastapi-task-manager" / "app" / "main.py",
 }
 
 
@@ -378,10 +380,10 @@ def main() -> int:
         if not rec:
             continue
         per_dom_rows.append([
-            {"commercial_web": "Commercial Web",
-             "financial_services": "Financial Services",
-             "healthcare": "Healthcare",
-             "logistics": "Logistics"}[d],
+            {"http_utilities":  "HTTP Utilities (httpbin)",
+             "sports_players":  "Sports Players CRUD (fastapi-restful)",
+             "blogging":        "Blogging (flaskr)",
+             "task_management": "Task Management (fastapi-task-manager)"}[d],
             f"{rec['tokens'] / 1_000_000 * 0.6 + rec['requirements'] * setup_hours_per_req:.1f}",
             f"{rec['coverage_pct']:.1f}",
             f"{rec['mutation_score_pct']:.1f}",
